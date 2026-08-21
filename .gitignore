@@ -1,0 +1,38 @@
+# Secrets and authorized-scope (never commit)
+.env
+config/.env
+scope.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Hydra run artifacts (keep empty directory placeholders)
+output/*
+!output/.gitkeep
+logs/*
+!logs/.gitkeep
+*.db
+reports/*.md
+reports/*.json
+reports/*.html
+reports/*.bak
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

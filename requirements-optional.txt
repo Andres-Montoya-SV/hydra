@@ -1,0 +1,2 @@
+# Active browser cloaking probe (large optional browser download)
+playwright==1.62.0

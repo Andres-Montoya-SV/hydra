@@ -1,0 +1,6 @@
+# Copy to scope.txt (gitignored) and edit for your program.
+# One authorized root or hostname per line. Optional *.example.com wildcards.
+metaversejustice.com
+www.metaversejustice.com
+metaversephone.com
+www.metaversephone.com

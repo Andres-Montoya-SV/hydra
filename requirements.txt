@@ -1,0 +1,8 @@
+# Runtime dependencies (pinned for reproducibility)
+# python-dotenv: .env configuration loading (no stdlib equivalent for dotenv format)
+python-dotenv==1.0.1
+# rich: Terminal UI (progress, tables, live dashboard)
+rich==13.9.4
+
+# Development / QA (install with: pip install -r requirements-dev.txt)
+# See requirements-dev.txt

@@ -1,0 +1,68 @@
+[project]
+name = "hydra"
+version = "1.0.0"
+description = "Modular bug bounty reconnaissance framework"
+requires-python = ">=3.10"
+dependencies = [
+    "python-dotenv==1.0.1",
+    "rich==13.9.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "bandit==1.8.3",
+    "black==25.1.0",
+    "isort==6.0.1",
+    "mypy==1.15.0",
+    "pytest==8.3.5",
+    "pytest-asyncio==0.25.3",
+    "ruff==0.11.2",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+extend-exclude = "/(\\.venv|output|logs)/"
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip = [".venv", "output", "logs"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [".venv", "output", "logs", "reports"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "S", "UP", "N"]
+ignore = [
+    "E501",  # black owns wrapping
+    "S310",  # urllib used for explicit HTTP(S) probes
+    "S311",  # PRNG for canary names/ports, not cryptography
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S105", "S108"]
+"app.py" = ["E402"]
+"core/store.py" = ["S608"]
+"modules/naabu.py" = ["S105"]  # probe_pass is not a password
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = false
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+exclude = ["(?x)(tests/|\\.venv/|output/|logs/)"]
+
+[[tool.mypy.overrides]]
+module = ["app", "config.*", "core.*", "modules.*", "ui.*", "utils.*"]
+ignore_errors = true
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
