@@ -736,9 +736,7 @@ class PipelineRunner:
         input_hash = digest.hexdigest()
         return f"{plugin.name}:{input_hash}", input_hash
 
-    def _copy_cached_artifact(
-        self, cached_path: Path, dest_dir: Path, plugin: ReconPlugin
-    ) -> Path:
+    def _copy_cached_artifact(self, cached_path: Path, dest_dir: Path, plugin: ReconPlugin) -> Path:
         """Copy a cached file plus httpx siblings (json/alive/csv) into dest_dir."""
         names = {cached_path.name}
         if plugin.name == "httpx":
