@@ -15,6 +15,9 @@ class KatanaPlugin(BaseToolPlugin):
     display_name = "katana"
     required = False
     stage_order = 50
+    produces = ("urls",)
+    capability = "post_http"
+    active_collection = True
     install_hint_macos = "brew install katana"
     install_hint_linux = "go install github.com/projectdiscovery/katana/cmd/katana@latest"
 

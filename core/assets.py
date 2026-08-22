@@ -66,6 +66,37 @@ def normalize_domain(domain: str) -> str:
     return domain.strip().lower().rstrip(".")
 
 
+def normalize_http_url(url: str) -> str:
+    """Canonical HTTP(S) URL: lowercase host, drop default ports and fragments."""
+    from urllib.parse import urlparse, urlunparse
+
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw if "://" in raw else f"//{raw}")
+    scheme = (parsed.scheme or "https").lower()
+    if scheme not in {"http", "https"}:
+        scheme = "https"
+    host = normalize_domain(parsed.hostname or "")
+    if not host:
+        return raw.split("#", 1)[0]
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    default = 443 if scheme == "https" else 80
+    if ":" in host:
+        netloc = f"[{host}]"
+    else:
+        netloc = host
+    if port and port != default:
+        netloc = f"{netloc}:{port}"
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunparse((scheme, netloc, path, "", parsed.query, ""))
+
+
 @dataclass
 class TechnologyFinding:
     """Technology stack entry with provenance."""
@@ -153,13 +184,19 @@ class DnsRecord:
 
 @dataclass
 class TlsCertificate:
-    """TLS certificate metadata."""
+    """TLS certificate metadata.
+
+    Identity for intelligence correlation is ``fingerprint_sha256`` (leaf
+    SHA-256). SAN lists are observations on the certificate, never its id.
+    """
 
     host: str
     issuer: str | None = None
     subject: str | None = None
     sans: list[str] = field(default_factory=list)
     not_after: str | None = None
+    not_before: str | None = None
+    fingerprint_sha256: str | None = None
     is_wildcard: bool = False
     source: str = "httpx"
     confidence_score: int = 90
@@ -590,6 +627,10 @@ class GraphEdge:
     target_id: str
     relation: str
     confidence: int = 80
+    evidence_id: str | None = None
+    first_seen: str | None = None
+    last_seen: str | None = None
+    confidence_label: str | None = None
 
 
 @dataclass
@@ -623,6 +664,10 @@ class InfrastructureGraph:
                     "target": e.target_id,
                     "relation": e.relation,
                     "confidence": e.confidence,
+                    "confidence_label": e.confidence_label,
+                    "evidence_id": e.evidence_id,
+                    "first_seen": e.first_seen,
+                    "last_seen": e.last_seen,
                 }
                 for e in self.edges
             ],

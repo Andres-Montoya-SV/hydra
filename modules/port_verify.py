@@ -36,6 +36,9 @@ class PortVerifyPlugin(BaseToolPlugin):
     display_name = "Port Verification"
     required = False
     stage_order = 36
+    produces = ("ports",)
+    capability = "port_verify"
+    active_collection = True
     # This plugin exists specifically to re-check naabu's findings against
     # the *current* live TCP state. Replaying a cached artifact would defeat
     # its entire purpose — a target's filtering/firewall behavior can change

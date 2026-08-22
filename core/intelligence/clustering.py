@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from core.assets import Host, InfrastructureCluster
+from core.intel.correlate import band_score, cluster_signal_confidence
 
 
 def compute_clusters(hosts: dict[str, Host]) -> list[InfrastructureCluster]:
@@ -21,7 +22,7 @@ def compute_clusters(hosts: dict[str, Host]) -> list[InfrastructureCluster]:
         ("favicon", _cluster_by_favicon, "Hosts sharing favicon hash"),
         ("title", _cluster_by_title, "Application cluster — shared HTTP title"),
         ("technology", _cluster_by_technology, "Hosts sharing primary technology"),
-        ("certificate", _cluster_by_certificate, "Hosts sharing TLS certificate SAN"),
+        ("certificate", _cluster_by_certificate, "Hosts sharing TLS certificate fingerprint"),
         ("body_hash", _cluster_by_body_hash, "Hosts with identical response body"),
         ("redirect", _cluster_by_redirect, "Hosts with identical redirect chain"),
         ("webserver", _cluster_by_webserver, "Hosts sharing web server fingerprint"),
@@ -34,13 +35,14 @@ def compute_clusters(hosts: dict[str, Host]) -> list[InfrastructureCluster]:
                 continue
             cluster_id = f"{cluster_type}_{idx}"
             idx += 1
+            band, reason = cluster_signal_confidence(cluster_type, signal, len(set(members)))
             cluster = InfrastructureCluster(
                 cluster_id=cluster_id,
                 cluster_type=cluster_type,
                 signal=signal[:200],
                 members=sorted(set(members)),
-                confidence=_cluster_confidence(cluster_type, len(members)),
-                description=description,
+                confidence=band_score(band),
+                description=f"{description}; reason={reason}; band={band.value}",
             )
             clusters.append(cluster)
             for domain in cluster.members:
@@ -48,13 +50,6 @@ def compute_clusters(hosts: dict[str, Host]) -> list[InfrastructureCluster]:
                     hosts[domain].cluster_ids[cluster_type] = cluster_id
 
     return clusters
-
-
-def _cluster_confidence(cluster_type: str, size: int) -> int:
-    base = {"ip": 90, "favicon": 95, "body_hash": 95, "certificate": 92, "title": 85}.get(
-        cluster_type, 75
-    )
-    return min(100, base + min(size, 10))
 
 
 def _cluster_by_ip(hosts: dict[str, Host]) -> dict[str, list[str]]:
@@ -127,9 +122,8 @@ def _cluster_by_technology(hosts: dict[str, Host]) -> dict[str, list[str]]:
 def _cluster_by_certificate(hosts: dict[str, Host]) -> dict[str, list[str]]:
     cert_map: dict[str, list[str]] = defaultdict(list)
     for host in hosts.values():
-        if host.tls and host.tls.sans:
-            key = "|".join(sorted(host.tls.sans[:3]))
-            cert_map[key].append(host.domain)
+        if host.tls and host.tls.fingerprint_sha256:
+            cert_map[host.tls.fingerprint_sha256].append(host.domain)
     return {k: v for k, v in cert_map.items() if len(v) > 1}
 
 

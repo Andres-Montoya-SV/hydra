@@ -15,6 +15,9 @@ class AnewPlugin(BaseToolPlugin):
     display_name = "anew"
     required = False
     stage_order = 25
+    produces = ("domains",)
+    capability = "dedupe"
+    strict_opsec_allowed = True
     install_hint_macos = "go install -v github.com/tomnomnom/anew@latest"
     install_hint_linux = "go install -v github.com/tomnomnom/anew@latest"
 

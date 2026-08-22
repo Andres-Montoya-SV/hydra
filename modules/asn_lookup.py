@@ -39,6 +39,9 @@ class AsnLookupPlugin(BaseToolPlugin):
     required = False
     external_dependency = False
     stage_order = 32
+    produces = ("ips",)
+    capability = "asn"
+    active_collection = True
 
     def is_enabled(self) -> bool:
         return self.settings.enable_asn_lookup

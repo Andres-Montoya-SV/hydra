@@ -46,6 +46,10 @@ class BrowserProbePlugin(BaseToolPlugin):
     external_dependency = False
     stage_order = 65
     cacheable = False
+    produces = ("urls",)
+    capability = "browser"
+    active_collection = True
+    strict_opsec_allowed = True
 
     def is_enabled(self) -> bool:
         return self.settings.enable_browser_probe

@@ -65,6 +65,25 @@ def test_print_banner_renders_tagline_on_tty() -> None:
     assert "██╗" in text
 
 
+def test_parser_exposes_intel_and_skip_network() -> None:
+    from app import build_parser
+
+    parser = build_parser()
+    opsec = parser.parse_args(["check-opsec", "--skip-network"])
+    assert opsec.skip_network is True
+    inv = parser.parse_args(["investigate", "example.com"])
+    assert inv.command == "investigate"
+    assert inv.domain == "example.com"
+    diff = parser.parse_args(["diff", "run_a", "run_b"])
+    assert diff.run_a == "run_a"
+    assert diff.run_b == "run_b"
+    diff_domain = parser.parse_args(["diff", "virusbarrier.xyz"])
+    assert diff_domain.run_a == "virusbarrier.xyz"
+    assert diff_domain.run_b is None
+    ev_rel = parser.parse_args(["evidence", "abcd" * 8])
+    assert ev_rel.domain == "abcd" * 8
+
+
 def test_heads_covers_registered_plugins(project_root: Path) -> None:
     from app import cmd_heads
 

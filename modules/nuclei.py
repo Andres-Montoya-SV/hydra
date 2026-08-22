@@ -15,6 +15,9 @@ class NucleiPlugin(BaseToolPlugin):
     display_name = "nuclei"
     required = False
     stage_order = 60
+    produces = ("findings",)
+    capability = "post_http"
+    active_collection = True
     install_hint_macos = "brew install nuclei"
     install_hint_linux = "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
 

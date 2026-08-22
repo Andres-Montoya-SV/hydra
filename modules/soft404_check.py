@@ -39,6 +39,10 @@ class Soft404CheckPlugin(BaseToolPlugin):
     required = False
     external_dependency = False
     stage_order = 42
+    produces = ("urls",)
+    capability = "http_verify"
+    active_collection = True
+    strict_opsec_allowed = True
     cacheable = False
 
     def is_enabled(self) -> bool:

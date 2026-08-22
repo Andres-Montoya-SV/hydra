@@ -15,6 +15,9 @@ class WaybackurlsPlugin(BaseToolPlugin):
     display_name = "waybackurls"
     required = False
     stage_order = 21
+    produces = ("urls",)
+    capability = "url_archive"
+    active_collection = True
     install_hint_macos = "go install github.com/tomnomnom/waybackurls@latest"
     install_hint_linux = "go install github.com/tomnomnom/waybackurls@latest"
 

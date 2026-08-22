@@ -15,6 +15,9 @@ class HakrawlerPlugin(BaseToolPlugin):
     display_name = "hakrawler"
     required = False
     stage_order = 51
+    produces = ("urls",)
+    capability = "post_http"
+    active_collection = True
     install_hint_macos = "go install github.com/hakluke/hakrawler@latest"
     install_hint_linux = "go install github.com/hakluke/hakrawler@latest"
 

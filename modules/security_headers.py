@@ -67,6 +67,10 @@ class SecurityHeadersPlugin(BaseToolPlugin):
     external_dependency = False
     stage_order = 58
     cacheable = False
+    produces = ("findings",)
+    capability = "http_headers"
+    active_collection = True
+    strict_opsec_allowed = True
 
     def is_enabled(self) -> bool:
         return self.settings.enable_security_headers

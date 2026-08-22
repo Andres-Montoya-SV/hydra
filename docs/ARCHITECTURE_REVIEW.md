@@ -37,8 +37,10 @@
 >
 > Items **not yet addressed**: resume/checkpoint (M6), config profiles,
 > per-tool configurable timeouts beyond the handful that already have one,
-> scope-file filtering, a declarative plugin DAG (plugins are still wired
-> into `runner.py` explicitly per the "Extensibility" gap noted below).
+> a fully generic plugin DAG (capability groups exist; unique stages are
+> still explicit in `runner.py`). **Scope-file filtering is implemented**
+> (`SCOPE_FILE` + `allows_active_collection`). **Standalone diff CLI is
+> implemented** (`python app.py diff`).
 
 ---
 

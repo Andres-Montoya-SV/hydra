@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 
-from core.assets import URL, Finding, Host, normalize_domain
+from core.assets import URL, Finding, Host, normalize_domain, normalize_http_url
 from core.provenance import record_observation
 from utils.files import read_jsonl, read_lines
 
@@ -40,8 +40,11 @@ def parse_crawler_output(
         domain = normalize_domain(parsed.hostname or "")
         if not domain:
             continue
+        canonical = normalize_http_url(raw_url) or raw_url
 
         host = by_host.setdefault(domain, Host(domain=domain))
+        if any(existing.url == canonical for existing in host.urls):
+            continue
         params = sorted({key for key, _value in parse_qsl(parsed.query, keep_blank_values=True)})
         secrets = _SECRET_RE.findall(raw_url)
         jwt_matches = _JWT_RE.findall(raw_url)
@@ -49,7 +52,7 @@ def parse_crawler_output(
 
         host.urls.append(
             URL(
-                url=raw_url,
+                url=canonical,
                 host=domain,
                 source=source,
                 confidence_score=70 if endpoint_type != "page" else 60,

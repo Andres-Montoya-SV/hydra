@@ -51,6 +51,10 @@ class VulnMatchPlugin(BaseToolPlugin):
     external_dependency = False
     stage_order = 57
     cacheable = False
+    produces = ("findings", "technologies")
+    capability = "vuln_match"
+    active_collection = True
+    strict_opsec_allowed = True
 
     def is_enabled(self) -> bool:
         return self.settings.enable_vuln_match

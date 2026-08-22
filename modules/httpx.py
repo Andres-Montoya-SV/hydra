@@ -19,6 +19,11 @@ class HttpxPlugin(BaseToolPlugin):
     display_name = "httpx"
     required = True
     stage_order = 40
+    produces = ("urls", "certificates", "technologies", "ips")
+    followup_kinds = ("domains",)
+    capability = "http_probe"
+    active_collection = True
+    strict_opsec_allowed = True
     install_hint_macos = "brew install httpx"
     install_hint_linux = "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"
 
@@ -74,9 +79,11 @@ class HttpxPlugin(BaseToolPlugin):
         return args
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
-        json_output = self._output_path(context, "httpx.json")
-        alive_output = self._output_path(context, "alive.txt")
-        csv_output = self._output_path(context, "httpx.csv")
+        input_path = self._authorized_input(context, input_path)
+        suffix = str(context.metadata.get("httpx_output_suffix") or "")
+        json_output = self._output_path(context, f"httpx{suffix}.json")
+        alive_output = self._output_path(context, f"alive{suffix}.txt")
+        csv_output = self._output_path(context, f"httpx{suffix}.csv")
 
         if not input_path.exists() or input_path.stat().st_size == 0:
             return PluginResult(success=False, message="No hosts to probe")

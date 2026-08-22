@@ -38,6 +38,9 @@ class NaabuPlugin(BaseToolPlugin):
     display_name = "naabu"
     required = False
     stage_order = 35
+    produces = ("ports",)
+    capability = "port_scan"
+    active_collection = True
     # Port state is a live, time-varying network property (firewalls, rate
     # limiting, and ephemeral services all change it between runs) — a
     # cached result is not a re-scan and must never be silently replayed.
@@ -52,6 +55,7 @@ class NaabuPlugin(BaseToolPlugin):
         return self.settings.naabu_path
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
+        input_path = self._authorized_input(context, input_path)
         output_path = self._output_path(context, "naabu.txt")
         hosts = [h for h in read_lines(input_path) if h.strip()]
 

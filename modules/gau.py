@@ -15,6 +15,9 @@ class GauPlugin(BaseToolPlugin):
     display_name = "gau"
     required = False
     stage_order = 20
+    produces = ("urls",)
+    capability = "url_archive"
+    active_collection = True
     install_hint_macos = "brew install gau"
     install_hint_linux = "go install github.com/lc/gau/v2/cmd/gau@latest"
 

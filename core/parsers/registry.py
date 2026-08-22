@@ -17,6 +17,7 @@ from core.assets import (
     TechnologyFinding,
     TlsCertificate,
     normalize_domain,
+    normalize_http_url,
 )
 from core.parsers.crawlers import parse_crawler_output
 from core.provenance import record_observation
@@ -471,7 +472,7 @@ class HttpxParser(ToolParser):
                 chain = []
 
             svc = HttpService(
-                url=record.get("url", ""),
+                url=normalize_http_url(str(record.get("url") or "")) or str(record.get("url") or ""),
                 host=domain,
                 status_code=record.get("status_code"),
                 title=record.get("title"),
@@ -590,8 +591,11 @@ class UrlListParser(ToolParser):
             if not domain:
                 continue
             host = by_host.setdefault(domain, Host(domain=domain))
+            canonical = normalize_http_url(line) or line
+            if any(existing.url == canonical for existing in host.urls):
+                continue
             host.urls.append(
-                URL(url=line, host=domain, source=self.url_source, confidence_score=60)
+                URL(url=canonical, host=domain, source=self.url_source, confidence_score=60)
             )
             host.add_provenance(
                 record_observation(
@@ -1504,12 +1508,18 @@ def _parse_tls(record: dict, domain: str) -> TlsCertificate | None:
     if isinstance(sans, str):
         sans = [sans]
     is_wildcard = any(str(s).startswith("*.") for s in sans)
+    from core.intel.tls import extract_sans, extract_tls_fingerprint
+
+    fingerprint = extract_tls_fingerprint(tls)
+    san_names = extract_sans(sans)
     return TlsCertificate(
         host=domain,
         issuer=str(tls.get("issuer_cn", tls.get("issuer", ""))) or None,
         subject=str(subject) if subject else None,
-        sans=[str(s) for s in sans],
+        sans=san_names,
         not_after=str(tls.get("not_after", "")) or None,
+        not_before=str(tls.get("not_before", "")) or None,
+        fingerprint_sha256=fingerprint or None,
         is_wildcard=is_wildcard,
         source="httpx",
         confidence_score=90,

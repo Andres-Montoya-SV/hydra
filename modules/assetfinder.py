@@ -15,6 +15,8 @@ class AssetfinderPlugin(BaseToolPlugin):
     display_name = "Assetfinder"
     required = False
     stage_order = 15
+    produces = ("domains",)
+    capability = "enumerate_domains"
     install_hint_macos = "go install github.com/tomnomnom/assetfinder@latest"
     install_hint_linux = "go install github.com/tomnomnom/assetfinder@latest"
 

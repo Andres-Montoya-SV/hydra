@@ -17,7 +17,7 @@ def diff_has_changes(diff: dict[str, Any] | None) -> bool:
     if not diff:
         return False
     keys = ("new_hosts", "removed_hosts", "new_http", "removed_http")
-    return any(diff.get(key) for key in keys)
+    return any(diff.get(key) for key in keys) or bool(diff.get("field_changes"))
 
 
 def format_diff_message(diff: dict[str, Any]) -> str:

@@ -44,6 +44,14 @@ class ReconPlugin(ABC):
     # state) — caching such a result defeats "verification" by silently
     # replaying a stale observation instead of re-probing the target.
     cacheable: ClassVar[bool] = True
+    # Declarative collector contract. Artifacts remain the primary output;
+    # these fields tell the runner what the plugin is allowed to produce and
+    # whether it may touch the network.
+    produces: ClassVar[tuple[str, ...]] = ()
+    followup_kinds: ClassVar[tuple[str, ...]] = ()
+    capability: ClassVar[str] = ""
+    active_collection: ClassVar[bool] = False
+    strict_opsec_allowed: ClassVar[bool] = False
     _registry: ClassVar[list[type[ReconPlugin]]] = []
 
     def __init_subclass__(cls, **kwargs: object) -> None:

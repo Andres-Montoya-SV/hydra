@@ -32,6 +32,9 @@ class WildcardCheckPlugin(BaseToolPlugin):
     # separate ToolDefinition named "wildcard_check".
     external_dependency = False
     stage_order = 29
+    produces = ("domains",)
+    capability = "wildcard_dns"
+    active_collection = True
     cacheable = False
     install_hint_macos = "brew install dnsx"
     install_hint_linux = "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
@@ -49,12 +52,22 @@ class WildcardCheckPlugin(BaseToolPlugin):
         return context.resolved_binaries.get("dnsx", self.settings.dnsx_path)
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
+        from utils.files import read_lines
+
         root_domains = list(
             dict.fromkeys(
                 parse_hostname(target.domain)[2] for target in context.targets if target.domain
             )
         )
-        root_domains = [domain for domain in root_domains if domain]
+        if input_path.exists():
+            for line in read_lines(input_path):
+                host = line.strip().lower().rstrip(".")
+                if not host:
+                    continue
+                root = parse_hostname(host)[2]
+                if root:
+                    root_domains.append(root)
+        root_domains = list(dict.fromkeys(domain for domain in root_domains if domain))
         if not root_domains:
             return self._skip("No root domains to probe for wildcard DNS")
 

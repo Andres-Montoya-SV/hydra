@@ -182,6 +182,10 @@ class ParamFuzzPlugin(BaseToolPlugin):
     external_dependency = False
     stage_order = 55
     cacheable = False
+    produces = ("urls",)
+    capability = "param_fuzz"
+    active_collection = True
+    strict_opsec_allowed = True
 
     def is_enabled(self) -> bool:
         return self.settings.enable_param_fuzz

@@ -15,6 +15,9 @@ class UnfurlPlugin(BaseToolPlugin):
     display_name = "unfurl"
     required = False
     stage_order = 55
+    produces = ("urls",)
+    capability = "post_http"
+    strict_opsec_allowed = True
     install_hint_macos = "go install github.com/tomnomnom/unfurl@latest"
     install_hint_linux = "go install github.com/tomnomnom/unfurl@latest"
 

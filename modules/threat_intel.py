@@ -27,6 +27,10 @@ class ThreatIntelPlugin(BaseToolPlugin):
     required = False
     external_dependency = False
     stage_order = 45
+    produces = ("urls",)
+    capability = "reputation"
+    active_collection = True
+    strict_opsec_allowed = True
 
     def is_enabled(self) -> bool:
         return self.settings.enable_threat_intel

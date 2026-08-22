@@ -24,6 +24,10 @@ class CtlogsPlugin(BaseToolPlugin):
     required = False
     external_dependency = False
     stage_order = 12
+    produces = ("domains", "certificates")
+    followup_kinds = ("domains",)
+    capability = "enumerate_domains"
+    strict_opsec_allowed = True
 
     def is_enabled(self) -> bool:
         return self.settings.enable_ctlogs
@@ -59,7 +63,10 @@ class CtlogsPlugin(BaseToolPlugin):
                 dedupe_key = cert_id or json.dumps(record, sort_keys=True, default=str)
                 record["query_domain"] = domain
                 all_certs[dedupe_key] = record
-                discovered.update(_extract_names(record.get("name_value"), domain))
+                # Active collection input stays seed-rooted. Off-root SANs are
+                # preserved on the jsonl artifact and ingested as observations
+                # by the intelligence engine — they are not DNS/HTTP probed.
+                discovered.update(_names_under_root(record.get("name_value"), domain))
 
             if index < len(targets) - 1:
                 await asyncio.sleep(self.settings.ctlogs_delay_seconds)
@@ -76,6 +83,17 @@ class CtlogsPlugin(BaseToolPlugin):
         if warnings:
             context.add_warning("Certificate Transparency: " + "; ".join(warnings[:3]))
         self.update_status(context, ToolStatus.COMPLETED, output_lines=domain_count)
+        from core.intel.plugin import StructuredEmission
+        from core.intel.tls import extract_certificate_names
+
+        observed: list[str] = []
+        for record in all_certs.values():
+            observed.extend(extract_certificate_names(record.get("name_value")))
+        emission = StructuredEmission(
+            produces=["Domain", "Certificate"],
+            domains=sorted(set(observed)),
+            followups=[{"kind": "DOMAIN", "reason": "CERTIFICATE_SAN"}],
+        )
         return PluginResult(
             success=True,
             output_path=domains_path,
@@ -84,6 +102,7 @@ class CtlogsPlugin(BaseToolPlugin):
                 f"Discovered {domain_count} hostnames from "
                 f"{len(all_certs)} certificate record(s)"
             ),
+            data={"intel": emission.to_dict()},
         )
 
 
@@ -107,11 +126,21 @@ def _fetch_crtsh(
     return data if isinstance(data, list) else []
 
 
-def _extract_names(raw_names: object, root_domain: str) -> set[str]:
-    names: set[str] = set()
+def extract_all_names(raw_names: object) -> set[str]:
+    """Every hostname in a CT name_value blob, including off-root SANs."""
+    from core.intel.tls import extract_certificate_names
+
+    return set(extract_certificate_names(raw_names))
+
+
+def _names_under_root(raw_names: object, root_domain: str) -> set[str]:
+    """Names authorized for active collection (seed registrable domain)."""
     root = normalize_domain(root_domain)
-    for raw_name in str(raw_names or "").splitlines():
-        candidate = normalize_domain(raw_name.removeprefix("*."))
-        if candidate == root or candidate.endswith(f".{root}"):
-            names.add(candidate)
-    return names
+    return {
+        name for name in extract_all_names(raw_names) if name == root or name.endswith(f".{root}")
+    }
+
+
+def _extract_names(raw_names: object, root_domain: str) -> set[str]:
+    """Backward-compatible alias used by existing tests."""
+    return _names_under_root(raw_names, root_domain)

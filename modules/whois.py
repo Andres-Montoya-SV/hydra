@@ -35,6 +35,9 @@ class WhoisPlugin(BaseToolPlugin):
     display_name = "WHOIS"
     required = False
     stage_order = 5
+    produces = ("domains",)
+    capability = "registration"
+    active_collection = True
     install_hint_macos = "whois is included with macOS"
     install_hint_linux = "sudo apt install whois"
 

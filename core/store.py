@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS runs (
     host_count INTEGER DEFAULT 0,
     alive_count INTEGER DEFAULT 0,
     warnings_json TEXT,
-    errors_json TEXT
+    errors_json TEXT,
+    intel_truncated INTEGER DEFAULT 0,
+    intel_truncation_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS hosts (
@@ -153,6 +155,8 @@ CREATE TABLE IF NOT EXISTS tls_certificates (
     subject TEXT,
     sans_json TEXT,
     not_after TEXT,
+    not_before TEXT,
+    fingerprint_sha256 TEXT,
     is_wildcard INTEGER DEFAULT 0,
     source TEXT,
     confidence_score INTEGER DEFAULT 90,
@@ -238,6 +242,10 @@ CREATE TABLE IF NOT EXISTS graph_edges (
     target_id TEXT NOT NULL,
     relation TEXT NOT NULL,
     confidence INTEGER DEFAULT 80,
+    evidence_id TEXT,
+    first_seen TEXT,
+    last_seen TEXT,
+    confidence_label TEXT,
     FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 
@@ -251,6 +259,99 @@ CREATE INDEX IF NOT EXISTS idx_clusters_run ON clusters(run_id);
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_run ON graph_nodes(run_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_run ON graph_edges(run_id);
 
+CREATE TABLE IF NOT EXISTS intel_entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    key TEXT NOT NULL,
+    data_json TEXT,
+    scope_status TEXT,
+    collection_status TEXT,
+    is_seed INTEGER DEFAULT 0,
+    first_seen TEXT,
+    last_seen TEXT,
+    UNIQUE(run_id, entity_id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS intel_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    observation_id TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    source TEXT,
+    collector TEXT,
+    observed_at TEXT,
+    data_json TEXT,
+    scope_status TEXT,
+    UNIQUE(run_id, observation_id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+    FOREIGN KEY(run_id, entity_id) REFERENCES intel_entities(run_id, entity_id)
+);
+
+CREATE TABLE IF NOT EXISTS intel_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    source TEXT,
+    collector TEXT,
+    observation_id TEXT,
+    reason TEXT,
+    metadata_json TEXT,
+    observed_at TEXT,
+    UNIQUE(run_id, evidence_id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+    FOREIGN KEY(run_id, observation_id) REFERENCES intel_observations(run_id, observation_id)
+);
+
+CREATE TABLE IF NOT EXISTS intel_relationships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    relationship_id TEXT NOT NULL,
+    source_entity TEXT NOT NULL,
+    relationship_type TEXT NOT NULL,
+    target_entity TEXT NOT NULL,
+    confidence TEXT,
+    strength TEXT,
+    first_seen TEXT,
+    last_seen TEXT,
+    evidence_id TEXT,
+    data_json TEXT,
+    UNIQUE(run_id, relationship_id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+    FOREIGN KEY(run_id, source_entity) REFERENCES intel_entities(run_id, entity_id),
+    FOREIGN KEY(run_id, target_entity) REFERENCES intel_entities(run_id, entity_id),
+    FOREIGN KEY(run_id, evidence_id) REFERENCES intel_evidence(run_id, evidence_id)
+);
+
+CREATE TABLE IF NOT EXISTS intel_indicators (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    indicator_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL,
+    depth INTEGER DEFAULT 0,
+    parent_id TEXT,
+    reason TEXT,
+    scope_status TEXT,
+    collection_status TEXT,
+    evidence_id TEXT,
+    priority INTEGER DEFAULT 100,
+    discovered_from TEXT,
+    UNIQUE(run_id, indicator_id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_intel_entities_run ON intel_entities(run_id, entity_type);
+CREATE INDEX IF NOT EXISTS idx_intel_entities_key ON intel_entities(run_id, key);
+CREATE INDEX IF NOT EXISTS idx_intel_obs_entity ON intel_observations(run_id, entity_id);
+CREATE INDEX IF NOT EXISTS idx_intel_rel_src ON intel_relationships(run_id, source_entity);
+CREATE INDEX IF NOT EXISTS idx_intel_rel_dst ON intel_relationships(run_id, target_entity);
+CREATE INDEX IF NOT EXISTS idx_intel_rel_type ON intel_relationships(run_id, relationship_type);
+CREATE INDEX IF NOT EXISTS idx_intel_ind_value ON intel_indicators(run_id, value);
+CREATE INDEX IF NOT EXISTS idx_runs_finished_started ON runs(finished_at, started_at DESC);
+
 CREATE TABLE IF NOT EXISTS result_cache (
     cache_key TEXT PRIMARY KEY,
     tool TEXT NOT NULL,
@@ -261,6 +362,24 @@ CREATE TABLE IF NOT EXISTS result_cache (
     expires_at TEXT NOT NULL
 );
 """
+
+
+def configure_sqlite(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Apply the single store/intel/CLI connection configuration."""
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def connect_sqlite(db_path: Path, *, timeout: float = 30) -> sqlite3.Connection:
+    """Open a SQLite connection with WAL and foreign keys enabled."""
+    return configure_sqlite(sqlite3.connect(db_path, timeout=timeout))
+
+
+def _normalize_run_target(value: object) -> str:
+    return str(value).lower().rstrip(".")
 
 
 class AssetStore:
@@ -313,6 +432,16 @@ class AssetStore:
                 "tarpit_canary_ports_json": "ALTER TABLE hosts ADD COLUMN tarpit_canary_ports_json TEXT",
                 "soft_404_detected": "ALTER TABLE hosts ADD COLUMN soft_404_detected INTEGER DEFAULT 0",
             },
+            "tls_certificates": {
+                "not_before": "ALTER TABLE tls_certificates ADD COLUMN not_before TEXT",
+                "fingerprint_sha256": "ALTER TABLE tls_certificates ADD COLUMN fingerprint_sha256 TEXT",
+            },
+            "graph_edges": {
+                "evidence_id": "ALTER TABLE graph_edges ADD COLUMN evidence_id TEXT",
+                "first_seen": "ALTER TABLE graph_edges ADD COLUMN first_seen TEXT",
+                "last_seen": "ALTER TABLE graph_edges ADD COLUMN last_seen TEXT",
+                "confidence_label": "ALTER TABLE graph_edges ADD COLUMN confidence_label TEXT",
+            },
             "ports": {
                 "confidence_score": "ALTER TABLE ports ADD COLUMN confidence_score INTEGER DEFAULT 50",
                 "verification_state": "ALTER TABLE ports ADD COLUMN verification_state TEXT DEFAULT 'unverified'",
@@ -343,6 +472,10 @@ class AssetStore:
                 "secrets_json": "ALTER TABLE urls ADD COLUMN secrets_json TEXT",
                 "jwts_json": "ALTER TABLE urls ADD COLUMN jwts_json TEXT",
             },
+            "runs": {
+                "intel_truncated": "ALTER TABLE runs ADD COLUMN intel_truncated INTEGER DEFAULT 0",
+                "intel_truncation_reason": "ALTER TABLE runs ADD COLUMN intel_truncation_reason TEXT",
+            },
         }
         for table, migrations in table_migrations.items():
             existing = {
@@ -359,11 +492,7 @@ class AssetStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        self._restrict_database_permissions()
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        conn = connect_sqlite(self.db_path)
         self._restrict_database_permissions()
         try:
             yield conn
@@ -431,6 +560,11 @@ class AssetStore:
             "clusters",
             "graph_edges",
             "graph_nodes",
+            "intel_indicators",
+            "intel_relationships",
+            "intel_evidence",
+            "intel_observations",
+            "intel_entities",
         )
         with self._connect() as conn:
             for table in tables:
@@ -440,7 +574,7 @@ class AssetStore:
                 )
 
     def persist_registry(
-        self, run_id: str, hosts: dict[str, Host], *, clusters=None, graph=None
+        self, run_id: str, hosts: dict[str, Host], *, clusters=None, graph=None, intel=None
     ) -> None:
         """Persist full intelligence snapshot (replace child data for run)."""
         self.clear_run_data(run_id)
@@ -478,10 +612,33 @@ class AssetStore:
                     )
                 for edge in graph.edges:
                     conn.execute(
-                        """INSERT INTO graph_edges (run_id, source_id, target_id, relation, confidence)
-                           VALUES (?, ?, ?, ?, ?)""",
-                        (run_id, edge.source_id, edge.target_id, edge.relation, edge.confidence),
+                        """INSERT INTO graph_edges
+                           (run_id, source_id, target_id, relation, confidence,
+                            evidence_id, first_seen, last_seen, confidence_label)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            run_id,
+                            edge.source_id,
+                            edge.target_id,
+                            edge.relation,
+                            edge.confidence,
+                            getattr(edge, "evidence_id", None),
+                            getattr(edge, "first_seen", None),
+                            getattr(edge, "last_seen", None),
+                            getattr(edge, "confidence_label", None),
+                        ),
                     )
+            if intel is not None:
+                self._insert_intel(conn, run_id, intel)
+                conn.execute(
+                    """UPDATE runs SET intel_truncated=?, intel_truncation_reason=?
+                       WHERE run_id=?""",
+                    (
+                        int(bool(getattr(intel, "truncated", False))),
+                        getattr(intel, "truncation_reason", None),
+                        run_id,
+                    ),
+                )
 
     def upsert_host(self, run_id: str, host: Host) -> None:
         """Legacy single-host upsert (used by tests)."""
@@ -556,6 +713,12 @@ class AssetStore:
                         target_id=row["target_id"],
                         relation=row["relation"],
                         confidence=row["confidence"] or 80,
+                        evidence_id=row["evidence_id"] if "evidence_id" in row.keys() else None,
+                        first_seen=row["first_seen"] if "first_seen" in row.keys() else None,
+                        last_seen=row["last_seen"] if "last_seen" in row.keys() else None,
+                        confidence_label=(
+                            row["confidence_label"] if "confidence_label" in row.keys() else None
+                        ),
                     )
                 )
         return graph
@@ -706,8 +869,9 @@ class AssetStore:
             t = host.tls
             conn.execute(
                 """INSERT OR REPLACE INTO tls_certificates
-                   (run_id, host, issuer, subject, sans_json, not_after, is_wildcard, source, confidence_score)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (run_id, host, issuer, subject, sans_json, not_after, not_before,
+                    fingerprint_sha256, is_wildcard, source, confidence_score)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     t.host,
@@ -715,6 +879,8 @@ class AssetStore:
                     t.subject,
                     json.dumps(t.sans),
                     t.not_after,
+                    getattr(t, "not_before", None),
+                    getattr(t, "fingerprint_sha256", None),
                     int(t.is_wildcard),
                     t.source,
                     t.confidence_score,
@@ -934,6 +1100,10 @@ class AssetStore:
                     subject=row["subject"],
                     sans=json.loads(row["sans_json"] or "[]"),
                     not_after=row["not_after"],
+                    not_before=row["not_before"] if "not_before" in row.keys() else None,
+                    fingerprint_sha256=(
+                        row["fingerprint_sha256"] if "fingerprint_sha256" in row.keys() else None
+                    ),
                     is_wildcard=bool(row["is_wildcard"]),
                     source=row["source"] or "httpx",
                     confidence_score=row["confidence_score"] or 90,
@@ -1101,3 +1271,315 @@ class AssetStore:
             version=row["version"] if "version" in row.keys() else None,
             warnings=json.loads(row["warnings_json"] or "[]"),
         )
+
+    def _insert_intel(self, conn: sqlite3.Connection, run_id: str, intel) -> None:
+        """Batched insert of the intelligence snapshot."""
+        entities = list(intel.entities.values())
+        known = {e.entity_id for e in entities}
+        observations = [o for o in intel.observations if o.entity_id in known]
+        obs_ids = {o.observation_id for o in observations}
+        evidence = [
+            ev
+            for ev in intel.evidence.values()
+            if not ev.observation_id or ev.observation_id in obs_ids
+        ]
+        ev_ids = {ev.evidence_id for ev in evidence}
+        relationships = [
+            rel
+            for rel in intel.relationships.values()
+            if rel.source_entity in known
+            and rel.target_entity in known
+            and (not rel.evidence_id or rel.evidence_id in ev_ids)
+        ]
+        if entities:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_entities
+                   (run_id, entity_id, entity_type, key, data_json, scope_status,
+                    collection_status, is_seed, first_seen, last_seen)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        e.entity_id,
+                        e.entity_type.value,
+                        e.key,
+                        json.dumps(e.data, sort_keys=True, default=str),
+                        e.scope_status.value,
+                        e.collection_status.value,
+                        int(e.is_seed),
+                        e.first_seen,
+                        e.last_seen,
+                    )
+                    for e in entities
+                ],
+            )
+        if observations:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_observations
+                   (run_id, observation_id, entity_id, source, collector, observed_at,
+                    data_json, scope_status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        o.observation_id,
+                        o.entity_id,
+                        o.source,
+                        o.collector,
+                        o.observed_at,
+                        json.dumps(o.data, sort_keys=True, default=str),
+                        o.scope_status.value,
+                    )
+                    for o in observations
+                ],
+            )
+        if evidence:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_evidence
+                   (run_id, evidence_id, source, collector, observation_id, reason,
+                    metadata_json, observed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        ev.evidence_id,
+                        ev.source,
+                        ev.collector,
+                        ev.observation_id or None,
+                        ev.reason,
+                        json.dumps(ev.metadata, sort_keys=True, default=str),
+                        ev.observed_at,
+                    )
+                    for ev in evidence
+                ],
+            )
+        if relationships:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_relationships
+                   (run_id, relationship_id, source_entity, relationship_type, target_entity,
+                    confidence, strength, first_seen, last_seen, evidence_id, data_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        r.relationship_id,
+                        r.source_entity,
+                        r.relationship_type.value,
+                        r.target_entity,
+                        r.confidence.value,
+                        r.strength,
+                        r.first_seen,
+                        r.last_seen,
+                        r.evidence_id or None,
+                        json.dumps(r.data, sort_keys=True, default=str),
+                    )
+                    for r in relationships
+                ],
+            )
+        if intel.indicators:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_indicators
+                   (run_id, indicator_id, kind, value, depth, parent_id, reason,
+                    scope_status, collection_status, evidence_id, priority, discovered_from)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        i.indicator_id,
+                        i.kind.value,
+                        i.value,
+                        i.depth,
+                        i.parent_id,
+                        i.reason.value,
+                        i.scope_status.value,
+                        i.collection_status.value,
+                        i.evidence_id,
+                        i.priority,
+                        i.discovered_from,
+                    )
+                    for i in intel.indicators
+                ],
+            )
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if not row:
+            return None
+        return {
+            "run_id": row["run_id"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "targets": json.loads(row["targets_json"] or "[]"),
+            "program_name": row["program_name"],
+            "host_count": row["host_count"],
+            "alive_count": row["alive_count"],
+        }
+
+    def find_previous_run(self, current_run_id: str) -> str | None:
+        """Most recent finished run whose target set overlaps the current run.
+
+        Single bounded query. Never selects an unfinished run. Does not fall
+        back to an unrelated latest run.
+        """
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT targets_json FROM runs WHERE run_id=?", (current_run_id,)
+            ).fetchone()
+            if not current:
+                return None
+            targets = {
+                _normalize_run_target(item)
+                for item in json.loads(current["targets_json"] or "[]")
+                if _normalize_run_target(item)
+            }
+            if not targets:
+                return None
+            placeholders = ",".join("?" * len(targets))
+            row = conn.execute(
+                f"""
+                SELECT r.run_id
+                FROM runs r
+                WHERE r.run_id != ?
+                  AND r.finished_at IS NOT NULL
+                  AND r.finished_at != ''
+                  AND EXISTS (
+                    SELECT 1 FROM json_each(COALESCE(r.targets_json, '[]')) t
+                    WHERE lower(trim(t.value, '.')) IN ({placeholders})
+                  )
+                ORDER BY r.started_at DESC
+                LIMIT 1
+                """,  # noqa: S608  # nosec B608  # placeholders are bound '?' only
+                (current_run_id, *targets),
+            ).fetchone()
+        return row["run_id"] if row else None
+
+    def find_latest_finished_run(self, *, domain: str | None = None) -> str | None:
+        """Latest finished run, preferring one that observed or targeted domain."""
+        host = _normalize_run_target(domain) if domain else ""
+        with self._connect() as conn:
+            if host:
+                row = conn.execute(
+                    """
+                    SELECT r.run_id
+                    FROM runs r
+                    JOIN intel_entities e ON e.run_id = r.run_id
+                    WHERE r.finished_at IS NOT NULL
+                      AND r.finished_at != ''
+                      AND e.entity_type = 'DOMAIN'
+                      AND e.key = ?
+                    ORDER BY r.started_at DESC
+                    LIMIT 1
+                    """,
+                    (host,),
+                ).fetchone()
+                if row:
+                    return row["run_id"]
+                row = conn.execute(
+                    """
+                    SELECT r.run_id
+                    FROM runs r
+                    WHERE r.finished_at IS NOT NULL
+                      AND r.finished_at != ''
+                      AND EXISTS (
+                        SELECT 1 FROM json_each(COALESCE(r.targets_json, '[]')) t
+                        WHERE lower(trim(t.value, '.')) = ?
+                      )
+                    ORDER BY r.started_at DESC
+                    LIMIT 1
+                    """,
+                    (host,),
+                ).fetchone()
+                if row:
+                    return row["run_id"]
+            row = conn.execute(
+                """
+                SELECT run_id FROM runs
+                WHERE finished_at IS NOT NULL AND finished_at != ''
+                ORDER BY started_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return row["run_id"] if row else None
+
+    def intel_connection(self) -> sqlite3.Connection:
+        """Read connection used by intelligence query CLI. Same PRAGMAs as store."""
+        return connect_sqlite(self.db_path)
+
+    def intel_integrity(self, run_id: str | None = None) -> dict[str, Any]:
+        """SQLite + application-level referential checks for intelligence tables."""
+        with self._connect() as conn:
+            fk_on = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            fk_rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+            orphans = self._intel_orphans(conn, run_id)
+        fk_violations = [
+            {"table": row[0], "rowid": row[1], "parent": row[2], "fkid": row[3]} for row in fk_rows
+        ]
+        return {
+            "foreign_keys": int(fk_on),
+            "integrity_check": integrity,
+            "foreign_key_violations": fk_violations,
+            "orphans": orphans,
+            "ok": integrity == "ok" and not fk_violations and not any(orphans.values()),
+        }
+
+    def _intel_orphans(self, conn: sqlite3.Connection, run_id: str | None) -> dict[str, list[str]]:
+        run_clause = {
+            "observations": " AND o.run_id=?" if run_id else "",
+            "relationships": " AND r.run_id=?" if run_id else "",
+            "evidence": " AND ev.run_id=?" if run_id else "",
+        }
+        params: tuple[Any, ...] = (run_id,) if run_id else ()
+        observations = [
+            row["observation_id"]
+            for row in conn.execute(
+                f"""
+                SELECT o.observation_id FROM intel_observations o
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM intel_entities e
+                    WHERE e.run_id=o.run_id AND e.entity_id=o.entity_id
+                ){run_clause["observations"]}
+                """,  # noqa: S608  # nosec B608
+                params,
+            )
+        ]
+        relationships = [
+            row["relationship_id"]
+            for row in conn.execute(
+                f"""
+                SELECT r.relationship_id FROM intel_relationships r
+                WHERE (
+                    NOT EXISTS (
+                        SELECT 1 FROM intel_entities e
+                        WHERE e.run_id=r.run_id AND e.entity_id=r.source_entity
+                    )
+                    OR NOT EXISTS (
+                        SELECT 1 FROM intel_entities e
+                        WHERE e.run_id=r.run_id AND e.entity_id=r.target_entity
+                    )
+                ){run_clause["relationships"]}
+                """,  # noqa: S608  # nosec B608
+                params,
+            )
+        ]
+        evidence = [
+            row["evidence_id"]
+            for row in conn.execute(
+                f"""
+                SELECT ev.evidence_id FROM intel_evidence ev
+                WHERE ev.observation_id IS NOT NULL
+                  AND ev.observation_id != ''
+                  AND NOT EXISTS (
+                    SELECT 1 FROM intel_observations o
+                    WHERE o.run_id=ev.run_id AND o.observation_id=ev.observation_id
+                ){run_clause["evidence"]}
+                """,  # noqa: S608  # nosec B608
+                params,
+            )
+        ]
+        return {
+            "observations": observations,
+            "relationships": relationships,
+            "evidence": evidence,
+        }

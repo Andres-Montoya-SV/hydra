@@ -12,22 +12,23 @@ Works on **macOS**, **Ubuntu**, **Debian**, and **Kali Linux**.
 
 ## Features
 
-- **Plugin architecture** — each recon tool is an isolated module; add new tools without touching core code
-- **Mandatory pipeline** — subfinder → dedupe → dnsx → httpx
-- **Infrastructure intelligence** — WHOIS, Certificate Transparency, ASN ownership, DNS, HTTP, and port provenance
+- **Plugin architecture** — each recon tool is an isolated subprocess module. New tools still need a settings flag, a `modules/` file, and (if they write a novel artifact) a parser; they may also emit structured entities via `PluginResult.data["intel"]`
+- **Mandatory pipeline** — subfinder → dedupe → dnsx → httpx, then optional bounded follow-up of in-scope indicators
+- **Evidence-driven intelligence** — Certificate Transparency / TLS SANs are retained as observations even when they are out of scope. Hydra records the relationship; it does not probe unauthorized names
+- **First-class entities** — Domain, IP, Certificate (SHA-256 fingerprint), ASN, nameserver, HTTP service. `Host` remains the reporting view
 - **Optional plugins** — URLhaus reputation, WebKit cloaking detection, amass, naabu, katana, hakrawler, gau, waybackurls, nuclei, assetfinder, unfurl, anew
-- **Canonical intelligence model** — every tool's output is parsed into a single `Host` object (`core/assets.py`) with full provenance (which tool found it, when, at what confidence) instead of siloed per-tool files
-- **SQLite intelligence store** (`core/store.py`, `output/recon.db`) — hosts, ports, HTTP services, DNS records, findings, and run history persist across scans for querying and cross-run comparison
-- **Intelligence engine** (`core/intelligence/`) — automatic host profiling/categorization, confidence scoring, risk scoring (Critical/High/Medium/Low/Info), clustering, and an infrastructure graph (ASN/CDN/provider/cert/technology relationships)
-- **Historical diffing** (`core/diff.py`) — each run is automatically compared against the previous run for the same target(s); new/removed hosts, ports, and technologies surface as warnings
-- **Interactive HTML reports** — dark/light theme toggle, live search, risk-level filtering, sortable host tables
+- **SQLite intelligence store** (`core/store.py`, `output/recon.db`) — hosts plus entities, observations, evidence, relationships, and indicators persist across scans
+- **Correlation, not attribution** — shared certificate / IP / ASN / nameserver / favicon / body hash with named confidence. Shared cloud IPs are `shared_cloud_tenancy` (MEDIUM). Hydra never emits actor/owner/campaign entities
+- **Query without rescanning** — `investigate`, `graph`, `relationships`, `evidence` (domain or relationship id), `certificates`, `indicators`, `diff DOMAIN` or `diff RUN_A RUN_B`. All read SQLite.
+- **Historical diffing** (`core/diff.py`) — compares the current run to the latest finished run with overlapping targets; host-set plus field-level changes (IP, cert fingerprint, SANs, HTTP, tech, …)
+- **Interactive HTML reports** — dark/light theme toggle, live search, risk-level filtering
 - **Async execution** — concurrent optional tools, non-blocking subprocess I/O
 - **Rich TUI** — live progress, tool status, statistics, logs, and results tables
 - **Structured logging** — console + file, configurable levels
 - **Secure subprocess** — no `shell=True`, input validation, path sanitization
 - **Fail-closed OPSEC mode** (`STRICT_OPSEC`) — proxy-only egress, header suppression, and a `check-opsec` pre-flight diagnostic command
 - **Bug bounty headers** — configurable `X-HackerOne-Researcher` and custom HTTP headers via `.env`
-- **Multiple outputs** — JSON, CSV, HTML, Markdown reports
+- **Outputs** — JSON and HTML/Markdown reports; httpx also writes a per-run `httpx.csv` artifact
 
 ---
 
@@ -139,12 +140,16 @@ All settings live in `.env`. Key variables:
 | `ENABLE_BROWSER_PROBE` | Compare httpx vs mobile WebKit destinations (opt-in, active) | `false` |
 | `ENABLE_THREAT_INTEL` | Check live hosts in URLhaus (requires Auth-Key) | `false` |
 | `URLHAUS_API_KEY` | Free key from https://auth.abuse.ch/ | — |
-| `ENABLE_BROWSER_PROBE` | Compare httpx against mobile WebKit redirects | `false` |
 | `BROWSER_PROBE_MAX_HOSTS` | Maximum active browser navigations per run | `20` |
 | `STRICT_OPSEC` | Fail closed and permit verified proxy-routed components only | `false` |
 | `OUTBOUND_PROXY_URL` | Required HTTP(S) CONNECT proxy for strict mode | — |
 | `ENABLE_NUCLEI` | Enable nuclei scanning | `false` |
 | `ENABLE_CACHE` | Reuse a plugin's prior artifact for identical input + network mode | `true` |
+| `MAX_DISCOVERY_DEPTH` | Follow-up depth (0 = seeds only) | `1` |
+| `MAX_FOLLOWUP_INDICATORS` | Cap on extra in-scope collects | `50` |
+| `ENABLE_FOLLOWUP_COLLECTION` | One bounded follow-up pass after the seed collect | `true` |
+| `MAX_HTTP_PROBES` / `MAX_DNS_PROBES` | Follow-up HTTP/DNS budgets | `200` |
+| `MAX_ENTITIES` / `MAX_RELATIONSHIPS` | Intelligence graph caps (fail closed, no dummy rows) | `5000` / `20000` |
 | `CACHE_TTL_SECONDS` | How long cached artifacts remain valid (max 604800 / 7 days) | `86400` |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
 
@@ -203,6 +208,24 @@ Add `--skip-network` to check configuration only (no live requests), or
 service so you can visually confirm the proxied and direct IPs differ (opt-in,
 since it deliberately reveals your real IP to that third-party service).
 
+### Query persisted intelligence (no rescan)
+
+```bash
+python app.py investigate virusbarrier.xyz
+python app.py graph virusbarrier.xyz
+python app.py relationships virusbarrier.xyz
+python app.py evidence virusbarrier.xyz
+python app.py evidence <relationship_id>
+python app.py certificates virusbarrier.xyz
+python app.py indicators virusbarrier.xyz
+python app.py diff virusbarrier.xyz
+python app.py diff run_a run_b
+```
+
+`investigate` includes analyst-readable `explanations` for each relationship
+(certificate fingerprint, SAN cardinality, cloud tenancy, named confidence,
+`active_collection`). It never emits actor/owner/threat-group language.
+
 ### Custom Run ID (for reruns / comparison)
 
 ```bash
@@ -234,11 +257,11 @@ Optional: katana, hakrawler, unfurl, nuclei
       ↓
 Optional active WebKit cloaking probe
       ↓
-Collect Metadata
+Bounded follow-up (depth ≤ MAX_DISCOVERY_DEPTH; in-scope only)
       ↓
-Generate Reports
+Normalize → observe → correlate → persist SQLite
       ↓
-Display Results
+Generate Reports / query CLI
 ```
 
 ---
@@ -254,27 +277,21 @@ confidence. All `Host` objects for a run are merged in an in-memory
 database shared across every run:
 
 ```
-output/recon.db   # hosts, ports, http_services, dns_records, findings, runs, provenance
+output/recon.db
 ```
 
-After collection, the intelligence engine (`core/intelligence/`) runs over
-every host and:
+Two layers share that file:
 
-- assigns a **category** (e.g. admin interface, API, staging, forgotten
-  subdomain) and a **priority** (`critical` / `high` / `medium` / `low` /
-  `info`) with a confidence score (`profile.py`, `risk.py`)
-- **clusters** related hosts by shared certificate, ASN, or technology
-  fingerprint (`clustering.py`)
-- builds an **infrastructure graph** of ASN/CDN/provider/technology/cert
-  relationships (`graph.py`)
-- **diffs** the current run against the most recent prior run for the same
-  target(s) (`core/diff.py`), surfacing new/removed hosts, ports, and
-  technologies as warnings in the report — no flags needed, this happens
-  automatically whenever history exists for a target
+- **Host reporting view** (`hosts`, `http_services`, `ports`, `graph_nodes` / `graph_edges`) — what the HTML/Markdown reports render.
+- **Intelligence store** (`intel_entities`, `intel_observations`, `intel_evidence`, `intel_relationships`, `intel_indicators`) — the source of truth for `investigate` / `graph` / `relationships` / `evidence`. The in-memory graph is a view over these rows, not a second database.
 
-Reports (console, Markdown, HTML) read from this store rather than re-parsing
-raw tool files, so "Top assets to investigate" and risk summaries reflect the
-merged, cross-tool picture rather than any single tool's view.
+**Collect vs observe.** Active collectors (dnsx, httpx, naabu, crawlers, …) run only against indicators that pass `allows_active_collection`. Certificate Transparency SANs, plugin emissions, and parser hosts may still be **observed** when out of scope. Observation is not authorization.
+
+**Correlation vs risk.** Named bands (`VERY_HIGH` / `HIGH` / `MEDIUM` / `LOW`) answer “how strongly are these observations related?” Host `risk_score` answers “how interesting is this surface?” Shared certificates do not bump risk. Shared cloud IPs are `shared_cloud_tenancy` (MEDIUM), not ownership.
+
+**Follow-up.** After the seed collect, Hydra claims in-scope `ELIGIBLE` indicators, re-checks scope and wildcard DNS, and runs at most one extra DNS/HTTP pass. Depth default is 1. There is no recursive crawler.
+
+After collection, `core/intel/engine.py` normalizes artifacts into entities/observations/relationships. Separately, `core/intelligence/` profiles hosts, scores risk, and clusters the reporting view.
 
 ---
 
@@ -305,8 +322,9 @@ output/20250629_143022/
 └── summary.html        # Interactive HTML report (dark mode, search, filters)
 
 output/
-└── recon.db            # Cross-run SQLite intelligence store (hosts, ports,
-                         # HTTP services, DNS records, findings, run history)
+└── recon.db            # Cross-run SQLite store. Host tables plus intel_entities /
+                         # observations / evidence / relationships / indicators.
+                         # graph_nodes/graph_edges are a reporting view, not Neo4j.
 
 reports/
 ├── overview.md         # Markdown overview
@@ -383,7 +401,17 @@ logs/
 
 ## Extending the Framework
 
-Adding a new recon tool requires **only one new file** in `modules/`:
+Adding a recon tool is not “one new file”. You typically need:
+
+1. `modules/my_tool.py` with declarative `produces`, `capability`, `active_collection`, `strict_opsec_allowed`
+2. `enable_my_tool` / path in `config/settings.py` and `config/.env.example`
+3. Import in `modules/__init__.py` (auto-registers via `__init_subclass__`)
+4. A parser in `core/parsers/registry.py` if the artifact is not already covered
+5. Runner stage placement is derived from `capability` for subdomain / URL / DNS / post-HTTP groups; a brand-new stage still needs an explicit call in `core/runner.py`
+
+Subprocess isolation is unchanged (`no shell=True`). Plugins may also attach
+`PluginResult.data["intel"]` (`StructuredEmission`) so the engine can ingest
+entities without a new parser class. Artifact files remain the production path.
 
 ```python
 # modules/my_tool.py
@@ -396,7 +424,12 @@ class MyToolPlugin(BaseToolPlugin):
     name = "my_tool"
     display_name = "My Tool"
     required = False
-    stage_order = 45  # Controls pipeline position
+    stage_order = 45
+    produces = ("domains",)
+    followup_kinds = ("domains",)
+    capability = "enumerate_domains"
+    active_collection = False
+    strict_opsec_allowed = False
 
     install_hint_macos = "brew install my_tool"
     install_hint_linux = "go install example.com/my_tool@latest"
@@ -412,13 +445,6 @@ class MyToolPlugin(BaseToolPlugin):
         args = [str(self.get_binary_path()), "-l", str(input_path)]
         return await self._execute(context, args, output_path)
 ```
-
-Then:
-
-1. Add `enable_my_tool` and `my_tool_path` to `config/settings.py` and `.env.example`
-2. Import the module in `modules/__init__.py`
-
-The plugin auto-registers via `__init_subclass__`. No core changes needed.
 
 ---
 
@@ -510,15 +536,15 @@ that permit only the proxy. Hydra cannot enforce host firewall policy itself.
 ## Suggested Improvements
 
 - [x] SQLite backend for cross-run querying and deduplication (`core/store.py`, `output/recon.db`)
-- [x] Historical diffing — automatic, per target, against the most recent prior run (`core/diff.py`)
+- [x] Historical diffing — overlapping targets, field-level changes (`core/diff.py`, `python app.py diff`)
 - [x] Integration with Amass as an additional plugin (`modules/amass.py`)
-- [x] Export to JSONL for downstream tooling — every new intelligence plugin (WHOIS, ASN, CT logs, port verify, threat intel, browser probe) writes `.jsonl`
+- [x] Export to JSONL for downstream tooling — intelligence plugins write `.jsonl`
+- [x] Scope file authorization (`SCOPE_FILE`; out-of-scope names are observed, not probed)
 - [ ] Resume interrupted runs from last completed stage
-- [ ] Standalone `diff`/`export` CLI subcommands (diffing/export currently happen automatically or via `AssetStore` API, not a dedicated CLI flag)
-- [ ] Scope file integration (in-scope / out-of-scope filtering)
-- [ ] Webhook notifications on completion (Slack, Discord)
+- [ ] Webhook notifications on completion (Slack, Discord) — optional webhook exists for diffs only
 - [ ] Config profiles (`--profile h1-program-name`)
 - [ ] massdns integration for high-volume DNS resolution
+- [ ] Completely separate evidence model for actor/owner attribution (intentionally absent)
 
 ---
 

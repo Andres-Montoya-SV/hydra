@@ -15,6 +15,8 @@ class SubfinderPlugin(BaseToolPlugin):
     display_name = "Subfinder"
     required = True
     stage_order = 10
+    produces = ("domains",)
+    capability = "enumerate_domains"
     install_hint_macos = "brew install subfinder"
     install_hint_linux = (
         "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"

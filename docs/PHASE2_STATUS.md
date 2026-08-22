@@ -1,5 +1,10 @@
 # Phase 2 Refactor Status
 
+> Runtime after the intelligence-engine work is documented in
+> `docs/ARCHITECTURE.md` and `docs/ARCHITECTURE_CURRENT.md`. This file is
+> the Phase 2/3 implementation log, not a claim that Hydra is
+> production-ready.
+
 ## Implemented
 
 | Component | Path | Status |

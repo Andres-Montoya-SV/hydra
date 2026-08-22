@@ -251,3 +251,9 @@ class BaseToolPlugin(ReconPlugin):
     def _output_path(self, context: PipelineContext, filename: str) -> Path:
         validate_safe_filename(filename)
         return context.output_dir / filename
+
+    def _authorized_input(self, context: PipelineContext, input_path: Path) -> Path:
+        """Re-check authorization immediately before this collector runs."""
+        from core.intel.scope import authorize_plugin_input
+
+        return authorize_plugin_input(context, input_path, self.name)

@@ -45,8 +45,15 @@ def _bool(value: str | None, default: bool = False) -> bool:
     )
 
 
-def _int(value: str | None, default: int, name: str, *, maximum: int = 10_000) -> int:
-    """Parse a bounded positive integer environment variable.
+def _int(
+    value: str | None,
+    default: int,
+    name: str,
+    *,
+    maximum: int = 10_000,
+    minimum: int = 1,
+) -> int:
+    """Parse a bounded integer environment variable.
 
     Raises:
         ConfigurationError: If value is not a valid integer.
@@ -57,7 +64,7 @@ def _int(value: str | None, default: int, name: str, *, maximum: int = 10_000) -
         parsed = int(value.strip())
     except ValueError as exc:
         raise ConfigurationError(f"Invalid integer for {name}: {value!r}") from exc
-    return validate_positive_int(parsed, name, maximum=maximum)
+    return validate_positive_int(parsed, name, minimum=minimum, maximum=maximum)
 
 
 def _parse_headers(raw: str | None) -> dict[str, str]:
@@ -237,6 +244,18 @@ class Settings:
     vuln_match_timeout: int = 15
     wpscan_api_token: str | None = None
     scope_file: Path | None = None
+    # Bounded iterative discovery. Conservative defaults — observe freely,
+    # collect only in-scope indicators up to depth 1.
+    max_discovery_depth: int = 1
+    max_followup_indicators: int = 50
+    max_domains_per_source: int = 20
+    max_collection_budget: int = 200
+    max_http_probes: int = 200
+    max_dns_probes: int = 200
+    max_runtime_seconds: int = 3600
+    max_entities: int = 5000
+    max_relationships: int = 20000
+    enable_followup_collection: bool = True
     webhook_url: str | None = None
 
     # Optional API credentials (never included in to_safe_dict)
@@ -424,6 +443,41 @@ class Settings:
             vuln_match_timeout=_int(os.getenv("VULN_MATCH_TIMEOUT"), 15, "VULN_MATCH_TIMEOUT"),
             wpscan_api_token=os.getenv("WPSCAN_API_TOKEN", "").strip() or None,
             scope_file=_optional_scope_file(os.getenv("SCOPE_FILE", "").strip()),
+            max_discovery_depth=_int(
+                os.getenv("MAX_DISCOVERY_DEPTH"),
+                1,
+                "MAX_DISCOVERY_DEPTH",
+                minimum=0,
+                maximum=5,
+            ),
+            max_followup_indicators=_int(
+                os.getenv("MAX_FOLLOWUP_INDICATORS"),
+                50,
+                "MAX_FOLLOWUP_INDICATORS",
+                maximum=500,
+            ),
+            max_domains_per_source=_int(
+                os.getenv("MAX_DOMAINS_PER_SOURCE"),
+                20,
+                "MAX_DOMAINS_PER_SOURCE",
+                maximum=500,
+            ),
+            max_collection_budget=_int(
+                os.getenv("MAX_COLLECTION_BUDGET"),
+                200,
+                "MAX_COLLECTION_BUDGET",
+                maximum=5000,
+            ),
+            max_http_probes=_int(
+                os.getenv("MAX_HTTP_PROBES"), 200, "MAX_HTTP_PROBES", maximum=5000
+            ),
+            max_dns_probes=_int(os.getenv("MAX_DNS_PROBES"), 200, "MAX_DNS_PROBES", maximum=5000),
+            max_runtime_seconds=_int(os.getenv("MAX_RUNTIME"), 3600, "MAX_RUNTIME", maximum=86400),
+            max_entities=_int(os.getenv("MAX_ENTITIES"), 5000, "MAX_ENTITIES", maximum=100000),
+            max_relationships=_int(
+                os.getenv("MAX_RELATIONSHIPS"), 20000, "MAX_RELATIONSHIPS", maximum=200000
+            ),
+            enable_followup_collection=_bool(os.getenv("ENABLE_FOLLOWUP_COLLECTION"), True),
             webhook_url=os.getenv("WEBHOOK_URL", "").strip() or None,
             urlhaus_api_key=os.getenv("URLHAUS_API_KEY", "").strip() or None,
             custom_http_headers=_parse_headers(os.getenv("HTTP_CUSTOM_HEADERS")),
@@ -627,6 +681,8 @@ class Settings:
             "has_webhook": self.webhook_url is not None,
             "has_scope_file": self.scope_file is not None,
             "has_wpscan_token": self.wpscan_api_token is not None,
+            "max_discovery_depth": self.max_discovery_depth,
+            "enable_followup_collection": self.enable_followup_collection,
         }
 
 

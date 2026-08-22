@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from core.intel.correlate import score_to_band
 from core.models import PipelineContext, RunSummary
 from utils.files import safe_write_text, write_json
 from utils.security import escape_html
@@ -216,10 +217,7 @@ class ReportGenerator:
             if app_clusters:
                 lines.extend(["## Application Clusters", ""])
                 for cluster in sorted(app_clusters, key=lambda c: -len(c.members))[:10]:
-                    lines.append(
-                        f"- **{cluster.signal[:60]}** — {len(cluster.members)} hosts "
-                        f"({cluster.cluster_type}, confidence {cluster.confidence}%)"
-                    )
+                    lines.append(f"- {_format_cluster(cluster)}")
                 lines.append("")
 
             infra_clusters = [
@@ -228,11 +226,9 @@ class ReportGenerator:
             if infra_clusters:
                 lines.extend(["## Infrastructure Clusters", ""])
                 for cluster in sorted(infra_clusters, key=lambda c: -len(c.members))[:10]:
-                    lines.append(
-                        f"- **{cluster.cluster_type}**: {cluster.signal[:40]} — "
-                        f"{len(cluster.members)} hosts"
-                    )
+                    lines.append(f"- {_format_cluster(cluster)}")
                 lines.append("")
+            lines.extend(self._intel_relationship_lines(store, context.run_id))
 
             # Query all hosts (not just risk_score-filtered ones): tarpit
             # detection deliberately excludes port signal from risk scoring,
@@ -407,6 +403,7 @@ class ReportGenerator:
             "  </div>",
         ]
         html_parts.extend(self._executive_summary_html(context, summary, store))
+        html_parts.extend(self._clusters_html(context, store))
         html_parts.extend(
             [
                 "  <h2>Assets</h2>",
@@ -727,3 +724,63 @@ class ReportGenerator:
         context.metadata = metadata
         write_json(context.output_dir / "metadata.json", metadata, base_dir=context.output_dir)
         return metadata
+
+    def _intel_relationship_lines(self, store: AssetStore, run_id: str) -> list[str]:
+        from core.intel.query import IntelQuery
+
+        conn = store.intel_connection()
+        try:
+            rows = IntelQuery(conn, run_id).relationships_for_run(limit=80)
+        finally:
+            conn.close()
+        if not rows:
+            return []
+        lines = [
+            "## Intelligence Relationships",
+            "",
+            "Correlation is infrastructure evidence, not actor or owner attribution.",
+            "",
+        ]
+        for row in rows[:40]:
+            rel_type = str(row.get("relationship_type") or "")
+            confidence = str(row.get("confidence") or "")
+            strength = str(row.get("strength") or "")
+            lines.append(
+                f"- `{row.get('source_entity')}` — {rel_type} → "
+                f"`{row.get('target_entity')}` ({confidence}, {strength})"
+            )
+        lines.append("")
+        return lines
+
+    def _clusters_html(self, context: PipelineContext, store: AssetStore | None) -> list[str]:
+        if not (store and context.run_id):
+            return []
+        getter = getattr(store, "get_clusters", None)
+        if not callable(getter):
+            return []
+        clusters = getter(context.run_id)
+        if not clusters:
+            return []
+        parts = [
+            "  <h2>Infrastructure Correlation</h2>",
+            "  <p class='muted'>Named confidence bands match SQLite intelligence. "
+            "Shared cloud addresses are tenancy, not ownership.</p>",
+            "  <ul>",
+        ]
+        for cluster in sorted(clusters, key=lambda c: -len(c.members))[:15]:
+            parts.append(f"    <li>{escape_html(_format_cluster(cluster))}</li>")
+        parts.append("  </ul>")
+        return parts
+
+
+def _format_cluster(cluster: Any) -> str:
+    band = score_to_band(int(cluster.confidence))
+    description = str(cluster.description or "")
+    tenancy = ""
+    if "shared_cloud_tenancy" in description or cluster.cluster_type in {"cdn", "ip"}:
+        if "shared_cloud_tenancy" in description:
+            tenancy = "; shared cloud tenancy, not ownership"
+    return (
+        f"{cluster.cluster_type}: {str(cluster.signal)[:60]} — "
+        f"{len(cluster.members)} hosts ({band.value}, {cluster.confidence}%{tenancy})"
+    )

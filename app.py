@@ -92,6 +92,49 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exit non-zero if any check is fail (same as default). Kept for scripts.",
     )
+    opsec_parser.add_argument(
+        "--skip-network",
+        action="store_true",
+        help="Check configuration only; do not make live network requests.",
+    )
+
+    investigate = subparsers.add_parser(
+        "investigate",
+        help="Query persisted intelligence for a domain (no rescan)",
+    )
+    investigate.add_argument("domain", nargs="?", default="", help="Domain indicator")
+    investigate.add_argument("--entity", help="Explicit entity value (same as domain)")
+    investigate.add_argument("--run-id", help="Run to query (default: latest)")
+
+    graph_p = subparsers.add_parser("graph", help="Show intelligence-graph neighborhood")
+    graph_p.add_argument("domain", help="Domain to center the graph on")
+    graph_p.add_argument("--run-id", help="Run to query (default: latest)")
+
+    rel_p = subparsers.add_parser("relationships", help="List evidence-backed relationships")
+    rel_p.add_argument("domain")
+    rel_p.add_argument("--run-id")
+
+    ev_p = subparsers.add_parser(
+        "evidence",
+        help="Show evidence for a domain or a relationship id (no rescan)",
+    )
+    ev_p.add_argument("domain", help="Domain or 32-char relationship_id")
+    ev_p.add_argument("--run-id")
+
+    cert_p = subparsers.add_parser("certificates", help="Certificates linked to a domain")
+    cert_p.add_argument("domain")
+    cert_p.add_argument("--run-id")
+
+    ind_p = subparsers.add_parser("indicators", help="Indicator-queue rows for a domain")
+    ind_p.add_argument("domain")
+    ind_p.add_argument("--run-id")
+
+    diff_p = subparsers.add_parser(
+        "diff",
+        help="Field-level diff of two persisted runs, or latest two finished runs for a domain",
+    )
+    diff_p.add_argument("run_a", help="Previous run id, or domain when used alone")
+    diff_p.add_argument("run_b", nargs="?", default=None, help="Current run id")
 
     return parser
 
@@ -209,6 +252,8 @@ def cmd_list_plugins(settings: Settings) -> int:
     table = Table(title="Registered Plugins")
     table.add_column("Name")
     table.add_column("Display Name")
+    table.add_column("Capability")
+    table.add_column("Produces")
     table.add_column("Required")
     table.add_column("Enabled")
     table.add_column("Stage Order")
@@ -217,6 +262,8 @@ def cmd_list_plugins(settings: Settings) -> int:
         table.add_row(
             plugin.name,
             plugin.display_name,
+            plugin.capability or "—",
+            ",".join(plugin.produces) or "—",
             "Yes" if plugin.required else "No",
             "Yes" if plugin.is_enabled() else "No",
             str(plugin.stage_order),
@@ -272,6 +319,49 @@ def cmd_validate_config(settings: Settings) -> int:
     return 1 if errors else 0
 
 
+def cmd_intel(args: argparse.Namespace, settings: Settings) -> int:
+    """Query the SQLite intelligence store without running reconnaissance."""
+    from core.intel.cli import (
+        cmd_certificates,
+        cmd_diff_runs,
+        cmd_evidence,
+        cmd_graph,
+        cmd_indicators,
+        cmd_investigate,
+        cmd_relationships,
+        default_db,
+    )
+
+    db_path = default_db(settings.project_root, settings.output_directory)
+    if not db_path.exists():
+        print(f"Error: intelligence database not found: {db_path}", file=sys.stderr)
+        return 1
+    run_id = getattr(args, "run_id", None)
+    if args.command == "diff":
+        run_b = getattr(args, "run_b", None)
+        if not args.run_a:
+            print("Error: provide DOMAIN or RUN_A RUN_B", file=sys.stderr)
+            return 1
+        return cmd_diff_runs(db_path, args.run_a, run_b)
+    domain = getattr(args, "entity", None) or getattr(args, "domain", "")
+    if args.command == "investigate":
+        if not domain:
+            print("Error: provide DOMAIN or --entity", file=sys.stderr)
+            return 1
+        return cmd_investigate(db_path, domain, run_id, getattr(args, "entity", None))
+    if args.command == "graph":
+        return cmd_graph(db_path, domain, run_id)
+    if args.command == "relationships":
+        return cmd_relationships(db_path, domain, run_id)
+    if args.command == "evidence":
+        return cmd_evidence(db_path, domain, run_id)
+    if args.command == "certificates":
+        return cmd_certificates(db_path, domain, run_id)
+    if args.command == "indicators":
+        return cmd_indicators(db_path, domain, run_id)
+    return 1
+
+
 async def cmd_check_opsec(settings: Settings, *, reveal_direct_ip: bool, skip_network: bool) -> int:
     """Run STRICT_OPSEC pre-flight diagnostics and print a report."""
     from core.opsec_check import run_diagnostics, summarize_checks
@@ -320,6 +410,16 @@ def main() -> int:
                     skip_network=args.skip_network,
                 )
             )
+        if args.command in {
+            "investigate",
+            "graph",
+            "relationships",
+            "evidence",
+            "certificates",
+            "indicators",
+            "diff",
+        }:
+            return cmd_intel(args, settings)
         return 1
 
     except (ConfigurationError, ValidationError, ReconError) as exc:

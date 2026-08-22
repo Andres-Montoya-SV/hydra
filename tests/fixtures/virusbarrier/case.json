@@ -1,0 +1,20 @@
+{
+  "seed": "virusbarrier.xyz",
+  "ipv4": "34.75.127.116",
+  "fingerprint_sha256": "7d1e4c8a9b2f0e6d5c4b3a29180766554433221100ffeeddccbbaa9988776655",
+  "sans": [
+    "virusbarrier.xyz",
+    "virusinspector.top",
+    "cybermedic.buzz",
+    "defendervault.shop",
+    "shieldvertex.mom",
+    "safesentinel.lol"
+  ],
+  "subject": "virusinspector.top",
+  "issuer": "Let's Encrypt YE1",
+  "not_before": "2026-06-01T00:00:00Z",
+  "not_after": "2026-08-30T00:00:00Z",
+  "cloud_provider": "GCP",
+  "asn": "396982",
+  "asn_org": "GOOGLE-CLOUD-PLATFORM"
+}

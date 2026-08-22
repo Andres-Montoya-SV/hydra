@@ -16,6 +16,9 @@ class DnsxPlugin(BaseToolPlugin):
     display_name = "dnsx"
     required = True
     stage_order = 30
+    produces = ("domains", "ips")
+    capability = "resolve_dns"
+    active_collection = True
     install_hint_macos = "brew install dnsx"
     install_hint_linux = "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
 
@@ -27,6 +30,7 @@ class DnsxPlugin(BaseToolPlugin):
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
         """Resolve all record types and emit resolved.txt + dnsx_records.json."""
+        input_path = self._authorized_input(context, input_path)
         output_path = self._output_path(context, "resolved.txt")
         records_path = self._output_path(context, "dnsx_records.jsonl")
 
@@ -90,6 +94,12 @@ class DnsxPlugin(BaseToolPlugin):
             # binary was missing, resolved_hosts must stay empty so the failure
             # is visible instead of being silently treated as "everything resolved".
             resolved_hosts = read_lines(input_path)
+
+        from core.intel.scope import filter_authorized_indicators
+
+        scope = getattr(context, "collection_scope", None)
+        if scope is not None:
+            resolved_hosts = filter_authorized_indicators(resolved_hosts, scope)
 
         count = write_lines(output_path, resolved_hosts)
         context.resolved = read_lines(output_path)

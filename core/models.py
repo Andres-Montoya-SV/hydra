@@ -93,6 +93,8 @@ class PipelineContext:
     store_warnings: list[str] = field(default_factory=list)
     registry: Any = None  # HostRegistry — populated during pipeline
     finalized: bool = False  # set once _finalize_to_store + reporter.generate have run
+    intel_emissions: list[dict[str, Any]] = field(default_factory=list)
+    collection_scope: Any = None
 
     @property
     def duration_seconds(self) -> float:

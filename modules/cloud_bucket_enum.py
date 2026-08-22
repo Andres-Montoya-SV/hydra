@@ -67,6 +67,10 @@ class CloudBucketEnumPlugin(BaseToolPlugin):
     external_dependency = False
     stage_order = 56
     cacheable = False
+    produces = ("urls",)
+    capability = "cloud_enum"
+    active_collection = True
+    strict_opsec_allowed = True
 
     def is_enabled(self) -> bool:
         return self.settings.enable_cloud_bucket_enum

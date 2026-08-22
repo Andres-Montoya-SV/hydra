@@ -20,6 +20,8 @@ class AmassPlugin(BaseToolPlugin):
     display_name = "amass"
     required = False
     stage_order = 16  # runs after subfinder (10) and before assetfinder-only dedup (17)
+    produces = ("domains",)
+    capability = "enumerate_domains"
     install_hint_macos = "brew install amass"
     install_hint_linux = "go install -v github.com/owasp-amass/amass/v4/...@master"
 

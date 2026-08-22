@@ -22,6 +22,8 @@ class HostRegistry(AssetCollection):
         self.source_counts: dict[str, int] = {}
         self.correlated_hosts: dict[str, list[str]] = {}
         self._engine = IntelligenceEngine()
+        self.intel_config = None
+        self.intel = None
 
     def ingest(self, tool: str, *, artifact: Path | None = None) -> int:
         """Parse tool output and merge into registry. Returns hosts touched."""
@@ -49,6 +51,12 @@ class HostRegistry(AssetCollection):
         self.clusters = result.clusters
         self.graph = result.graph
         self.warnings.extend(result.warnings)
+        if self.intel_config is not None:
+            from core.intel.engine import build_intel
+
+            engine = build_intel(self.intel_config, hosts, self.output_dir)
+            self.intel = engine.snapshot()
+            self.graph = engine.to_infrastructure_graph(host_graph=result.graph)
         return hosts
 
     def alive_count(self) -> int:

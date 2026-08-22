@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from core.assets import GraphEdge, GraphNode, Host, InfrastructureCluster, InfrastructureGraph
+from core.intel.correlate import band_score
+from core.intel.model import ConfidenceBand
 
 
 def build_infrastructure_graph(
@@ -25,7 +27,15 @@ def build_infrastructure_graph(
             ip_id = f"ip:{ip}"
             if ip_id not in graph.nodes:
                 graph.add_node(GraphNode(node_id=ip_id, node_type="ip", label=ip))
-            graph.add_edge(GraphEdge(host_node.node_id, ip_id, "resolves_to", confidence=90))
+            graph.add_edge(
+                GraphEdge(
+                    host_node.node_id,
+                    ip_id,
+                    "resolves_to",
+                    confidence=band_score(ConfidenceBand.HIGH),
+                    confidence_label=ConfidenceBand.HIGH.value,
+                )
+            )
 
         if host.asn:
             asn_id = f"asn:{host.asn}"
@@ -39,13 +49,29 @@ def build_infrastructure_graph(
                     )
                 )
             for ip in host.ips:
-                graph.add_edge(GraphEdge(f"ip:{ip}", asn_id, "belongs_to", confidence=85))
+                graph.add_edge(
+                    GraphEdge(
+                        f"ip:{ip}",
+                        asn_id,
+                        "belongs_to",
+                        confidence=band_score(ConfidenceBand.HIGH),
+                        confidence_label=ConfidenceBand.HIGH.value,
+                    )
+                )
 
         if host.cdn_provider:
             cdn_id = f"cdn:{host.cdn_provider}"
             if cdn_id not in graph.nodes:
                 graph.add_node(GraphNode(node_id=cdn_id, node_type="cdn", label=host.cdn_provider))
-            graph.add_edge(GraphEdge(host_node.node_id, cdn_id, "served_by", confidence=85))
+            graph.add_edge(
+                GraphEdge(
+                    host_node.node_id,
+                    cdn_id,
+                    "served_by",
+                    confidence=band_score(ConfidenceBand.HIGH),
+                    confidence_label=ConfidenceBand.HIGH.value,
+                )
+            )
 
         if host.provider:
             prov_id = f"provider:{host.provider}"
@@ -53,7 +79,15 @@ def build_infrastructure_graph(
                 graph.add_node(
                     GraphNode(node_id=prov_id, node_type="provider", label=host.provider)
                 )
-            graph.add_edge(GraphEdge(host_node.node_id, prov_id, "hosted_on", confidence=80))
+            graph.add_edge(
+                GraphEdge(
+                    host_node.node_id,
+                    prov_id,
+                    "hosted_on",
+                    confidence=band_score(ConfidenceBand.MEDIUM),
+                    confidence_label=ConfidenceBand.MEDIUM.value,
+                )
+            )
 
         for svc in host.http_services:
             for tech in svc.technologies[:3]:
@@ -71,26 +105,44 @@ def build_infrastructure_graph(
                     )
                 )
 
-        # Was nested inside the http_services loop, adding one duplicate
-        # "secured_by" edge per HTTP service instead of once per host.
-        if host.tls and host.tls.sans:
-            cert_key = "|".join(sorted(host.tls.sans[:2]))
-            cert_id = f"cert:{hash(cert_key) & 0xFFFFFFFF:08x}"
+        # Certificate nodes are identified by leaf SHA-256 fingerprint only.
+        # Do not hash SAN slices — that is not a certificate identity.
+        if host.tls and host.tls.fingerprint_sha256:
+            cert_id = f"cert:{host.tls.fingerprint_sha256}"
             if cert_id not in graph.nodes:
                 graph.add_node(
                     GraphNode(
                         node_id=cert_id,
                         node_type="cert",
-                        label=host.tls.subject or cert_key[:40],
-                        metadata={"sans": host.tls.sans[:5]},
+                        label=host.tls.subject or host.tls.fingerprint_sha256[:16],
+                        metadata={
+                            "fingerprint_sha256": host.tls.fingerprint_sha256,
+                            "sans": host.tls.sans,
+                        },
                     )
                 )
-            graph.add_edge(GraphEdge(host_node.node_id, cert_id, "secured_by", confidence=90))
+            graph.add_edge(
+                GraphEdge(
+                    host_node.node_id,
+                    cert_id,
+                    "PRESENTS_CERTIFICATE",
+                    confidence=band_score(ConfidenceBand.VERY_HIGH),
+                    confidence_label=ConfidenceBand.VERY_HIGH.value,
+                )
+            )
 
         for related in host.profile.related_hosts if host.profile else []:
             rel_id = f"host:{related}"
             if rel_id in graph.nodes or related in hosts:
-                graph.add_edge(GraphEdge(host_node.node_id, rel_id, "related_to", confidence=70))
+                graph.add_edge(
+                    GraphEdge(
+                        host_node.node_id,
+                        rel_id,
+                        "related_to",
+                        confidence=band_score(ConfidenceBand.MEDIUM),
+                        confidence_label=ConfidenceBand.MEDIUM.value,
+                    )
+                )
 
     for cluster in clusters:
         if len(cluster.members) < 2:
