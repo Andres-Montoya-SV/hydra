@@ -10,6 +10,7 @@ import pytest
 from config.settings import Settings
 from core.assets import Host
 from core.confidence import score_subdomain
+from core.intel.scope import CollectionScope
 from core.intelligence.engine import IntelligenceEngine
 from core.models import DomainTarget, PipelineContext
 from core.parsers.registry import (
@@ -147,6 +148,7 @@ async def test_wildcard_check_plugin_detects_when_canaries_resolve(
     context = PipelineContext(
         output_dir=output_dir,
         targets=[DomainTarget(domain="www.example.com", source="cli")],
+        collection_scope=CollectionScope.from_seeds(["www.example.com", "example.com"]),
     )
     context.resolved_binaries["dnsx"] = Path("/usr/bin/dnsx")
     plugin = WildcardCheckPlugin(settings)
@@ -179,6 +181,7 @@ async def test_wildcard_check_plugin_clean_when_canaries_do_not_resolve(
     context = PipelineContext(
         output_dir=output_dir,
         targets=[DomainTarget(domain="example.com", source="cli")],
+        collection_scope=CollectionScope.from_seeds(["example.com"]),
     )
     context.resolved_binaries["dnsx"] = Path("/usr/bin/dnsx")
     plugin = WildcardCheckPlugin(settings)
@@ -280,7 +283,10 @@ async def test_soft404_plugin_detects_matching_canary(settings: Settings, tmp_pa
     settings.enable_soft404_check = True
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(
+        output_dir=output_dir,
+        collection_scope=CollectionScope.from_seeds(["example.com"]),
+    )
     context.httpx_results = [{"url": "https://example.com/", "input": "example.com"}]
     plugin = Soft404CheckPlugin(settings)
 
@@ -306,7 +312,10 @@ async def test_soft404_plugin_clean_when_canary_is_404(settings: Settings, tmp_p
     settings.enable_soft404_check = True
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(
+        output_dir=output_dir,
+        collection_scope=CollectionScope.from_seeds(["example.com"]),
+    )
     context.httpx_results = [{"url": "https://example.com/", "input": "example.com"}]
     plugin = Soft404CheckPlugin(settings)
 

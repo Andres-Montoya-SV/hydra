@@ -255,7 +255,11 @@ class Settings:
     max_runtime_seconds: int = 3600
     max_entities: int = 5000
     max_relationships: int = 20000
+    max_ct_names_per_certificate: int = 200
+    max_certificates: int = 500
+    max_ips: int = 2000
     enable_followup_collection: bool = True
+    cloud_bucket_enum_authorize_derived: bool = False
     webhook_url: str | None = None
 
     # Optional API credentials (never included in to_safe_dict)
@@ -477,7 +481,20 @@ class Settings:
             max_relationships=_int(
                 os.getenv("MAX_RELATIONSHIPS"), 20000, "MAX_RELATIONSHIPS", maximum=200000
             ),
+            max_ct_names_per_certificate=_int(
+                os.getenv("MAX_CT_NAMES_PER_CERTIFICATE"),
+                200,
+                "MAX_CT_NAMES_PER_CERTIFICATE",
+                maximum=10000,
+            ),
+            max_certificates=_int(
+                os.getenv("MAX_CERTIFICATES"), 500, "MAX_CERTIFICATES", maximum=20000
+            ),
+            max_ips=_int(os.getenv("MAX_IPS"), 2000, "MAX_IPS", maximum=50000),
             enable_followup_collection=_bool(os.getenv("ENABLE_FOLLOWUP_COLLECTION"), True),
+            cloud_bucket_enum_authorize_derived=_bool(
+                os.getenv("CLOUD_BUCKET_ENUM_AUTHORIZE_DERIVED")
+            ),
             webhook_url=os.getenv("WEBHOOK_URL", "").strip() or None,
             urlhaus_api_key=os.getenv("URLHAUS_API_KEY", "").strip() or None,
             custom_http_headers=_parse_headers(os.getenv("HTTP_CUSTOM_HEADERS")),
@@ -683,6 +700,10 @@ class Settings:
             "has_wpscan_token": self.wpscan_api_token is not None,
             "max_discovery_depth": self.max_discovery_depth,
             "enable_followup_collection": self.enable_followup_collection,
+            "cloud_bucket_enum_authorize_derived": self.cloud_bucket_enum_authorize_derived,
+            "max_ct_names_per_certificate": self.max_ct_names_per_certificate,
+            "max_certificates": self.max_certificates,
+            "max_ips": self.max_ips,
         }
 
 

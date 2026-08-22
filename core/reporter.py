@@ -210,12 +210,23 @@ class ReportGenerator:
                     )
                 lines.append("")
 
+            lines.extend(self._intel_relationship_lines(store, context.run_id))
+
             clusters = store.get_clusters(context.run_id)
             app_clusters = [
                 c for c in clusters if c.cluster_type in ("title", "body_hash", "favicon")
             ]
             if app_clusters:
-                lines.extend(["## Application Clusters", ""])
+                lines.extend(
+                    [
+                        "## Host Projection — Application Clusters",
+                        "",
+                        "Host clusters are a reporting projection of collected HTTP/TLS "
+                        "fields. Correlation confidence comes from `intel_*` relationships "
+                        "above, not from cluster size.",
+                        "",
+                    ]
+                )
                 for cluster in sorted(app_clusters, key=lambda c: -len(c.members))[:10]:
                     lines.append(f"- {_format_cluster(cluster)}")
                 lines.append("")
@@ -224,11 +235,19 @@ class ReportGenerator:
                 c for c in clusters if c.cluster_type in ("ip", "cdn", "certificate", "asn")
             ]
             if infra_clusters:
-                lines.extend(["## Infrastructure Clusters", ""])
+                lines.extend(
+                    [
+                        "## Host Projection — Infrastructure Clusters",
+                        "",
+                        "These groupings are Host-view projections. They must not override "
+                        "intel relationship confidence (for example a shared GCP address is "
+                        "MEDIUM tenancy, not ownership).",
+                        "",
+                    ]
+                )
                 for cluster in sorted(infra_clusters, key=lambda c: -len(c.members))[:10]:
                     lines.append(f"- {_format_cluster(cluster)}")
                 lines.append("")
-            lines.extend(self._intel_relationship_lines(store, context.run_id))
 
             # Query all hosts (not just risk_score-filtered ones): tarpit
             # detection deliberately excludes port signal from risk scoring,
@@ -403,7 +422,8 @@ class ReportGenerator:
             "  </div>",
         ]
         html_parts.extend(self._executive_summary_html(context, summary, store))
-        html_parts.extend(self._clusters_html(context, store))
+        html_parts.extend(self._intel_correlation_html(context, store))
+        html_parts.extend(self._host_projection_clusters_html(context, store))
         html_parts.extend(
             [
                 "  <h2>Assets</h2>",
@@ -738,6 +758,8 @@ class ReportGenerator:
         lines = [
             "## Intelligence Relationships",
             "",
+            "Discovery of an indicator does not imply authorization to probe it. "
+            "Out-of-scope names may be observed; they are never active collection targets. "
             "Correlation is infrastructure evidence, not actor or owner attribution.",
             "",
         ]
@@ -752,7 +774,78 @@ class ReportGenerator:
         lines.append("")
         return lines
 
-    def _clusters_html(self, context: PipelineContext, store: AssetStore | None) -> list[str]:
+    def _intel_correlation_html(self, context: PipelineContext, store: AssetStore | None) -> list[str]:
+        if not (store and context.run_id):
+            return []
+        getter = getattr(store, "intel_connection", None)
+        if not callable(getter):
+            return []
+        from core.intel.query import IntelQuery
+
+        conn = store.intel_connection()
+        try:
+            query = IntelQuery(conn, context.run_id)
+            rows = query.relationships_for_run(limit=80)
+            entities = {
+                row["entity_id"]: dict(row)
+                for row in conn.execute(
+                    "SELECT entity_id, key, entity_type, scope_status, collection_status "
+                    "FROM intel_entities WHERE run_id=?",
+                    (context.run_id,),
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        parts = [
+            "  <h2>Intelligence Correlation</h2>",
+            "  <p class='muted'>Discovery of an indicator does not imply authorization "
+            "to probe it. Observed names may be out of scope. Confidence bands match "
+            "SQLite <code>intel_relationships</code> and the investigate CLI. "
+            "Hydra correlates infrastructure; it is not an attribution engine.</p>",
+        ]
+        if not rows:
+            return parts
+        parts.append("  <ul>")
+        for row in rows[:40]:
+            rel_type = escape_html(str(row.get("relationship_type") or ""))
+            confidence = escape_html(str(row.get("confidence") or ""))
+            source = row.get("source_entity") or ""
+            target = row.get("target_entity") or ""
+            src_ent = entities.get(source) or {}
+            dst_ent = entities.get(target) or {}
+            src_label = escape_html(str(src_ent.get("key") or source))
+            dst_label = escape_html(str(dst_ent.get("key") or target))
+            src_scope = escape_html(str(src_ent.get("scope_status") or ""))
+            dst_scope = escape_html(str(dst_ent.get("scope_status") or ""))
+            src_coll = escape_html(str(src_ent.get("collection_status") or ""))
+            dst_coll = escape_html(str(dst_ent.get("collection_status") or ""))
+            data = row.get("data") or {}
+            evidence_bits: list[str] = []
+            for key in (
+                "fingerprint_sha256",
+                "certificate_fingerprint",
+                "san_cardinality",
+                "ip",
+                "provider",
+                "favicon",
+            ):
+                if data.get(key) not in (None, "", []):
+                    evidence_bits.append(f"{key}={data.get(key)}")
+            evidence_html = escape_html("; ".join(str(bit) for bit in evidence_bits[:4]))
+            parts.append(
+                "    <li>"
+                f"<code>{src_label}</code> [{src_scope}/{src_coll}] "
+                f"— <strong>{rel_type}</strong> [{confidence}] → "
+                f"<code>{dst_label}</code> [{dst_scope}/{dst_coll}]"
+                f"{f'<br><span class=\"muted\">{evidence_html}</span>' if evidence_html else ''}"
+                "</li>"
+            )
+        parts.append("  </ul>")
+        return parts
+
+    def _host_projection_clusters_html(
+        self, context: PipelineContext, store: AssetStore | None
+    ) -> list[str]:
         if not (store and context.run_id):
             return []
         getter = getattr(store, "get_clusters", None)
@@ -762,9 +855,11 @@ class ReportGenerator:
         if not clusters:
             return []
         parts = [
-            "  <h2>Infrastructure Correlation</h2>",
-            "  <p class='muted'>Named confidence bands match SQLite intelligence. "
-            "Shared cloud addresses are tenancy, not ownership.</p>",
+            "  <h2>Host Projection Clusters</h2>",
+            "  <p class='muted'>Host clusters are a reporting projection of collected "
+            "HTTP/port/TLS fields. They are not the correlation source of truth and "
+            "must not override intel confidence (shared cloud addresses are tenancy, "
+            "not ownership).</p>",
             "  <ul>",
         ]
         for cluster in sorted(clusters, key=lambda c: -len(c.members))[:15]:

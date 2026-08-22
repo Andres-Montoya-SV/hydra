@@ -82,6 +82,16 @@ class CloudBucketEnumPlugin(BaseToolPlugin):
         return "Built-in (stdlib urllib) — opt-in active probe"
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
+        from core.intel.scope import require_collection_scope
+
+        require_collection_scope(context)
+        if not self.settings.cloud_bucket_enum_authorize_derived:
+            return self._skip(
+                "Cloud-derived endpoints (*.s3.amazonaws.com, storage.googleapis.com, "
+                "*.blob.core.windows.net) are not seed-scoped. Set "
+                "CLOUD_BUCKET_ENUM_AUTHORIZE_DERIVED=true to opt in to probing them. "
+                "Discovery of a brand name does not authorize cloud infrastructure probes."
+            )
         brands = _brand_labels(context)
         if not brands:
             return self._skip("No root domains available for bucket name permutation")

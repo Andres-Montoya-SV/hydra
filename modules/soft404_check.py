@@ -55,7 +55,14 @@ class Soft404CheckPlugin(BaseToolPlugin):
         return "Built-in (stdlib urllib)"
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
-        targets = _alive_targets(context)[: self.settings.soft404_max_hosts]
+        from core.intel.scope import allows_active_collection, require_collection_scope
+
+        scope = require_collection_scope(context)
+        targets = [
+            target
+            for target in _alive_targets(context)[: self.settings.soft404_max_hosts]
+            if allows_active_collection(str(target.get("host") or target.get("url") or ""), scope)
+        ]
         if not targets:
             return self._skip("No live HTTP services to probe for soft-404")
 

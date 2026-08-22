@@ -29,10 +29,16 @@ class DnsxPlugin(BaseToolPlugin):
         return self.settings.dnsx_path
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
-        """Resolve all record types and emit resolved.txt + dnsx_records.json."""
+        """Resolve all record types and emit resolved.txt + dnsx_records.jsonl.
+
+        Follow-up collection sets ``dnsx_output_suffix`` so seed artifacts are
+        not overwritten. The runner merges follow-up files into the canonical
+        collection state atomically.
+        """
         input_path = self._authorized_input(context, input_path)
-        output_path = self._output_path(context, "resolved.txt")
-        records_path = self._output_path(context, "dnsx_records.jsonl")
+        suffix = str(context.metadata.get("dnsx_output_suffix") or "")
+        output_path = self._output_path(context, f"resolved{suffix}.txt")
+        records_path = self._output_path(context, f"dnsx_records{suffix}.jsonl")
 
         args = [
             str(self.get_binary_path()),
@@ -102,7 +108,10 @@ class DnsxPlugin(BaseToolPlugin):
             resolved_hosts = filter_authorized_indicators(resolved_hosts, scope)
 
         count = write_lines(output_path, resolved_hosts)
-        context.resolved = read_lines(output_path)
+        # Follow-up writes a sidecar file. Replacing context.resolved here would
+        # drop the seed set; the runner unions after an atomic merge.
+        if not suffix:
+            context.resolved = read_lines(output_path)
 
         if not result.success:
             return PluginResult(

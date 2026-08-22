@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from config.settings import Settings
+from core.intel.scope import CollectionScope
 from core.models import PipelineContext
 from core.parsers.registry import SecurityHeadersParser, VulnMatchParser
 from core.reporter import ReportGenerator
@@ -46,7 +47,12 @@ async def test_vuln_match_bookly_cve_fixture(settings: Settings, tmp_path: Path)
     settings.enable_vuln_match = True
     output_dir = tmp_path / "Users" / "testuser" / "secret-project" / "output" / "run1"
     output_dir.mkdir(parents=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(
+        output_dir=output_dir,
+        collection_scope=CollectionScope.from_seeds(
+            ["www.metaversejustice.com", "metaversejustice.com"]
+        ),
+    )
     context.httpx_results = [
         {
             "host": "www.metaversejustice.com",
@@ -91,7 +97,12 @@ async def test_security_headers_missing_and_complete(settings: Settings, tmp_pat
     settings.enable_security_headers = True
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(
+        output_dir=output_dir,
+        collection_scope=CollectionScope.from_seeds(
+            ["www.metaversejustice.com", "metaversejustice.com"]
+        ),
+    )
     context.httpx_results = [
         {
             "host": "missing.example",
@@ -282,7 +293,10 @@ def test_httpx_cache_copies_json_sibling(settings: Settings, project_root: Path)
     )
     current = project_root / "output" / "current"
     current.mkdir()
-    context = PipelineContext(output_dir=current)
+    context = PipelineContext(
+        output_dir=current,
+        collection_scope=CollectionScope.from_seeds(["example.com", "www.example.com"]),
+    )
     input_path = current / "resolved.txt"
     input_path.write_text("example.com\n", encoding="utf-8")
     plugin = HttpxPlugin(settings)

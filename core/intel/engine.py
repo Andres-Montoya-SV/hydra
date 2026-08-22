@@ -149,11 +149,51 @@ class IntelEngine:
         existing = self.entities.get(entity.entity_id)
         if existing:
             return existing
-        if len(self.entities) >= self.bounds.max_entities:
-            self._mark_truncated("entity_limit")
+        if entity.entity_type is EntityType.CERTIFICATE and self._count_type(
+            EntityType.CERTIFICATE
+        ) >= self.bounds.max_certificates:
+            self._mark_truncated("certificate_limit")
             return None
+        if entity.entity_type is EntityType.IP_ADDRESS and self._count_type(
+            EntityType.IP_ADDRESS
+        ) >= self.bounds.max_ips:
+            self._mark_truncated("ip_limit")
+            return None
+        if len(self.entities) >= self.bounds.max_entities:
+            if entity.is_seed:
+                victim = next(
+                    (
+                        eid
+                        for eid, item in reversed(list(self.entities.items()))
+                        if not item.is_seed and item.entity_type is EntityType.DOMAIN
+                    ),
+                    None,
+                )
+                if victim:
+                    del self.entities[victim]
+                    self._mark_truncated("entity_limit")
+                else:
+                    self._mark_truncated("entity_limit")
+                    return None
+            else:
+                self._mark_truncated("entity_limit")
+                return None
         self.entities[entity.entity_id] = entity
         return entity
+
+    def _count_type(self, entity_type: EntityType) -> int:
+        return sum(1 for item in self.entities.values() if item.entity_type is entity_type)
+
+    def _prioritize_certificate_names(self, names: list[str]) -> list[str]:
+        unique = list(dict.fromkeys(normalize_domain(name) for name in names if normalize_domain(name)))
+        seeds = [name for name in unique if name in self.seeds]
+        in_scope = [
+            name
+            for name in unique
+            if name not in self.seeds and allows_active_collection(name, self.scope)
+        ]
+        rest = [name for name in unique if name not in seeds and name not in in_scope]
+        return seeds + in_scope + rest
 
     def _drop_orphans(self) -> None:
         known = set(self.entities)
@@ -230,7 +270,9 @@ class IntelEngine:
         for record in records:
             if not isinstance(record, dict):
                 continue
-            names = extract_certificate_names(record.get("name_value") or record.get("common_name"))
+            names = self._prioritize_certificate_names(
+                extract_certificate_names(record.get("name_value") or record.get("common_name"))
+            )
             if not names:
                 continue
             fingerprint = extract_tls_fingerprint(record) or normalize_fingerprint(
@@ -239,40 +281,55 @@ class IntelEngine:
             cert_id_raw = str(record.get("id") or "")
             serial = str(record.get("serial_number") or "")
             issuer = str(record.get("issuer_name") or record.get("issuer") or "")
+            not_before = str(record.get("not_before") or "") or None
+            not_after = str(record.get("not_after") or "") or None
             if fingerprint:
                 cert_key = fingerprint
                 identity_kind = "sha256"
             elif serial and issuer:
-                cert_key = f"serial:{stable_id(issuer, serial)}"
+                cert_key = f"serial:{stable_id(issuer, serial, not_before or '', not_after or '')}"
                 identity_kind = "serial_issuer"
             else:
                 # crt.sh id / SAN tuples are not cryptographic identity.
                 cert_key = f"unidentified:{stable_id(dump_json(record))}"
                 identity_kind = "unidentified"
+            observed_names = names[: self.bounds.max_ct_names_per_certificate]
+            if len(names) > len(observed_names):
+                self._mark_truncated("ct_names_per_certificate")
             cert = self._certificate_entity(
                 cert_key,
                 fingerprint_sha256=fingerprint,
                 subject=str(record.get("common_name") or names[0]),
                 issuer=issuer or None,
                 serial=serial or None,
-                not_before=str(record.get("not_before") or "") or None,
-                not_after=str(record.get("not_after") or "") or None,
-                sans=names,
+                not_before=not_before,
+                not_after=not_after,
+                sans=observed_names,
                 identity_kind=identity_kind,
             )
             if cert is None:
                 continue
+            cert.data["san_cardinality"] = len(set(names))
+            cert.data["sans_truncated"] = len(names) > len(observed_names)
             obs = self._observe(
                 cert.entity_id,
                 source="certificate_transparency",
                 collector="ctlogs",
-                data={"names": names, "crtsh_id": cert_id_raw, "identity_kind": identity_kind},
+                data={
+                    "names": observed_names,
+                    "san_cardinality": len(set(names)),
+                    "crtsh_id": cert_id_raw,
+                    "identity_kind": identity_kind,
+                    "identified": identity_kind in {"sha256", "serial_issuer"},
+                },
             )
+            if obs is None:
+                continue
             query_domain = normalize_domain(str(record.get("query_domain") or ""))
             parent = self.queue.get(IndicatorKind.DOMAIN, query_domain) if query_domain else None
             parent_id = parent.indicator_id if parent else None
             parent_depth = parent.depth if parent else 0
-            for name in names:
+            for name in observed_names:
                 self._observe_san(
                     cert,
                     name,
@@ -765,7 +822,16 @@ class IntelEngine:
             return None
         metadata = metadata or {}
         evidence = self._evidence_from(observation, strength, metadata)
-        rid = stable_id("rel", source, rel_type.value, target)
+        identity = (
+            str(metadata.get("certificate") or "")
+            or str(metadata.get("fingerprint_sha256") or "")
+            or str(metadata.get("ip") or "")
+            or str(metadata.get("favicon") or metadata.get("favicon_hash") or "")
+            or str(metadata.get("body_hash") or "")
+            or str(metadata.get("nameserver") or "")
+            or str(metadata.get("asn") or "")
+        )
+        rid = stable_id("rel", source, rel_type.value, target, identity)
         existing = self.relationships.get(rid)
         if existing:
             existing.last_seen = self.observed_at
@@ -1236,7 +1302,7 @@ class IntelEngine:
             self._pairwise_share(
                 domains,
                 RelationshipType.SHARES_ASN,
-                ConfidenceBand.MEDIUM,
+                ConfidenceBand.LOW,
                 "shared_asn",
                 entity_id(EntityType.ASN, asn),
                 {"asn": asn},
@@ -1288,7 +1354,7 @@ class IntelEngine:
             kinds = {item.split(":", 1)[0] for item in pair_signals.get(pair, set())}
             corroborated = len(kinds) >= 2
             if kind in {"favicon", "body_hash"}:
-                return ConfidenceBand.HIGH if corroborated else ConfidenceBand.MEDIUM
+                return ConfidenceBand.HIGH if corroborated else ConfidenceBand.LOW
             return ConfidenceBand.LOW
 
         def _share(

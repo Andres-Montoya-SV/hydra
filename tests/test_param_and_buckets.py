@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from config.settings import Settings
+from core.intel.scope import CollectionScope
 from core.models import DomainTarget, PipelineContext
 from core.parsers.registry import CloudBucketEnumParser, ParamFuzzParser
 from core.response_diff import (
@@ -23,6 +24,8 @@ from modules.cloud_bucket_enum import (
 )
 from modules.param_fuzz import CANARY_VALUE, PARAM_WORDLIST, ParamFuzzPlugin
 from utils.files import read_jsonl
+
+_SCOPE = CollectionScope.from_seeds(["example.com", "metaversejustice.com"])
 
 
 def test_bodies_near_identical_and_significant_change() -> None:
@@ -69,7 +72,7 @@ async def test_param_fuzz_detects_status_change_and_creates_finding(
     settings.param_fuzz_max_urls_per_host = 1
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.alive_urls = ["https://example.com/"]
     context.httpx_results = [{"url": "https://example.com/"}]
 
@@ -100,7 +103,7 @@ async def test_param_fuzz_marks_reflected_as_medium(settings: Settings, tmp_path
     settings.param_fuzz_delay_ms = 0
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.alive_urls = ["https://example.com/"]
     context.httpx_results = [{"url": "https://example.com/"}]
 
@@ -134,7 +137,7 @@ async def test_param_fuzz_influence_without_reflection_has_no_context(
     settings.param_fuzz_delay_ms = 0
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.alive_urls = ["https://example.com/"]
     context.httpx_results = [{"url": "https://example.com/"}]
 
@@ -163,7 +166,7 @@ async def test_param_fuzz_skips_host_when_baseline_rate_limited(
     settings.param_fuzz_delay_ms = 0
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.alive_urls = ["https://example.com/"]
     context.httpx_results = [{"url": "https://example.com/"}]
 
@@ -213,7 +216,7 @@ async def test_param_fuzz_raw_artifact_never_embeds_analyst_home(
     settings.param_fuzz_delay_ms = 0
     output_dir = tmp_path / "Users" / "testuser" / "secret-project" / "output" / "run1"
     output_dir.mkdir(parents=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.alive_urls = ["https://example.com/"]
     context.httpx_results = [{"url": "https://example.com/"}]
 
@@ -240,7 +243,7 @@ async def test_param_fuzz_continues_when_baseline_ok(settings: Settings, tmp_pat
     settings.param_fuzz_delay_ms = 0
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.alive_urls = ["https://example.com/"]
     context.httpx_results = [{"url": "https://example.com/"}]
 
@@ -284,7 +287,7 @@ async def test_param_fuzz_no_noise_when_unchanged(settings: Settings, tmp_path: 
     settings.param_fuzz_delay_ms = 0
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.alive_urls = ["https://example.com/"]
     context.httpx_results = [{"url": "https://example.com/"}]
 
@@ -339,9 +342,10 @@ async def test_cloud_bucket_enum_reports_private_and_public(
     settings: Settings, tmp_path: Path
 ) -> None:
     settings.cloud_bucket_enum_delay_ms = 0
+    settings.cloud_bucket_enum_authorize_derived = True
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.targets = [DomainTarget(domain="metaversejustice.com")]
 
     def fake_get(url: str, **kwargs):
@@ -391,9 +395,10 @@ async def test_cloud_bucket_enum_dns_failure_warning_for_s3(
     settings: Settings, tmp_path: Path
 ) -> None:
     settings.cloud_bucket_enum_delay_ms = 0
+    settings.cloud_bucket_enum_authorize_derived = True
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.targets = [DomainTarget(domain="example.com")]
 
     def fake_get(url: str, **kwargs):
@@ -432,9 +437,10 @@ async def test_cloud_bucket_enum_dns_failure_warning_for_s3(
 @pytest.mark.asyncio
 async def test_cloud_bucket_enum_nosuchbucket_silent(settings: Settings, tmp_path: Path) -> None:
     settings.cloud_bucket_enum_delay_ms = 0
+    settings.cloud_bucket_enum_authorize_derived = True
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.targets = [DomainTarget(domain="example.com")]
 
     with patch(

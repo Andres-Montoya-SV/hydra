@@ -249,6 +249,10 @@ class BaseToolPlugin(ReconPlugin):
         return f"macOS: {self.install_hint_macos} | Linux: {self.install_hint_linux}"
 
     def _output_path(self, context: PipelineContext, filename: str) -> Path:
+        if self.active_collection:
+            from core.intel.scope import require_collection_scope
+
+            require_collection_scope(context)
         validate_safe_filename(filename)
         return context.output_dir / filename
 

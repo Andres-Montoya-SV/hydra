@@ -215,7 +215,7 @@ def test_favicon_alone_is_not_high() -> None:
         if r.relationship_type is RelationshipType.SHARES_FAVICON
     ]
     assert fav
-    assert all(r.confidence is ConfidenceBand.MEDIUM for r in fav)
+    assert all(r.confidence is ConfidenceBand.LOW for r in fav)
     assert all(r.data.get("corroborated") is False for r in fav)
 
 
@@ -338,7 +338,7 @@ def test_cluster_and_report_use_named_confidence(tmp_path: Path, settings: Setti
     fav_cluster = next(c for c in clusters if c.cluster_type == "favicon")
     assert ip_cluster.confidence == band_score(ConfidenceBand.MEDIUM)
     assert "shared_cloud_tenancy" in ip_cluster.description
-    assert fav_cluster.confidence == band_score(ConfidenceBand.MEDIUM)
+    assert fav_cluster.confidence == band_score(ConfidenceBand.LOW)
     assert ip_cluster.confidence != 90
     assert fav_cluster.confidence != 95
 

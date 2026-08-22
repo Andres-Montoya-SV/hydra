@@ -52,8 +52,10 @@ class WildcardCheckPlugin(BaseToolPlugin):
         return context.resolved_binaries.get("dnsx", self.settings.dnsx_path)
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
+        from core.intel.scope import allows_active_collection, require_collection_scope
         from utils.files import read_lines
 
+        scope = require_collection_scope(context)
         root_domains = list(
             dict.fromkeys(
                 parse_hostname(target.domain)[2] for target in context.targets if target.domain
@@ -67,7 +69,13 @@ class WildcardCheckPlugin(BaseToolPlugin):
                 root = parse_hostname(host)[2]
                 if root:
                     root_domains.append(root)
-        root_domains = list(dict.fromkeys(domain for domain in root_domains if domain))
+        root_domains = list(
+            dict.fromkeys(
+                domain
+                for domain in root_domains
+                if domain and allows_active_collection(domain, scope)
+            )
+        )
         if not root_domains:
             return self._skip("No root domains to probe for wildcard DNS")
 

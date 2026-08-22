@@ -20,8 +20,18 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from config.settings import Settings
+from core.intel.scope import CollectionScope
 from core.models import PipelineContext
 from modules.naabu import NaabuPlugin
+
+_SCOPE = CollectionScope.from_seeds(
+    ["www.metaversejustice.com", "metaversejustice.com", "example.com"],
+    patterns=["metaversejustice.com", "example.com"],
+)
+
+
+def _ctx(output_dir):
+    return PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
 
 
 @pytest.mark.asyncio
@@ -32,7 +42,7 @@ async def test_confirm_ports_keeps_only_ports_that_reproduce(
     pass reported open, that port must be dropped — it never reproduced,
     so it is noise, not a real finding."""
     plugin = NaabuPlugin(settings)
-    context = PipelineContext(output_dir=tmp_path)
+    context = _ctx(tmp_path)
     input_path = tmp_path / "resolved.txt"
     input_path.write_text("www.metaversejustice.com\n", encoding="utf-8")
 
@@ -63,7 +73,7 @@ async def test_confirm_ports_keeps_all_when_fully_reproduced(
     """A genuinely stable service (e.g. a real web server) must not be
     dropped just because confirmation is enabled."""
     plugin = NaabuPlugin(settings)
-    context = PipelineContext(output_dir=tmp_path)
+    context = _ctx(tmp_path)
     input_path = tmp_path / "resolved.txt"
     input_path.write_text("example.com\n", encoding="utf-8")
 
@@ -87,7 +97,7 @@ async def test_confirm_ports_falls_back_to_first_pass_on_error(
     missing, timeout), fail open to the first pass rather than silently
     discarding all results."""
     plugin = NaabuPlugin(settings)
-    context = PipelineContext(output_dir=tmp_path)
+    context = _ctx(tmp_path)
     input_path = tmp_path / "resolved.txt"
     input_path.write_text("example.com\n", encoding="utf-8")
 
@@ -112,7 +122,7 @@ async def test_naabu_plugin_run_drops_unconfirmed_ports_and_warns(
     the noise-filtering is visible/auditable, not silent."""
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = _ctx(output_dir)
     input_path = output_dir / "resolved.txt"
     input_path.write_text("www.metaversejustice.com\n", encoding="utf-8")
 
@@ -216,7 +226,7 @@ async def test_run_tarpit_check_retries_with_patient_timing_after_filtered_fast_
     plugin = NaabuPlugin(settings)
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = _ctx(output_dir)
     input_path = output_dir / "resolved.txt"
     input_path.write_text("www.metaversejustice.com\n", encoding="utf-8")
     canaries = [6, 9999, 23456, 54321]
@@ -267,7 +277,7 @@ async def test_run_tarpit_check_uses_nmap_sv_and_flags_metaverse_style_tarpit(
     plugin = NaabuPlugin(settings)
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = _ctx(output_dir)
     input_path = output_dir / "resolved.txt"
     input_path.write_text("www.metaversejustice.com\n", encoding="utf-8")
     canaries = [6, 9999, 23456, 54321]
@@ -317,7 +327,7 @@ async def test_run_tarpit_check_does_not_flag_host_with_filtered_canaries(
     plugin = NaabuPlugin(settings)
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = _ctx(output_dir)
     input_path = output_dir / "resolved.txt"
     input_path.write_text("example.com\n", encoding="utf-8")
 
@@ -352,7 +362,7 @@ async def test_run_tarpit_check_does_not_silently_treat_probe_failure_as_clean(
     plugin = NaabuPlugin(settings)
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = _ctx(output_dir)
     input_path = output_dir / "resolved.txt"
     input_path.write_text("www.metaversejustice.com\n", encoding="utf-8")
 
@@ -390,7 +400,7 @@ async def test_run_tarpit_check_records_exception_as_probe_error_not_clean(
     plugin = NaabuPlugin(settings)
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = _ctx(output_dir)
     input_path = output_dir / "resolved.txt"
     input_path.write_text("example.com\n", encoding="utf-8")
 
@@ -419,7 +429,7 @@ async def test_naabu_run_skips_real_scan_when_all_hosts_tarpit_suspected(
     plugin = NaabuPlugin(settings)
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = _ctx(output_dir)
     input_path = output_dir / "resolved.txt"
     input_path.write_text("www.metaversejustice.com\n", encoding="utf-8")
 
@@ -451,7 +461,7 @@ async def test_naabu_run_scans_only_non_tarpit_hosts_when_mixed(
     plugin = NaabuPlugin(settings)
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = _ctx(output_dir)
     input_path = output_dir / "resolved.txt"
     input_path.write_text("www.metaversejustice.com\nexample.com\n", encoding="utf-8")
 
@@ -493,7 +503,7 @@ async def test_naabu_confirmation_disabled_keeps_raw_first_pass(
     settings.naabu_confirm_open_ports = False
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = _ctx(output_dir)
     input_path = output_dir / "resolved.txt"
     input_path.write_text("example.com\n", encoding="utf-8")
 

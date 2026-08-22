@@ -111,15 +111,15 @@ def cluster_signal_confidence(
             return ipv6_confidence(signal)
         return ConfidenceBand.LOW, "unparseable_ip"
     if cluster_type == "favicon":
-        return ConfidenceBand.MEDIUM, "shared_favicon"
+        return ConfidenceBand.LOW, "shared_favicon"
     if cluster_type == "body_hash":
-        return ConfidenceBand.MEDIUM, "shared_body_hash"
+        return ConfidenceBand.LOW, "shared_body_hash"
     if cluster_type == "certificate":
         if size >= 20:
             return ConfidenceBand.MEDIUM, "shared_certificate_diverse_san"
         return ConfidenceBand.HIGH, "shared_leaf_certificate"
     if cluster_type in {"cdn", "waf", "asn", "cidr"}:
-        return ConfidenceBand.MEDIUM, f"shared_{cluster_type}"
+        return ConfidenceBand.LOW, f"shared_{cluster_type}"
     if cluster_type in {"title", "technology", "redirect", "webserver"}:
         return ConfidenceBand.LOW, f"shared_{cluster_type}"
     return ConfidenceBand.MEDIUM, f"shared_{cluster_type}"

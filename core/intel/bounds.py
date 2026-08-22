@@ -22,6 +22,9 @@ class DiscoveryBounds:
     max_runtime_seconds: int = 3600
     max_entities: int = 5000
     max_relationships: int = 20000
+    max_ct_names_per_certificate: int = 200
+    max_certificates: int = 500
+    max_ips: int = 2000
     enable_followup_collection: bool = True
 
     @classmethod
@@ -36,5 +39,8 @@ class DiscoveryBounds:
             max_runtime_seconds=settings.max_runtime_seconds,
             max_entities=settings.max_entities,
             max_relationships=settings.max_relationships,
+            max_ct_names_per_certificate=settings.max_ct_names_per_certificate,
+            max_certificates=settings.max_certificates,
+            max_ips=settings.max_ips,
             enable_followup_collection=settings.enable_followup_collection,
         )

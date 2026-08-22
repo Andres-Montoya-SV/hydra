@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from core.assets import normalize_domain
 from core.domain import parse_hostname
+from core.exceptions import ConfigurationError
 from core.intel.model import ScopeStatus
 from core.scope import host_in_scope, load_scope_patterns
 from utils.files import read_lines, write_lines
@@ -58,6 +59,8 @@ def classify_scope(
     domain = normalize_domain(hostname)
     if not domain:
         return ScopeStatus.UNKNOWN
+    if not _hostname_is_collectable(domain):
+        return ScopeStatus.UNKNOWN
 
     seeds = [normalize_domain(s) for s in seed_domains if normalize_domain(s)]
     if domain in seeds:
@@ -84,10 +87,25 @@ def scope_status_allows_collection(status: ScopeStatus) -> bool:
     return status is ScopeStatus.IN_SCOPE
 
 
+def _hostname_is_collectable(host: str) -> bool:
+    """Reject wildcards, empties, and junk that must never become probe targets."""
+    if not host:
+        return False
+    if any(ch in host for ch in ("*", " ", "\t", "\n", "?", "#")):
+        return False
+    if host.startswith(".") or host.endswith(".."):
+        return False
+    if host in {".", "localhost"}:
+        return False
+    return True
+
+
 def allows_active_collection(indicator: str, scope: CollectionScope) -> bool:
     """Authoritative gate: True only when this indicator may be actively probed."""
+    if scope is None:
+        return False
     host = indicator_hostname(indicator)
-    if not host:
+    if not host or not _hostname_is_collectable(host):
         return False
     status = classify_scope(
         host,
@@ -103,8 +121,11 @@ def indicator_hostname(raw: str) -> str:
     if not text or text.startswith("#"):
         return ""
     if "://" in text:
-        parsed = urlparse(text)
-        return normalize_domain(parsed.hostname or "")
+        try:
+            parsed = urlparse(text)
+            return normalize_domain(parsed.hostname or "")
+        except ValueError:
+            return ""
     host = text.split("/")[0].split("%")[0].strip()
     if host.startswith("[") and "]" in host:
         return host
@@ -150,19 +171,28 @@ def authorize_collect_input(
     return dest, kept, dropped
 
 
+def require_collection_scope(context: object) -> CollectionScope:
+    """Fail closed: active collection is refused without an attached scope."""
+    scope = getattr(context, "collection_scope", None)
+    if scope is None:
+        raise ConfigurationError(
+            "Active collection refused: CollectionScope is missing (fail closed). "
+            "Discovery of an indicator does not imply authorization to probe it."
+        )
+    return scope
+
+
 def authorize_plugin_input(context: object, input_path: Path, plugin_name: str) -> Path:
     """Re-check collector input immediately before active use.
 
-    When ``context.collection_scope`` is unset the call is a no-op so isolated
-    plugin unit tests can exercise argument construction. Production always
-    attaches a CollectionScope on PipelineContext before any collector runs.
+    Missing CollectionScope is never a no-op. Discovery is not authorization.
     """
-    scope = getattr(context, "collection_scope", None)
-    if scope is None:
-        return input_path
+    scope = require_collection_scope(context)
     output_dir = getattr(context, "output_dir", None)
     if output_dir is None:
-        return input_path
+        raise ConfigurationError(
+            f"{plugin_name}: active collection refused — output directory missing"
+        )
     dest_name = input_path.name
     if not dest_name.startswith("authorized_"):
         dest_name = f"authorized_{plugin_name}_{input_path.name}"

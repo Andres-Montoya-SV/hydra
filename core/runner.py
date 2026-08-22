@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import shutil
 import time
 from collections.abc import Callable
@@ -47,6 +48,14 @@ if TYPE_CHECKING:
     StageCallback = Callable[[PipelineContext, PipelineStage, str], None]
 
 logger = get_logger("runner")
+
+
+def _dns_record_identity(record: dict) -> str:
+    """Deterministic identity for DNS JSONL records. First write wins."""
+    host = str(record.get("host") or "").strip().rstrip(".").lower()
+    payload = {key: record[key] for key in sorted(record) if key not in {"timestamp", "rtt"}}
+    payload["host"] = host
+    return json.dumps(payload, sort_keys=True, default=str)
 
 
 def intel_config_for_pipeline(context: PipelineContext, settings: Settings) -> IntelRunConfig:
@@ -484,6 +493,8 @@ class PipelineRunner:
                     input_for_optional = alive_path
                 await self._run_plugins_concurrent(context, optional, input_for_optional)
 
+            await self._maybe_collect_followups(context, resolved_path)
+
             browser_probe = self.tool_manager.get_plugin("browser_probe")
             if (
                 browser_probe
@@ -604,12 +615,33 @@ class PipelineRunner:
         from core.intel.model import IndicatorKind
 
         collected = {host.lower().rstrip(".") for host in context.resolved}
+        previously_claimed = [
+            str(item).lower().rstrip(".")
+            for item in (context.metadata.get("followup_claimed_indicators") or [])
+            if item
+        ]
         config = intel_config_for_pipeline(context, settings)
         engine = IntelEngine(config)
         for domain in collected:
             engine.queue.mark_collected(IndicatorKind.DOMAIN, domain)
+        if context.registry:
+            engine.ingest_hosts(context.registry.to_dict())
         engine.ingest_artifacts(context.output_dir)
+        for domain in previously_claimed:
+            engine.queue.mark_collected(IndicatorKind.DOMAIN, domain)
+        engine.queue.followups_enqueued = max(
+            engine.queue.followups_enqueued,
+            int(context.metadata.get("followup_enqueued") or 0),
+        )
+        engine.queue.budget_used = max(
+            engine.queue.budget_used,
+            int(context.metadata.get("followup_budget_used") or 0),
+        )
         plan = self.schedule_followup_collection(context, engine)
+        claimed = list(dict.fromkeys([*previously_claimed, *plan.dns_targets, *plan.http_targets]))
+        context.metadata["followup_claimed_indicators"] = claimed
+        context.metadata["followup_enqueued"] = engine.queue.followups_enqueued
+        context.metadata["followup_budget_used"] = engine.queue.budget_used
         if not plan.dns_targets and not plan.http_targets:
             return
 
@@ -626,15 +658,12 @@ class PipelineRunner:
             and self.tool_manager.is_runnable("dnsx")
             and not settings.strict_opsec
         ):
-            await self._run_plugin_chain(context, dnsx_plugins, follow_path)
-            follow_resolved = [
-                line
-                for line in read_lines(resolved_path)
-                if line and line.lower().rstrip(".") in set(plan.dns_targets)
-            ]
-            merged = self._authorized_names(context, list(context.resolved) + follow_resolved)
-            write_lines(resolved_path, merged, base_dir=context.output_dir)
-            context.resolved = merged
+            context.metadata["dnsx_output_suffix"] = "_followup"
+            try:
+                await self._run_plugin_chain(context, dnsx_plugins, follow_path)
+            finally:
+                context.metadata.pop("dnsx_output_suffix", None)
+            self._merge_dnsx_followup(context)
             context.metadata["dns_probes"] = int(context.metadata.get("dns_probes") or 0) + len(
                 plan.dns_targets
             )
@@ -666,6 +695,37 @@ class PipelineRunner:
         )
         for host in http_targets:
             engine.queue.mark_collected(IndicatorKind.DOMAIN, host)
+
+    def _merge_dnsx_followup(self, context: PipelineContext) -> None:
+        """Atomically union follow-up DNS into canonical artifacts without clobbering seed evidence."""
+        from utils.files import read_jsonl, write_jsonl
+
+        canonical_resolved = context.output_dir / "resolved.txt"
+        follow_resolved = context.output_dir / "resolved_followup.txt"
+        canonical_records = context.output_dir / "dnsx_records.jsonl"
+        follow_records = context.output_dir / "dnsx_records_followup.jsonl"
+
+        seed_hosts = read_lines(canonical_resolved) if canonical_resolved.exists() else []
+        extra_hosts = read_lines(follow_resolved) if follow_resolved.exists() else []
+        merged_hosts = self._authorized_names(
+            context, list(context.resolved) + seed_hosts + extra_hosts
+        )
+        write_lines(canonical_resolved, merged_hosts, base_dir=context.output_dir)
+        context.resolved = merged_hosts
+
+        if follow_records.exists():
+            merged_records: list[dict] = []
+            seen: set[str] = set()
+            for path in (canonical_records, follow_records):
+                if not path.exists():
+                    continue
+                for record in read_jsonl(path):
+                    key = _dns_record_identity(record)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged_records.append(record)
+            write_jsonl(canonical_records, merged_records, base_dir=context.output_dir)
 
     def _merge_httpx_followup(self, context: PipelineContext) -> None:
         from utils.files import read_jsonl, write_jsonl

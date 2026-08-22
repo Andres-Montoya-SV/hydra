@@ -109,3 +109,61 @@ def test_field_level_certificate_and_ip_diff(tmp_path) -> None:
     )
     assert diff.new_http == ["https://example.com/login"]
     assert diff.removed_http == ["https://example.com"]
+
+
+def test_intel_relationship_history_tracks_certificate_rotation(tmp_path) -> None:
+    from core.intel.engine import IntelEngine, IntelRunConfig
+    from core.intel.model import RelationshipType
+
+    store = AssetStore(tmp_path / "db.sqlite")
+    sans = ["example.com", "www.example.com"]
+    fp_a = "a" * 64
+    fp_b = "b" * 64
+
+    def _snap(run_id: str, fingerprint: str):
+        engine = IntelEngine(
+            IntelRunConfig(
+                run_id=run_id,
+                seed_domains=["example.com", "www.example.com"],
+                collected_domains={"example.com", "www.example.com"},
+                observed_at="2026-01-01T00:00:00Z",
+            )
+        )
+        engine.ingest_ct_records(
+            [
+                {
+                    "id": fingerprint[:4],
+                    "name_value": "\n".join(sans),
+                    "fingerprint_sha256": fingerprint,
+                    "query_domain": "example.com",
+                }
+            ]
+        )
+        engine.correlate()
+        return engine.snapshot()
+
+    store.create_run(
+        ScanRun(run_id="rel-a", started_at="2026-01-01T00:00:00Z", targets=["example.com"])
+    )
+    store.persist_registry("rel-a", {}, intel=_snap("rel-a", fp_a))
+    store.finish_run("rel-a", host_count=1, alive_count=0, warnings=[], errors=[])
+
+    store.create_run(
+        ScanRun(run_id="rel-b", started_at="2026-01-02T00:00:00Z", targets=["example.com"])
+    )
+    store.persist_registry("rel-b", {}, intel=_snap("rel-b", fp_b))
+    store.finish_run("rel-b", host_count=1, alive_count=0, warnings=[], errors=[])
+
+    diff = diff_runs(store, "rel-b", "rel-a")
+    assert diff is not None
+    appeared = [r for r in diff.new_relationships if r.get("relationship_type") == "SHARES_CERTIFICATE"]
+    disappeared = [
+        r for r in diff.removed_relationships if r.get("relationship_type") == "SHARES_CERTIFICATE"
+    ]
+    assert appeared
+    assert disappeared
+    assert appeared[0]["relationship_id"] != disappeared[0]["relationship_id"]
+    assert RelationshipType.SHARES_CERTIFICATE.value in {
+        appeared[0]["relationship_type"],
+        disappeared[0]["relationship_type"],
+    }

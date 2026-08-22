@@ -115,7 +115,11 @@ def test_relationship_cap_keeps_strong_hub_edges(tmp_path) -> None:
         IntelRunConfig(
             run_id="cap-r",
             seed_domains=["example.com"],
-            bounds=DiscoveryBounds(max_entities=5000, max_relationships=80),
+            bounds=DiscoveryBounds(
+                max_entities=5000,
+                max_relationships=80,
+                max_ct_names_per_certificate=500,
+            ),
         )
     )
     engine.ingest_ct_records([_ct_record(["example.com", *names], "2" * 64)])
@@ -148,7 +152,11 @@ def test_large_certificate_does_not_emit_unbounded_clique() -> None:
         IntelRunConfig(
             run_id="clique",
             seed_domains=["example.com"],
-            bounds=DiscoveryBounds(max_entities=5000, max_relationships=20000),
+            bounds=DiscoveryBounds(
+                max_entities=5000,
+                max_relationships=20000,
+                max_ct_names_per_certificate=500,
+            ),
         )
     )
     engine.ingest_ct_records([_ct_record(["example.com", *names], "3" * 64)])

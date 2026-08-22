@@ -8,6 +8,7 @@ import pytest
 
 from config.settings import Settings
 from core.assets import Host, Port
+from core.intel.scope import CollectionScope
 from core.models import DomainTarget, PipelineContext
 from core.parsers.registry import (
     ASNParser,
@@ -34,6 +35,17 @@ from modules.port_verify import PortVerifyPlugin, _normalize_state, _parse_nmap_
 from modules.threat_intel import _has_online_url
 from modules.whois import WhoisPlugin, _parse_whois
 from utils.files import read_jsonl, write_jsonl, write_lines
+
+_SCOPE = CollectionScope.from_seeds(
+    [
+        "metaversejustice.com",
+        "www.metaversejustice.com",
+        "example.com",
+        "virusbarrier.xyz",
+        "a.example.com",
+        "b.example.com",
+    ]
+)
 
 
 def test_whois_parser_normalizes_registration(tmp_path: Path) -> None:
@@ -167,7 +179,7 @@ async def test_whois_plugin_queries_root_domain_not_full_hostname(
     """
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.targets = [DomainTarget(domain="www.metaversejustice.com")]
 
     plugin = WhoisPlugin(settings)
@@ -209,7 +221,7 @@ async def test_whois_plugin_reduces_deep_subdomain_to_root_domain(
     collapse to the same root domain, not be queried as-is."""
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.targets = [DomainTarget(domain="booking.staging.metaversejustice.com")]
 
     plugin = WhoisPlugin(settings)
@@ -235,7 +247,7 @@ async def test_whois_plugin_uses_short_timeout_and_retries_on_timeout(
     settings.whois_retry_delay_seconds = 0  # keep the unit test fast
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.targets = [DomainTarget(domain="metaversejustice.com")]
 
     plugin = WhoisPlugin(settings)
@@ -267,7 +279,7 @@ async def test_whois_plugin_distinguishes_rate_limit_from_timeout(
     settings.whois_retry_delay_seconds = 0
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.targets = [DomainTarget(domain="metaversejustice.com")]
 
     plugin = WhoisPlugin(settings)
@@ -291,7 +303,7 @@ async def test_whois_plugin_dedupes_targets_sharing_a_root_domain(
     once against the WHOIS registry."""
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.targets = [
         DomainTarget(domain="www.example.com"),
         DomainTarget(domain="example.com"),
@@ -318,7 +330,7 @@ async def test_asn_lookup_warns_when_no_ips_available(settings: Settings, tmp_pa
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
     (output_dir / "dnsx_records.jsonl").write_text("", encoding="utf-8")
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.resolved = []
 
     plugin = AsnLookupPlugin(settings)
@@ -339,7 +351,7 @@ async def test_asn_collect_ips_falls_back_to_resolving_hostnames(
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
     (output_dir / "dnsx_records.jsonl").write_text("", encoding="utf-8")
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.resolved = ["localhost"]
 
     ips = await _collect_ips(context)
@@ -367,7 +379,7 @@ async def test_asn_lookup_warning_not_empty_when_connection_fails(
         output_dir / "dnsx_records.jsonl",
         [{"host": "www.metaversejustice.com", "a": ["173.236.247.198"]}],
     )
-    context = PipelineContext(output_dir=output_dir)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
 
     async def boom(_ips: list[str]) -> list[dict[str, str]]:
         raise TimeoutError()  # empty str(exc) — the exact bug from 20260806_185622
@@ -650,7 +662,7 @@ async def test_port_verify_writes_raw_nmap_artifact_per_host(
     original_run_command = port_verify_module.run_command
     port_verify_module.run_command = fake_run_command
     try:
-        context = PipelineContext(output_dir=output_dir)
+        context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
         result = await plugin.run(context, output_dir / "resolved.txt")
     finally:
         port_verify_module.run_command = original_run_command
@@ -701,7 +713,7 @@ async def test_port_verify_does_not_bleed_state_between_separate_runs(
     write_lines(output_dir_1 / "naabu.txt", ["hosta.example.com:646"])
     port_verify_module.run_command = await make_fake_run_command({646: "646/tcp   open  ldp?"})
     try:
-        context1 = PipelineContext(output_dir=output_dir_1)
+        context1 = PipelineContext(output_dir=output_dir_1, collection_scope=_SCOPE)
         await plugin.run(context1, output_dir_1 / "resolved.txt")
     finally:
         port_verify_module.run_command = original_run_command
@@ -714,7 +726,7 @@ async def test_port_verify_does_not_bleed_state_between_separate_runs(
         {5432: "5432/tcp  open  postgresql?"}
     )
     try:
-        context2 = PipelineContext(output_dir=output_dir_2)
+        context2 = PipelineContext(output_dir=output_dir_2, collection_scope=_SCOPE)
         await plugin.run(context2, output_dir_2 / "resolved.txt")
     finally:
         port_verify_module.run_command = original_run_command
@@ -859,7 +871,7 @@ def test_httpx_strict_opsec_uses_proxy_without_direct_side_probes(
         outbound_proxy_url="http://proxy.example:8080",
     )
     plugin = HttpxPlugin(settings)
-    context = PipelineContext(output_dir=tmp_path)
+    context = PipelineContext(output_dir=tmp_path, collection_scope=_SCOPE)
     args = plugin._build_args(context, tmp_path / "hosts.txt", tmp_path / "httpx.json")
     assert "-proxy" in args
     assert "http://proxy.example:8080" in args

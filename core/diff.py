@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,6 +41,9 @@ class ScanDiff:
     new_http: list[str] = field(default_factory=list)
     removed_http: list[str] = field(default_factory=list)
     field_changes: list[FieldChange] = field(default_factory=list)
+    new_relationships: list[dict[str, Any]] = field(default_factory=list)
+    removed_relationships: list[dict[str, Any]] = field(default_factory=list)
+    changed_relationships: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +54,9 @@ class ScanDiff:
             "new_http": self.new_http,
             "removed_http": self.removed_http,
             "field_changes": [c.to_dict() for c in self.field_changes],
+            "new_relationships": self.new_relationships,
+            "removed_relationships": self.removed_relationships,
+            "changed_relationships": self.changed_relationships,
         }
 
 
@@ -78,6 +85,7 @@ def diff_runs(
         new_http=sorted(current_http - previous_http),
         removed_http=sorted(previous_http - current_http),
         field_changes=_field_changes(previous_hosts, current_hosts),
+        **_intel_relationship_diff(store, previous_run_id, current_run_id),
     )
     return diff
 
@@ -174,3 +182,85 @@ def _primary_http(host: Host) -> dict[str, Any]:
         "favicon": svc.favicon_hash,
         "body": svc.body_hash,
     }
+
+
+def _intel_relationship_diff(
+    store: AssetStore, previous_run_id: str, current_run_id: str
+) -> dict[str, list[dict[str, Any]]]:
+    """Compare intel_relationships by stable evidence-backed identity."""
+    previous = _load_intel_relationships(store, previous_run_id)
+    current = _load_intel_relationships(store, current_run_id)
+    new_ids = sorted(set(current) - set(previous))
+    gone_ids = sorted(set(previous) - set(current))
+    changed: list[dict[str, Any]] = []
+    for rid in sorted(set(previous) & set(current)):
+        old = previous[rid]
+        new = current[rid]
+        if old.get("confidence") != new.get("confidence") or old.get("evidence_id") != new.get(
+            "evidence_id"
+        ):
+            changed.append(
+                {
+                    "relationship_id": rid,
+                    "change_type": "RELATIONSHIP_CHANGED",
+                    "relationship_type": new.get("relationship_type"),
+                    "old_confidence": old.get("confidence"),
+                    "new_confidence": new.get("confidence"),
+                    "old_evidence_id": old.get("evidence_id"),
+                    "new_evidence_id": new.get("evidence_id"),
+                    "source_entity": new.get("source_entity"),
+                    "target_entity": new.get("target_entity"),
+                }
+            )
+    return {
+        "new_relationships": [_relationship_summary(current[rid], "RELATIONSHIP_APPEARED") for rid in new_ids],
+        "removed_relationships": [
+            _relationship_summary(previous[rid], "RELATIONSHIP_DISAPPEARED") for rid in gone_ids
+        ],
+        "changed_relationships": changed,
+    }
+
+
+def _relationship_summary(row: dict[str, Any], change_type: str) -> dict[str, Any]:
+    return {
+        "relationship_id": row.get("relationship_id"),
+        "change_type": change_type,
+        "relationship_type": row.get("relationship_type"),
+        "source_entity": row.get("source_entity"),
+        "target_entity": row.get("target_entity"),
+        "confidence": row.get("confidence"),
+        "evidence_id": row.get("evidence_id"),
+        "data": row.get("data") or {},
+    }
+
+
+def _load_intel_relationships(store: AssetStore, run_id: str) -> dict[str, dict[str, Any]]:
+    try:
+        conn = store.intel_connection()
+    except Exception:
+        return {}
+    try:
+        rows = conn.execute(
+            "SELECT relationship_id, source_entity, relationship_type, target_entity, "
+            "confidence, strength, evidence_id, data_json FROM intel_relationships WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        item = dict(row)
+        data = item.get("data_json")
+        if data:
+            try:
+                item["data"] = json.loads(data)
+            except (TypeError, ValueError):
+                item["data"] = {}
+        else:
+            item["data"] = {}
+        rid = str(item.get("relationship_id") or "")
+        if rid:
+            out[rid] = item
+    return out

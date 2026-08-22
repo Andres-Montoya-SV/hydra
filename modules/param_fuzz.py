@@ -197,7 +197,14 @@ class ParamFuzzPlugin(BaseToolPlugin):
         return "Built-in (stdlib urllib) — opt-in active probe"
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
-        urls = _select_urls(context, self.settings.param_fuzz_max_urls_per_host)
+        from core.intel.scope import allows_active_collection, require_collection_scope
+
+        scope = require_collection_scope(context)
+        urls = [
+            url
+            for url in _select_urls(context, self.settings.param_fuzz_max_urls_per_host)
+            if allows_active_collection(url, scope)
+        ]
         if not urls:
             return self._skip("No live HTTP URLs to fuzz for parameters")
 

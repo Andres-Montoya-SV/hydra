@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from config.settings import Settings
+from core.intel.scope import CollectionScope
 from core.models import PipelineContext
 from core.runner import PipelineRunner
 from core.store import AssetStore
@@ -61,7 +62,10 @@ class TestRunner:
 
         output_dir = project_root / "output" / "run1"
         output_dir.mkdir(parents=True)
-        context = PipelineContext(output_dir=output_dir)
+        context = PipelineContext(
+            output_dir=output_dir,
+            collection_scope=CollectionScope.from_seeds(["virusbarrier.xyz"]),
+        )
         context.run_id = "run1"
 
         input_path = output_dir / "naabu.txt"
