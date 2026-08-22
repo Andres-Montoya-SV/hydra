@@ -166,6 +166,7 @@ async def _probe_target(
 
         page.on("response", capture_response)
         error: str | None = None
+        await _install_scope_navigation_guard(page, context)
         try:
             await page.goto(
                 target["probe_url"],
@@ -228,7 +229,41 @@ async def _write_html_artifact(
         return relative_output_path(raw_path, context.output_dir)
 
 
+def allow_browser_navigation(url: str, context: PipelineContext) -> bool:
+    """Document navigations must re-check CollectionScope. Redirects are not authorization."""
+    from core.intel.scope import allows_active_collection
+
+    scope = getattr(context, "collection_scope", None)
+    if scope is None:
+        return True
+    return allows_active_collection(url, scope)
+
+
+async def _install_scope_navigation_guard(page: object, context: PipelineContext) -> None:
+    """Abort in-browser document navigations whose hostname is not authorized."""
+    if getattr(context, "collection_scope", None) is None:
+        return
+
+    async def guard(route: object) -> None:
+        try:
+            request = route.request
+            if request.is_navigation_request() and not allow_browser_navigation(
+                request.url, context
+            ):
+                await route.abort("blockedbyclient")
+                return
+        except Exception:
+            await route.continue_()
+            return
+        await route.continue_()
+
+    await page.route("**/*", guard)
+
+
 def _httpx_targets(context: PipelineContext) -> list[dict[str, str]]:
+    from core.intel.scope import allows_active_collection
+
+    scope = getattr(context, "collection_scope", None)
     targets: dict[str, dict[str, str]] = {}
     for record in context.httpx_results:
         probe_url = str(record.get("url") or record.get("input") or "")
@@ -236,8 +271,21 @@ def _httpx_targets(context: PipelineContext) -> list[dict[str, str]]:
             continue
         if "://" not in probe_url:
             probe_url = f"https://{probe_url}"
+        input_raw = str(record.get("input") or "")
+        input_url = (
+            input_raw if "://" in input_raw else (f"https://{input_raw}" if input_raw else probe_url)
+        )
+        if scope is not None:
+            if allows_active_collection(probe_url, scope):
+                pass
+            elif allows_active_collection(input_url, scope):
+                probe_url = input_url
+            else:
+                continue
         host = _url_host(str(record.get("input") or probe_url))
         if not host:
+            continue
+        if scope is not None and not allows_active_collection(host, scope):
             continue
         explicit_final = str(record.get("final_url") or "")
         location = str(record.get("location") or "")

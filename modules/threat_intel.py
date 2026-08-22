@@ -114,13 +114,19 @@ def _query_urlhaus(
 
 
 def _alive_hosts(context: PipelineContext) -> list[str]:
+    from core.intel.scope import allows_active_collection
+
+    scope = getattr(context, "collection_scope", None)
     hosts: set[str] = set()
     for record in context.httpx_results:
         raw = str(record.get("input") or record.get("url") or "")
         parsed = urlparse(raw if "://" in raw else f"//{raw}")
         host = normalize_domain(parsed.hostname or raw.split(":")[0])
-        if host:
-            hosts.add(host)
+        if not host:
+            continue
+        if scope is not None and not allows_active_collection(host, scope):
+            continue
+        hosts.add(host)
     return sorted(hosts)
 
 

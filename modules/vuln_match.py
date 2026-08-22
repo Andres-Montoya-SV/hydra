@@ -130,11 +130,18 @@ class VulnMatchPlugin(BaseToolPlugin):
 
 
 def _collect_techs(context: PipelineContext) -> list[dict[str, str]]:
+    from core.intel.scope import allows_active_collection
+
+    scope = getattr(context, "collection_scope", None)
     found: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
     for record in context.httpx_results:
         host = str(record.get("host") or record.get("input") or "")
         url = str(record.get("url") or "")
+        if scope is not None:
+            landing = url or host
+            if landing and not allows_active_collection(landing, scope):
+                continue
         techs = record.get("tech") or []
         if not isinstance(techs, list):
             continue

@@ -7,7 +7,7 @@ from pathlib import Path
 from core.models import PipelineContext
 from core.plugin_base import PluginResult
 from modules._base import BaseToolPlugin
-from utils.files import read_jsonl
+from utils.files import read_jsonl, read_lines
 
 
 class NucleiPlugin(BaseToolPlugin):
@@ -29,9 +29,12 @@ class NucleiPlugin(BaseToolPlugin):
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
         output_path = self._output_path(context, "nuclei.json")
-        alive_path = self._output_path(context, "alive.txt")
+        alive_path = self._authorized_input(
+            context,
+            input_path if input_path.exists() else self._output_path(context, "alive.txt"),
+        )
 
-        if not self._alive_urls(context):
+        if not self._alive_urls(context) and not read_lines(alive_path):
             return self._skip("Skipped — no alive URLs for nuclei")
 
         args = [
