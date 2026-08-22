@@ -6,7 +6,6 @@ from core.intel.bounds import DiscoveryBounds
 from core.intel.engine import IntelEngine, IntelRunConfig
 from core.intel.model import EntityType, RelationshipType, ScopeStatus
 
-
 FP_A = "a" * 64
 FP_B = "b" * 64
 SANS = ["x.example", "y.example", "z.example"]
