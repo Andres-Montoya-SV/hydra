@@ -162,7 +162,7 @@ def test_webhook_silent_without_url_and_posts_on_diff() -> None:
     assert notify_scan_diff(None, diff) is False
     assert notify_scan_diff("https://hooks.example/x", {"new_hosts": []}) is False
 
-    with patch("core.webhook.urllib.request.urlopen", return_value=_FakeResp(b"ok")) as mocked:
+    with patch("core.webhook.open_url", return_value=_FakeResp(b"ok")) as mocked:
         assert notify_scan_diff("https://hooks.example/x", diff) is True
         mocked.assert_called_once()
 

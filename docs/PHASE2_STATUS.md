@@ -189,6 +189,17 @@ port/WHOIS reliability issues, each closed with a regression test:
 - `WEBHOOK_URL` — Slack/Discord `text`/`content` payload on `diff.json`
   changes; silent no-op when unset.
 
+### TLS / CA bundle (certifi)
+
+Stdlib HTTPS (OSV.dev, crt.sh, WPScan, URLhaus, OPSEC echo, webhooks) always
+uses `utils.network.default_ssl_context()` with `certifi.where()` as `cafile`.
+This avoids macOS virtualenvs whose default trust store cannot verify public
+CAs even when `curl` (Anaconda/system bundle) succeeds. `certifi` is a pinned
+runtime dependency. If verification still fails, the exception/raw artifact
+states that it may be real MITM/interception, not a local Python CA-store
+issue. Target-host recon probes (`core.http_probe.insecure_ssl_context`) are
+unchanged — they still skip TLS verify to match httpx's alive-host posture.
+
 ### HTML reports
 
 - Executive summary (template, no LLM), per-`template_id` glossary, and

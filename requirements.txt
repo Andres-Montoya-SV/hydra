@@ -3,6 +3,9 @@
 python-dotenv==1.0.1
 # rich: Terminal UI (progress, tables, live dashboard)
 rich==13.9.4
+# certifi: explicit Mozilla CA bundle for stdlib HTTPS (OSV.dev, crt.sh, …)
+# Do not rely on this arriving transitively — macOS venvs have no usable default store.
+certifi==2026.7.22
 
 # Development / QA (install with: pip install -r requirements-dev.txt)
 # See requirements-dev.txt

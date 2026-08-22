@@ -42,6 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to .env file (default: ./.env or ./config/.env)",
     )
+    parser.add_argument(
+        "--no-banner",
+        action="store_true",
+        help="Suppress the startup ASCII banner (also: HYDRA_NO_BANNER=1)",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_parser = subparsers.add_parser("run", help="Run reconnaissance pipeline")
@@ -55,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--no-ui", action="store_true", help="Run without terminal UI")
     run_parser.add_argument("--run-id", help="Custom run identifier for output directory")
+    run_parser.add_argument(
+        "--no-banner",
+        action="store_true",
+        help="Suppress the startup ASCII banner (also: HYDRA_NO_BANNER=1)",
+    )
 
     subparsers.add_parser("check-tools", help="Check availability of recon tools")
     subparsers.add_parser("list-plugins", help="List registered tool plugins")

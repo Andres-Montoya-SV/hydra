@@ -8,6 +8,7 @@ import urllib.request
 from typing import Any
 
 from core.logger import get_logger
+from utils.network import open_url
 
 logger = get_logger("webhook")
 
@@ -52,9 +53,7 @@ def notify_scan_diff(webhook_url: str | None, diff: dict[str, Any] | None) -> bo
         method="POST",
     )
     try:
-        with urllib.request.urlopen(
-            request, timeout=10
-        ) as response:  # nosec B310  # webhook_url from operator config, HTTPS expected
+        with open_url(request, timeout=10) as response:
             response.read(256)
         return True
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
