@@ -156,7 +156,9 @@ def test_intel_relationship_history_tracks_certificate_rotation(tmp_path) -> Non
 
     diff = diff_runs(store, "rel-b", "rel-a")
     assert diff is not None
-    appeared = [r for r in diff.new_relationships if r.get("relationship_type") == "SHARES_CERTIFICATE"]
+    appeared = [
+        r for r in diff.new_relationships if r.get("relationship_type") == "SHARES_CERTIFICATE"
+    ]
     disappeared = [
         r for r in diff.removed_relationships if r.get("relationship_type") == "SHARES_CERTIFICATE"
     ]

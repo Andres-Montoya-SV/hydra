@@ -48,11 +48,17 @@ class BaseToolPlugin(ReconPlugin):
         )
 
     def _alive_urls(self, context: PipelineContext) -> list[str]:
-        """Read non-empty alive URL list from run output."""
+        """Read alive URLs, re-checking scope. Discovery is not authorization."""
         alive_path = self._output_path(context, "alive.txt")
         if not alive_path.exists():
             return []
-        return read_lines(alive_path)
+        urls = read_lines(alive_path)
+        scope = getattr(context, "collection_scope", None)
+        if scope is None:
+            return urls
+        from core.intel.scope import filter_authorized_indicators
+
+        return filter_authorized_indicators(urls, scope)
 
     def _skip(self, message: str) -> PluginResult:
         """Return a skipped plugin result (not counted as failure)."""

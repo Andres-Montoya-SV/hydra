@@ -77,9 +77,7 @@ async def test_maybe_collect_followups_preserves_seed_dns_artifacts(
         write_lines(resolved_path, hosts, base_dir=ctx.output_dir)
         if not suffix:
             ctx.resolved = hosts
-        return PluginResult(
-            success=True, output_path=resolved_path, lines_produced=len(hosts)
-        )
+        return PluginResult(success=True, output_path=resolved_path, lines_produced=len(hosts))
 
     dnsx.run = stub_dnsx  # type: ignore[method-assign]
     runner.tool_manager.is_runnable = lambda name: name == "dnsx"  # type: ignore[method-assign]

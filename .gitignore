@@ -1,7 +1,7 @@
 # Secrets and authorized-scope (never commit)
 .env
 config/.env
-scope.txt
+/scope.txt
 
 # Python
 __pycache__/

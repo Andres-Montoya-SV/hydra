@@ -220,9 +220,7 @@ def test_malformed_plugin_output_is_ignored() -> None:
     )
     engine.correlate()
     assert "actor:evil" not in engine.entities
-    assert not any(
-        r.relationship_type.value == "OWNED_BY" for r in engine.relationships.values()
-    )
+    assert not any(r.relationship_type.value == "OWNED_BY" for r in engine.relationships.values())
     assert engine.queue.get(IndicatorKind.DOMAIN, SIBLINGS[0]) is None
 
 
@@ -306,9 +304,7 @@ def test_unfinished_run_is_not_selected_by_cli(tmp_path, capsys) -> None:
 
 
 def test_queue_duplication_from_plugin_followups() -> None:
-    engine = IntelEngine(
-        IntelRunConfig(run_id="q", seed_domains=[SEED], collected_domains={SEED})
-    )
+    engine = IntelEngine(IntelRunConfig(run_id="q", seed_domains=[SEED], collected_domains={SEED}))
     emission = StructuredEmission(
         domains=[SEED, "www.virusbarrier.xyz"],
         followups=[
@@ -318,7 +314,9 @@ def test_queue_duplication_from_plugin_followups() -> None:
         ],
     )
     engine.ingest_emissions([emission, emission.to_dict()])
-    indicators = [i for i in engine.queue.values() if i.kind is IndicatorKind.DOMAIN and i.value == SEED]
+    indicators = [
+        i for i in engine.queue.values() if i.kind is IndicatorKind.DOMAIN and i.value == SEED
+    ]
     assert len(indicators) == 1
 
 
@@ -356,7 +354,9 @@ def test_url_normalization_collapses_duplicates(tmp_path: Path) -> None:
 
 def test_http_service_entities_dedupe_equivalent_urls() -> None:
     engine = IntelEngine(
-        IntelRunConfig(run_id="urls", seed_domains=["example.com"], collected_domains={"example.com"})
+        IntelRunConfig(
+            run_id="urls", seed_domains=["example.com"], collected_domains={"example.com"}
+        )
     )
     host = Host(domain="example.com", dns_resolved=True)
 
@@ -379,7 +379,9 @@ def test_recursive_explosion_stops_at_depth_and_followup_cap() -> None:
             run_id="boom",
             seed_domains=["example.com"],
             collected_domains={"example.com"},
-            bounds=DiscoveryBounds(max_discovery_depth=1, max_followup_indicators=5, max_domains_per_source=8),
+            bounds=DiscoveryBounds(
+                max_discovery_depth=1, max_followup_indicators=5, max_domains_per_source=8
+            ),
         )
     )
     sans = ["example.com"] + [f"h{i}.example.com" for i in range(40)]
@@ -403,7 +405,13 @@ def test_wildcard_blocks_followup_schedule(tmp_path: Path, settings: Settings) -
     output_dir = tmp_path / "out"
     output_dir.mkdir()
     (output_dir / "wildcard_check.jsonl").write_text(
-        json.dumps({"root_domain": "example.com", "wildcard_dns_detected": True, "canary_resolved": ["a.example.com"]})
+        json.dumps(
+            {
+                "root_domain": "example.com",
+                "wildcard_dns_detected": True,
+                "canary_resolved": ["a.example.com"],
+            }
+        )
         + "\n",
         encoding="utf-8",
     )

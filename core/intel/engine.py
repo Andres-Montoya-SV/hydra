@@ -149,14 +149,16 @@ class IntelEngine:
         existing = self.entities.get(entity.entity_id)
         if existing:
             return existing
-        if entity.entity_type is EntityType.CERTIFICATE and self._count_type(
-            EntityType.CERTIFICATE
-        ) >= self.bounds.max_certificates:
+        if (
+            entity.entity_type is EntityType.CERTIFICATE
+            and self._count_type(EntityType.CERTIFICATE) >= self.bounds.max_certificates
+        ):
             self._mark_truncated("certificate_limit")
             return None
-        if entity.entity_type is EntityType.IP_ADDRESS and self._count_type(
-            EntityType.IP_ADDRESS
-        ) >= self.bounds.max_ips:
+        if (
+            entity.entity_type is EntityType.IP_ADDRESS
+            and self._count_type(EntityType.IP_ADDRESS) >= self.bounds.max_ips
+        ):
             self._mark_truncated("ip_limit")
             return None
         if len(self.entities) >= self.bounds.max_entities:
@@ -185,7 +187,9 @@ class IntelEngine:
         return sum(1 for item in self.entities.values() if item.entity_type is entity_type)
 
     def _prioritize_certificate_names(self, names: list[str]) -> list[str]:
-        unique = list(dict.fromkeys(normalize_domain(name) for name in names if normalize_domain(name)))
+        unique = list(
+            dict.fromkeys(normalize_domain(name) for name in names if normalize_domain(name))
+        )
         seeds = [name for name in unique if name in self.seeds]
         in_scope = [
             name

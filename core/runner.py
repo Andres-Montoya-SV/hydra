@@ -743,6 +743,11 @@ class PipelineRunner:
         extra_alive = context.output_dir / "alive_followup.txt"
         if extra_alive.exists():
             merged_alive = list(dict.fromkeys(context.alive_urls + read_lines(extra_alive)))
+            from core.intel.scope import filter_authorized_indicators
+
+            scope = getattr(context, "collection_scope", None)
+            if scope is not None:
+                merged_alive = filter_authorized_indicators(merged_alive, scope)
             write_lines(context.output_dir / "alive.txt", merged_alive, base_dir=context.output_dir)
             context.alive_urls = merged_alive
 
@@ -764,8 +769,15 @@ class PipelineRunner:
         context.alive_urls = []
         for host in hosts.values():
             for svc in host.http_services:
-                if svc.url and svc.url not in context.alive_urls:
-                    context.alive_urls.append(svc.url)
+                if not svc.url or svc.url in context.alive_urls:
+                    continue
+                scope = getattr(context, "collection_scope", None)
+                if scope is not None:
+                    from core.intel.scope import allows_active_collection
+
+                    if not allows_active_collection(svc.url, scope):
+                        continue
+                context.alive_urls.append(svc.url)
 
         context.store_warnings.extend(registry.warnings)
         for w in registry.warnings:
@@ -1070,6 +1082,7 @@ class PipelineRunner:
                 from utils.files import read_jsonl
 
                 context.httpx_results = read_jsonl(httpx_json)
+            self._restrict_alive_to_scope(context)
         elif output_path.name == "httpx.json":
             from utils.files import read_jsonl
 
@@ -1078,8 +1091,30 @@ class PipelineRunner:
             if alive_path.exists() and alive_path.stat().st_size > 0:
                 context.alive_urls = read_lines(alive_path)
             elif context.httpx_results:
-                context.alive_urls = [
-                    str(rec.get("url") or rec.get("input") or "")
-                    for rec in context.httpx_results
-                    if rec.get("url") or rec.get("input")
-                ]
+                from core.intel.scope import filter_authorized_indicators
+                from modules.httpx import authorized_alive_url
+
+                rebuilt: list[str] = []
+                scope = getattr(context, "collection_scope", None)
+                if scope is not None:
+                    for rec in context.httpx_results:
+                        url = authorized_alive_url(rec, scope)
+                        if url:
+                            rebuilt.append(url)
+                    context.alive_urls = filter_authorized_indicators(rebuilt, scope)
+                else:
+                    context.alive_urls = [
+                        str(rec.get("url") or rec.get("input") or "")
+                        for rec in context.httpx_results
+                        if rec.get("url") or rec.get("input")
+                    ]
+            self._restrict_alive_to_scope(context)
+
+    def _restrict_alive_to_scope(self, context: PipelineContext) -> None:
+        """alive.txt consumers must never inherit out-of-scope redirect landings."""
+        scope = getattr(context, "collection_scope", None)
+        if scope is None or not context.alive_urls:
+            return
+        from core.intel.scope import filter_authorized_indicators
+
+        context.alive_urls = filter_authorized_indicators(context.alive_urls, scope)

@@ -100,19 +100,25 @@ def _hostname_is_collectable(host: str) -> bool:
     return True
 
 
-def allows_active_collection(indicator: str, scope: CollectionScope) -> bool:
-    """Authoritative gate: True only when this indicator may be actively probed."""
+def scope_status_for(indicator: str, scope: CollectionScope) -> ScopeStatus:
+    """Classify a host/URL with the same rules as ``allows_active_collection``."""
     if scope is None:
-        return False
+        return ScopeStatus.UNKNOWN
     host = indicator_hostname(indicator)
     if not host or not _hostname_is_collectable(host):
-        return False
-    status = classify_scope(
+        return ScopeStatus.UNKNOWN
+    return classify_scope(
         host,
         seed_domains=list(scope.seed_domains),
         scope_patterns=list(scope.scope_patterns) or None,
     )
-    return scope_status_allows_collection(status)
+
+
+def allows_active_collection(indicator: str, scope: CollectionScope) -> bool:
+    """Authoritative gate: True only when this indicator may be actively probed."""
+    if scope is None:
+        return False
+    return scope_status_allows_collection(scope_status_for(indicator, scope))
 
 
 def indicator_hostname(raw: str) -> str:

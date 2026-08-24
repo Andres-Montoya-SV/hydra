@@ -175,7 +175,9 @@ async def test_pipeline_runner_virusbarrier_production_path(tmp_path: Path, caps
             assert name not in body
     for name in SIBLINGS:
         assert name not in read_lines(output_dir / "resolved.txt")
-        assert name not in {str(r.get("host")) for r in read_jsonl(output_dir / "dnsx_records.jsonl")}
+        assert name not in {
+            str(r.get("host")) for r in read_jsonl(output_dir / "dnsx_records.jsonl")
+        }
         assert name not in {
             str(r.get("input") or r.get("host") or "")
             for r in read_jsonl(output_dir / "httpx.json")
@@ -214,11 +216,16 @@ async def test_pipeline_runner_virusbarrier_production_path(tmp_path: Path, caps
         )
     }
     assert RelationshipType.SHARES_CERTIFICATE.value in rel_types
-    blob = json.dumps([dict(row) for row in conn.execute(
-        "SELECT source_entity, relationship_type, target_entity, data_json "
-        "FROM intel_relationships WHERE run_id=?",
-        (context.run_id,),
-    )]).lower()
+    blob = json.dumps(
+        [
+            dict(row)
+            for row in conn.execute(
+                "SELECT source_entity, relationship_type, target_entity, data_json "
+                "FROM intel_relationships WHERE run_id=?",
+                (context.run_id,),
+            )
+        ]
+    ).lower()
     assert "actor:" not in blob
     assert "owner:" not in blob
     conn.close()

@@ -774,7 +774,9 @@ class ReportGenerator:
         lines.append("")
         return lines
 
-    def _intel_correlation_html(self, context: PipelineContext, store: AssetStore | None) -> list[str]:
+    def _intel_correlation_html(
+        self, context: PipelineContext, store: AssetStore | None
+    ) -> list[str]:
         if not (store and context.run_id):
             return []
         getter = getattr(store, "intel_connection", None)
@@ -832,12 +834,15 @@ class ReportGenerator:
                 if data.get(key) not in (None, "", []):
                     evidence_bits.append(f"{key}={data.get(key)}")
             evidence_html = escape_html("; ".join(str(bit) for bit in evidence_bits[:4]))
+            evidence_suffix = (
+                f'<br><span class="muted">{evidence_html}</span>' if evidence_html else ""
+            )
             parts.append(
                 "    <li>"
                 f"<code>{src_label}</code> [{src_scope}/{src_coll}] "
                 f"— <strong>{rel_type}</strong> [{confidence}] → "
                 f"<code>{dst_label}</code> [{dst_scope}/{dst_coll}]"
-                f"{f'<br><span class=\"muted\">{evidence_html}</span>' if evidence_html else ''}"
+                f"{evidence_suffix}"
                 "</li>"
             )
         parts.append("  </ul>")

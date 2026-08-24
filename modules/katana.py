@@ -29,9 +29,12 @@ class KatanaPlugin(BaseToolPlugin):
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
         output_path = self._output_path(context, "katana.jsonl")
-        alive_path = self._output_path(context, "alive.txt")
+        alive_path = self._authorized_input(
+            context,
+            input_path if input_path.exists() else self._output_path(context, "alive.txt"),
+        )
 
-        if not self._alive_urls(context):
+        if not self._alive_urls(context) and not read_lines(alive_path):
             return self._skip("Skipped — no alive URLs for katana")
 
         args = [

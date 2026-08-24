@@ -472,7 +472,8 @@ class HttpxParser(ToolParser):
                 chain = []
 
             svc = HttpService(
-                url=normalize_http_url(str(record.get("url") or "")) or str(record.get("url") or ""),
+                url=normalize_http_url(str(record.get("url") or ""))
+                or str(record.get("url") or ""),
                 host=domain,
                 status_code=record.get("status_code"),
                 title=record.get("title"),
