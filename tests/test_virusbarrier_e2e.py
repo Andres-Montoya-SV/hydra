@@ -207,7 +207,8 @@ def test_virusbarrier_pipeline_e2e_seed_only(tmp_path: Path, capsys) -> None:
     assert SIBLINGS[0] in sibling_out
     assert "NOT_ALLOWED" in sibling_out or "OUT_OF_SCOPE" in sibling_out
     assert any(
-        "NOT_ALLOWED" in (item.get("text") or "") for item in sibling_payload.get("explanations") or []
+        "NOT_ALLOWED" in (item.get("text") or "")
+        for item in sibling_payload.get("explanations") or []
     )
     assert cmd_relationships(db_path, SEED, RUN_ID) == 0
     capsys.readouterr()

@@ -213,7 +213,9 @@ def _intel_relationship_diff(
                 }
             )
     return {
-        "new_relationships": [_relationship_summary(current[rid], "RELATIONSHIP_APPEARED") for rid in new_ids],
+        "new_relationships": [
+            _relationship_summary(current[rid], "RELATIONSHIP_APPEARED") for rid in new_ids
+        ],
         "removed_relationships": [
             _relationship_summary(previous[rid], "RELATIONSHIP_DISAPPEARED") for rid in gone_ids
         ],

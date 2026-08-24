@@ -47,9 +47,10 @@ def test_duplicate_certificates_same_sans_different_fingerprints() -> None:
     assert FP_A in fps
     assert FP_B in fps
     assert len(certs) == 2
-    assert engine.entities[f"certificate:{FP_A}"].entity_id != engine.entities[
-        f"certificate:{FP_B}"
-    ].entity_id
+    assert (
+        engine.entities[f"certificate:{FP_A}"].entity_id
+        != engine.entities[f"certificate:{FP_B}"].entity_id
+    )
     engine.correlate()
     shares = [
         r
@@ -143,7 +144,9 @@ def test_unidentified_ct_record_does_not_emit_shares_certificate() -> None:
         if r.relationship_type is RelationshipType.SHARES_CERTIFICATE
     ]
     assert shares == []
-    assert any(r.relationship_type is RelationshipType.SAN_CONTAINS for r in engine.relationships.values())
+    assert any(
+        r.relationship_type is RelationshipType.SAN_CONTAINS for r in engine.relationships.values()
+    )
 
 
 def test_100_san_certificate_stays_hub_not_clique() -> None:

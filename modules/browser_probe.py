@@ -273,7 +273,9 @@ def _httpx_targets(context: PipelineContext) -> list[dict[str, str]]:
             probe_url = f"https://{probe_url}"
         input_raw = str(record.get("input") or "")
         input_url = (
-            input_raw if "://" in input_raw else (f"https://{input_raw}" if input_raw else probe_url)
+            input_raw
+            if "://" in input_raw
+            else (f"https://{input_raw}" if input_raw else probe_url)
         )
         if scope is not None:
             if allows_active_collection(probe_url, scope):

@@ -100,7 +100,9 @@ def test_wildcard_and_malformed_hostnames_are_not_collectable() -> None:
 
 
 def test_oos_ct_san_is_observed_not_collected() -> None:
-    engine = IntelEngine(IntelRunConfig(run_id="oos-ct", seed_domains=[SEED], scope_patterns=[SEED]))
+    engine = IntelEngine(
+        IntelRunConfig(run_id="oos-ct", seed_domains=[SEED], scope_patterns=[SEED])
+    )
     engine.ingest_ct_records(
         [
             {
