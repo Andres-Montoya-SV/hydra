@@ -28,9 +28,19 @@ class WaybackurlsPlugin(BaseToolPlugin):
         return self.settings.waybackurls_path
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
+        from core.intel.authorize import authorize_active_indicator
+        from core.intel.scope import require_collection_scope
+
         output_path = self._output_path(context, "waybackurls.txt")
         all_urls: list[str] = []
-        domains = [t.domain for t in context.targets]
+        scope = require_collection_scope(context)
+        domains = [
+            t.domain
+            for t in context.targets
+            if authorize_active_indicator(
+                t.domain, scope, "waybackurls", "seed_archive"
+            ).allowed
+        ]
         results: list[PluginResult] = []
 
         for domain in domains:

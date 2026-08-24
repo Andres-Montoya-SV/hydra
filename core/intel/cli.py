@@ -52,9 +52,14 @@ def cmd_graph(db_path: Path, domain: str, run_id: str | None) -> int:
 
 def cmd_relationships(db_path: Path, domain: str, run_id: str | None) -> int:
     from core.intel.query import domain_entity_id
+    from core.intel.serialize import serialize_relationships
 
     _, query, resolved = open_query(db_path, run_id, domain=domain)
-    payload = {"run_id": resolved, "relationships": query.relationships(domain_entity_id(domain))}
+    rows = query.relationships(domain_entity_id(domain))
+    payload = {
+        "run_id": resolved,
+        "relationships": serialize_relationships(rows, run_id=resolved),
+    }
     print_json(payload)
     query.conn.close()
     return 0

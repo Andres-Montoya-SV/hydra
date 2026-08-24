@@ -66,6 +66,7 @@ class IntelRunConfig:
     collected_domains: set[str] = field(default_factory=set)
     emissions: list[dict[str, Any]] = field(default_factory=list)
     observed_at: str = ""
+    cloud_collection_allowed: bool = False
 
     def collection_scope(self) -> CollectionScope:
         return CollectionScope(
@@ -73,6 +74,7 @@ class IntelRunConfig:
                 normalize_domain(s) for s in self.seed_domains if normalize_domain(s)
             ),
             scope_patterns=tuple(self.scope_patterns),
+            cloud_collection_allowed=self.cloud_collection_allowed,
         )
 
 
@@ -160,6 +162,18 @@ class IntelEngine:
             and self._count_type(EntityType.IP_ADDRESS) >= self.bounds.max_ips
         ):
             self._mark_truncated("ip_limit")
+            return None
+        if (
+            entity.entity_type is EntityType.URL
+            and self._count_type(EntityType.URL) >= self.bounds.max_url_entities
+        ):
+            self._mark_truncated("entity_limit")
+            return None
+        if (
+            entity.entity_type is EntityType.TECHNOLOGY
+            and self._count_type(EntityType.TECHNOLOGY) >= self.bounds.max_technology_entities
+        ):
+            self._mark_truncated("entity_limit")
             return None
         if len(self.entities) >= self.bounds.max_entities:
             if entity.is_seed:
@@ -522,17 +536,12 @@ class IntelEngine:
             self._ingest_emission_followups(emission)
 
     def _ingest_emission_followups(self, emission: StructuredEmission) -> None:
-        """Queue follow-up kinds declared by the plugin. Scope still decides collection."""
+        """Queue plugin follow-ups. A reason string is never evidence."""
         if not emission.followups:
             return
-        reason = CollectReason.PLUGIN
         for item in emission.followups:
-            raw_reason = str(item.get("reason") or "")
-            try:
-                reason = CollectReason(raw_reason) if raw_reason else CollectReason.PLUGIN
-            except ValueError:
-                reason = CollectReason.PLUGIN
             values = [item.get("value")] if item.get("value") else list(emission.domains)
+            claimed_evidence = str(item.get("evidence_id") or "")
             for raw in values:
                 name = normalize_domain(str(raw or ""))
                 if not name:
@@ -540,17 +549,19 @@ class IntelEngine:
                 entity = self.entities.get(entity_id(EntityType.DOMAIN, name))
                 if entity is None:
                     continue
+                evidence_id = claimed_evidence if claimed_evidence in self.evidence else ""
                 self.queue.add(
                     kind=IndicatorKind.DOMAIN,
                     value=name,
                     depth=1,
                     parent_id=None,
-                    reason=reason,
+                    reason=CollectReason.PLUGIN,
                     scope_status=entity.scope_status,
-                    evidence_id="",
+                    evidence_id=evidence_id,
                     discovered_from="plugin_followup",
                     collected=entity.collection_status is CollectionStatus.COLLECTED,
                     is_seed=entity.is_seed,
+                    source_entity_id=entity.entity_id,
                 )
 
     def correlate(self) -> None:
@@ -896,6 +907,16 @@ class IntelEngine:
                 "san": name,
             },
         )
+        san_rel = next(
+            (
+                rel
+                for rel in self.relationships.values()
+                if rel.relationship_type is RelationshipType.SAN_CONTAINS
+                and rel.source_entity == cert.entity_id
+                and rel.target_entity == domain.entity_id
+            ),
+            None,
+        )
         collected = domain.collection_status is CollectionStatus.COLLECTED
         self.queue.add(
             kind=IndicatorKind.DOMAIN,
@@ -904,10 +925,11 @@ class IntelEngine:
             parent_id=parent_id,
             reason=reason,
             scope_status=domain.scope_status,
-            evidence_id=name_obs.observation_id,
+            evidence_id=san_rel.evidence_id if san_rel else "",
             discovered_from=cert.entity_id,
             collected=collected,
             is_seed=domain.is_seed,
+            source_entity_id=cert.entity_id,
             priority=40 if domain.scope_status is ScopeStatus.IN_SCOPE else 90,
         )
 
@@ -1153,7 +1175,10 @@ class IntelEngine:
         unique = sorted(set(members))
         if len(unique) < 2 or hub_eid not in self.entities:
             return
-        pairs = bounded_pairs(unique)
+        cap = min(self.bounds.max_relationships_per_signal, 16)
+        from core.intel.correlate import bounded_pairs as _bounded
+
+        pairs = _bounded(unique, max_members=cap)
         if not pairs:
             return
         if len(self.relationships) + len(pairs) > self.bounds.max_relationships:

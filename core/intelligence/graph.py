@@ -54,8 +54,8 @@ def build_infrastructure_graph(
                         f"ip:{ip}",
                         asn_id,
                         "belongs_to",
-                        confidence=band_score(ConfidenceBand.HIGH),
-                        confidence_label=ConfidenceBand.HIGH.value,
+                        confidence=band_score(ConfidenceBand.LOW),
+                        confidence_label=ConfidenceBand.LOW.value,
                     )
                 )
 
@@ -68,8 +68,8 @@ def build_infrastructure_graph(
                     host_node.node_id,
                     cdn_id,
                     "served_by",
-                    confidence=band_score(ConfidenceBand.HIGH),
-                    confidence_label=ConfidenceBand.HIGH.value,
+                    confidence=band_score(ConfidenceBand.LOW),
+                    confidence_label=ConfidenceBand.LOW.value,
                 )
             )
 

@@ -31,7 +31,9 @@ class NucleiPlugin(BaseToolPlugin):
         output_path = self._output_path(context, "nuclei.json")
         alive_path = self._authorized_input(
             context,
-            input_path if input_path.exists() else self._output_path(context, "alive.txt"),
+            self._output_path(context, "authorized_alive.txt")
+            if self._output_path(context, "authorized_alive.txt").exists()
+            else (input_path if input_path.exists() else self._output_path(context, "alive.txt")),
         )
 
         if not self._alive_urls(context) and not read_lines(alive_path):

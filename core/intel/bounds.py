@@ -25,6 +25,10 @@ class DiscoveryBounds:
     max_ct_names_per_certificate: int = 200
     max_certificates: int = 500
     max_ips: int = 2000
+    max_url_entities: int = 4000
+    max_technology_entities: int = 500
+    max_followups_per_relationship: int = 20
+    max_relationships_per_signal: int = 64
     enable_followup_collection: bool = True
 
     @classmethod
@@ -42,5 +46,11 @@ class DiscoveryBounds:
             max_ct_names_per_certificate=settings.max_ct_names_per_certificate,
             max_certificates=settings.max_certificates,
             max_ips=settings.max_ips,
+            max_url_entities=getattr(settings, "max_url_entities", 4000),
+            max_technology_entities=getattr(settings, "max_technology_entities", 500),
+            max_followups_per_relationship=getattr(
+                settings, "max_followups_per_relationship", settings.max_domains_per_source
+            ),
+            max_relationships_per_signal=getattr(settings, "max_relationships_per_signal", 64),
             enable_followup_collection=settings.enable_followup_collection,
         )

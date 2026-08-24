@@ -1,8 +1,12 @@
-# Hydra — Attack Surface Intelligence Framework
+# Hydra — scope-aware reconnaissance with evidence-backed intelligence
 
 [![CI](https://github.com/Andres-Montoya-SV/hydra/actions/workflows/ci.yml/badge.svg)](https://github.com/Andres-Montoya-SV/hydra/actions/workflows/ci.yml)
 
-Hydra is an Attack Surface Intelligence Framework that transforms reconnaissance data into actionable intelligence for security researchers. Multiple recon "heads" (plugins) operate in a coordinated pipeline.
+Hydra is a **scope-aware reconnaissance pipeline with an evidence-backed intelligence control loop**. When follow-up collection is enabled, the production path is:
+
+collect → intelligence → authorize → bounded follow-up → evidence → relationship → SQLite → explanation
+
+That loop is what Hydra means by Attack Surface Intelligence. Intelligence is not a post-scan sidecar: `PipelineRunner` ingests artifacts, plans indicators, re-authorizes them, and only then runs follow-up DNS/HTTP. Out-of-scope names may be **observed**. They are never actively collected unless `authorize_active_indicator` returns `ALLOW`.
 
 Works on **macOS**, **Ubuntu**, **Debian**, and **Kali Linux**.
 
@@ -13,14 +17,15 @@ Works on **macOS**, **Ubuntu**, **Debian**, and **Kali Linux**.
 ## Features
 
 - **Plugin architecture** — each recon tool is an isolated subprocess module. New tools still need a settings flag, a `modules/` file, and (if they write a novel artifact) a parser; they may also emit structured entities via `PluginResult.data["intel"]`
-- **Mandatory pipeline** — subfinder → dedupe → dnsx → httpx, then optional bounded follow-up of in-scope indicators
-- **Evidence-driven intelligence** — Certificate Transparency / TLS SANs are retained as observations even when they are out of scope. Hydra records the relationship; it does not probe unauthorized names
-- **First-class entities** — Domain, IP, Certificate (SHA-256 fingerprint), ASN, nameserver, HTTP service. `Host` remains the reporting view
-- **Optional plugins** — URLhaus reputation, WebKit cloaking detection, amass, naabu, katana, hakrawler, gau, waybackurls, nuclei, assetfinder, unfurl, anew
-- **SQLite intelligence store** (`core/store.py`, `output/recon.db`) — hosts plus entities, observations, evidence, relationships, and indicators persist across scans
-- **Correlation, not attribution** — shared certificate / IP / ASN / nameserver / favicon / body hash with named confidence. Shared cloud IPs are `shared_cloud_tenancy` (MEDIUM). Hydra never emits actor/owner/campaign entities
-- **Query without rescanning** — `investigate`, `graph`, `relationships`, `evidence` (domain or relationship id), `certificates`, `indicators`, `diff DOMAIN` or `diff RUN_A RUN_B`. All read SQLite.
-- **Historical diffing** (`core/diff.py`) — compares the current run to the latest finished run with overlapping targets; host-set plus field-level changes (IP, cert fingerprint, SANs, HTTP, tech, …)
+- **Mandatory pipeline** — subfinder → CT (observe) → seed dnsx → httpx, then bounded intelligence follow-up of **authorized** indicators
+- **Central authorization** — every active probe must pass `authorize_active_indicator` (`ALLOW` / `DENY` / `UNKNOWN`). `UNKNOWN` fails closed. A `CollectionScope` object is not itself authorization
+- **Evidence-driven intelligence** — Certificate Transparency / TLS SANs are retained as observations even when they are out of scope. Hydra records the relationship; it does not probe unauthorized names. Follow-up reasons such as `CERTIFICATE_SAN` are rejected unless the referenced evidence, SAN observation, and certificate entity exist
+- **First-class entities** — Domain, IP, Certificate (SHA-256 fingerprint first), ASN, nameserver, HTTP service. `Host` is an attack-surface **projection**. Intel relationships are the correlation truth
+- **Optional plugins** — URLhaus reputation, WebKit cloaking detection, amass, naabu, katana, hakrawler, gau, waybackurls, nuclei, assetfinder, unfurl, anew. Crawlers/scanners consume `authorized_alive.txt`, not raw `alive.txt`
+- **SQLite intelligence store** (`core/store.py`, `output/recon.db`) — hosts plus entities, observations, evidence, relationships, and durable indicator lifecycle persist across scans
+- **Correlation, not attribution** — shared certificate / IP / ASN / nameserver / favicon / body hash with named confidence. Shared IP, CDN, ASN, favicon, or body hash alone is never `HIGH`. Shared cloud IPs are `shared_cloud_tenancy` (MEDIUM). Hydra never emits actor/owner/campaign entities
+- **Query without rescanning** — `investigate`, `graph`, `relationships`, `evidence` (domain or relationship id), `certificates`, `indicators`, `diff DOMAIN` or `diff RUN_A RUN_B`. CLI, HTML, Markdown, and JSON consume the same `serialize_relationship()` objects
+- **Historical diffing** (`core/diff.py`) — host fields plus entities, observations, evidence, relationships (appeared / disappeared / confidence / evidence), indicators, and certificate rotation
 - **Interactive HTML reports** — dark/light theme toggle, live search, risk-level filtering
 - **Async execution** — concurrent optional tools, non-blocking subprocess I/O
 - **Rich TUI** — live progress, tool status, statistics, logs, and results tables
@@ -28,7 +33,7 @@ Works on **macOS**, **Ubuntu**, **Debian**, and **Kali Linux**.
 - **Secure subprocess** — no `shell=True`, input validation, path sanitization
 - **Fail-closed OPSEC mode** (`STRICT_OPSEC`) — proxy-only egress, header suppression, and a `check-opsec` pre-flight diagnostic command
 - **Bug bounty headers** — configurable `X-HackerOne-Researcher` and custom HTTP headers via `.env`
-- **Outputs** — JSON and HTML/Markdown reports; httpx also writes a per-run `httpx.csv` artifact
+- **Outputs** — JSON and HTML/Markdown reports; httpx also writes a per-run `httpx.csv` artifact. Follow-up writes sidecar files (`resolved_followup_<pass>.txt`, `alive_followup_<pass>.txt`, …) and unions them into canonical artifacts without clobbering the seed snapshot
 
 ---
 
@@ -237,32 +242,41 @@ python app.py run -d example.com --run-id program_v1_baseline
 ## Pipeline Workflow
 
 ```
-Validate Input
+CLI: python app.py run -d <target>
       ↓
-WHOIS registration intelligence
+Authorization context (CollectionScope from seeds + SCOPE_FILE)
       ↓
-Subfinder + Certificate Transparency (+ optional: amass, assetfinder)
+WHOIS (authorized roots only)
       ↓
-Deduplicate
+Subfinder (+ optional amass, assetfinder)
       ↓
-dnsx → Team Cymru ASN ownership (+ optional: naabu)
+Certificate Transparency (observe SANs; do not seed-resolve the whole set)
       ↓
-Optional nmap service verification for Naabu observations
+Seed dnsx (authorized enum names, not the full CT merge)
       ↓
-httpx
+httpx (authorized inputs; OOS redirect landings are observations, not alive targets)
       ↓
-Optional URLhaus host reputation
+Intelligence ingest → evidence → relationships → indicator queue
       ↓
-Optional: katana, hakrawler, unfurl, nuclei
+authorize_active_indicator (ALLOW / DENY / UNKNOWN)
       ↓
-Optional active WebKit cloaking probe
+Bounded follow-up DNS/HTTP into sidecar artifacts
       ↓
-Bounded follow-up (depth ≤ MAX_DISCOVERY_DEPTH; in-scope only)
+Deterministic authorized union → canonical resolved.txt / alive.txt
       ↓
-Normalize → observe → correlate → persist SQLite
+SQLite persist (entities, observations, evidence, relationships, indicator lifecycle)
       ↓
-Generate Reports / query CLI
+Reports + CLI (investigate / relationships / evidence / diff)
 ```
+
+Hard invariants:
+
+- No active network collection without a concrete authorized indicator.
+- No relationship without evidence.
+- No `HIGH` correlation from a single weak signal (shared IP / ASN / CDN / favicon / body hash).
+- `COLLECTED` is set only after collection succeeds. Crashes and empty follow-up leave seed artifacts intact.
+
+Follow-up is bounded (`MAX_DISCOVERY_DEPTH`, `MAX_FOLLOWUP_INDICATORS`, `MAX_DNS_PROBES`, `MAX_HTTP_PROBES`, `MAX_RUNTIME`). There is no unrestricted recursive crawler.
 
 ---
 
@@ -285,13 +299,13 @@ Two layers share that file:
 - **Host reporting view** (`hosts`, `http_services`, `ports`, `graph_nodes` / `graph_edges`) — what the HTML/Markdown reports render.
 - **Intelligence store** (`intel_entities`, `intel_observations`, `intel_evidence`, `intel_relationships`, `intel_indicators`) — the source of truth for `investigate` / `graph` / `relationships` / `evidence`. The in-memory graph is a view over these rows, not a second database.
 
-**Collect vs observe.** Active collectors (dnsx, httpx, naabu, crawlers, …) run only against indicators that pass `allows_active_collection`. Certificate Transparency SANs, plugin emissions, and parser hosts may still be **observed** when out of scope. Observation is not authorization.
+**Collect vs observe.** Active collectors (dnsx, httpx, naabu, crawlers, …) run only against indicators that pass `authorize_active_indicator`. Certificate Transparency SANs, plugin emissions, and parser hosts may still be **observed** when out of scope. Observation is not authorization. Indicator states are `DISCOVERED` → `ELIGIBLE` → `IN_FLIGHT` → `COLLECTED` or `FAILED` (or `NOT_ALLOWED` / `REJECTED`). An interrupted `IN_FLIGHT` row becomes `FAILED`, never `COLLECTED`.
 
-**Correlation vs risk.** Named bands (`VERY_HIGH` / `HIGH` / `MEDIUM` / `LOW`) answer “how strongly are these observations related?” Host `risk_score` answers “how interesting is this surface?” Shared certificates do not bump risk. Shared cloud IPs are `shared_cloud_tenancy` (MEDIUM), not ownership.
+**Correlation vs risk.** Named bands (`VERY_HIGH` / `HIGH` / `MEDIUM` / `LOW`) belong to evidence-backed **relationships**, not to Hosts. Host `risk_score` answers “how interesting is this surface?” Shared certificates do not bump risk. Shared cloud IPs are `shared_cloud_tenancy` (MEDIUM), not ownership. Host graph edges for CDN/ASN are `LOW` projections; they must not contradict intel relationships.
 
-**Follow-up.** After the seed collect, Hydra claims in-scope `ELIGIBLE` indicators, re-checks scope and wildcard DNS, and runs at most one extra DNS/HTTP pass. Depth default is 1. There is no recursive crawler.
+**Follow-up.** After seed collect, Hydra ingests artifacts into `IntelEngine`, verifies evidence for certificate-backed names, re-checks authorization and wildcard DNS, and runs bounded extra DNS/HTTP passes. Follow-up writes `resolved_followup_<n>.txt` / `alive_followup_<n>.txt` (and matching jsonl/json) then unions into canonical files. Seed snapshots (`resolved_seed.txt`, `alive_seed.txt`) remain intact if follow-up is empty or crashes. Depth default is 1.
 
-After collection, `core/intel/engine.py` normalizes artifacts into entities/observations/relationships. Separately, `core/intelligence/` profiles hosts, scores risk, and clusters the reporting view.
+After collection, `core/intel/engine.py` is the correlation truth. `core/intelligence/` still profiles hosts and scores risk for the reporting view. CLI / HTML / Markdown / `assets.json` serialize relationships through `core/intel/serialize.py`.
 
 ---
 
@@ -301,10 +315,16 @@ Each run creates a timestamped directory under `output/`:
 
 ```
 output/20250629_143022/
-├── subdomains.txt      # Enumerated subdomains
-├── resolved.txt        # DNS-resolved hosts
-├── alive.txt           # Live HTTP URLs
-├── httpx.json          # Full httpx JSON output
+├── subdomains.txt      # Enumerated subdomains (may include observed OOS CT names)
+├── authorized_dns_targets.txt  # Seed DNS input (enum+seeds, not the full CT merge)
+├── resolved.txt        # Canonical authorized DNS union
+├── resolved_seed.txt   # Seed DNS snapshot (immutable during follow-up)
+├── resolved_followup_1.txt     # Follow-up DNS sidecar
+├── alive.txt           # Canonical authorized HTTP union
+├── alive_seed.txt      # Seed HTTP snapshot
+├── alive_followup_1.txt
+├── authorized_alive.txt        # Centrally authorized view for crawlers/scanners
+├── httpx.json          # Canonical httpx JSON union
 ├── httpx.csv           # httpx CSV export
 ├── whois.jsonl         # Parsed WHOIS registration data
 ├── asn.jsonl           # Team Cymru ASN/IP ownership
@@ -362,12 +382,20 @@ logs/
 │   │   └── crawlers.py     # Katana/Hakrawler/crawl-specific parsing
 │   ├── dependencies/       # Phased external-tool discovery & validation
 │   ├── intelligence/
-│   │   ├── engine.py       # Orchestrates the post-collection intelligence pipeline
-│   │   ├── profile.py      # Host categorization + priority assignment
-│   │   ├── risk.py         # Risk scoring
-│   │   ├── clustering.py   # Certificate/ASN/technology clustering
-│   │   └── graph.py        # Infrastructure relationship graph
-│   ├── reporter.py         # Console/Markdown/HTML report generation
+│   │   ├── engine.py       # Host profiling/risk/clusters (reporting projection)
+│   │   ├── profile.py
+│   │   ├── risk.py
+│   │   ├── clustering.py
+│   │   └── graph.py        # Host visualization graph (CDN/ASN edges are LOW)
+│   ├── intel/
+│   │   ├── authorize.py    # ALLOW / DENY / UNKNOWN for every active probe
+│   │   ├── engine.py       # Entities, observations, evidence, relationships
+│   │   ├── followup.py     # Evidence-backed bounded follow-up planner
+│   │   ├── artifacts.py    # Seed snapshots, sidecars, authorized union
+│   │   ├── queue.py        # Indicator lifecycle
+│   │   ├── serialize.py    # Canonical relationship objects for all reporters
+│   │   └── cli.py          # investigate / relationships / evidence / diff
+│   ├── reporter.py         # Console/Markdown/HTML — consumes serialize_relationship
 │   ├── models.py           # Dataclasses & enums
 │   ├── logger.py           # Structured logging
 │   └── exceptions.py

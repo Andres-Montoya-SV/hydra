@@ -25,6 +25,7 @@ class CollectionScope:
 
     seed_domains: tuple[str, ...] = ()
     scope_patterns: tuple[str, ...] = ()
+    cloud_collection_allowed: bool = False
 
     @classmethod
     def from_seeds(
@@ -33,12 +34,17 @@ class CollectionScope:
         *,
         patterns: list[str] | None = None,
         scope_file: Path | None = None,
+        cloud_collection_allowed: bool = False,
     ) -> CollectionScope:
         normalized = tuple(normalize_domain(s) for s in seeds if normalize_domain(s))
         loaded: list[str] = list(patterns or [])
         if scope_file is not None and scope_file.exists():
             loaded.extend(load_scope_patterns(scope_file))
-        return cls(seed_domains=normalized, scope_patterns=tuple(loaded))
+        return cls(
+            seed_domains=normalized,
+            scope_patterns=tuple(loaded),
+            cloud_collection_allowed=cloud_collection_allowed,
+        )
 
 
 def classify_scope(
@@ -116,9 +122,15 @@ def scope_status_for(indicator: str, scope: CollectionScope) -> ScopeStatus:
 
 def allows_active_collection(indicator: str, scope: CollectionScope) -> bool:
     """Authoritative gate: True only when this indicator may be actively probed."""
-    if scope is None:
-        return False
-    return scope_status_allows_collection(scope_status_for(indicator, scope))
+    from core.intel.authorize import authorize_active_indicator
+
+    result = authorize_active_indicator(
+        indicator,
+        scope,
+        "active_collection",
+        "allows_active_collection",
+    )
+    return result.allowed
 
 
 def indicator_hostname(raw: str) -> str:

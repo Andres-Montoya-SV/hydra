@@ -169,3 +169,7 @@ def test_intel_relationship_history_tracks_certificate_rotation(tmp_path) -> Non
         appeared[0]["relationship_type"],
         disappeared[0]["relationship_type"],
     }
+    assert any(c["change_type"] == "CERTIFICATE_APPEARED" for c in diff.certificate_rotations)
+    assert any(c["change_type"] == "CERTIFICATE_DISAPPEARED" for c in diff.certificate_rotations)
+    assert diff.new_entities
+    assert diff.new_evidence or diff.removed_evidence or diff.new_observations

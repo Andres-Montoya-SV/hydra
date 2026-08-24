@@ -54,7 +54,10 @@ class PortVerifyPlugin(BaseToolPlugin):
         return self.settings.nmap_path
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
-        naabu_path = context.output_dir / "naabu.txt"
+        naabu_path = self._authorized_input(
+            context,
+            input_path if input_path.exists() else context.output_dir / "naabu.txt",
+        )
         output_path = self._output_path(context, "port_verify.jsonl")
         grouped = _group_naabu_ports(naabu_path)
         if not grouped:

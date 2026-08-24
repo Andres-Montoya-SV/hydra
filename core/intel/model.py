@@ -34,13 +34,15 @@ class ScopeStatus(str, Enum):
 
 
 class CollectionStatus(str, Enum):
-    NOT_COLLECTED = "NOT_COLLECTED"
+    DISCOVERED = "DISCOVERED"
     ELIGIBLE = "ELIGIBLE"
     IN_FLIGHT = "IN_FLIGHT"
     COLLECTED = "COLLECTED"
+    FAILED = "FAILED"
     NOT_ALLOWED = "NOT_ALLOWED"
     REJECTED = "REJECTED"
-    FAILED = "FAILED"
+    # Entity projection: observed but not actively collected.
+    NOT_COLLECTED = "NOT_COLLECTED"
 
 
 class ConfidenceBand(str, Enum):
@@ -220,20 +222,36 @@ class Indicator:
     evidence_id: str
     priority: int = 100
     discovered_from: str = ""
+    normalized_value: str = ""
+    source_entity_id: str = ""
+    authorization_status: str = ""
+    created_at: str = ""
+    claimed_at: str = ""
+    completed_at: str = ""
+    failure_reason: str = ""
+    collector: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "indicator_id": self.indicator_id,
             "kind": self.kind.value,
             "value": self.value,
+            "normalized_value": self.normalized_value or self.value,
+            "source_entity_id": self.source_entity_id or self.discovered_from,
             "depth": self.depth,
             "parent_id": self.parent_id,
             "reason": self.reason.value,
             "scope_status": self.scope_status.value,
             "collection_status": self.collection_status.value,
+            "authorization_status": self.authorization_status,
             "evidence_id": self.evidence_id,
             "priority": self.priority,
             "discovered_from": self.discovered_from,
+            "created_at": self.created_at,
+            "claimed_at": self.claimed_at,
+            "completed_at": self.completed_at,
+            "failure_reason": self.failure_reason,
+            "collector": self.collector,
         }
 
 

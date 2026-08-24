@@ -100,8 +100,8 @@ async def test_maybe_collect_followups_preserves_seed_dns_artifacts(
     assert seed_rows
     assert seed_rows[0].get("a") == ["203.0.113.10"]
 
-    follow_sidecar = output_dir / "dnsx_records_followup.jsonl"
-    follow_resolved = output_dir / "resolved_followup.txt"
+    follow_sidecar = output_dir / "dnsx_records_followup_1.jsonl"
+    follow_resolved = output_dir / "resolved_followup_1.txt"
     assert follow_sidecar.exists()
     assert FOLLOW in {str(rec.get("host")) for rec in read_jsonl(follow_sidecar)}
     assert FOLLOW in read_lines(follow_resolved)

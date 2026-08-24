@@ -258,6 +258,10 @@ class Settings:
     max_ct_names_per_certificate: int = 200
     max_certificates: int = 500
     max_ips: int = 2000
+    max_url_entities: int = 4000
+    max_technology_entities: int = 500
+    max_followups_per_relationship: int = 20
+    max_relationships_per_signal: int = 64
     enable_followup_collection: bool = True
     cloud_bucket_enum_authorize_derived: bool = False
     webhook_url: str | None = None
@@ -491,6 +495,27 @@ class Settings:
                 os.getenv("MAX_CERTIFICATES"), 500, "MAX_CERTIFICATES", maximum=20000
             ),
             max_ips=_int(os.getenv("MAX_IPS"), 2000, "MAX_IPS", maximum=50000),
+            max_url_entities=_int(
+                os.getenv("MAX_URL_ENTITIES"), 4000, "MAX_URL_ENTITIES", maximum=100000
+            ),
+            max_technology_entities=_int(
+                os.getenv("MAX_TECHNOLOGY_ENTITIES"),
+                500,
+                "MAX_TECHNOLOGY_ENTITIES",
+                maximum=20000,
+            ),
+            max_followups_per_relationship=_int(
+                os.getenv("MAX_FOLLOWUPS_PER_RELATIONSHIP"),
+                20,
+                "MAX_FOLLOWUPS_PER_RELATIONSHIP",
+                maximum=500,
+            ),
+            max_relationships_per_signal=_int(
+                os.getenv("MAX_RELATIONSHIPS_PER_SIGNAL"),
+                64,
+                "MAX_RELATIONSHIPS_PER_SIGNAL",
+                maximum=500,
+            ),
             enable_followup_collection=_bool(os.getenv("ENABLE_FOLLOWUP_COLLECTION"), True),
             cloud_bucket_enum_authorize_derived=_bool(
                 os.getenv("CLOUD_BUCKET_ENUM_AUTHORIZE_DERIVED")
@@ -704,6 +729,8 @@ class Settings:
             "max_ct_names_per_certificate": self.max_ct_names_per_certificate,
             "max_certificates": self.max_certificates,
             "max_ips": self.max_ips,
+            "max_url_entities": self.max_url_entities,
+            "max_technology_entities": self.max_technology_entities,
         }
 
 

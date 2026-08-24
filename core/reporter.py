@@ -747,10 +747,12 @@ class ReportGenerator:
 
     def _intel_relationship_lines(self, store: AssetStore, run_id: str) -> list[str]:
         from core.intel.query import IntelQuery
+        from core.intel.serialize import serialize_relationship
 
         conn = store.intel_connection()
         try:
-            rows = IntelQuery(conn, run_id).relationships_for_run(limit=80)
+            query = IntelQuery(conn, run_id)
+            rows = query.relationships_for_run(limit=80)
         finally:
             conn.close()
         if not rows:
@@ -764,13 +766,16 @@ class ReportGenerator:
             "",
         ]
         for row in rows[:40]:
-            rel_type = str(row.get("relationship_type") or "")
-            confidence = str(row.get("confidence") or "")
-            strength = str(row.get("strength") or "")
+            payload = serialize_relationship(row, run_id=run_id)
             lines.append(
-                f"- `{row.get('source_entity')}` — {rel_type} → "
-                f"`{row.get('target_entity')}` ({confidence}, {strength})"
+                f"- `{payload.get('source_entity')}` — {payload.get('relationship_type')} → "
+                f"`{payload.get('target_entity')}` ({payload.get('confidence_band')}, "
+                f"{payload.get('strength')})"
             )
+            if payload.get("explanation"):
+                first = str(payload["explanation"]).splitlines()[0]
+                if first:
+                    lines.append(f"  {first}")
         lines.append("")
         return lines
 
@@ -783,6 +788,7 @@ class ReportGenerator:
         if not callable(getter):
             return []
         from core.intel.query import IntelQuery
+        from core.intel.serialize import serialize_relationship
 
         conn = store.intel_connection()
         try:
@@ -809,30 +815,31 @@ class ReportGenerator:
             return parts
         parts.append("  <ul>")
         for row in rows[:40]:
-            rel_type = escape_html(str(row.get("relationship_type") or ""))
-            confidence = escape_html(str(row.get("confidence") or ""))
-            source = row.get("source_entity") or ""
-            target = row.get("target_entity") or ""
-            src_ent = entities.get(source) or {}
-            dst_ent = entities.get(target) or {}
-            src_label = escape_html(str(src_ent.get("key") or source))
-            dst_label = escape_html(str(dst_ent.get("key") or target))
+            payload = serialize_relationship(
+                row,
+                source_entity=entities.get(row.get("source_entity") or ""),
+                target_entity=entities.get(row.get("target_entity") or ""),
+                run_id=context.run_id,
+            )
+            rel_type = escape_html(str(payload.get("relationship_type") or ""))
+            confidence = escape_html(str(payload.get("confidence_band") or ""))
+            src_ent = entities.get(payload.get("source_entity") or "") or {}
+            dst_ent = entities.get(payload.get("target_entity") or "") or {}
+            src_label = escape_html(str(src_ent.get("key") or payload.get("source_entity") or ""))
+            dst_label = escape_html(str(dst_ent.get("key") or payload.get("target_entity") or ""))
             src_scope = escape_html(str(src_ent.get("scope_status") or ""))
             dst_scope = escape_html(str(dst_ent.get("scope_status") or ""))
             src_coll = escape_html(str(src_ent.get("collection_status") or ""))
             dst_coll = escape_html(str(dst_ent.get("collection_status") or ""))
-            data = row.get("data") or {}
             evidence_bits: list[str] = []
-            for key in (
-                "fingerprint_sha256",
-                "certificate_fingerprint",
-                "san_cardinality",
-                "ip",
-                "provider",
-                "favicon",
+            for key, value in (
+                ("fingerprint", payload.get("certificate_fingerprint")),
+                ("serial", payload.get("certificate_serial")),
+                ("san_cardinality", payload.get("san_cardinality")),
+                ("ip", payload.get("shared_ip")),
             ):
-                if data.get(key) not in (None, "", []):
-                    evidence_bits.append(f"{key}={data.get(key)}")
+                if value not in (None, "", []):
+                    evidence_bits.append(f"{key}={value}")
             evidence_html = escape_html("; ".join(str(bit) for bit in evidence_bits[:4]))
             evidence_suffix = (
                 f'<br><span class="muted">{evidence_html}</span>' if evidence_html else ""

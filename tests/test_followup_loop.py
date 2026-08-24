@@ -139,13 +139,30 @@ def test_wildcard_does_not_authorize_dns_only_hosts() -> None:
     roots = {SEED}
     assert (
         wildcard_blocks_active_collection(
-            "rand.virusbarrier.xyz", roots, CollectReason.DNS_RESOLUTION
+            "rand.virusbarrier.xyz",
+            roots,
+            CollectReason.DNS_RESOLUTION,
+            evidence_ok=False,
         )
         is True
     )
-    assert wildcard_blocks_active_collection(WWW, roots, CollectReason.CERTIFICATE_SAN) is False
     assert (
-        wildcard_blocks_active_collection("other.com", roots, CollectReason.DNS_RESOLUTION) is False
+        wildcard_blocks_active_collection(
+            WWW, roots, CollectReason.CERTIFICATE_SAN, evidence_ok=True
+        )
+        is False
+    )
+    assert (
+        wildcard_blocks_active_collection(
+            WWW, roots, CollectReason.CERTIFICATE_SAN, evidence_ok=False
+        )
+        is True
+    )
+    assert (
+        wildcard_blocks_active_collection(
+            "other.com", roots, CollectReason.DNS_RESOLUTION, evidence_ok=False
+        )
+        is False
     )
 
 
@@ -183,8 +200,8 @@ def test_followup_wildcard_skips_http_without_independent_evidence() -> None:
     assert "rand.virusbarrier.xyz" not in plan.dns_targets
     assert "rand.virusbarrier.xyz" not in plan.http_targets
     assert any(item.reason == "wildcard_unconfirmed" for item in plan.rejected())
-    assert WWW in plan.dns_targets
-    assert WWW in plan.http_targets
+    assert WWW not in plan.dns_targets
+    assert any(item.reason == "spoofed_or_missing_evidence" for item in plan.rejected())
 
 
 def test_corrupted_followup_file_cannot_reach_collectors(tmp_path: Path) -> None:
@@ -348,7 +365,12 @@ def test_virusbarrier_followup_loop_integration(tmp_path: Path, capsys) -> None:
         assert by_value[name].collection_status is CollectionStatus.NOT_ALLOWED
     transitions = [(item.value, item.previous, item.current) for item in engine.queue.trace]
     assert (SEED, "", CollectionStatus.COLLECTED.value) in transitions
-    assert (WWW, "", CollectionStatus.ELIGIBLE.value) in transitions
+    assert (WWW, "", CollectionStatus.DISCOVERED.value) in transitions
+    assert (
+        WWW,
+        CollectionStatus.DISCOVERED.value,
+        CollectionStatus.ELIGIBLE.value,
+    ) in transitions
     assert (WWW, CollectionStatus.ELIGIBLE.value, CollectionStatus.IN_FLIGHT.value) in transitions
     assert (SIBLINGS[0], "", CollectionStatus.NOT_ALLOWED.value) in transitions
 
@@ -385,6 +407,16 @@ def test_schedule_blocks_wildcard_dns_only_name(tmp_path: Path) -> None:
             collected_domains={SEED},
         )
     )
+    engine.ingest_ct_records(
+        [
+            {
+                "id": 1,
+                "name_value": f"{SEED}\n{WWW}",
+                "fingerprint_sha256": "ab" * 32,
+                "query_domain": SEED,
+            }
+        ]
+    )
     engine.queue.add(
         kind=IndicatorKind.DOMAIN,
         value="rand.virusbarrier.xyz",
@@ -394,16 +426,6 @@ def test_schedule_blocks_wildcard_dns_only_name(tmp_path: Path) -> None:
         scope_status=ScopeStatus.IN_SCOPE,
         evidence_id="dns",
         discovered_from="dnsx",
-    )
-    engine.queue.add(
-        kind=IndicatorKind.DOMAIN,
-        value=WWW,
-        depth=1,
-        parent_id=None,
-        reason=CollectReason.CERTIFICATE_SAN,
-        scope_status=ScopeStatus.IN_SCOPE,
-        evidence_id="ct",
-        discovered_from="certificate:seed",
     )
     plan = PipelineRunner(settings).schedule_followup_collection(context, engine)
     assert "rand.virusbarrier.xyz" not in plan.dns_targets

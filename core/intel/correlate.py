@@ -64,18 +64,18 @@ def registrable_domain(hostname: str) -> str:
 
 
 def ipv4_confidence(ip: str) -> tuple[ConfidenceBand, str]:
-    """Shared IPv4 is MEDIUM on cloud tenancy, HIGH on non-cloud addresses."""
+    """Shared IPv4 is never HIGH by itself. Cloud tenancy is MEDIUM; dedicated is MEDIUM."""
     provider = cloud_provider_for_ip(ip)
     if provider:
         return ConfidenceBand.MEDIUM, "shared_cloud_tenancy"
-    return ConfidenceBand.HIGH, "shared_ipv4"
+    return ConfidenceBand.MEDIUM, "shared_ipv4"
 
 
 def ipv6_confidence(ip: str) -> tuple[ConfidenceBand, str]:
     provider = cloud_provider_for_ip(ip)
     if provider:
         return ConfidenceBand.MEDIUM, "shared_cloud_tenancy"
-    return ConfidenceBand.HIGH, "shared_ipv6"
+    return ConfidenceBand.MEDIUM, "shared_ipv6"
 
 
 def shares_certificate_confidence(

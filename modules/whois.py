@@ -71,6 +71,18 @@ class WhoisPlugin(BaseToolPlugin):
         )
         root_domains = [domain for domain in root_domains if domain]
 
+        from core.intel.authorize import authorize_active_indicator
+
+        scope = getattr(context, "collection_scope", None)
+        authorized_roots: list[str] = []
+        for domain in root_domains:
+            decision = authorize_active_indicator(domain, scope, "whois", "seed_registration")
+            if not decision.allowed:
+                warnings.append(f"{domain}: not authorized for WHOIS ({decision.reason})")
+                continue
+            authorized_roots.append(domain)
+        root_domains = authorized_roots
+
         self.update_status(context, ToolStatus.RUNNING)
         for domain in root_domains:
             context.current_target = domain
