@@ -58,7 +58,7 @@ Order is from `core/runner.py` `run()`, not from plugin `stage_order` alone. Opt
 | Security headers | `security_headers` | none (parses captured headers) | `context.httpx_results` | no live probe; will describe OOS landing headers if those records remain in `httpx.json` | `security_headers.jsonl` |
 | Optional concurrent | gau, waybackurls, katana, hakrawler, unfurl, nuclei | see §3 | runner passes `alive.txt` if non-empty else `resolved.txt`; `_gate_active_input` filters that path for `active_collection=True` plugins | **katana/nuclei previously ignored `input_path` and read `alive.txt`.** After Part B they `_authorized_input` that file. hakrawler uses `_alive_urls()` (re-filters). gau/waybackurls ignore the path and use `context.targets`. | tool-specific |
 | Follow-up pass 2 | `_maybe_collect_followups` again | same as pass 1 | same | same | same class of sidecars |
-| Browser probe | `browser_probe` | Playwright WebKit **executes page JS** | `_httpx_targets(context.httpx_results)` — not `alive.txt` | After Part B: start URL must be authorized; document navigations to unauthorized hosts are aborted | `browser_probe.jsonl`, `browser_probe_raw/*.html` |
+| Browser probe | `browser_probe` | Playwright WebKit **executes page JS** | `_httpx_targets(context.httpx_results)` — not `alive.txt` | After Part B: start URL must be authorized; **every** request on the page (document, iframe navigation, and every subresource type) is authorized before it's let through (§3.4) | `browser_probe.jsonl` (with `blocked_subresources` / `blocked_subresources_total`), `browser_probe_raw/*.html` |
 | Finalize | parsers + IntelEngine + SQLite | none | all artifacts | Intel observes OOS names; must not probe | `recon.db`, reports, `assets.json` |
 
 `STRICT_OPSEC`: plugins not in `STRICT_OPSEC_ALLOWED_PLUGINS` are skipped before `plugin.run`. httpx is allowed (proxy). dnsx/naabu/crawlers/scanners are not.
@@ -88,7 +88,11 @@ Order is from `core/runner.py` `run()`, not from plugin `stage_order` alone. Opt
 
 ### 3.4 Browser
 
-- **browser_probe:** Playwright WebKit `page.goto(probe_url)`. `probe_url` is taken from httpx `url` (final) unless that host fails the gate, in which case it falls back to the authorized `input`. A route guard aborts **document navigations** whose hostname fails `allows_active_collection`; if evaluating that check itself raises, the guard now aborts too (fail closed — fixed this change set, §8 G-GUARD-1) rather than letting the request through. Subresource loads (CDN images/scripts) are **not** blocked — that is still a network touch of third-party hosts during an in-scope page load, and is **not** the same as seeding those hosts into `alive.txt`. Left as a documented residual.
+- **browser_probe:** Playwright WebKit `page.goto(probe_url)`. `probe_url` is taken from httpx `url` (final) unless that host fails the gate, in which case it falls back to the authorized `input`. `_install_scope_request_guard` installs a single `page.route("**/*", guard)` and routes **every** request through `browser_request_decision`, keyed by `allows_active_collection` — not just `request.is_navigation_request()`. That covers:
+  - **`document`** requests: both the top-level navigation and cross-origin `<iframe>` navigation. Confirmed empirically against the pinned Playwright version (1.62.0, WebKit): a sub-frame navigation also reports `resource_type == "document"` and `is_navigation_request() == True`. This means iframe navigation was **already** blocked by the old navigation-only guard before this change — it was not the gap. The confirmed gap was subresources.
+  - **Every subresource type** (`script`, `stylesheet`, `image`, `font`, `media`, `xhr`, `fetch`, `websocket`, `manifest`, `other`, `texttrack`, `eventsource`, ...): blocked by default when the destination host is not authorized. Hydra does not allowlist third-party CDNs/fonts/trackers just because an in-scope page references them — a visibly incomplete render is the intended outcome (fixed this change set, §8 G-GUARD-2).
+  - If evaluating the policy for **any** resource type raises, the guard aborts (fail closed — fixed the prior P0 prompt, §8 G-GUARD-1) rather than letting the request through.
+  - Blocked requests are tallied by resource type into `blocked_subresources` on the `browser_probe.jsonl` record for that host (`blocked_subresources_total` is the sum), and a `context.add_warning` is raised per host with any blocks so a visibly broken/incomplete render is legible as "scope policy did this," not a silent tool malfunction. Verified against a real page (`www.metaversejustice.com`): 3 blocked `fonts.googleapis.com` stylesheet requests and 2 blocked `embed.app.guidde.com` iframe (`document`-type) requests in one run.
 
 ### 3.5 Threat-intel / vuln APIs
 
@@ -290,8 +294,9 @@ Failure modes of this contract (still true after Part B):
 - **G-REDIR-3 (confirmed, fixed):** browser_probe started on httpx `url` (final).
 - **G-REDIR-4 (confirmed, fixed):** threat_intel / vuln_match could take the OOS landing as the subject.
 - **G-REDIR-5 (confirmed, fixed):** multi-hop used only the final URL; filter now keys off the landing host.
-- **G-REDIR-6 (confirmed, fixed — this change set, §5.4):** httpx no longer fetches an out-of-scope `Location` at all. `-follow-redirects` is removed; each hop is authorized before httpx is invoked again for it. Previously "confirmed, not fixed" item 6 below.
-- **G-GUARD-1 (confirmed, fixed — this change set):** `browser_probe`'s in-page navigation guard (`_install_scope_navigation_guard`) fell open (`route.continue_()`) if evaluating `allow_browser_navigation` raised. It now aborts the navigation (fail closed) and logs the exception. The happy-path authorization logic (`scope is None → False`) was already correct; only the exception handler around it was fail-open.
+- **G-REDIR-6 (confirmed, fixed — P0 redirect-fetch prompt, §5.4):** httpx no longer fetches an out-of-scope `Location` at all. `-follow-redirects` is removed; each hop is authorized before httpx is invoked again for it. Previously "confirmed, not fixed" item 6.
+- **G-GUARD-1 (confirmed, fixed — P0 redirect-fetch prompt):** `browser_probe`'s in-page navigation guard fell open (`route.continue_()`) if evaluating `allow_browser_navigation` raised. It now aborts the navigation (fail closed) and logs the exception. The happy-path authorization logic (`scope is None → False`) was already correct; only the exception handler around it was fail-open.
+- **G-GUARD-2 (confirmed, fixed — this change set, §3.4):** `browser_probe`'s guard only checked `request.is_navigation_request()`, so subresources (script/image/stylesheet/font/xhr/fetch/websocket/...) bypassed authorization entirely. All resource types now go through `browser_request_decision`. Investigation also found that cross-origin **iframe navigation was already covered** by the old guard (Playwright reports `is_navigation_request() == True` for sub-frame navigation too) — that was not the gap; subresources were. Previously "confirmed, not fixed" item 6.
 
 ### Confirmed, **not** fixed (later prompts)
 
@@ -299,16 +304,15 @@ Failure modes of this contract (still true after Part B):
 2. **Follow-up claims indicators before success.** Failed names are not retried.
 3. **No `PipelineRunner.run()` E2E with an in-scope follow-up hostname** (virusbarrier fixture SANs are all OOS). Tests passing ≠ that path works.
 4. **Wildcard DNS:** initial dnsx still resolves junk under a catch-all. Follow-up planner exempts `CERTIFICATE_SAN`. Plugin emissions can set that reason.
-5. **Crawler link-follow:** katana/hakrawler, once started in-scope, can still request OOS links they discover themselves. Part B only stops **seeding** those URLs from httpx redirects.
-6. **Browser subresources** to third-party hosts during an in-scope navigation are not gated (scripts/images/iframes/fetch can still reach unauthorized hosts even though document navigation is fail-closed). Planned as a follow-up `EgressPolicy`/subresource-guard prompt, not addressed here.
-7. **Host clusters / `graph_edges` / `assets.json`** remain a second correlation story vs `intel_relationships`.
-8. **Certificate identity, SAN bounds, intel queue durability** — engine exists; not re-audited as “done”. Queue is not a SQLite source of truth for IN_FLIGHT/FAILED.
-9. **`port_verify` trusts `naabu.txt`.** Fine if naabu was gated; not a second check.
-10. **Cloud bucket enum** probes non-seed cloud FQDNs when the derived flag is on.
-11. **ASN `getaddrinfo` fallback** is extra DNS on resolved names.
-12. **Reporting:** Markdown intel lines omit fingerprints; `export_run_json` omits intel tables.
-13. **Two follow-up invocations per run** (after httpx and after optional plugins). Bounded by depth, not one-shot, not persisted as queue history.
-14. **All of the above authorization is logical, not a network-level egress boundary.** A buggy plugin that skips the gate can still reach an unauthorized host; nothing at the socket/process level enforces `CollectionScope`. Planned as a follow-up `EgressPolicy` prompt, not addressed here.
+5. **Crawler link-follow:** katana/hakrawler, once started in-scope, can still request OOS links they discover themselves. Part B only stops **seeding** those URLs from httpx redirects. `browser_probe`'s per-request guard (G-GUARD-2) does not apply to katana/hakrawler/nuclei — out of scope for that prompt by design.
+6. **Host clusters / `graph_edges` / `assets.json`** remain a second correlation story vs `intel_relationships`.
+7. **Certificate identity, SAN bounds, intel queue durability** — engine exists; not re-audited as “done”. Queue is not a SQLite source of truth for IN_FLIGHT/FAILED.
+8. **`port_verify` trusts `naabu.txt`.** Fine if naabu was gated; not a second check.
+9. **Cloud bucket enum** probes non-seed cloud FQDNs when the derived flag is on.
+10. **ASN `getaddrinfo` fallback** is extra DNS on resolved names.
+11. **Reporting:** Markdown intel lines omit fingerprints; `export_run_json` omits intel tables.
+12. **Two follow-up invocations per run** (after httpx and after optional plugins). Bounded by depth, not one-shot, not persisted as queue history.
+13. **All of the above authorization is logical, not a network-level egress boundary.** A buggy plugin that skips the gate can still reach an unauthorized host; nothing at the socket/process level enforces `CollectionScope`. Planned as a follow-up `EgressPolicy` prompt, not addressed here.
 
 ### `SCOPE_FILE` missing
 

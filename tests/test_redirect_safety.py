@@ -270,6 +270,7 @@ async def test_browser_navigation_guard_fails_closed_on_exception(
 
     class FakeRequest:
         url = f"https://{SEED}/"
+        resource_type = "document"
 
         def is_navigation_request(self) -> bool:
             return True
@@ -289,11 +290,13 @@ async def test_browser_navigation_guard_fails_closed_on_exception(
         async def route(self, pattern: str, handler: object) -> None:
             handlers["guard"] = handler
 
-    await browser_probe._install_scope_navigation_guard(FakePage(), context)
+    blocked_counts: dict[str, int] = {}
+    await browser_probe._install_scope_request_guard(FakePage(), context, blocked_counts)
     await handlers["guard"](FakeRoute())
 
     assert calls["abort"] == "blockedbyclient"
     assert calls["continued"] is False
+    assert blocked_counts.get("document") == 1
 
 
 def test_multi_hop_filter_uses_final_destination_not_first_hop() -> None:

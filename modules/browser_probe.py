@@ -117,10 +117,23 @@ class BrowserProbePlugin(BaseToolPlugin):
                                 "cloaking_suspected": False,
                                 "raw_artifact": None,
                                 "error": str(exc)[:240],
+                                "blocked_subresources": {},
+                                "blocked_subresources_total": 0,
                             }
                         )
             finally:
                 await browser.close()
+
+        for record in records:
+            blocked_total = record.get("blocked_subresources_total") or 0
+            if blocked_total:
+                context.add_warning(
+                    f"Browser Probe blocked {blocked_total} subresource request(s) "
+                    f"to host(s) outside CollectionScope while rendering "
+                    f"{record['host']} ({record.get('blocked_subresources')}). "
+                    "Page render may be visibly incomplete (missing scripts/"
+                    "images/styles/analytics) by scope policy, not a tool fault."
+                )
 
         output_path = self._output_path(context, "browser_probe.jsonl")
         count = write_jsonl(output_path, records, base_dir=context.output_dir)
@@ -172,7 +185,8 @@ async def _probe_target(
 
         page.on("response", capture_response)
         error: str | None = None
-        await _install_scope_navigation_guard(page, context)
+        blocked_counts: dict[str, int] = {}
+        await _install_scope_request_guard(page, context, blocked_counts)
         try:
             await page.goto(
                 target["probe_url"],
@@ -203,6 +217,8 @@ async def _probe_target(
             "cloaking_suspected": cloaking,
             "raw_artifact": raw_artifact,
             "error": error,
+            "blocked_subresources": blocked_counts,
+            "blocked_subresources_total": sum(blocked_counts.values()),
         }
     finally:
         # Always torn down, even if page creation, script injection, or
@@ -236,7 +252,12 @@ async def _write_html_artifact(
 
 
 def allow_browser_navigation(url: str, context: PipelineContext) -> bool:
-    """Document navigations must re-check CollectionScope. Redirects are not authorization.
+    """A request's destination host must be authorized under CollectionScope.
+
+    Despite the name (kept for backward compatibility — this is the same
+    check `browser_request_decision` uses for every resource type, not just
+    document navigation), it is not navigation-specific: it just answers
+    "is this host in scope". Redirects are not authorization.
 
     Missing CollectionScope is DENY, never allow.
     """
@@ -248,28 +269,59 @@ def allow_browser_navigation(url: str, context: PipelineContext) -> bool:
     return allows_active_collection(url, scope)
 
 
-async def _install_scope_navigation_guard(page: object, context: PipelineContext) -> None:
-    """Abort in-browser document navigations whose hostname is not authorized.
+def browser_request_decision(request: object, context: PipelineContext) -> bool:
+    """True = allow the request, False = block it. Every resource type goes through here.
 
-    Always install. Missing CollectionScope aborts every navigation (fail closed).
-    An exception while evaluating authorization also aborts (fail closed) — a
-    bug in the scope check must never fall open into an unauthorized request.
+    Playwright reports a `resource_type` per request: `document` (this
+    covers both the top-level page AND cross-origin `<iframe>` navigation —
+    Playwright sets `is_navigation_request()` for sub-frame navigations too,
+    confirmed against the pinned playwright version), plus subresource types
+    (`script`, `stylesheet`, `image`, `font`, `media`, `xhr`, `fetch`,
+    `websocket`, `manifest`, `other`, `texttrack`, `eventsource`, ...).
+
+    Hydra applies the same rule to all of them: the destination host must be
+    IN_SCOPE. Third-party subresources (CDN scripts, tracker pixels, web
+    fonts) are not allowed by default just because an in-scope page
+    references them — a visibly incomplete render (missing styles/images/
+    analytics) is the intended, safer outcome, not a bug. If a later prompt
+    wants a narrower allowlist for specific subresource types, it changes
+    this one function, not the guard's plumbing.
+    """
+    return allow_browser_navigation(request.url, context)
+
+
+async def _install_scope_request_guard(
+    page: object, context: PipelineContext, blocked_counts: dict[str, int]
+) -> None:
+    """Route every request on the page through `browser_request_decision`.
+
+    Covers the main document, iframe/sub-frame navigations, and every
+    subresource type — not just `is_navigation_request()`. Always install.
+    Missing CollectionScope blocks everything (fail closed). An exception
+    while evaluating the policy also blocks (fail closed) — a bug in the
+    scope check must never fall open into an unauthorized request.
+
+    Blocked requests are tallied into `blocked_counts` by resource type so
+    the caller can report how much of the page was withheld by policy.
     """
 
     async def guard(route: object) -> None:
+        request = route.request
         try:
-            request = route.request
-            if request.is_navigation_request() and not allow_browser_navigation(
-                request.url, context
-            ):
-                await route.abort("blockedbyclient")
-                return
+            allowed = browser_request_decision(request, context)
         except Exception:
             logger.warning(
-                "browser_probe: navigation guard raised while evaluating %s; blocking (fail closed)",
-                getattr(getattr(route, "request", None), "url", "<unknown>"),
+                "browser_probe: request guard raised while evaluating %s (%s); "
+                "blocking (fail closed)",
+                getattr(request, "url", "<unknown>"),
+                getattr(request, "resource_type", "<unknown>"),
                 exc_info=True,
             )
+            allowed = False
+
+        if not allowed:
+            resource_type = str(getattr(request, "resource_type", "") or "other")
+            blocked_counts[resource_type] = blocked_counts.get(resource_type, 0) + 1
             await route.abort("blockedbyclient")
             return
         await route.continue_()
