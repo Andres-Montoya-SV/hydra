@@ -187,9 +187,7 @@ def plan_followup_collection(
             continue
         if item.reason in INDEPENDENT_REASONS and item.reason is not CollectReason.SEED:
             pass  # evidence checked after scope so OOS still reports out_of_scope
-        decision = authorize_active_indicator(
-            host, scope, "followup_collection", item.reason.value
-        )
+        decision = authorize_active_indicator(host, scope, "followup_collection", item.reason.value)
         if not decision.allowed:
             plan.decisions.append(
                 FollowUpDecision(
@@ -201,9 +199,7 @@ def plan_followup_collection(
             continue
         if item.reason in INDEPENDENT_REASONS and item.reason is not CollectReason.SEED:
             if not evidence_supports_certificate_followup(engine, item):
-                plan.decisions.append(
-                    FollowUpDecision(host, False, "spoofed_or_missing_evidence")
-                )
+                plan.decisions.append(FollowUpDecision(host, False, "spoofed_or_missing_evidence"))
                 continue
         evidence_ok = evidence_supports_certificate_followup(engine, item)
         if wildcard_blocks_active_collection(
@@ -227,6 +223,8 @@ def plan_followup_collection(
         )
         if allow_dns:
             plan.dns_targets.append(host)
+            if engine is not None:
+                engine.authorize_hypothesis(host)
         if allow_http:
             plan.http_targets.append(host)
     return plan

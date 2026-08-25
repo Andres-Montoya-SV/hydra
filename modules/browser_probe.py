@@ -61,6 +61,9 @@ class BrowserProbePlugin(BaseToolPlugin):
         return "pip install -r requirements-optional.txt && playwright install webkit"
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
+        from core.intel.scope import require_collection_scope
+
+        require_collection_scope(context)
         try:
             from playwright.async_api import async_playwright
         except ImportError:
@@ -230,19 +233,23 @@ async def _write_html_artifact(
 
 
 def allow_browser_navigation(url: str, context: PipelineContext) -> bool:
-    """Document navigations must re-check CollectionScope. Redirects are not authorization."""
+    """Document navigations must re-check CollectionScope. Redirects are not authorization.
+
+    Missing CollectionScope is DENY, never allow.
+    """
     from core.intel.scope import allows_active_collection
 
     scope = getattr(context, "collection_scope", None)
     if scope is None:
-        return True
+        return False
     return allows_active_collection(url, scope)
 
 
 async def _install_scope_navigation_guard(page: object, context: PipelineContext) -> None:
-    """Abort in-browser document navigations whose hostname is not authorized."""
-    if getattr(context, "collection_scope", None) is None:
-        return
+    """Abort in-browser document navigations whose hostname is not authorized.
+
+    Always install. Missing CollectionScope aborts every navigation (fail closed).
+    """
 
     async def guard(route: object) -> None:
         try:
@@ -277,17 +284,18 @@ def _httpx_targets(context: PipelineContext) -> list[dict[str, str]]:
             if "://" in input_raw
             else (f"https://{input_raw}" if input_raw else probe_url)
         )
-        if scope is not None:
-            if allows_active_collection(probe_url, scope):
-                pass
-            elif allows_active_collection(input_url, scope):
-                probe_url = input_url
-            else:
-                continue
+        if scope is None:
+            continue
+        if allows_active_collection(probe_url, scope):
+            pass
+        elif allows_active_collection(input_url, scope):
+            probe_url = input_url
+        else:
+            continue
         host = _url_host(str(record.get("input") or probe_url))
         if not host:
             continue
-        if scope is not None and not allows_active_collection(host, scope):
+        if not allows_active_collection(host, scope):
             continue
         explicit_final = str(record.get("final_url") or "")
         location = str(record.get("location") or "")

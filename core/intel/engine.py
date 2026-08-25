@@ -26,11 +26,16 @@ from core.intel.correlate import (
     shares_certificate_confidence,
 )
 from core.intel.model import (
+    AttemptStatus,
+    CollectionAttempt,
+    CollectionCapability,
     CollectionStatus,
     CollectReason,
     ConfidenceBand,
     EntityType,
     Evidence,
+    Hypothesis,
+    HypothesisStatus,
     Indicator,
     IndicatorKind,
     IntelEntity,
@@ -86,6 +91,8 @@ class IntelSnapshot:
     evidence: dict[str, Evidence]
     relationships: dict[str, Relationship]
     indicators: list[Indicator]
+    hypotheses: list[Hypothesis] = field(default_factory=list)
+    collection_attempts: list[CollectionAttempt] = field(default_factory=list)
     truncated: bool = False
     truncation_reason: str | None = None
 
@@ -108,6 +115,8 @@ class IntelEngine:
         self.evidence: dict[str, Evidence] = {}
         self.relationships: dict[str, Relationship] = {}
         self.queue = IndicatorQueue(config.bounds)
+        self.hypotheses: dict[str, Hypothesis] = {}
+        self.attempts: list[CollectionAttempt] = []
         self._truncated = False
         self._truncation_reason: str | None = None
         seeds = [normalize_domain(s) for s in config.seed_domains if normalize_domain(s)]
@@ -138,6 +147,8 @@ class IntelEngine:
             evidence=self.evidence,
             relationships=self.relationships,
             indicators=self.queue.values(),
+            hypotheses=list(self.hypotheses.values()),
+            collection_attempts=list(self.attempts),
             truncated=self._truncated,
             truncation_reason=self._truncation_reason,
         )
@@ -570,6 +581,77 @@ class IntelEngine:
         self._correlate_shared_nameservers()
         self._correlate_shared_asn()
         self._correlate_http_identity()
+        self._emit_hypotheses()
+
+    def _emit_hypotheses(self) -> None:
+        """Relationships do not authorize collection. They may create hypotheses."""
+        collected = {normalize_domain(c) for c in self.config.collected_domains}
+        for rel in self.relationships.values():
+            if rel.relationship_type is not RelationshipType.SAN_CONTAINS:
+                continue
+            domain = rel.target_entity.removeprefix("domain:")
+            host = normalize_domain(domain)
+            if not host or host in collected:
+                continue
+            hid = stable_id("hypothesis", rel.relationship_id, host)
+            in_scope = allows_active_collection(host, self.scope)
+            status = HypothesisStatus.OPEN.value if in_scope else HypothesisStatus.REJECTED.value
+            rationale = (
+                "Observed SAN relationship; possible related infrastructure. "
+                "Not authorization to collect."
+                if in_scope
+                else "Observed SAN relationship is out of scope; not a collection command."
+            )
+            self.hypotheses[hid] = Hypothesis(
+                hypothesis_id=hid,
+                relationship_id=rel.relationship_id,
+                target_value=host,
+                evidence_id=rel.evidence_id,
+                confidence_band=rel.confidence.value,
+                status=status,
+                rationale=rationale,
+                depth=1,
+            )
+
+    def record_attempt(
+        self,
+        value: str,
+        *,
+        capability: CollectionCapability,
+        success: bool,
+        collector: str,
+        reason: str,
+        artifact: str = "",
+    ) -> CollectionAttempt:
+        item = self.queue.get(IndicatorKind.DOMAIN, value)
+        indicator_id = item.indicator_id if item else stable_id("indicator", "DOMAIN", value)
+        attempt = CollectionAttempt(
+            attempt_id=stable_id("attempt", indicator_id, capability.value, collector, reason),
+            indicator_id=indicator_id,
+            value=value,
+            capability=capability.value,
+            status=AttemptStatus.SUCCESS.value if success else AttemptStatus.FAILED.value,
+            reason=reason,
+            collector=collector,
+            observed_at=self.observed_at,
+            artifact=artifact,
+        )
+        self.attempts.append(attempt)
+        return attempt
+
+    def authorize_hypothesis(self, hostname: str) -> None:
+        host = normalize_domain(hostname)
+        for hyp in self.hypotheses.values():
+            if hyp.target_value == host and hyp.status == HypothesisStatus.OPEN.value:
+                hyp.status = HypothesisStatus.AUTHORIZED_FOR_COLLECTION.value
+
+    def reject_hypothesis(self, hostname: str, *, reason: str = "") -> None:
+        host = normalize_domain(hostname)
+        for hyp in self.hypotheses.values():
+            if hyp.target_value == host and hyp.status == HypothesisStatus.OPEN.value:
+                hyp.status = HypothesisStatus.REJECTED.value
+                if reason:
+                    hyp.rationale = reason
 
     def eligible_followups(
         self, kind: IndicatorKind | None = IndicatorKind.DOMAIN

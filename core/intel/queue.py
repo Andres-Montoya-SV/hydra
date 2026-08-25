@@ -132,9 +132,7 @@ class IndicatorQueue:
             self.budget_used += 1
         return indicator
 
-    def mark_collected(
-        self, kind: IndicatorKind, value: str, *, collector: str = ""
-    ) -> None:
+    def mark_collected(self, kind: IndicatorKind, value: str, *, collector: str = "") -> None:
         """COLLECTED only from IN_FLIGHT (or seed ingest that already succeeded)."""
         item = self.get(kind, value)
         if item is None:
@@ -146,6 +144,7 @@ class IndicatorQueue:
             CollectionStatus.REJECTED,
             CollectionStatus.FAILED,
             CollectionStatus.COLLECTED,
+            CollectionStatus.PARTIAL,
         }:
             return
         if item.collection_status in {
@@ -174,6 +173,12 @@ class IndicatorQueue:
         if item is None:
             return
         if item.collection_status is CollectionStatus.COLLECTED:
+            self._transition(item, CollectionStatus.PARTIAL, reason)
+            item.completed_at = utc_now_iso()
+            item.failure_reason = reason
+            return
+        if item.collection_status is CollectionStatus.PARTIAL:
+            item.failure_reason = reason
             return
         if item.collection_status in {
             CollectionStatus.IN_FLIGHT,

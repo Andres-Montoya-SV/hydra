@@ -41,6 +41,7 @@ class CollectionStatus(str, Enum):
     FAILED = "FAILED"
     NOT_ALLOWED = "NOT_ALLOWED"
     REJECTED = "REJECTED"
+    PARTIAL = "PARTIAL"
     # Entity projection: observed but not actively collected.
     NOT_COLLECTED = "NOT_COLLECTED"
 
@@ -50,6 +51,7 @@ class ConfidenceBand(str, Enum):
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
     LOW = "LOW"
+    VERY_LOW = "VERY_LOW"
 
 
 class RelationshipType(str, Enum):
@@ -252,6 +254,88 @@ class Indicator:
             "completed_at": self.completed_at,
             "failure_reason": self.failure_reason,
             "collector": self.collector,
+        }
+
+
+class HypothesisStatus(str, Enum):
+    OPEN = "OPEN"
+    AUTHORIZED_FOR_COLLECTION = "AUTHORIZED_FOR_COLLECTION"
+    REJECTED = "REJECTED"
+    RESOLVED = "RESOLVED"
+
+
+class CollectionCapability(str, Enum):
+    DNS_RESOLUTION = "DNS_RESOLUTION"
+    HTTP_COLLECTION = "HTTP_COLLECTION"
+    PORT_SCAN = "PORT_SCAN"
+    BROWSER_NAVIGATION = "BROWSER_NAVIGATION"
+    PASSIVE_LOOKUP = "PASSIVE_LOOKUP"
+    URL_ARCHIVE = "URL_ARCHIVE"
+    REGISTRATION = "REGISTRATION"
+    CLOUD_ENUM = "CLOUD_ENUM"
+    REPUTATION = "REPUTATION"
+    CRAWL = "CRAWL"
+
+
+class AttemptStatus(str, Enum):
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
+
+
+@dataclass
+class Hypothesis:
+    """A relationship is not a collection command. Hypotheses may become plans."""
+
+    hypothesis_id: str
+    relationship_id: str
+    target_value: str
+    evidence_id: str
+    confidence_band: str
+    status: str
+    rationale: str
+    depth: int = 1
+    kind: str = "RELATED_INFRASTRUCTURE"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "hypothesis_id": self.hypothesis_id,
+            "relationship_id": self.relationship_id,
+            "target_value": self.target_value,
+            "evidence_id": self.evidence_id,
+            "confidence_band": self.confidence_band,
+            "status": self.status,
+            "rationale": self.rationale,
+            "depth": self.depth,
+            "kind": self.kind,
+        }
+
+
+@dataclass
+class CollectionAttempt:
+    """One capability attempt against one indicator. Not the same as indicator.status."""
+
+    attempt_id: str
+    indicator_id: str
+    value: str
+    capability: str
+    status: str
+    reason: str
+    collector: str
+    observed_at: str
+    artifact: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "indicator_id": self.indicator_id,
+            "value": self.value,
+            "capability": self.capability,
+            "status": self.status,
+            "reason": self.reason,
+            "collector": self.collector,
+            "observed_at": self.observed_at,
+            "artifact": self.artifact,
         }
 
 

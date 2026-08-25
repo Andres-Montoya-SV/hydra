@@ -349,6 +349,38 @@ CREATE TABLE IF NOT EXISTS intel_indicators (
     FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 
+CREATE TABLE IF NOT EXISTS intel_hypotheses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    hypothesis_id TEXT NOT NULL,
+    relationship_id TEXT,
+    target_value TEXT NOT NULL,
+    evidence_id TEXT,
+    confidence_band TEXT,
+    status TEXT,
+    rationale TEXT,
+    depth INTEGER DEFAULT 1,
+    kind TEXT,
+    UNIQUE(run_id, hypothesis_id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS intel_collection_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    indicator_id TEXT,
+    value TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    collector TEXT,
+    observed_at TEXT,
+    artifact TEXT,
+    UNIQUE(run_id, attempt_id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_intel_entities_run ON intel_entities(run_id, entity_type);
 CREATE INDEX IF NOT EXISTS idx_intel_entities_key ON intel_entities(run_id, key);
 CREATE INDEX IF NOT EXISTS idx_intel_obs_entity ON intel_observations(run_id, entity_id);
@@ -574,6 +606,8 @@ class AssetStore:
             "clusters",
             "graph_edges",
             "graph_nodes",
+            "intel_collection_attempts",
+            "intel_hypotheses",
             "intel_indicators",
             "intel_relationships",
             "intel_evidence",
@@ -702,6 +736,33 @@ class AssetStore:
                         getattr(i, "collector", "") or "",
                     )
                     for i in indicators
+                ],
+            )
+
+    def upsert_intel_attempts(self, run_id: str, attempts) -> None:
+        """Persist collection attempts without wiping the rest of the run."""
+        if not attempts:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_collection_attempts
+                   (run_id, attempt_id, indicator_id, value, capability, status,
+                    reason, collector, observed_at, artifact)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        a.attempt_id,
+                        a.indicator_id,
+                        a.value,
+                        a.capability,
+                        a.status,
+                        a.reason,
+                        a.collector,
+                        a.observed_at,
+                        a.artifact,
+                    )
+                    for a in attempts
                 ],
             )
 
@@ -1521,6 +1582,56 @@ class AssetStore:
                     for i in intel.indicators
                 ],
             )
+        hypotheses = getattr(intel, "hypotheses", None) or []
+        if isinstance(hypotheses, dict):
+            hypotheses = list(hypotheses.values())
+        if hypotheses:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_hypotheses
+                   (run_id, hypothesis_id, relationship_id, target_value, evidence_id,
+                    confidence_band, status, rationale, depth, kind)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        h.hypothesis_id,
+                        h.relationship_id,
+                        h.target_value,
+                        h.evidence_id or None,
+                        h.confidence_band,
+                        h.status,
+                        h.rationale,
+                        h.depth,
+                        h.kind,
+                    )
+                    for h in hypotheses
+                ],
+            )
+        attempts = (
+            getattr(intel, "collection_attempts", None) or getattr(intel, "attempts", None) or []
+        )
+        if attempts:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_collection_attempts
+                   (run_id, attempt_id, indicator_id, value, capability, status,
+                    reason, collector, observed_at, artifact)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        a.attempt_id,
+                        a.indicator_id,
+                        a.value,
+                        a.capability,
+                        a.status,
+                        a.reason,
+                        a.collector,
+                        a.observed_at,
+                        a.artifact,
+                    )
+                    for a in attempts
+                ],
+            )
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -1730,7 +1841,9 @@ def _apply_prior_indicator_lifecycle(intel, prior_rows: list[dict[str, Any]]) ->
             if indicator.collection_status is not CollectionStatus.COLLECTED:
                 indicator.collection_status = CollectionStatus.FAILED
                 indicator.failure_reason = str(
-                    row.get("failure_reason") or getattr(indicator, "failure_reason", "") or "failed"
+                    row.get("failure_reason")
+                    or getattr(indicator, "failure_reason", "")
+                    or "failed"
                 )
         if row.get("claimed_at"):
             indicator.claimed_at = str(row.get("claimed_at"))

@@ -685,8 +685,51 @@ class PipelineRunner:
             return
         try:
             store.upsert_intel_indicators(context.run_id, engine.queue.values())
+            attempts = list(getattr(engine, "attempts", []) or [])
+            existing = context.metadata.setdefault("collection_attempts", [])
+            if not isinstance(existing, list):
+                existing = []
+                context.metadata["collection_attempts"] = existing
+            seen = {str(row.get("attempt_id") or "") for row in existing if isinstance(row, dict)}
+            for attempt in attempts:
+                payload = attempt.to_dict()
+                aid = str(payload.get("attempt_id") or "")
+                if aid and aid not in seen:
+                    existing.append(payload)
+                    seen.add(aid)
+            store.upsert_intel_attempts(context.run_id, attempts)
         except Exception:
             logger.exception("Failed to persist indicator lifecycle")
+
+    def _attach_collection_attempts(self, context: PipelineContext, intel) -> None:
+        if intel is None:
+            return
+        from core.intel.model import CollectionAttempt
+
+        rows = context.metadata.get("collection_attempts") or []
+        attached: list[CollectionAttempt] = []
+        seen: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            aid = str(row.get("attempt_id") or "")
+            if not aid or aid in seen:
+                continue
+            seen.add(aid)
+            attached.append(
+                CollectionAttempt(
+                    attempt_id=aid,
+                    indicator_id=str(row.get("indicator_id") or ""),
+                    value=str(row.get("value") or ""),
+                    capability=str(row.get("capability") or ""),
+                    status=str(row.get("status") or ""),
+                    reason=str(row.get("reason") or ""),
+                    collector=str(row.get("collector") or ""),
+                    observed_at=str(row.get("observed_at") or ""),
+                    artifact=str(row.get("artifact") or ""),
+                )
+            )
+        intel.collection_attempts = attached
 
     async def _maybe_collect_followups(self, context: PipelineContext, resolved_path: Path) -> None:
         """Bounded intelligence loop: ingest → authorize → collect → union → persist."""
@@ -766,8 +809,19 @@ class PipelineRunner:
             from core.intel.artifacts import successful_followup_hosts
 
             succeeded = successful_followup_hosts(context.output_dir, pass_no)
+            from core.intel.model import CollectionCapability
+
             for host in plan.dns_targets:
-                if host in succeeded:
+                ok = host in succeeded
+                engine.record_attempt(
+                    host,
+                    capability=CollectionCapability.DNS_RESOLUTION,
+                    success=ok,
+                    collector="dnsx",
+                    reason="followup_dns" if ok else "followup_dns_empty",
+                    artifact=f"resolved_followup_{pass_no}.txt",
+                )
+                if ok:
                     engine.queue.mark_collected(IndicatorKind.DOMAIN, host, collector="dnsx")
                 else:
                     engine.queue.mark_failed(
@@ -808,13 +862,22 @@ class PipelineRunner:
         from core.intel.artifacts import successful_followup_http_hosts
 
         http_ok = successful_followup_http_hosts(context.output_dir, pass_no)
+        from core.intel.model import CollectionCapability
+
         for host in http_targets:
-            if host in http_ok:
+            ok = host in http_ok
+            engine.record_attempt(
+                host,
+                capability=CollectionCapability.HTTP_COLLECTION,
+                success=ok,
+                collector="httpx",
+                reason="followup_http" if ok else "followup_http_empty",
+                artifact=f"alive_followup_{pass_no}.txt",
+            )
+            if ok:
                 engine.queue.mark_collected(IndicatorKind.DOMAIN, host, collector="httpx")
             else:
-                engine.queue.mark_failed(
-                    IndicatorKind.DOMAIN, host, reason="followup_http_empty"
-                )
+                engine.queue.mark_failed(IndicatorKind.DOMAIN, host, reason="followup_http_empty")
         self._persist_indicators(context, engine)
 
     def _merge_dnsx_followup(self, context: PipelineContext, pass_no: int = 1) -> None:
@@ -929,11 +992,12 @@ class PipelineRunner:
                 if not svc.url or svc.url in context.alive_urls:
                     continue
                 scope = getattr(context, "collection_scope", None)
-                if scope is not None:
-                    from core.intel.scope import allows_active_collection
+                if scope is None:
+                    continue
+                from core.intel.scope import allows_active_collection
 
-                    if not allows_active_collection(svc.url, scope):
-                        continue
+                if not allows_active_collection(svc.url, scope):
+                    continue
                 context.alive_urls.append(svc.url)
 
         context.store_warnings.extend(registry.warnings)
@@ -944,12 +1008,14 @@ class PipelineRunner:
         context.metadata["graph_nodes"] = len(registry.graph.nodes)
         context.metadata["graph_edges"] = len(registry.graph.edges)
 
+        intel = registry.intel
+        self._attach_collection_attempts(context, intel)
         store.persist_registry(
             context.run_id,
             hosts,
             clusters=registry.clusters,
             graph=registry.graph,
-            intel=registry.intel,
+            intel=intel,
         )
 
         store.finish_run(
@@ -1253,24 +1319,23 @@ class PipelineRunner:
 
                 rebuilt: list[str] = []
                 scope = getattr(context, "collection_scope", None)
-                if scope is not None:
+                if scope is None:
+                    context.alive_urls = []
+                else:
                     for rec in context.httpx_results:
                         url = authorized_alive_url(rec, scope)
                         if url:
                             rebuilt.append(url)
                     context.alive_urls = filter_authorized_indicators(rebuilt, scope)
-                else:
-                    context.alive_urls = [
-                        str(rec.get("url") or rec.get("input") or "")
-                        for rec in context.httpx_results
-                        if rec.get("url") or rec.get("input")
-                    ]
             self._restrict_alive_to_scope(context)
 
     def _restrict_alive_to_scope(self, context: PipelineContext) -> None:
         """alive.txt consumers must never inherit out-of-scope redirect landings."""
         scope = getattr(context, "collection_scope", None)
-        if scope is None or not context.alive_urls:
+        if not context.alive_urls:
+            return
+        if scope is None:
+            context.alive_urls = []
             return
         from core.intel.scope import filter_authorized_indicators
 

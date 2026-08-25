@@ -434,3 +434,33 @@ def test_plugin_scope_object_does_not_authorize_oos() -> None:
     result = authorize_active_indicator(OOS, scope, "httpx", "has_scope_object")
     assert result.decision is AuthorizationDecision.DENY
     assert not result.allowed
+
+
+def test_missing_scope_is_deny_not_allow() -> None:
+    from core.intel.authorize import authorize_collection
+    from modules.browser_probe import _httpx_targets, allow_browser_navigation
+    from modules.threat_intel import _alive_hosts
+    from modules.vuln_match import _collect_techs
+
+    context = PipelineContext(output_dir=Path("/tmp"), targets=[DomainTarget(domain=SEED)])
+    context.httpx_results = [
+        {
+            "input": SEED,
+            "url": f"https://{SEED}/",
+            "host": SEED,
+            "tech": ["nginx:1.25.0"],
+        }
+    ]
+    assert allow_browser_navigation(f"https://{SEED}/", context) is False
+    assert _httpx_targets(context) == []
+    assert _alive_hosts(context) == []
+    assert _collect_techs(context) == []
+    blocked = authorize_collection(
+        SEED,
+        CollectionScope.from_seeds([SEED]),
+        capability="DNS_RESOLUTION",
+        strict_opsec=True,
+        opsec_allowed=False,
+    )
+    assert blocked.decision is AuthorizationDecision.DENY
+    assert blocked.reason == "opsec_blocked"

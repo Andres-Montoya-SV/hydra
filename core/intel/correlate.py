@@ -14,6 +14,7 @@ BAND_SCORE: dict[ConfidenceBand, int] = {
     ConfidenceBand.HIGH: 88,
     ConfidenceBand.MEDIUM: 65,
     ConfidenceBand.LOW: 40,
+    ConfidenceBand.VERY_LOW: 20,
 }
 
 IDENTIFIED_CERTIFICATE_KINDS = frozenset({"sha256", "serial_issuer"})

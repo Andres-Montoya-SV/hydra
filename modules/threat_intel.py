@@ -124,7 +124,7 @@ def _alive_hosts(context: PipelineContext) -> list[str]:
         host = normalize_domain(parsed.hostname or raw.split(":")[0])
         if not host:
             continue
-        if scope is not None and not allows_active_collection(host, scope):
+        if scope is None or not allows_active_collection(host, scope):
             continue
         hosts.add(host)
     return sorted(hosts)

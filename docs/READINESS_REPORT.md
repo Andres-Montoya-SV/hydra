@@ -3,11 +3,13 @@
 **Date:** 2026-08-24  
 **Repository:** this workspace (`Andres-Montoya-SV/hydra`)  
 **Method:** forensic runtime audit (`docs/ARCHITECTURE_AUDIT.md`), control-loop refactor, then a second adversarial review that treated the new code as untrusted.  
-**Test proof used:** 355 pytest cases, including `PipelineRunner.run()` and `app.main()` with stubbed collectors. Tests that copy finished artifacts and call `finalize` were not counted as proof of the loop.
+**Test proof used:** 356 pytest cases, including `PipelineRunner.run()` and `app.main()` with stubbed collectors. Tests that copy finished artifacts and call `finalize` were not counted as proof of the loop.
 
 **Verdict: READY FOR CONTROLLED BETA**
 
-This is not `READY`. Residual tool-level fetches, browser subresources, and crawler-internal navigation are still not fully bound by `authorize_active_indicator`. It is also not `NOT READY`: the production path is now collect → intelligence → authorize → follow-up sidecars → union → evidence → SQLite → explanation, and that path is exercised by `PipelineRunner` and `python app.py run`.
+This is not `READY`. Residual tool-level fetches, browser subresources, and crawler-internal navigation are still not fully bound by `authorize_collection`. It is also not `NOT READY`: the production path is collect → intelligence → authorize → follow-up sidecars → union → evidence → hypothesis → collection attempts → SQLite → explanation.
+
+**Post-audit hardening (same day):** P0 fail-open paths (`scope is None → allow`) in browser_probe, threat_intel, vuln_match, dnsx output, and runner alive rebuild were inverted to DENY. `Hypothesis` and `CollectionAttempt` are persisted. CI `black --check` is clean. See `docs/ARCHITECTURE.md`.
 
 ---
 
@@ -91,7 +93,12 @@ SQLite remains `output/recon.db`. Foreign keys stay enabled.
 - `failure_reason`
 - `collector`
 
-`persist_registry` reads prior indicator rows **before** `clear_run_data`. Leftover `IN_FLIGHT` becomes `FAILED` (`interrupted_in_flight`). Finalize never invents `COLLECTED`. Mid-run `upsert_intel_indicators` records queue state so a crash is distinguishable from “never discovered” and from `NOT_ALLOWED`.
+New tables (`CREATE TABLE IF NOT EXISTS` on connect; existing DBs migrate safely):
+
+- `intel_hypotheses` — relationship-derived collection hypotheses (not authorization)
+- `intel_collection_attempts` — per-capability SUCCESS/FAILED (DNS vs HTTP)
+
+`persist_registry` reads prior indicator rows **before** `clear_run_data`. Leftover `IN_FLIGHT` becomes `FAILED` (`interrupted_in_flight`). Finalize never invents `COLLECTED`. Mid-run `upsert_intel_indicators` / `upsert_intel_attempts` record queue and attempt state. A later follow-up pass **merges** attempts; it does not wipe the first pass.
 
 ## 5. New invariants
 

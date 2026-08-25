@@ -160,5 +160,37 @@ def authorize_active_indicator(
     )
 
 
+def authorize_collection(
+    indicator: str,
+    collection_scope: CollectionScope | None,
+    *,
+    capability: str,
+    operation: str = "",
+    reason: str = "",
+    strict_opsec: bool = False,
+    opsec_allowed: bool = True,
+) -> AuthorizationResult:
+    """Compose scope, capability label, and OPSEC. All four must pass.
+
+    AUTHORIZED = IN_SCOPE AND capability requested AND OPSEC_ALLOWED.
+    Budget is enforced by the planner, not this function.
+    """
+    op = (operation or capability or "active_collection").strip()
+    if strict_opsec and not opsec_allowed:
+        host, _error = parse_indicator_hostname(indicator)
+        return AuthorizationResult(
+            AuthorizationDecision.DENY,
+            host,
+            op,
+            "opsec_blocked",
+        )
+    return authorize_active_indicator(
+        indicator,
+        collection_scope,
+        op,
+        reason or capability or "authorize_collection",
+    )
+
+
 def decision_allows_collection(result: AuthorizationResult) -> bool:
     return result.decision is AuthorizationDecision.ALLOW

@@ -119,7 +119,9 @@ def _install_loop_stubs(runner: PipelineRunner) -> dict[str, list[str]]:
             [SEED, WWW, OOS],
             base_dir=context.output_dir,
         )
-        merged = list(dict.fromkeys(read_lines(context.output_dir / "subdomains.txt") + [SEED, WWW, OOS]))
+        merged = list(
+            dict.fromkeys(read_lines(context.output_dir / "subdomains.txt") + [SEED, WWW, OOS])
+        )
         write_lines(context.output_dir / "subdomains.txt", merged, base_dir=context.output_dir)
         context.subdomains = merged
         return PluginResult(
@@ -253,6 +255,20 @@ async def test_pipeline_runner_authorized_followup_loop(tmp_path: Path, capsys) 
         (context.run_id,),
     ).fetchone()["c"]
     assert evidence_count > 0
+    hyp_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM intel_hypotheses WHERE run_id=?",
+        (context.run_id,),
+    ).fetchone()["c"]
+    assert hyp_count > 0
+    attempt_caps = {
+        row["capability"]
+        for row in conn.execute(
+            "SELECT capability, status FROM intel_collection_attempts WHERE run_id=?",
+            (context.run_id,),
+        )
+    }
+    assert "DNS_RESOLUTION" in attempt_caps
+    assert "HTTP_COLLECTION" in attempt_caps
     conn.close()
 
     assert cmd_investigate(db_path, SEED, context.run_id, None) == 0
@@ -264,6 +280,11 @@ async def test_pipeline_runner_authorized_followup_loop(tmp_path: Path, capsys) 
     assert relationships["relationships"]
     assert relationships["relationships"][0]["relationship_id"]
     assert relationships["relationships"][0]["confidence_band"]
+    assert (
+        relationships["relationships"][0]["rationale"]
+        or relationships["relationships"][0]["explanation"]
+    )
+    assert "evidence_ids" in relationships["relationships"][0]
     assert cmd_evidence(db_path, SEED, context.run_id) == 0
 
     assets = json.loads((output_dir / "assets.json").read_text(encoding="utf-8"))

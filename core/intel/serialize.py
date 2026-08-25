@@ -47,6 +47,21 @@ def serialize_relationship(
             target_entity=target_entity,
         )
         explanation = str(explained.get("text") or "")
+    evidence_ids = []
+    eid = row.get("evidence_id") or evidence_row.get("evidence_id")
+    if eid:
+        evidence_ids.append(eid)
+    extra_ids = data.get("evidence_ids") or evidence_meta.get("evidence_ids") or []
+    if isinstance(extra_ids, list):
+        for item in extra_ids:
+            if item and item not in evidence_ids:
+                evidence_ids.append(item)
+    observed_at = (
+        evidence_row.get("observed_at")
+        or data.get("observed_at")
+        or evidence_meta.get("observed_at")
+        or ""
+    )
     return {
         "relationship_id": row.get("relationship_id"),
         "source_entity": row.get("source_entity"),
@@ -54,7 +69,8 @@ def serialize_relationship(
         "relationship_type": row.get("relationship_type"),
         "confidence_band": row.get("confidence") or row.get("confidence_band"),
         "strength": row.get("strength"),
-        "evidence_id": row.get("evidence_id") or evidence_row.get("evidence_id"),
+        "evidence_id": eid,
+        "evidence_ids": evidence_ids,
         "evidence_type": evidence_row.get("reason") or row.get("strength") or "",
         "certificate_fingerprint": fingerprint,
         "certificate_serial": serial,
@@ -64,7 +80,26 @@ def serialize_relationship(
         "source_plugin": evidence_row.get("collector") or data.get("collector") or "",
         "run_id": run_id or row.get("run_id") or "",
         "explanation": explanation,
+        "rationale": explanation,
+        "observed_at": observed_at,
+        "collection_status": (
+            (source_entity or {}).get("collection_status")
+            or (target_entity or {}).get("collection_status")
+            or row.get("collection_status")
+            or ""
+        ),
+        "scope_status": (
+            (source_entity or {}).get("scope_status")
+            or (target_entity or {}).get("scope_status")
+            or row.get("scope_status")
+            or ""
+        ),
     }
+
+
+def relationship_view(*args, **kwargs) -> dict[str, Any]:
+    """Canonical RelationshipView. Reporters must not invent a second serializer."""
+    return serialize_relationship(*args, **kwargs)
 
 
 def serialize_relationships(

@@ -1,221 +1,126 @@
-# Hydra architecture
+# Hydra current-state architecture audit
 
-Hydra is an evidence-driven infrastructure intelligence engine. SQLite is the
-source of truth. The in-memory graph is a derived view. Host remains the
-reporting projection.
+**Date:** 2026-08-24  
+**Method:** runtime code, not README / prior reports. Entry: `python app.py run -d <target>` → `PipelineRunner.run()`.  
+**Rule:** observation is not authorization. Tests and comments were treated as untrusted.
 
-This document describes the system **as implemented**. `docs/ARCHITECTURE_CURRENT.md`
-is the runtime checklist (bounds, CLI, schema, collect vs observe).
+This document is the Phase 1 map. Implementation follows it; it is not a marketing recap of the previous refactor.
 
 ---
 
-## Control flow
+## Runtime map
 
 ```
-indicator (CLI seed)
-  → collectors (subprocess-isolated plugins)
-  → artifacts
-  → parsers → Host (reporting view)
-  → IntelEngine
-       entities / observations / evidence / relationships
-       scope-aware indicator queue
-  → optional bounded follow-up (depth ≤ MAX_DISCOVERY_DEPTH)
-  → correlation (named signals, not magic integers)
-  → SQLite persist
-  → query CLI / reports / field-level diff
+app.py:main
+  load_settings → cmd_run
+    ToolManager + PipelineRunner.run
+      CollectionScope.from_seeds (always attached if runner runs)
+      plugins (whois → enum → CT → seed dnsx → httpx → optional → follow-up)
+      IntelEngine ingest/correlate (follow-up + finalize)
+      AssetStore SQLite
+      ReportGenerator + CLI query
 ```
 
-Collection is no longer assumed to happen once. Follow-up is explicit, bounded,
-and refused for `OUT_OF_SCOPE` / `UNKNOWN`.
+Network sinks (actual I/O):
+
+| Sink | Module | Hostname source | Gate today |
+|---|---|---|---|
+| subprocess argv | `utils/subprocess.py` (no `shell=True`) | plugin argv | plugin-specific |
+| dnsx | `modules/dnsx.py` | authorized input file | `_authorized_input`; **output filter skipped if scope is None** |
+| httpx `-follow-redirects` | `modules/httpx.py` | authorized input | input gated; **binary still fetches OOS Location once** |
+| naabu / nmap | naabu, port_verify | authorized resolved / naabu list | `_authorized_input` |
+| katana | `modules/katana.py` | `authorized_alive.txt` | input gated; **tool-internal crawl ungated** |
+| hakrawler `-depth 2` | `modules/hakrawler.py` | `_alive_urls()` | input gated; **in-page crawl ungated** |
+| nuclei | `modules/nuclei.py` | authorized alive | input gated; **templates may hit derived URLs** |
+| Playwright | `modules/browser_probe.py` | httpx URLs | **FAIL OPEN if scope is None**; subresources not aborted |
+| urllib HTTPS | ctlogs, threat_intel, vuln_match, cloud, param_fuzz, soft404 | seeds / hosts / derived | mixed |
+| sockets | `modules/asn_lookup.py` | resolved IPs | Team Cymru; IPs not hostname-gated |
+| whois binary | `modules/whois.py` | target roots | `authorize_active_indicator` per root |
+| gau / waybackurls | archive APIs | seeds | per-seed authorize |
+| cloud_bucket_enum | derived FQDNs | brand permute | policy flag + require scope |
+
+No `os.system`, no `shell=True` execution, no `requests`/`aiohttp` in-tree.
 
 ---
 
-## Entity model
+## Invariant vs implementation
 
-Independently addressable entities (stable IDs):
+| Invariant | Current | Violation | Sev | Files | Correction |
+|---|---|---|---|---|---|
+| A Observation ≠ authorization | CT SANs observed; OOS kept out of canonical alive/resolved when scope exists | none for canonical artifacts when runner attached scope | — | engine, httpx, artifacts | keep |
+| B Fail closed without CollectionScope | `require_collection_scope` on `_output_path` for `active_collection=True` | **browser_probe `allow_browser_navigation` returns True if scope is None**; `_install_scope_navigation_guard` no-ops; `_httpx_targets` probes all records; threat_intel `_alive_hosts` queries all; vuln_match `_collect_techs` uses all; dnsx output unfiltered | **P0** | `browser_probe.py`, `threat_intel.py`, `vuln_match.py`, `dnsx.py`, `runner.py` `_restrict_alive_to_scope` | require scope; DENY |
+| C One authorization API | `authorize_active_indicator` + `allows_active_collection` wrapper | OPSEC is a separate runner skip list, not in the same primitive; plugins still mix `allows_*` vs `authorize_*` vs ad-hoc `if scope is not None` | P1 | `authorize.py`, plugins, `runner.py` | `authorize_collection(indicator, scope, capability, opsec)` used everywhere |
+| D Redirects never expand auth | httpx withholds OOS landing from alive | tool still follows; stored `httpx.json` may contain OOS URL as observation (intentional) | P2 residual | `httpx.py` | keep observation; do not add to alive; document fetch-once |
+| E alive/resolved derived | seed snapshots + follow-up sidecars + union | runner still mutates `context.alive_urls`; union uses files (good) | P2 | `runner.py`, `artifacts.py` | keep files authoritative |
+| F COLLECTED only on success | queue + sidecar presence | no per-capability attempt row; DNS success + HTTP fail still one indicator status | P1 | `queue.py`, `runner.py` | `CollectionAttempt` + `PARTIAL` |
+| G Collection attempts first-class | **missing** | overloaded `indicator.collection_status` | P1 | model, store | new table |
+| Hypothesis type | **missing** | planner consumes indicators; correlation can enqueue without an explicit hypothesis object | P1 | model, engine, followup | `Hypothesis` → plan |
+| Intel is correlation truth | intel_relationships + serialize | Host graph still built independently (CDN/ASN LOW) | P2 | `intelligence/graph.py` | keep as projection only |
+| Certificate identity | fingerprint → serial+issuer → unidentified | CT can be unidentified; SHARES_CERTIFICATE skipped without identity | ok | `engine.py` | keep; tests |
+| Wildcard | seed DNS policy + follow-up | — | ok | followup.py, runner `_seed_dns_input` | keep |
+| Cloud endpoints | policy required | cloud plugin still HTTP-gets canary `*.s3.amazonaws.com` when policy on | ok if policy | cloud_bucket_enum.py | keep fail-closed default |
+| STRICT_OPSEC vs scope | runner skips plugins | not composed in authorize() | P1 | authorize, runner | compose |
+| Hypothesis/attempts in SQLite | **missing tables** | cannot reconstruct DNS SUCCESS / HTTP FAILED | P1 | store.py | migrate |
+| RelationshipView | `serialize_relationship()` | missing `evidence_ids`, `rationale`, `scope_status`, `collection_status` on the view | P2 | serialize.py | extend, do not fork |
+| CI format | ruff format locally | **black --check fails on 8 files** | P0 CI | listed below | run `black` |
 
-| Type | ID |
-|---|---|
-| Domain | `domain:{normalized}` |
-| IPAddress | `ip_address:{addr}` |
-| Certificate | `certificate:{sha256}` |
-| ASN | `asn:{asn}` |
-| Nameserver | `nameserver:{fqdn}` |
-| URL / HTTPService / Technology | keyed by URL or name |
+Black-unformatted (CI):
 
-Certificate identity is the leaf SHA-256 fingerprint. It does **not** depend on
-sorted SANs, the first N SANs, or hostname. CT records without a fingerprint
-use `crtsh:{id}` or `serial:{issuer,serial}` as a provisional key and are
-merged onto the fingerprint entity when the SAN set matches a later TLS
-observation.
-
-`Host` is not deleted. It is a reporting view over collected domains: IPs,
-certificates, HTTP services, technologies, observations, and relationships.
-
----
-
-## Observation model
-
-Every observation records what, where, when, how, and scope status.
-
-`virusinspector.top` observed as a SAN on `certificate:ABC` (source
-`certificate_transparency` / `tls`) is not collapsed into "subfinder found a
-host". Provenance types stay distinct.
-
----
-
-## Relationship and evidence model
-
-Relationships are first-class SQLite rows:
-
-- `PRESENTS_CERTIFICATE` (VERY_HIGH — leaf fingerprint)
-- `SAN_CONTAINS` (VERY_HIGH)
-- `RESOLVES_TO`
-- `SHARES_CERTIFICATE` (HIGH only for identified certs with modest SAN
-  diversity; decays to MEDIUM/LOW as SAN / eTLD+1 cardinality grows;
-  unidentified certificates do not create this edge)
-- `SHARES_IPV4` / `SHARES_IPV6` (MEDIUM on cloud tenancy, HIGH otherwise)
-- `SHARES_NAMESERVER` / `SHARES_ASN` (MEDIUM)
-- `SHARES_FAVICON` / `SHARES_BODY_HASH` (MEDIUM unless an independent
-  second signal corroborates the pair)
-- `SHARES_TLS_CHARACTERISTICS` (LOW)
-
-Each row has `confidence` (named band), `strength` (named reason),
-`evidence_id`, `first_seen`, `last_seen`. Evidence answers why the edge exists.
-
-Hydra does **not** create actor, owner, threat-actor, or campaign entities.
+- `core/intel/followup.py`
+- `core/intel/queue.py`
+- `modules/katana.py`
+- `modules/nuclei.py`
+- `modules/waybackurls.py`
+- `core/store.py`
+- `core/runner.py`
+- `tests/test_asi_loop_e2e.py`
 
 ---
 
-## Scope model
+## Follow-up / intelligence loop (as coded)
 
-| Status | Active collection |
-|---|---|
-| `IN_SCOPE` | Allowed (still subject to bounds) |
-| `OUT_OF_SCOPE` | Forbidden — observation only |
-| `UNKNOWN` | Forbidden |
+Pass 0: seed collect (enum files → `authorized_dns_targets.txt`, not full CT merge) → httpx → snapshot seed DNS/HTTP.
 
-Seeds are in scope. With `SCOPE_FILE`, that file is authorization. Without it,
-only names under a seed's registrable domain are in scope. Off-root certificate
-SANs are recorded as `OUT_OF_SCOPE` / `NOT_ALLOWED` and are not DNS-resolved or
-HTTP-probed.
+Pass 1+: `IntelEngine.ingest_artifacts` → `correlate` → `plan_followup_collection` (authorize + evidence + wildcard) → sidecar collect → authorized union → persist indicators.
 
-Discovery ≠ authorization.
+Stop: `MAX_DISCOVERY_DEPTH`, probe budgets, `MAX_RUNTIME`. Second `_maybe_collect_followups` exists after optional plugins.
+
+**Gap:** there is no `Hypothesis` object. A SAN_CONTAINS relationship plus an ELIGIBLE indicator is the implicit hypothesis. That is correlation adjacent to collection, not a typed plan.
+
+**Gap:** `COLLECTED` is hostname-level, not capability-level.
 
 ---
 
-## Indicator lifecycle
+## SQLite
 
-```
-OBSERVED → (optional) RELATED → scope check
-  IN_SCOPE + depth ≤ max → ELIGIBLE_FOR_COLLECTION → COLLECTED
-  else → NOT_ALLOWED / NOT_COLLECTED
-```
-
-The queue deduplicates, stores parent, reason (`CERTIFICATE_SAN`,
-`DNS_RESOLUTION`, `SEED`, …), depth, and evidence.
+WAL + `foreign_keys=ON` on connect. Intel tables: entities, observations, evidence, relationships, indicators (+ lifecycle columns). No `intel_hypotheses`, no `intel_collection_attempts`. Truncation flags on `runs`.
 
 ---
 
-## Collection lifecycle and bounds
+## Reporting
 
-Configurable (conservative defaults):
-
-- `MAX_DISCOVERY_DEPTH` (default 1)
-- `MAX_FOLLOWUP_INDICATORS` (50)
-- `MAX_HTTP_PROBES` / `MAX_DNS_PROBES`
-- `MAX_RUNTIME`
-- `MAX_ENTITIES` / `MAX_RELATIONSHIPS`
-- `ENABLE_FOLLOWUP_COLLECTION`
-
-Depth 0 is the original target. Depth 1 is a direct CT/TLS/DNS discovery.
-There is no unbounded recursion.
+CLI/HTML/MD/JSON use `serialize_relationship`. Host clusters/graph remain a reporting projection.
 
 ---
 
-## Correlation semantics
+## What is already true (do not regress)
 
-Same leaf certificate fingerprint is strong infrastructure evidence
-(`VERY_HIGH`/`HIGH`). A shared Google Cloud IP (`34.0.0.0/8`, including
-`34.75.127.116`) is `shared_cloud_tenancy` at `MEDIUM`. It is not treated as
-dedicated ownership and does not become "same actor".
-
----
-
-## Historical model
-
-`core/diff.py` compares the current run to the most recent **finished** run
-whose target set overlaps. It does not use `others[0]`.
-
-Field changes include IP/IPv4/IPv6, certificate fingerprint, SAN add/remove,
-validity, ports, HTTP status/title, technologies, favicon/body hash, ASN, and
-nameservers.
+- No `shell=True` / `os.system`
+- Structured subprocess argv, path confinement, output caps
+- SQLite not Neo4j
+- Fingerprint-first certificates; SAN equality does not merge
+- Follow-up sidecars; seed snapshots survive empty/crash
+- Planner rejects spoofed `CERTIFICATE_SAN` without evidence
+- `UNKNOWN` authorization fails closed in `authorize_active_indicator`
+- Presence of a CollectionScope object is not authorization of a hostname
 
 ---
 
-## Query CLI
+## Implementation order after this audit
 
-These read `output/recon.db` and do not rescan:
-
-```
-python app.py investigate DOMAIN
-python app.py investigate --entity DOMAIN
-python app.py graph DOMAIN
-python app.py relationships DOMAIN
-python app.py evidence DOMAIN
-python app.py evidence RELATIONSHIP_ID
-python app.py certificates DOMAIN
-python app.py indicators DOMAIN
-python app.py diff DOMAIN
-python app.py diff RUN_A RUN_B
-```
-
-`investigate` includes `explanations` (fingerprint, SAN cardinality, tenancy,
-named confidence, `active_collection`). Graph is a neighborhood view over
-`intel_entities` / `intel_relationships`, not `graph_*` tables.
-
----
-
-## Graph
-
-Derived from SQLite. Certificate nodes use `certificate:{sha256}`. Edges carry
-relationship type, named confidence, evidence id, first_seen, last_seen.
-
----
-
-## Risk
-
-Surface risk (`core/intelligence/risk.py`) answers "what deserves attention?"
-(auth endpoints, weak TLS, findings).
-
-Correlation answers "what is technically related?" Shared certificate count may
-be attached as an explainable Host note. Shared cloud IP is labeled tenancy,
-not criticality.
-
-Attribution is never generated.
-
----
-
-## Extension model
-
-Plugins remain subprocess-isolated. They may attach
-`PluginResult.data["intel"]` as a `StructuredEmission`:
-
-```python
-produces: ["Domain", "Certificate"]
-domains / ip_addresses / certificates
-relationships: [{relationship_type, source_entity, target_entity, ...}]
-followups: [{kind, reason}]
-```
-
-Artifact files and parsers still work. A collector does not need a new parser
-class to land structured entities, but runner stage placement and a settings
-flag are still required for a new external tool.
-
----
-
-## Security model
-
-Unchanged controls: no `shell=True`, output caps, path confinement,
-`STRICT_OPSEC`, scope fail-closed on seeds, wildcard/tarpit/soft-404, certifi
-HTTPS, hostile parser input. Scope is now also enforced per indicator.
+1. Fail-closed every `if scope is None: allow` path.
+2. `authorize_collection` = scope + capability + OPSEC composition.
+3. `Hypothesis` + `CollectionAttempt` types, SQLite, planner/runner wiring.
+4. Extend `RelationshipView` fields; one serializer.
+5. Black format + adversarial tests for the new fail-closed paths and attempts/hypotheses.
+6. Honest claims only.

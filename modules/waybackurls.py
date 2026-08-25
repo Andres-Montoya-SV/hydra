@@ -37,9 +37,7 @@ class WaybackurlsPlugin(BaseToolPlugin):
         domains = [
             t.domain
             for t in context.targets
-            if authorize_active_indicator(
-                t.domain, scope, "waybackurls", "seed_archive"
-            ).allowed
+            if authorize_active_indicator(t.domain, scope, "waybackurls", "seed_archive").allowed
         ]
         results: list[PluginResult] = []
 
