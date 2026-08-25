@@ -150,6 +150,7 @@ class Settings:
     threads: int = 50
     rate_limit: int = 150
     httpx_threads: int = 50
+    httpx_max_redirect_hops: int = 10
     user_agent: str = "hydra/1.0"
     log_level: str = "INFO"
     default_output_format: str = "json"
@@ -328,6 +329,9 @@ class Settings:
             threads=_int(os.getenv("THREADS"), 50, "THREADS"),
             rate_limit=_int(os.getenv("RATE_LIMIT"), 150, "RATE_LIMIT"),
             httpx_threads=_int(os.getenv("HTTPX_THREADS"), 50, "HTTPX_THREADS"),
+            httpx_max_redirect_hops=_int(
+                os.getenv("HTTPX_MAX_REDIRECT_HOPS"), 10, "HTTPX_MAX_REDIRECT_HOPS", maximum=50
+            ),
             user_agent=_validate_user_agent(os.getenv("USER_AGENT", "hydra/1.0")),
             log_level=validate_log_level(os.getenv("LOG_LEVEL", "INFO")),
             default_output_format=os.getenv("DEFAULT_OUTPUT_FORMAT", "json").strip().lower(),
@@ -681,6 +685,7 @@ class Settings:
             "threads": self.threads,
             "rate_limit": self.rate_limit,
             "httpx_threads": self.httpx_threads,
+            "httpx_max_redirect_hops": self.httpx_max_redirect_hops,
             "log_level": self.log_level,
             "default_output_format": self.default_output_format,
             "enable_cache": self.enable_cache,

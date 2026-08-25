@@ -19,6 +19,7 @@ from urllib.parse import urljoin, urlparse
 
 from core.assets import normalize_domain
 from core.exceptions import ValidationError
+from core.logger import get_logger
 from core.models import PipelineContext, ToolStatus
 from core.plugin_base import PluginResult
 from modules._base import BaseToolPlugin
@@ -29,6 +30,8 @@ from utils.security import (
     validate_output_path,
     validate_safe_filename,
 )
+
+logger = get_logger("browser_probe")
 
 _IPHONE_USER_AGENT = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
@@ -249,6 +252,8 @@ async def _install_scope_navigation_guard(page: object, context: PipelineContext
     """Abort in-browser document navigations whose hostname is not authorized.
 
     Always install. Missing CollectionScope aborts every navigation (fail closed).
+    An exception while evaluating authorization also aborts (fail closed) — a
+    bug in the scope check must never fall open into an unauthorized request.
     """
 
     async def guard(route: object) -> None:
@@ -260,7 +265,12 @@ async def _install_scope_navigation_guard(page: object, context: PipelineContext
                 await route.abort("blockedbyclient")
                 return
         except Exception:
-            await route.continue_()
+            logger.warning(
+                "browser_probe: navigation guard raised while evaluating %s; blocking (fail closed)",
+                getattr(getattr(route, "request", None), "url", "<unknown>"),
+                exc_info=True,
+            )
+            await route.abort("blockedbyclient")
             return
         await route.continue_()
 

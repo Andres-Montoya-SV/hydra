@@ -437,8 +437,9 @@ def _load_intel_rows(
     except Exception:
         return {}
     try:
+        # table is checked against the allow-list above; run_id is bound, not interpolated
         rows = conn.execute(
-            f"SELECT * FROM {table} WHERE run_id=?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE run_id=?",  # noqa: S608 # nosec B608
             (run_id,),
         ).fetchall()
     except Exception:

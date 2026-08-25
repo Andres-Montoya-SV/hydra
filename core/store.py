@@ -877,10 +877,11 @@ class AssetStore:
                     ids = [r.get("evidence_id") for r in rels if r.get("evidence_id")]
                     if ids:
                         placeholders = ",".join("?" * len(ids))
+                        # placeholders is a fixed count of '?' chars; all values are bound params
                         evidence_rows = [
                             dict(row)
                             for row in conn.execute(
-                                f"SELECT * FROM intel_evidence WHERE run_id=? AND evidence_id IN ({placeholders})",  # noqa: S608
+                                f"SELECT * FROM intel_evidence WHERE run_id=? AND evidence_id IN ({placeholders})",  # noqa: S608 # nosec B608
                                 [run_id, *ids],
                             ).fetchall()
                         ]

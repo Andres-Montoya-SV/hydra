@@ -48,7 +48,7 @@ Order is from `core/runner.py` `run()`, not from plugin `stage_order` alone. Opt
 | ASN | `asn_lookup` | TCP whois.cymru.com:43 and/or DNS `origin.asn.cymru.com` | IPs from registry / `dnsx_records.jsonl` / **local `getaddrinfo` on `context.resolved`** | `_output_path` requires scope object. IPs are not hostname-gated. Fallback `_resolve_hostnames` is extra DNS. | `asn.jsonl` |
 | Ports | `naabu` | subprocess naabu (+ tarpit canaries) | `resolved.txt` gated | `_authorized_input` | `naabu.txt`, `tarpit_check.jsonl` |
 | Port verify | `port_verify` | subprocess nmap | **`naabu.txt` hosts, ignores gated `input_path`** | `_output_path` requires scope object. No per-host `allows_active_collection`. Relies on naabu having been gated. | `port_verify.jsonl` |
-| HTTP | `httpx` | subprocess httpx **`-follow-redirects`** | `resolved.txt` gated | `_authorized_input` on **input hosts**. Output URLs are classified against the same `CollectionScope` (Part B). | `httpx.json`, `alive.txt` (authorized URLs only after Part B), `httpx_redirects.jsonl`, `httpx.csv` |
+| HTTP | `httpx` | subprocess httpx, **no `-follow-redirects`** — one request per authorized hop, `Location` authorized before the next hop is requested | `resolved.txt` gated | `_authorized_input` on **input hosts**; each redirect hop re-checked against `CollectionScope` before httpx is invoked again (§5.4) | `httpx.json`, `alive.txt` (authorized URLs only after Part B), `httpx_redirects.jsonl`, `httpx.csv` |
 | Follow-up pass 1 | `_maybe_collect_followups` | dnsx + httpx again | CT/intel eligible names | planner + `_authorized_names` + collector gates | sidecars `*_followup*`, then merge into canonical DNS/HTTP files |
 | Soft-404 | `soft404_check` | HTTP GET | httpx records / `alive.txt` / `context.alive_urls` | `require_collection_scope` + `allows_active_collection` per target | `soft404_check.jsonl` |
 | Param fuzz | `param_fuzz` | HTTP GET with canary params | live URLs | same per-URL gate | `param_fuzz.jsonl` |
@@ -76,7 +76,7 @@ Order is from `core/runner.py` `run()`, not from plugin `stage_order` alone. Opt
 
 ### 3.2 HTTP
 
-- **httpx:** `-follow-redirects`. Input hosts are gated. The tool **will fetch** the out-of-scope Location (that is inherent to following a redirect from an authorized start). Part B stops that destination from becoming a **later** scan target (`alive.txt`, crawlers, nuclei, browser start URL, URLhaus host, vuln_match landing).
+- **httpx:** no `-follow-redirects`. Input hosts are gated, and httpx makes exactly one request per authorized hop: it reports the `Location` header without fetching it, Hydra checks that destination against `CollectionScope`, and only issues the follow-up httpx request (`-u <url>`) if it is authorized. An out-of-scope `Location` is never requested — not by httpx, not by Hydra — it is only recorded as an observation (§5.4). Bounded by `HTTPX_MAX_REDIRECT_HOPS` (default 10) to avoid an unbounded authorize-then-fetch loop against a redirect cycle.
 - **soft404_check / param_fuzz:** stdlib HTTP to live URLs; per-URL `allows_active_collection`.
 - **cloud_bucket_enum:** HTTP to cloud endpoints derived from brand tokens, only if the derived-authorize flag is on.
 - **gau / waybackurls:** HTTP(S) to archive APIs for **seed** domains (`context.targets`), `capability=url_archive` but `active_collection=True` so `_output_path` requires a scope object. They do not filter discovered archive URLs before writing `gau.txt` / `waybackurls.txt`. Those files are not the default input to katana/nuclei (those use `alive.txt`).
@@ -88,7 +88,7 @@ Order is from `core/runner.py` `run()`, not from plugin `stage_order` alone. Opt
 
 ### 3.4 Browser
 
-- **browser_probe:** Playwright WebKit `page.goto(probe_url)`. `probe_url` is taken from httpx `url` (final) unless that host fails the gate, in which case it falls back to the authorized `input`. A route guard aborts **document navigations** whose hostname fails `allows_active_collection`. Subresource loads (CDN images/scripts) are **not** blocked — that is still a network touch of third-party hosts during an in-scope page load, and is **not** the same as seeding those hosts into `alive.txt`. Left as a documented residual.
+- **browser_probe:** Playwright WebKit `page.goto(probe_url)`. `probe_url` is taken from httpx `url` (final) unless that host fails the gate, in which case it falls back to the authorized `input`. A route guard aborts **document navigations** whose hostname fails `allows_active_collection`; if evaluating that check itself raises, the guard now aborts too (fail closed — fixed this change set, §8 G-GUARD-1) rather than letting the request through. Subresource loads (CDN images/scripts) are **not** blocked — that is still a network touch of third-party hosts during an in-scope page load, and is **not** the same as seeding those hosts into `alive.txt`. Left as a documented residual.
 
 ### 3.5 Threat-intel / vuln APIs
 
@@ -198,7 +198,7 @@ Same `CollectionScope` / `allows_active_collection` / `SCOPE_FILE` patterns. No 
 - browser_probe will not **start** on an OOS URL; document navigations to OOS hosts abort.
 - threat_intel / vuln_match skip unauthorized hosts / landings.
 
-httpx **still follows** the redirect once. That fetch is recorded, not used as a new seed.
+Part B (as originally shipped) still let httpx **fetch** the out-of-scope Location once via `-follow-redirects` before Hydra classified the result — that fetch was recorded, not used as a new seed, but the outbound request to the unauthorized host had already happened. §5.4 below closes that.
 
 ### 5.3 `SCOPE_FILE` unset (not redesigned here)
 
@@ -215,6 +215,23 @@ So without a scope file:
 Pending (later prompt, not this one): whether missing `SCOPE_FILE` should mean “exact seeds only” vs “seed eTLD+1”. Changing that is a product decision, not a redirect bug.
 
 If `collection_scope` is missing entirely, `require_collection_scope` fails closed for active `_output_path` / `_authorized_input`. Production `run()` always attaches a scope object.
+
+### 5.4 This change set: httpx stops fetching before authorizing
+
+Part B (§5.2) removed the OOS destination from `alive.txt`, but the underlying gap the third independent review flagged was structural: `authorize_httpx_records` is a **filter on results**, not a barrier in front of the request. As long as `HttpxPlugin._build_args` passed `-follow-redirects`, the real HTTP GET to the unauthorized host happened before any Hydra code ran — authorization could only decide what to do with a fetch that had already occurred.
+
+This change removes `-follow-redirects` entirely. `HttpxPlugin._build_args` keeps `-location` (httpx reports the `Location` header) and stops there — httpx never follows it. `HttpxPlugin._resolve_authorized_redirects` then walks the chain itself, one hop at a time:
+
+1. httpx's single request to the authorized input returns; if the response carries `Location`, resolve it to an absolute URL.
+2. Check that destination with `allows_active_collection` **before** any request is made to it.
+3. Authorized → Hydra invokes httpx again, this time with `-u <url>` against just that one destination, and repeats from step 1 on its response.
+4. Not authorized → stop. The destination is recorded as a `httpx_redirects.jsonl` observation (`scope_status`, `collection_status: NOT_ALLOWED`, `raw_artifact`) exactly as before, but **no request was ever sent to it** — not by httpx, not by Hydra.
+
+Hop count is bounded by `Settings.httpx_max_redirect_hops` (env `HTTPX_MAX_REDIRECT_HOPS`, default 10) so a redirect cycle between authorized hosts can't turn into an unbounded authorize-then-fetch loop.
+
+The common case — a single in-scope redirect — is unchanged from the outside: the landing URL still ends up in `alive.txt`, `httpx.json` still carries `scope_status`/`redirect_chain`, and no observation row is written. The only difference is that it now takes one httpx invocation per hop instead of one invocation that follows internally. A chain that goes in-scope → in-scope → OOS now stops fetching at the OOS hop; anything the OOS host might have redirected to next (a hypothetical hop 3) is never discovered, because Hydra never requests hop 2 to find out.
+
+This obsoletes gap **G-REDIR-6** below (previously "confirmed, not fixed" item 6, §8) and the residual noted at the end of §5.2.
 
 ---
 
@@ -273,6 +290,8 @@ Failure modes of this contract (still true after Part B):
 - **G-REDIR-3 (confirmed, fixed):** browser_probe started on httpx `url` (final).
 - **G-REDIR-4 (confirmed, fixed):** threat_intel / vuln_match could take the OOS landing as the subject.
 - **G-REDIR-5 (confirmed, fixed):** multi-hop used only the final URL; filter now keys off the landing host.
+- **G-REDIR-6 (confirmed, fixed — this change set, §5.4):** httpx no longer fetches an out-of-scope `Location` at all. `-follow-redirects` is removed; each hop is authorized before httpx is invoked again for it. Previously "confirmed, not fixed" item 6 below.
+- **G-GUARD-1 (confirmed, fixed — this change set):** `browser_probe`'s in-page navigation guard (`_install_scope_navigation_guard`) fell open (`route.continue_()`) if evaluating `allow_browser_navigation` raised. It now aborts the navigation (fail closed) and logs the exception. The happy-path authorization logic (`scope is None → False`) was already correct; only the exception handler around it was fail-open.
 
 ### Confirmed, **not** fixed (later prompts)
 
@@ -281,15 +300,15 @@ Failure modes of this contract (still true after Part B):
 3. **No `PipelineRunner.run()` E2E with an in-scope follow-up hostname** (virusbarrier fixture SANs are all OOS). Tests passing ≠ that path works.
 4. **Wildcard DNS:** initial dnsx still resolves junk under a catch-all. Follow-up planner exempts `CERTIFICATE_SAN`. Plugin emissions can set that reason.
 5. **Crawler link-follow:** katana/hakrawler, once started in-scope, can still request OOS links they discover themselves. Part B only stops **seeding** those URLs from httpx redirects.
-6. **httpx still performs the OOS GET** while following redirects. Observation, not a second scan — but it is still an outbound request.
-7. **Browser subresources** to third-party hosts during an in-scope navigation are not gated.
-8. **Host clusters / `graph_edges` / `assets.json`** remain a second correlation story vs `intel_relationships`.
-9. **Certificate identity, SAN bounds, intel queue durability** — engine exists; not re-audited as “done”. Queue is not a SQLite source of truth for IN_FLIGHT/FAILED.
-10. **`port_verify` trusts `naabu.txt`.** Fine if naabu was gated; not a second check.
-11. **Cloud bucket enum** probes non-seed cloud FQDNs when the derived flag is on.
-12. **ASN `getaddrinfo` fallback** is extra DNS on resolved names.
-13. **Reporting:** Markdown intel lines omit fingerprints; `export_run_json` omits intel tables.
-14. **Two follow-up invocations per run** (after httpx and after optional plugins). Bounded by depth, not one-shot, not persisted as queue history.
+6. **Browser subresources** to third-party hosts during an in-scope navigation are not gated (scripts/images/iframes/fetch can still reach unauthorized hosts even though document navigation is fail-closed). Planned as a follow-up `EgressPolicy`/subresource-guard prompt, not addressed here.
+7. **Host clusters / `graph_edges` / `assets.json`** remain a second correlation story vs `intel_relationships`.
+8. **Certificate identity, SAN bounds, intel queue durability** — engine exists; not re-audited as “done”. Queue is not a SQLite source of truth for IN_FLIGHT/FAILED.
+9. **`port_verify` trusts `naabu.txt`.** Fine if naabu was gated; not a second check.
+10. **Cloud bucket enum** probes non-seed cloud FQDNs when the derived flag is on.
+11. **ASN `getaddrinfo` fallback** is extra DNS on resolved names.
+12. **Reporting:** Markdown intel lines omit fingerprints; `export_run_json` omits intel tables.
+13. **Two follow-up invocations per run** (after httpx and after optional plugins). Bounded by depth, not one-shot, not persisted as queue history.
+14. **All of the above authorization is logical, not a network-level egress boundary.** A buggy plugin that skips the gate can still reach an unauthorized host; nothing at the socket/process level enforces `CollectionScope`. Planned as a follow-up `EgressPolicy` prompt, not addressed here.
 
 ### `SCOPE_FILE` missing
 

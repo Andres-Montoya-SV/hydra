@@ -21,8 +21,9 @@ from modules._base import BaseToolPlugin
 from utils.files import read_jsonl, write_jsonl, write_lines
 from utils.security import atomic_write_text, validate_output_path
 
-# httpx followed the redirect from an authorized input. That is observation,
-# not permission to treat the destination as an active-collection target.
+# httpx observed the redirect Location header from an authorized input. That
+# is observation, not permission to treat the destination as an
+# active-collection target — it is never fetched unless authorized first.
 _REDIRECT_CONFIDENCE = 95
 
 
@@ -46,34 +47,49 @@ class HttpxPlugin(BaseToolPlugin):
         return self.settings.httpx_path
 
     def _build_args(
-        self, context: PipelineContext, input_path: Path, json_output: Path
+        self,
+        context: PipelineContext,
+        input_path: Path | None,
+        json_output: Path,
+        *,
+        target_url: str | None = None,
     ) -> list[str]:
-        args = [
-            str(self.resolved_binary(context)),
-            "-l",
-            str(input_path),
-            "-silent",
-            "-json",
-            "-o",
-            str(json_output),
-            "-t",
-            str(self.settings.httpx_threads),
-            "-timeout",
-            "10",
-            "-follow-redirects",
-            "-status-code",
-            "-title",
-            "-tech-detect",
-            "-content-length",
-            "-web-server",
-            "-location",
-            "-favicon",
-            "-hash",
-            "sha256",
-            "-include-response-header",
-            "-disable-update-check",
-            "-no-stdin",
-        ]
+        """Build httpx argv.
+
+        Never pass `-follow-redirects`: httpx would fetch the redirect
+        destination itself before Hydra gets a chance to authorize it. httpx
+        only reports the `Location` header (`-location`); the caller decides,
+        hop by hop, whether to issue a follow-up request via `target_url`.
+        """
+        args = [str(self.resolved_binary(context))]
+        if target_url is not None:
+            args.extend(["-u", target_url])
+        else:
+            args.extend(["-l", str(input_path)])
+        args.extend(
+            [
+                "-silent",
+                "-json",
+                "-o",
+                str(json_output),
+                "-t",
+                str(self.settings.httpx_threads),
+                "-timeout",
+                "10",
+                "-status-code",
+                "-title",
+                "-tech-detect",
+                "-content-length",
+                "-web-server",
+                "-location",
+                "-favicon",
+                "-hash",
+                "sha256",
+                "-include-response-header",
+                "-disable-update-check",
+                "-no-stdin",
+            ]
+        )
 
         if not self.settings.strict_opsec:
             args.extend(["-ip", "-cname", "-tls-probe", "-tls-grab"])
@@ -107,8 +123,12 @@ class HttpxPlugin(BaseToolPlugin):
         result = await self._execute_self_output(context, args, json_output, allow_empty=True)
 
         records = read_jsonl(json_output) if json_output.exists() else []
+        resolved_records = [
+            await self._resolve_authorized_redirects(context, record, scope, suffix, index)
+            for index, record in enumerate(records)
+        ]
         annotated, alive_urls, redirect_obs = authorize_httpx_records(
-            records, scope, raw_artifact=json_output.name
+            resolved_records, scope, raw_artifact=json_output.name
         )
         if annotated:
             write_jsonl(json_output, annotated, base_dir=context.output_dir)
@@ -141,6 +161,88 @@ class HttpxPlugin(BaseToolPlugin):
             data={"records": len(annotated), "redirect_observations": len(redirect_obs)},
         )
 
+    async def _resolve_authorized_redirects(
+        self,
+        context: PipelineContext,
+        record: dict,
+        scope: CollectionScope,
+        suffix: str,
+        record_index: int,
+    ) -> dict:
+        """Walk a redirect chain hop by hop, authorizing each destination before
+        httpx is allowed to request it.
+
+        `record` is the result of the single request httpx already made to an
+        authorized host (no `-follow-redirects`, so it never fetched past that
+        first hop on its own). Every subsequent hop named by `Location` is
+        checked against `scope` before Hydra issues the follow-up httpx
+        request for it. The walk stops — without ever requesting the
+        destination — at the first hop that is not authorized.
+        """
+        origin = httpx_input_url(record)
+        visited: list[str] = [origin] if origin else []
+        current = record
+        current_url = str(current.get("url") or origin)
+        if current_url and current_url not in visited:
+            visited.append(current_url)
+
+        blocked_target: str | None = None
+        hop = 0
+        max_hops = self.settings.httpx_max_redirect_hops
+        while hop < max_hops:
+            location = str(current.get("location") or "").strip()
+            if not location:
+                break
+            next_url = location if "://" in location else urljoin(current_url, location)
+            if not allows_active_collection(next_url, scope):
+                blocked_target = next_url
+                break
+            hop += 1
+            hop_record = await self._fetch_single_hop(
+                context, next_url, suffix=suffix, record_index=record_index, hop=hop
+            )
+            if hop_record is None:
+                # Follow-up request failed/produced nothing usable — stop where
+                # we are; `current` already reflects the last hop we reached.
+                break
+            current = hop_record
+            current_url = str(current.get("url") or next_url)
+            if current_url not in visited:
+                visited.append(current_url)
+
+        # `input`/scope bookkeeping always tracks the original origin host, even
+        # when `current` came from a later hop's own httpx response. `host`,
+        # `url`, `tech`, `title`, etc. intentionally stay whatever `current`
+        # (the last hop Hydra actually requested) reports — that data
+        # describes that hop, not the original origin.
+        merged = dict(current)
+        merged["input"] = record.get("input", origin)
+        merged["chain"] = [{"url": url} for url in visited]
+        merged["final_url"] = blocked_target or current_url
+        return merged
+
+    async def _fetch_single_hop(
+        self,
+        context: PipelineContext,
+        url: str,
+        *,
+        suffix: str,
+        record_index: int,
+        hop: int,
+    ) -> dict | None:
+        """Issue the httpx request for one already-authorized redirect hop."""
+        hop_output = self._output_path(context, f"httpx_hop{suffix}_{record_index}_{hop}.json")
+        args = self._build_args(context, None, hop_output, target_url=url)
+        result = await self._execute_self_output(context, args, hop_output, allow_empty=True)
+        records = read_jsonl(hop_output) if hop_output.exists() else []
+        try:
+            hop_output.unlink()
+        except OSError:
+            pass
+        if not result.success or not records:
+            return None
+        return records[0]
+
     def _write_csv(self, path: Path, records: list[dict], context: PipelineContext) -> None:
         if not records:
             return
@@ -170,7 +272,11 @@ def httpx_input_url(record: dict) -> str:
 
 
 def httpx_final_url(record: dict) -> str:
-    """Landing URL after httpx `-follow-redirects` (last hop, not the first)."""
+    """Landing URL after hop-by-hop authorized redirect resolution (last hop, not the first).
+
+    May be a hop that was never fetched — the destination of an
+    unauthorized `Location` header, reported for observation only.
+    """
     explicit = str(record.get("final_url") or record.get("url") or "").strip()
     if explicit:
         return explicit
