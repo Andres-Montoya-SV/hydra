@@ -114,22 +114,40 @@ def authorize_active_indicator(
             op,
             "hostname_not_collectable",
         )
-    if is_generated_cloud_endpoint(host) and not collection_scope.cloud_collection_allowed:
-        if op != "cloud_bucket_enum":
+    if is_generated_cloud_endpoint(host):
+        if not collection_scope.cloud_collection_allowed:
+            if op != "cloud_bucket_enum":
+                return AuthorizationResult(
+                    AuthorizationDecision.DENY,
+                    host,
+                    op,
+                    "cloud_endpoint_requires_explicit_policy",
+                    ScopeStatus.OUT_OF_SCOPE,
+                )
             return AuthorizationResult(
                 AuthorizationDecision.DENY,
                 host,
                 op,
-                "cloud_endpoint_requires_explicit_policy",
+                "cloud_collection_policy_disabled",
                 ScopeStatus.OUT_OF_SCOPE,
             )
-        return AuthorizationResult(
-            AuthorizationDecision.DENY,
-            host,
-            op,
-            "cloud_collection_policy_disabled",
-            ScopeStatus.OUT_OF_SCOPE,
-        )
+        if op == "cloud_bucket_enum":
+            # Explicitly opted in via the cloud policy. A generated bucket
+            # hostname is never going to share a registrable domain with the
+            # seed (that is the entire point of probing it) — falling
+            # through to the normal seed-root scope check below would deny
+            # every candidate even after the operator explicitly authorized
+            # this operation, which is not "fail closed", it is "this
+            # feature can never work". ScopeStatus stays OUT_OF_SCOPE (it
+            # genuinely is a different registrable domain) — only the
+            # collection decision is ALLOW.
+            return AuthorizationResult(
+                AuthorizationDecision.ALLOW,
+                host,
+                op,
+                why,
+                ScopeStatus.OUT_OF_SCOPE,
+            )
     status = classify_scope(
         host,
         seed_domains=list(collection_scope.seed_domains),

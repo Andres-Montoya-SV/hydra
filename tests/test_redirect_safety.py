@@ -286,12 +286,15 @@ async def test_browser_navigation_guard_fails_closed_on_exception(
 
     handlers: dict[str, object] = {}
 
-    class FakePage:
+    class FakeContext:
         async def route(self, pattern: str, handler: object) -> None:
             handlers["guard"] = handler
 
+        async def route_web_socket(self, pattern: str, handler: object) -> None:
+            handlers["websocket_guard"] = handler
+
     blocked_counts: dict[str, int] = {}
-    await browser_probe._install_scope_request_guard(FakePage(), context, blocked_counts)
+    await browser_probe._install_scope_request_guard(FakeContext(), context, blocked_counts)
     await handlers["guard"](FakeRoute())
 
     assert calls["abort"] == "blockedbyclient"

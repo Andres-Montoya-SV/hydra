@@ -49,12 +49,29 @@ def test_cloud_endpoint_requires_explicit_policy() -> None:
     scope = CollectionScope.from_seeds([SEED], cloud_collection_allowed=False)
     result = authorize_active_indicator("brand.s3.amazonaws.com", scope, "httpx", "derived")
     assert result.decision is AuthorizationDecision.DENY
+
+    denied_op = authorize_active_indicator(
+        "brand.s3.amazonaws.com", scope, "cloud_bucket_enum", "policy"
+    )
+    assert denied_op.decision is AuthorizationDecision.DENY
+
     allowed_scope = CollectionScope.from_seeds([SEED], cloud_collection_allowed=True)
     cloud = authorize_active_indicator(
         "brand.s3.amazonaws.com", allowed_scope, "cloud_bucket_enum", "policy"
     )
-    # Still a different registrable domain unless patterns include it.
-    assert cloud.decision in {AuthorizationDecision.DENY, AuthorizationDecision.ALLOW}
+    # A generated bucket hostname never shares a registrable domain with the
+    # seed by construction — explicit cloud_collection_allowed opt-in must
+    # still result in ALLOW for the cloud_bucket_enum operation specifically,
+    # not fall through to the normal seed-root scope check and get denied
+    # anyway (that would make the opt-in flag a no-op).
+    assert cloud.decision is AuthorizationDecision.ALLOW
+
+    # Opting in to cloud_bucket_enum must not blanket-authorize other
+    # capabilities to treat cloud infrastructure as an active target.
+    other_op = authorize_active_indicator(
+        "brand.s3.amazonaws.com", allowed_scope, "httpx", "derived"
+    )
+    assert other_op.decision is AuthorizationDecision.DENY
 
 
 def test_spoofed_certificate_san_reason_is_rejected() -> None:

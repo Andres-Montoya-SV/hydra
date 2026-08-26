@@ -281,6 +281,10 @@ class AttemptStatus(str, Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     NOT_ATTEMPTED = "NOT_ATTEMPTED"
+    # Claimed and persisted before the network operation runs, so a crash
+    # between the claim and the completing record_attempt() call leaves a
+    # durable trace instead of no CollectionAttempt row at all.
+    IN_FLIGHT = "IN_FLIGHT"
 
 
 @dataclass

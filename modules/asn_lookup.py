@@ -134,9 +134,16 @@ async def _collect_ips(context: PipelineContext) -> list[str]:
     # dnsx sometimes writes an empty dnsx_records.jsonl while still producing
     # resolved.txt via its hostname fallback (seen on run 20260806_183325).
     # Resolve those hostnames locally so ASN enrichment is not silently skipped
-    # when we clearly have live targets.
+    # when we clearly have live targets. This is the one place this plugin
+    # performs active DNS resolution of its own (the other two branches above
+    # only read IPs dnsx already resolved) — it must not trust that every
+    # entry in `context.resolved` was actually gated by dnsx; re-check here.
     if not ips and context.resolved:
-        ips.update(await _resolve_hostnames(context.resolved))
+        from core.intel.scope import allows_active_collection, require_collection_scope
+
+        scope = require_collection_scope(context)
+        authorized_hosts = [h for h in context.resolved if allows_active_collection(h, scope)]
+        ips.update(await _resolve_hostnames(authorized_hosts))
 
     valid: list[str] = []
     for value in ips:

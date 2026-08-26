@@ -174,17 +174,44 @@ def authorize_collect_input(
     scope: CollectionScope,
     dest: Path,
     base_dir: Path,
+    capability: str = "",
+    strict_opsec: bool = False,
+    opsec_allowed: bool = True,
 ) -> tuple[Path, list[str], list[str]]:
     """Write ``dest`` with only authorized indicators.
 
     Returns (dest, kept, dropped). The source file is not modified so
     out-of-scope names remain available as intelligence observations.
+
+    Composes scope AND OPSEC via ``authorize_collection`` — not the
+    scope-only ``allows_active_collection`` — so this is the actual
+    authoritative decision path for every active-collection plugin's input,
+    matching ``authorize_collection``'s documented contract instead of a
+    parallel scope-only check that happens to agree with a separately
+    enforced plugin-level OPSEC gate by convention.
     """
+    from core.intel.authorize import authorize_collection
+
+    def _allowed(indicator: str) -> bool:
+        return authorize_collection(
+            indicator,
+            scope,
+            capability=capability or "active_collection",
+            strict_opsec=strict_opsec,
+            opsec_allowed=opsec_allowed,
+        ).allowed
+
     source_lines = read_lines(input_path) if input_path.exists() else []
-    kept = filter_authorized_indicators(source_lines, scope)
-    dropped = [
-        line for line in source_lines if line.strip() and not allows_active_collection(line, scope)
-    ]
+    kept: list[str] = []
+    seen: set[str] = set()
+    for raw in source_lines:
+        line = raw.strip()
+        if not line or line in seen:
+            continue
+        if _allowed(line):
+            kept.append(line)
+            seen.add(line)
+    dropped = [line for line in source_lines if line.strip() and not _allowed(line)]
     write_lines(dest, kept, base_dir=base_dir)
     return dest, kept, dropped
 
@@ -200,7 +227,15 @@ def require_collection_scope(context: object) -> CollectionScope:
     return scope
 
 
-def authorize_plugin_input(context: object, input_path: Path, plugin_name: str) -> Path:
+def authorize_plugin_input(
+    context: object,
+    input_path: Path,
+    plugin_name: str,
+    *,
+    capability: str = "",
+    strict_opsec: bool = False,
+    opsec_allowed: bool = True,
+) -> Path:
     """Re-check collector input immediately before active use.
 
     Missing CollectionScope is never a no-op. Discovery is not authorization.
@@ -220,6 +255,9 @@ def authorize_plugin_input(context: object, input_path: Path, plugin_name: str) 
         scope=scope,
         dest=dest,
         base_dir=Path(output_dir),
+        capability=capability or plugin_name,
+        strict_opsec=strict_opsec,
+        opsec_allowed=opsec_allowed,
     )
     if dropped:
         add_warning = getattr(context, "add_warning", None)

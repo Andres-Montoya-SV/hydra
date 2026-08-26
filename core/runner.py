@@ -193,13 +193,28 @@ class PipelineRunner:
     def _gate_active_input(
         self, context: PipelineContext, plugin: ReconPlugin, input_path: Path
     ) -> Path:
-        """Filter collector input immediately before cache lookup and invocation."""
+        """Filter collector input immediately before cache lookup and invocation.
+
+        Composes scope AND OPSEC through ``authorize_collection`` (not just
+        scope via ``allows_active_collection``). The plugin-level STRICT_OPSEC
+        skip in ``_run_single_plugin`` already keeps a non-allowed plugin from
+        reaching this point at all — this is defense in depth so the gate a
+        plugin's input actually passes through is independently correct, not
+        reliant on that separate check running first.
+        """
         if plugin.name not in ACTIVE_COLLECTION_PLUGINS:
             return input_path
         from core.intel.scope import authorize_plugin_input
 
         context.collection_scope = self._collection_scope_for(context)
-        return authorize_plugin_input(context, input_path, plugin.name)
+        return authorize_plugin_input(
+            context,
+            input_path,
+            plugin.name,
+            capability=plugin.capability,
+            strict_opsec=self.settings.strict_opsec,
+            opsec_allowed=plugin.name in STRICT_OPSEC_ALLOWED_PLUGINS,
+        )
 
     def _enabled_plugins(self, names: frozenset[str]) -> list[ReconPlugin]:
         return [
@@ -790,6 +805,16 @@ class PipelineRunner:
             and not settings.strict_opsec
         ):
             context.metadata["dnsx_output_suffix"] = suffix
+            from core.intel.model import CollectionCapability
+
+            for host in plan.dns_targets:
+                engine.claim_attempt(
+                    host,
+                    capability=CollectionCapability.DNS_RESOLUTION,
+                    collector="dnsx",
+                    reason="followup_dns_claimed",
+                )
+            self._persist_indicators(context, engine)
             try:
                 await self._run_plugin_chain(context, dnsx_plugins, follow_path)
             except Exception:
@@ -845,6 +870,16 @@ class PipelineRunner:
         probe_path = context.output_dir / "followup_http_targets.txt"
         write_lines(probe_path, http_targets, base_dir=context.output_dir)
         context.metadata["httpx_output_suffix"] = suffix
+        from core.intel.model import CollectionCapability
+
+        for host in http_targets:
+            engine.claim_attempt(
+                host,
+                capability=CollectionCapability.HTTP_COLLECTION,
+                collector="httpx",
+                reason="followup_http_claimed",
+            )
+        self._persist_indicators(context, engine)
         try:
             await self._run_single_plugin(context, httpx, probe_path)
         except Exception:

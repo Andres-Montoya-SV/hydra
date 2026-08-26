@@ -107,9 +107,14 @@ async def _run_probe_page(
             except Exception as exc:  # pragma: no cover - environment without webkit binary
                 pytest.skip(f"WebKit browser binary not available: {exc}")
             try:
-                page = await browser.new_page()
+                browser_context = await browser.new_context()
                 context = _context(tmp_path)
-                await browser_probe._install_scope_request_guard(page, context, blocked_counts)
+                # Context-level, matching production _probe_target — this is
+                # what makes a window.open() popup inherit the same guard.
+                await browser_probe._install_scope_request_guard(
+                    browser_context, context, blocked_counts
+                )
+                page = await browser_context.new_page()
                 try:
                     await page.goto(
                         f"http://127.0.0.1:{port}/index.html",
@@ -121,6 +126,7 @@ async def _run_probe_page(
                     # miss networkidle; blocked_counts is already populated
                     # by the guard regardless of how goto() itself resolves.
                     print(f"page.goto did not settle cleanly (expected under blocking): {exc}")
+                await page.wait_for_timeout(500)
             finally:
                 await browser.close()
     finally:
@@ -216,14 +222,179 @@ async def test_subresource_guard_fails_closed_on_exception(
 
     handlers: dict[str, object] = {}
 
-    class FakePage:
+    class FakeContext:
         async def route(self, pattern: str, handler: object) -> None:
             handlers["guard"] = handler
 
+        async def route_web_socket(self, pattern: str, handler: object) -> None:
+            handlers["websocket_guard"] = handler
+
     blocked_counts: dict[str, int] = {}
-    await browser_probe._install_scope_request_guard(FakePage(), context, blocked_counts)
+    await browser_probe._install_scope_request_guard(FakeContext(), context, blocked_counts)
     await handlers["guard"](FakeRoute())
 
     assert calls["abort"] == "blockedbyclient"
     assert calls["continued"] is False
     assert blocked_counts.get("script") == 1
+
+
+@pytest.mark.asyncio
+async def test_websocket_guard_fails_closed_on_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bug evaluating policy for a WebSocket connection blocks it, same as any other type."""
+    context = _context(tmp_path)
+
+    def _boom(url: str, ctx: object) -> bool:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(browser_probe, "allow_browser_navigation", _boom)
+
+    calls: dict[str, object] = {"closed": None, "connected": False}
+
+    class FakeWebSocketRoute:
+        url = f"wss://cdn.{SEED}.evil/socket"
+
+        async def close(self, *, code: int | None = None, reason: str | None = None) -> None:
+            calls["closed"] = (code, reason)
+
+        def connect_to_server(self) -> None:
+            calls["connected"] = True
+
+    handlers: dict[str, object] = {}
+
+    class FakeContext:
+        async def route(self, pattern: str, handler: object) -> None:
+            handlers["guard"] = handler
+
+        async def route_web_socket(self, pattern: str, handler: object) -> None:
+            handlers["websocket_guard"] = handler
+
+    blocked_counts: dict[str, int] = {}
+    await browser_probe._install_scope_request_guard(FakeContext(), context, blocked_counts)
+    await handlers["websocket_guard"](FakeWebSocketRoute())
+
+    assert calls["closed"] is not None
+    assert calls["connected"] is False
+    assert blocked_counts.get("websocket") == 1
+
+
+@pytest.mark.asyncio
+async def test_websocket_to_out_of_scope_host_never_connects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OOS WebSocket target never receives a TCP connection at all.
+
+    Playwright's WebSocketRoute defaults to *not* connecting to the real
+    server unless the handler calls connect_to_server(); this test proves
+    that default is actually reached for an unauthorized destination — by
+    checking whether the raw TCP-level connection was ever attempted, not
+    just whether a WS handshake "succeeded" — using a bare TCP accept
+    counter as the target (no WS protocol needed to prove a connection
+    attempt occurred).
+    """
+    accepted: list[str] = []
+
+    class _RecordingHandler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            accepted.append(str(self.client_address))
+            self.request.close()
+
+    socketserver.TCPServer.allow_reuse_address = True
+    ws_httpd = socketserver.TCPServer(("127.0.0.1", 0), _RecordingHandler)
+    ws_port = ws_httpd.server_address[1]
+    ws_thread = threading.Thread(target=ws_httpd.serve_forever, daemon=True)
+    ws_thread.start()
+
+    directory = tmp_path / "in_scope"
+    directory.mkdir()
+    index_html = f"""<html><body>
+    <script>
+    try {{ new WebSocket('ws://127.0.0.1:{ws_port}/'); }} catch (e) {{}}
+    </script>
+    </body></html>"""
+    (directory / "index.html").write_text(index_html)
+    httpd, port, thread = _serve(directory)
+    monkeypatch.setattr(browser_probe, "allow_browser_navigation", _allow_only_port(port))
+
+    try:
+        async with async_playwright() as playwright:
+            try:
+                browser = await playwright.webkit.launch(headless=True)
+            except Exception as exc:  # pragma: no cover - environment without webkit binary
+                pytest.skip(f"WebKit browser binary not available: {exc}")
+            try:
+                browser_context = await browser.new_context()
+                context = _context(tmp_path)
+                blocked_counts: dict[str, int] = {}
+                await browser_probe._install_scope_request_guard(
+                    browser_context, context, blocked_counts
+                )
+                page = await browser_context.new_page()
+                await page.goto(
+                    f"http://127.0.0.1:{port}/index.html",
+                    wait_until="load",
+                    timeout=5000,
+                )
+                await page.wait_for_timeout(500)
+            finally:
+                await browser.close()
+    finally:
+        ws_httpd.shutdown()
+        ws_thread.join(timeout=2)
+        httpd.shutdown()
+        thread.join(timeout=2)
+
+    assert accepted == []
+    assert blocked_counts.get("websocket", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_window_open_popup_to_out_of_scope_host_is_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, oos_server: int
+) -> None:
+    """A window.open() popup inherits the same context-level guard as the opener.
+
+    A page-scoped route (the pre-fix implementation) would leave a popup
+    page — a new Playwright Page created in the same browser context —
+    completely unguarded. This proves the popup's own top-level navigation
+    to an OOS host is blocked, not just requests made by the original page.
+    """
+    directory = tmp_path / "in_scope"
+    directory.mkdir()
+    index_html = f"""<html><body>
+    <script>window.open('http://127.0.0.1:{oos_server}/frame.html', '_blank');</script>
+    </body></html>"""
+    (directory / "index.html").write_text(index_html)
+    httpd, port, thread = _serve(directory)
+    monkeypatch.setattr(browser_probe, "allow_browser_navigation", _allow_only_port(port))
+
+    try:
+        async with async_playwright() as playwright:
+            try:
+                browser = await playwright.webkit.launch(headless=True)
+            except Exception as exc:  # pragma: no cover - environment without webkit binary
+                pytest.skip(f"WebKit browser binary not available: {exc}")
+            try:
+                browser_context = await browser.new_context()
+                context = _context(tmp_path)
+                blocked_counts: dict[str, int] = {}
+                await browser_probe._install_scope_request_guard(
+                    browser_context, context, blocked_counts
+                )
+                page = await browser_context.new_page()
+                await page.goto(
+                    f"http://127.0.0.1:{port}/index.html",
+                    wait_until="load",
+                    timeout=5000,
+                )
+                await page.wait_for_timeout(500)
+            finally:
+                await browser.close()
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=2)
+
+    # The opener's own navigation was to the in-scope host; any blocked
+    # `document` request had to come from the popup's own top-level nav.
+    assert blocked_counts.get("document", 0) >= 1

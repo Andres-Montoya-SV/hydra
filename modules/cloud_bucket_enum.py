@@ -82,9 +82,10 @@ class CloudBucketEnumPlugin(BaseToolPlugin):
         return "Built-in (stdlib urllib) — opt-in active probe"
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
+        from core.intel.authorize import authorize_active_indicator
         from core.intel.scope import require_collection_scope
 
-        require_collection_scope(context)
+        scope = require_collection_scope(context)
         if not self.settings.cloud_bucket_enum_authorize_derived:
             return self._skip(
                 "Cloud-derived endpoints (*.s3.amazonaws.com, storage.googleapis.com, "
@@ -117,6 +118,21 @@ class CloudBucketEnumPlugin(BaseToolPlugin):
         baselines: dict[str, str] = {}
         for provider in ("s3", "gcs", "azure"):
             url = _provider_url(provider, canary_name)
+            decision = authorize_active_indicator(
+                url, scope, "cloud_bucket_enum", "cloud_bucket_enum_canary"
+            )
+            if not decision.allowed:
+                # Defense in depth: the entry check above already requires
+                # cloud_bucket_enum_authorize_derived, but the request itself
+                # must still be authorized against the actual CollectionScope
+                # object per host, like every other active-collection plugin —
+                # not just a Settings flag checked once at plugin entry.
+                context.add_warning(
+                    f"cloud_bucket_enum: canary for {provider} not authorized by "
+                    f"CollectionScope ({decision.reason}); skipped"
+                )
+                baselines[provider] = "not_authorized"
+                continue
             snap = await asyncio.to_thread(http_get, url, timeout=timeout, proxy_url=proxy)
             classification = _classify(provider, snap)
             # Provider-specific canary semantics:
@@ -147,9 +163,16 @@ class CloudBucketEnumPlugin(BaseToolPlugin):
         candidates = _candidate_buckets(brands)
         hits: list[dict[str, object]] = []
         total_probes = 3  # canaries
+        denied_probes = 0
         for bucket in candidates:
             for provider in ("s3", "gcs", "azure"):
                 url = _provider_url(provider, bucket)
+                decision = authorize_active_indicator(
+                    url, scope, "cloud_bucket_enum", "cloud_bucket_enum_probe"
+                )
+                if not decision.allowed:
+                    denied_probes += 1
+                    continue
                 snap = await asyncio.to_thread(http_get, url, timeout=timeout, proxy_url=proxy)
                 total_probes += 1
                 classification = _classify(provider, snap)
@@ -176,6 +199,12 @@ class CloudBucketEnumPlugin(BaseToolPlugin):
                 if delay:
                     await asyncio.sleep(delay)
 
+        if denied_probes:
+            context.add_warning(
+                f"cloud_bucket_enum: {denied_probes} candidate probe(s) were not "
+                "authorized by CollectionScope and were never requested"
+            )
+
         raw_artifact = self._write_raw_artifact(context, "\n".join(raw_lines) + "\n")
         for row in hits:
             row["raw_artifact"] = raw_artifact
@@ -183,6 +212,7 @@ class CloudBucketEnumPlugin(BaseToolPlugin):
         output_path = self._output_path(context, "cloud_bucket_enum.jsonl")
         count = write_jsonl(output_path, hits, base_dir=context.output_dir)
         context.metadata["cloud_bucket_enum_probes"] = total_probes
+        context.metadata["cloud_bucket_enum_denied_probes"] = denied_probes
         context.metadata["cloud_bucket_enum_candidates"] = len(candidates)
         context.metadata["cloud_bucket_enum_hits"] = count
         context.metadata["cloud_bucket_enum_brands"] = brands

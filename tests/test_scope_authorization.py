@@ -141,6 +141,42 @@ async def test_cloud_derived_endpoints_require_explicit_opt_in(
 
 
 @pytest.mark.asyncio
+async def test_cloud_enum_scope_object_governs_even_if_settings_flag_is_stale(
+    tmp_path: Path, settings: Settings
+) -> None:
+    """Per-host authorization must check the CollectionScope object itself, not
+    just the Settings flag checked once at plugin entry.
+
+    Production always keeps ``settings.cloud_bucket_enum_authorize_derived``
+    and ``CollectionScope.cloud_collection_allowed`` in sync
+    (`core/runner.py:_collection_scope_for`), but nothing enforces that for a
+    scope object built any other way. This proves that if they ever drift —
+    the settings flag says yes, the actual scope object says no — the scope
+    object wins and no request is ever made, not just that the settings-only
+    entry check happens to catch the common case.
+    """
+    settings.enable_cloud_bucket_enum = True
+    settings.cloud_bucket_enum_authorize_derived = True
+    settings.cloud_bucket_enum_delay_ms = 0
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(exist_ok=True)
+    context = PipelineContext(
+        output_dir=output_dir,
+        targets=[DomainTarget(domain="metaversejustice.com")],
+        # Deliberately NOT threading cloud_collection_allowed through, unlike
+        # the production wiring — this is the drift scenario.
+        collection_scope=CollectionScope.from_seeds(["metaversejustice.com"]),
+    )
+    plugin = CloudBucketEnumPlugin(settings)
+    with patch("modules.cloud_bucket_enum.http_get") as http_get:
+        result = await plugin.run(context, output_dir / "targets.txt")
+    http_get.assert_not_called()
+    assert result.success
+    assert context.metadata.get("cloud_bucket_enum_denied_probes", 0) > 0
+    assert any("not authorized by CollectionScope" in w for w in context.warnings)
+
+
+@pytest.mark.asyncio
 async def test_cloud_enum_missing_scope_fails_closed(tmp_path: Path, settings: Settings) -> None:
     settings.enable_cloud_bucket_enum = True
     settings.cloud_bucket_enum_authorize_derived = True

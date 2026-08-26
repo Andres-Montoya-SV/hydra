@@ -6,6 +6,8 @@ import json
 import shutil
 from pathlib import Path
 
+import pytest
+
 from config.settings import Settings
 from core.assets import ScanRun
 from core.intel.bounds import DiscoveryBounds
@@ -373,6 +375,72 @@ def test_virusbarrier_followup_loop_integration(tmp_path: Path, capsys) -> None:
     ) in transitions
     assert (WWW, CollectionStatus.ELIGIBLE.value, CollectionStatus.IN_FLIGHT.value) in transitions
     assert (SIBLINGS[0], "", CollectionStatus.NOT_ALLOWED.value) in transitions
+
+
+@pytest.mark.asyncio
+async def test_followup_dns_crash_leaves_durable_in_flight_attempt(tmp_path: Path) -> None:
+    """A crash between claiming a follow-up indicator and dnsx completing must
+    leave a durable IN_FLIGHT CollectionAttempt row, not silence.
+
+    Before this fix, `record_attempt()` only ran after the subprocess plugin
+    finished and its output was parsed — a crash in between left the
+    indicator lifecycle crash-safe (overlay_status turns a restored IN_FLIGHT
+    into FAILED) but `intel_collection_attempts` got no row at all for that
+    specific attempt. `engine.claim_attempt()` + a persist call now happen
+    immediately after the claim and before `_run_plugin_chain` runs.
+    """
+    output_dir = tmp_path / "output" / "vb-crash"
+    _write_integration_artifacts(output_dir)
+    settings = Settings(
+        project_root=tmp_path,
+        scope_file=output_dir / "scope.txt",
+        max_discovery_depth=1,
+        max_followup_indicators=10,
+        max_domains_per_source=20,
+        max_collection_budget=50,
+    )
+    run_id = "vb-crash"
+    context = PipelineContext(
+        targets=[DomainTarget(domain=SEED)],
+        subdomains=[SEED],
+        resolved=[SEED],
+        output_dir=output_dir,
+        run_id=run_id,
+        metadata={"dns_probes": 1, "http_probes": 1},
+    )
+
+    db = tmp_path / "output" / "recon-crash.db"
+    store = AssetStore(db)
+    store.create_run(ScanRun(run_id=run_id, started_at="2026-08-24T00:00:00Z", targets=[SEED]))
+
+    runner = PipelineRunner(settings)
+    runner._store = store
+
+    async def crash(*args, **kwargs):
+        raise RuntimeError("simulated crash mid-subprocess")
+
+    runner._run_plugin_chain = crash  # type: ignore[method-assign]
+    runner.tool_manager.is_runnable = lambda name: True  # type: ignore[method-assign]
+
+    resolved_path = output_dir / "resolved.txt"
+    await runner._maybe_collect_followups(context, resolved_path)
+
+    assert "Follow-up DNS crashed; seed DNS artifacts preserved" in context.warnings
+
+    attempts = context.metadata.get("collection_attempts") or []
+    claimed = [row for row in attempts if row.get("value") == WWW]
+    assert claimed, "expected a persisted attempt row for the claimed host before the crash"
+    assert claimed[0]["status"] == "IN_FLIGHT"
+    assert claimed[0]["capability"] == "DNS_RESOLUTION"
+    assert claimed[0]["collector"] == "dnsx"
+
+    # The row is durable in SQLite too, not just in the in-memory context.
+    with store._connect() as conn:
+        stored = conn.execute(
+            "SELECT status, capability FROM intel_collection_attempts WHERE run_id=? AND value=?",
+            (run_id, WWW),
+        ).fetchall()
+    assert any(row[0] == "IN_FLIGHT" and row[1] == "DNS_RESOLUTION" for row in stored)
 
 
 def test_schedule_blocks_wildcard_dns_only_name(tmp_path: Path) -> None:

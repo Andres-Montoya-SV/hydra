@@ -25,7 +25,9 @@ from modules.cloud_bucket_enum import (
 from modules.param_fuzz import CANARY_VALUE, PARAM_WORDLIST, ParamFuzzPlugin
 from utils.files import read_jsonl
 
-_SCOPE = CollectionScope.from_seeds(["example.com", "metaversejustice.com"])
+_SCOPE = CollectionScope.from_seeds(
+    ["example.com", "metaversejustice.com"], cloud_collection_allowed=True
+)
 
 
 def test_bodies_near_identical_and_significant_change() -> None:

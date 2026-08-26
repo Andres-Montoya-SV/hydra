@@ -166,6 +166,14 @@ async def _probe_target(
         service_workers="block",
     )
     try:
+        blocked_counts: dict[str, int] = {}
+        # Installed on the context, not the page: a page-scoped route would
+        # leave any popup/new-tab page a hostile site opens via
+        # window.open() completely unguarded, since Playwright only applies
+        # page.route() to the one page it was called on. Context-level
+        # routing covers every page — and every WebSocket — created in this
+        # context, present or future.
+        await _install_scope_request_guard(browser_context, context, blocked_counts)
         page = await browser_context.new_page()
         await page.add_init_script(
             """
@@ -185,8 +193,6 @@ async def _probe_target(
 
         page.on("response", capture_response)
         error: str | None = None
-        blocked_counts: dict[str, int] = {}
-        await _install_scope_request_guard(page, context, blocked_counts)
         try:
             await page.goto(
                 target["probe_url"],
@@ -291,18 +297,35 @@ def browser_request_decision(request: object, context: PipelineContext) -> bool:
 
 
 async def _install_scope_request_guard(
-    page: object, context: PipelineContext, blocked_counts: dict[str, int]
+    browser_context: object, context: PipelineContext, blocked_counts: dict[str, int]
 ) -> None:
-    """Route every request on the page through `browser_request_decision`.
+    """Route every request in the browser context through `browser_request_decision`.
 
-    Covers the main document, iframe/sub-frame navigations, and every
-    subresource type — not just `is_navigation_request()`. Always install.
-    Missing CollectionScope blocks everything (fail closed). An exception
-    while evaluating the policy also blocks (fail closed) — a bug in the
-    scope check must never fall open into an unauthorized request.
+    Installed with `browser_context.route()`/`route_web_socket()`, not
+    `page.route()`: a page-scoped route only ever covers the one Page object
+    it was installed on, so a hostile page's `window.open()` popup — a new
+    Page Playwright creates in the same context — would otherwise carry no
+    route handler at all and could make fully unrestricted requests.
+    Context-level routing covers the main document, iframe/sub-frame
+    navigations, every HTTP subresource type, and any page opened later in
+    this context.
 
-    Blocked requests are tallied into `blocked_counts` by resource type so
-    the caller can report how much of the page was withheld by policy.
+    WebSocket connections are a separate Playwright interception surface —
+    `page.route()`/`browser_context.route()` do not see the WS upgrade at
+    all — so they are routed independently via `route_web_socket()`. A
+    routed WebSocket does not connect to the real server unless the handler
+    explicitly calls `connect_to_server()`, so simply not connecting when
+    unauthorized is itself the block; `close()` is called in addition so the
+    page sees a clean close rather than a hang.
+
+    Always install both. Missing CollectionScope blocks everything (fail
+    closed). An exception while evaluating the policy also blocks (fail
+    closed) — a bug in the scope check must never fall open into an
+    unauthorized request.
+
+    Blocked requests are tallied into `blocked_counts` by resource type
+    (`websocket` for WS connections) so the caller can report how much was
+    withheld by policy.
     """
 
     async def guard(route: object) -> None:
@@ -326,7 +349,29 @@ async def _install_scope_request_guard(
             return
         await route.continue_()
 
-    await page.route("**/*", guard)
+    async def websocket_guard(ws: object) -> None:
+        url = str(getattr(ws, "url", "") or "")
+        try:
+            allowed = allow_browser_navigation(url, context)
+        except Exception:
+            logger.warning(
+                "browser_probe: websocket guard raised while evaluating %s; "
+                "blocking (fail closed)",
+                url,
+                exc_info=True,
+            )
+            allowed = False
+
+        if not allowed:
+            blocked_counts["websocket"] = blocked_counts.get("websocket", 0) + 1
+            await ws.close(code=1008, reason="blocked by CollectionScope policy")
+            return
+        # Routed WebSockets default to not connecting to the server at all;
+        # an authorized destination must be explicitly wired through.
+        ws.connect_to_server()
+
+    await browser_context.route("**/*", guard)
+    await browser_context.route_web_socket("**/*", websocket_guard)
 
 
 def _httpx_targets(context: PipelineContext) -> list[dict[str, str]]:

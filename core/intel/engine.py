@@ -613,6 +613,47 @@ class IntelEngine:
                 depth=1,
             )
 
+    def claim_attempt(
+        self,
+        value: str,
+        *,
+        capability: CollectionCapability,
+        collector: str,
+        reason: str = "claimed",
+    ) -> CollectionAttempt:
+        """Record an IN_FLIGHT attempt BEFORE the network operation runs.
+
+        `record_attempt()` alone only creates a row once the plugin has
+        already finished and its output was parsed — a crash between the
+        indicator being claimed (ELIGIBLE -> IN_FLIGHT) and that call leaves
+        the indicator lifecycle crash-safe (`IndicatorQueue.overlay_status`
+        turns a restored IN_FLIGHT into FAILED) but the `intel_collection_
+        attempts` audit table gets no row at all for that attempt. Calling
+        this immediately after claiming — before invoking the plugin, and
+        persisted (`_persist_indicators`) before the subprocess/network call
+        — means a crash there still leaves a durable IN_FLIGHT attempt
+        record instead of nothing.
+
+        Uses a distinct attempt_id (the reason is fixed to "claimed", not
+        the eventual outcome) so the completing `record_attempt()` call
+        writes its own SUCCESS/FAILED row alongside this one rather than
+        colliding with it — both are kept as a claimed-then-completed trail.
+        """
+        item = self.queue.get(IndicatorKind.DOMAIN, value)
+        indicator_id = item.indicator_id if item else stable_id("indicator", "DOMAIN", value)
+        attempt = CollectionAttempt(
+            attempt_id=stable_id("attempt", indicator_id, capability.value, collector, "claimed"),
+            indicator_id=indicator_id,
+            value=value,
+            capability=capability.value,
+            status=AttemptStatus.IN_FLIGHT.value,
+            reason=reason,
+            collector=collector,
+            observed_at=self.observed_at,
+        )
+        self.attempts.append(attempt)
+        return attempt
+
     def record_attempt(
         self,
         value: str,

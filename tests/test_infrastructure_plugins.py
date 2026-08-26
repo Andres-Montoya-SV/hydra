@@ -345,18 +345,30 @@ async def test_asn_lookup_warns_when_no_ips_available(settings: Settings, tmp_pa
 
 @pytest.mark.asyncio
 async def test_asn_collect_ips_falls_back_to_resolving_hostnames(
-    settings: Settings, tmp_path: Path
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When dnsx_records.jsonl is empty but resolved hostnames exist, resolve them."""
+    """When dnsx_records.jsonl is empty but resolved hostnames exist, resolve them —
+    but only the ones CollectionScope actually authorizes. This is the one place
+    asn_lookup performs active DNS resolution of its own; an out-of-scope entry in
+    ``context.resolved`` must never reach ``_resolve_hostnames`` at all."""
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
     (output_dir / "dnsx_records.jsonl").write_text("", encoding="utf-8")
     context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
-    context.resolved = ["localhost"]
+    context.resolved = ["example.com", "evil-out-of-scope.test"]
+
+    resolved_calls: list[list[str]] = []
+
+    async def fake_resolve(hostnames: list[str]) -> set[str]:
+        resolved_calls.append(list(hostnames))
+        return {"93.184.216.34"}
+
+    monkeypatch.setattr("modules.asn_lookup._resolve_hostnames", fake_resolve)
 
     ips = await _collect_ips(context)
-    assert ips  # at least 127.0.0.1 and/or ::1
-    assert any(ip.startswith("127.") or ip == "::1" for ip in ips)
+    assert ips == ["93.184.216.34"]
+    # The out-of-scope hostname was filtered before _resolve_hostnames was ever called.
+    assert resolved_calls == [["example.com"]]
 
 
 def test_format_exc_never_empty_for_bare_timeout_error() -> None:
