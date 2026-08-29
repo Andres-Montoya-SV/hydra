@@ -1053,6 +1053,10 @@ class PipelineRunner:
             intel=intel,
         )
 
+        network_requests = context.metadata.get("network_requests")
+        if isinstance(network_requests, list) and network_requests:
+            store.record_network_requests(context.run_id, network_requests)
+
         store.finish_run(
             context.run_id,
             host_count=len(hosts),

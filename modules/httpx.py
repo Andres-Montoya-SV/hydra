@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+from core.collection.audit import NetworkRequestRecord, append_network_request
 from core.collection.target import AuthorizedCollectionTarget
 from core.intel.model import CollectionStatus, ScopeStatus
 from core.intel.scope import (
@@ -26,6 +27,38 @@ from utils.security import atomic_write_text, validate_output_path
 # is observation, not permission to treat the destination as an
 # active-collection target — it is never fetched unless authorized first.
 _REDIRECT_CONFIDENCE = 95
+
+
+def _record_hop_decision(
+    context: object,
+    *,
+    url: str,
+    redirect_hop: int,
+    allowed: bool,
+    reason: str,
+    completed: bool = False,
+) -> None:
+    """Append one redirect-hop authorization decision to the durable
+    `intel_network_requests` audit trail (core/collection/audit.py)."""
+    from urllib.parse import urlparse as _urlparse
+
+    parsed = _urlparse(url) if "://" in url else None
+    append_network_request(
+        context,
+        NetworkRequestRecord(
+            collector="httpx",
+            capability="http_probe",
+            method="GET",
+            url=url,
+            normalized_hostname=(parsed.hostname or "") if parsed else "",
+            port=parsed.port if parsed else None,
+            redirect_hop=redirect_hop,
+            decision="ALLOW" if allowed else "DENY",
+            reason=reason,
+            network_attempted=allowed,
+            network_completed=completed,
+        ),
+    )
 
 
 class HttpxPlugin(BaseToolPlugin):
@@ -200,10 +233,25 @@ class HttpxPlugin(BaseToolPlugin):
             )
             if target is None:
                 blocked_target = next_url
+                _record_hop_decision(
+                    context,
+                    url=next_url,
+                    redirect_hop=hop + 1,
+                    allowed=False,
+                    reason="out_of_scope",
+                )
                 break
             hop += 1
             hop_record = await self._fetch_single_hop(
                 context, target, suffix=suffix, record_index=record_index, hop=hop
+            )
+            _record_hop_decision(
+                context,
+                url=next_url,
+                redirect_hop=hop,
+                allowed=True,
+                reason="in_scope",
+                completed=hop_record is not None,
             )
             if hop_record is None:
                 # Follow-up request failed/produced nothing usable — stop where

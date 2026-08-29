@@ -299,6 +299,11 @@ class BaseToolPlugin(ReconPlugin):
             yield proxy
         finally:
             await proxy.stop()
+            from core.collection.audit import append_network_request
+
+            for record in proxy.audit:
+                record.collector = self.name
+                append_network_request(context, record)
             if proxy.denied:
                 denied_hosts = sorted({item.host for item in proxy.denied if item.host})
                 preview = ", ".join(denied_hosts[:10])

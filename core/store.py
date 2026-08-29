@@ -381,6 +381,38 @@ CREATE TABLE IF NOT EXISTS intel_collection_attempts (
     FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 
+-- Per-destination network authorization audit trail — finer-grained than
+-- intel_collection_attempts (one row per plugin capability attempt): one row
+-- per concrete network decision the crawler-confinement proxy or httpx's
+-- redirect-hop resolver actually made, ALLOW and DENY alike. Answers "was
+-- this host actually contacted, under which authorization, why" from SQLite
+-- alone, without re-reading warnings text.
+CREATE TABLE IF NOT EXISTS intel_network_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    collector TEXT NOT NULL,
+    capability TEXT,
+    method TEXT,
+    url TEXT NOT NULL,
+    normalized_hostname TEXT,
+    port INTEGER,
+    redirect_hop INTEGER DEFAULT 0,
+    decision TEXT NOT NULL,
+    reason TEXT,
+    network_attempted INTEGER NOT NULL DEFAULT 0,
+    network_completed INTEGER NOT NULL DEFAULT 0,
+    response_status INTEGER,
+    response_location TEXT,
+    parent_request_id TEXT,
+    observed_at TEXT,
+    UNIQUE(run_id, request_id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_intel_network_requests_run ON intel_network_requests(run_id, decision);
+CREATE INDEX IF NOT EXISTS idx_intel_network_requests_host ON intel_network_requests(run_id, normalized_hostname);
+
 CREATE INDEX IF NOT EXISTS idx_intel_entities_run ON intel_entities(run_id, entity_type);
 CREATE INDEX IF NOT EXISTS idx_intel_entities_key ON intel_entities(run_id, key);
 CREATE INDEX IF NOT EXISTS idx_intel_obs_entity ON intel_observations(run_id, entity_id);
@@ -607,6 +639,7 @@ class AssetStore:
             "graph_edges",
             "graph_nodes",
             "intel_collection_attempts",
+            "intel_network_requests",
             "intel_hypotheses",
             "intel_indicators",
             "intel_relationships",
@@ -765,6 +798,69 @@ class AssetStore:
                     for a in attempts
                 ],
             )
+
+    def record_network_requests(self, run_id: str, requests: list[dict]) -> None:
+        """Persist per-destination network authorization decisions.
+
+        `requests` is a list of plain dicts (see `core.collection.audit.
+        NetworkRequestRecord.to_dict()`), accumulated in `context.metadata
+        ["network_requests"]` by the crawler-confinement proxy and httpx's
+        redirect-hop resolver — the two components that make individual,
+        per-destination ALLOW/DENY decisions outside the input-file gate.
+        `INSERT OR REPLACE` so a retried/partial finalize is idempotent.
+        """
+        if not requests:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_network_requests
+                   (run_id, request_id, collector, capability, method, url,
+                    normalized_hostname, port, redirect_hop, decision, reason,
+                    network_attempted, network_completed, response_status,
+                    response_location, parent_request_id, observed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        str(r.get("request_id") or ""),
+                        str(r.get("collector") or ""),
+                        str(r.get("capability") or ""),
+                        str(r.get("method") or ""),
+                        str(r.get("url") or ""),
+                        str(r.get("normalized_hostname") or ""),
+                        r.get("port"),
+                        int(r.get("redirect_hop") or 0),
+                        str(r.get("decision") or ""),
+                        str(r.get("reason") or ""),
+                        1 if r.get("network_attempted") else 0,
+                        1 if r.get("network_completed") else 0,
+                        r.get("response_status"),
+                        str(r.get("response_location") or ""),
+                        str(r.get("parent_request_id") or ""),
+                        str(r.get("observed_at") or ""),
+                    )
+                    for r in requests
+                    if r.get("request_id")
+                ],
+            )
+
+    def get_network_requests(
+        self, run_id: str, *, decision: str | None = None
+    ) -> list[dict[str, object]]:
+        """Read back the network-request audit trail for a run (CLI/debugging)."""
+        with self._connect() as conn:
+            if decision:
+                rows = conn.execute(
+                    "SELECT * FROM intel_network_requests WHERE run_id=? AND decision=? "
+                    "ORDER BY id",
+                    (run_id, decision),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM intel_network_requests WHERE run_id=? ORDER BY id",
+                    (run_id,),
+                ).fetchall()
+        return [dict(row) for row in rows]
 
     def upsert_host(self, run_id: str, host: Host) -> None:
         """Legacy single-host upsert (used by tests)."""

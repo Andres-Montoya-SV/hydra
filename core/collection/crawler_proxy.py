@@ -29,8 +29,10 @@ import asyncio
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+from core.collection.audit import NetworkRequestRecord
 from core.intel.scope import CollectionScope, allows_active_collection
 from core.logger import get_logger
+from core.provenance import utc_now_iso
 
 logger = get_logger("crawler_proxy")
 
@@ -62,6 +64,9 @@ class ScopeEnforcingProxy:
         self.port = 0
         self.denied: list[DeniedConnection] = []
         self.allowed_hosts: list[str] = []
+        # Durable audit trail (core/collection/audit.py) — every decision,
+        # ALLOW and DENY alike, for persistence into intel_network_requests.
+        self.audit: list[NetworkRequestRecord] = []
 
     @property
     def proxy_url(self) -> str:
@@ -92,10 +97,15 @@ class ScopeEnforcingProxy:
         await self.stop()
 
     def _authorized(self, host: str) -> bool:
-        if not host or self.scope is None:
-            return False
+        return self._authorize_with_reason(host)[0]
+
+    def _authorize_with_reason(self, host: str) -> tuple[bool, str]:
+        if not host:
+            return False, "empty_host"
+        if self.scope is None:
+            return False, "missing_collection_scope"
         try:
-            return allows_active_collection(host, self.scope)
+            allowed = allows_active_collection(host, self.scope)
         except Exception:
             # A bug evaluating scope must block, never fall open.
             logger.warning(
@@ -103,7 +113,32 @@ class ScopeEnforcingProxy:
                 host,
                 exc_info=True,
             )
-            return False
+            return False, "authorization_error"
+        return allowed, ("in_scope" if allowed else "out_of_scope")
+
+    def _record(
+        self,
+        *,
+        method: str,
+        host: str,
+        port: int,
+        allowed: bool,
+        reason: str,
+    ) -> None:
+        self.audit.append(
+            NetworkRequestRecord(
+                collector=self.capability,
+                capability=self.capability,
+                method=method,
+                url=f"{host}:{port}" if host else "",
+                normalized_hostname=host,
+                port=port,
+                decision="ALLOW" if allowed else "DENY",
+                reason=reason,
+                network_attempted=allowed,
+                observed_at=utc_now_iso(),
+            )
+        )
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -143,7 +178,9 @@ class ScopeEnforcingProxy:
         host = parsed.hostname or host_header.split(":")[0]
         port = parsed.port or 80
 
-        if not self._authorized(host):
+        allowed, reason = self._authorize_with_reason(host)
+        self._record(method=method, host=host or "", port=port, allowed=allowed, reason=reason)
+        if not allowed:
             self.denied.append(
                 DeniedConnection(host=host or "", capability=self.capability, method=method)
             )
@@ -164,6 +201,7 @@ class ScopeEnforcingProxy:
             )
             await writer.drain()
             return
+        self.audit[-1].network_completed = True
 
         try:
             path = parsed.path or "/"
@@ -184,7 +222,9 @@ class ScopeEnforcingProxy:
     ) -> None:
         host, _, port_str = target.rpartition(":")
         port = int(port_str) if port_str.isdigit() else 443
-        if not self._authorized(host):
+        allowed, reason = self._authorize_with_reason(host)
+        self._record(method="CONNECT", host=host, port=port, allowed=allowed, reason=reason)
+        if not allowed:
             self.denied.append(
                 DeniedConnection(host=host, capability=self.capability, method="CONNECT")
             )
@@ -201,6 +241,7 @@ class ScopeEnforcingProxy:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
             await writer.drain()
             return
+        self.audit[-1].network_completed = True
 
         try:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")

@@ -310,3 +310,44 @@ was explicit about not altering existing scope-matching policy.
 New tests: `tests/test_url_normalization_adversarial.py` (23 cases across both layers),
 `tests/test_crawler_proxy.py` (2 new cases: CONNECT with a userinfo-shaped target, plain-HTTP
 userinfo confusion against the proxy's own request-line parser).
+
+---
+
+## 11. Durable per-destination network authorization audit trail (this change set)
+
+Everything in §§9–10 proves authorization decisions are *correct*. It does not, on its own, let
+an analyst or the CLI answer, after the fact and from SQLite alone: was this specific host ever
+actually contacted, under what authorization, and why (or why not)? `intel_collection_attempts`
+answers this at the plugin/capability granularity ("did httpx run against this scope"); it has no
+row per individual destination a crawler discovered or a redirect chain hopped through. This gap
+is closed with a new table, `intel_network_requests` (`core/store.py`), and a small dataclass,
+`NetworkRequestRecord` (`core/collection/audit.py`), that both of the components making
+individual per-destination decisions — `ScopeEnforcingProxy` (§9.1) and httpx's
+`_resolve_authorized_redirects` (§8/§9.2) — append to on every decision, ALLOW and DENY alike.
+
+Each row records: `collector`, `capability`, `method`, `url`/`normalized_hostname`/`port`,
+`redirect_hop`, `decision` (`ALLOW`/`DENY`), `reason` (`in_scope`/`out_of_scope`/
+`missing_collection_scope`/`authorization_error`/`empty_host`), and two independent attempt
+flags — `network_attempted` (was a connection ever opened) and `network_completed` (did that
+connection succeed) — so a `DENY` row is mechanically guaranteed to show `network_attempted=0`
+(the record is only ever constructed *after* the authorization check, and the code path that
+would open a socket is behind the same `if not allowed: return` that writes the DENY reason).
+Records accumulate in `context.metadata["network_requests"]` during a run (via
+`append_network_request()`) and are persisted by `core/runner.py:_finalize_to_store` in the same
+pass as the rest of the run's data, keyed by `run_id` for the new
+`AssetStore.record_network_requests`/`get_network_requests` methods to query back.
+
+Verified end-to-end (not just at the dataclass level) by
+`tests/test_network_request_audit_trail.py`: one test drives `ScopeEnforcingProxy` through the
+real `modules/_base.py:_crawler_confinement` context manager with the real `KatanaPlugin`, then
+reads the persisted rows back out of a real SQLite file and asserts the ALLOW row shows
+`network_attempted=1`/`network_completed=1` and the DENY row shows `network_attempted=0`; a
+second drives the real `HttpxPlugin._resolve_authorized_redirects` against an out-of-scope
+`Location` header and asserts the resulting DENY row never shows a completed connection.
+
+**Scope of what this covers:** only the two call sites wired above. It is not yet wired into
+every plugin that makes a network call (that is the same `CollectionGateway` retrofit already
+noted as the open item in §9) — a plugin outside those two paths has no `intel_network_requests`
+rows at all, which is a coverage gap for forensic completeness, not an authorization bypass
+(§§1–10's enforcement is unaffected either way; this table is a record of decisions already being
+made correctly, not a new gate).
