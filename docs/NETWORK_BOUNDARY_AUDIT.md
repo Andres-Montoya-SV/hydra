@@ -270,3 +270,43 @@ The two items §8 explicitly deferred — the crawler containment proxy and a ty
 5. **Missing-scope coverage extended to all 19 active-collection plugins (new test, `tests/test_missing_scope_all_active_plugins.py`).** Prior tests each covered one or two plugins (dnsx, httpx, cloud_bucket_enum). This parametrizes over every plugin `core.collectors.ACTIVE_COLLECTION_PLUGINS` actually lists, patches every network/subprocess primitive a plugin could reach (`run_command`, `run_command_to_file`, `http_get`, `open_url`, `asyncio.open_connection`), and asserts none of them are ever called when `context.collection_scope is None` — regardless of whether the plugin raises, returns empty, or skips. A companion assertion (`test_every_active_collection_plugin_is_covered_by_this_parametrization`) fails if a future plugin adds `active_collection = True` without this coverage picking it up automatically.
 
 **Still not attempted**, and now the clear next increment: the full `CollectionGateway` retrofit across every remaining plugin, and unifying seed vs. follow-up `CollectionAttempt` accounting (§8 item 5's residual). Both are scoped in `docs/FINAL_SECURITY_AUDIT.md`.
+
+---
+
+## 10. Adversarial URL/hostname normalization (this change set)
+
+Targeted stress-testing of the specific bug class behind most real-world SSRF/scope-bypass
+vulnerabilities: does host-parsing get fooled by userinfo, IP literals, protocol-relative
+redirects, subdomain-confusion labels, or encoding tricks? Tested at two independent layers —
+`allows_active_collection` (the shared primitive) and the real `httpx`
+`_resolve_authorized_redirects` code path (proving the follow-up subprocess request is never
+issued, not just that the primitive would deny the string) — plus the crawler-confinement
+proxy's own, structurally separate URL-parsing code (`core/collection/crawler_proxy.py`, which
+parses raw HTTP proxy-protocol lines, not `Location` headers).
+
+**No bypass found.** Specifically verified safe: userinfo confusion (`https://allowed@oos/` → the
+real host `oos` is correctly extracted and denied; `https://oos@allowed/` → the real host
+`allowed` is correctly extracted and allowed — this is the *correct* behavior for both, not a
+bug in either direction), IPv4/IPv6 literals (denied against a domain-based scope), IPv6 with a
+port in a `CONNECT` target (`rpartition(":")` correctly splits on the last colon, not confused by
+the address's own colons), protocol-relative redirects (`urljoin` resolves `//oos/path` against
+the current scheme+host into a fully-qualified `https://oos/path` *before* authorization ever
+sees it), subdomain-confusion labels (`allowed.test.oos.test` denied — `oos.test` is the real
+registrable host; `oos.test.allowed.test` allowed — this one **is** a genuine subdomain of the
+authorized domain, correctly matching this codebase's existing, deliberate
+`host_in_scope`/`core/scope.py` policy that an exact scope entry also covers its subdomains, which
+this testing pass confirmed but did not and should not change), and encoding tricks
+(`allowed.test%2eevil.com`, a literal null byte) that don't merge into the authorized hostname
+under Python's `urlparse`.
+
+**One functionality gap noted, not a security bypass:** `normalize_domain()` is
+`.strip().lower().rstrip(".")` with no IDNA/punycode conversion. A `SCOPE_FILE` entry written in
+punycode and a discovered indicator in the equivalent Unicode form (or vice versa) will not match
+each other — but the failure mode is under-matching (denying something that should arguably be
+in scope), never over-matching, so it cannot become an authorization bypass. Not fixed, since it
+is a matching-completeness question, not a safety one, and the mission text for this change set
+was explicit about not altering existing scope-matching policy.
+
+New tests: `tests/test_url_normalization_adversarial.py` (23 cases across both layers),
+`tests/test_crawler_proxy.py` (2 new cases: CONNECT with a userinfo-shaped target, plain-HTTP
+userinfo confusion against the proxy's own request-line parser).

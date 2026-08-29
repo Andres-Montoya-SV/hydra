@@ -199,3 +199,51 @@ async def test_authorization_exception_denies_fail_closed(monkeypatch: pytest.Mo
     finally:
         await proxy.stop()
     assert b"403" in response
+
+
+@pytest.mark.asyncio
+async def test_connect_userinfo_style_target_is_parsed_by_real_host(destination) -> None:
+    """CONNECT doesn't have userinfo per spec, but a malformed/malicious client
+    sending one must not let the userinfo-looking prefix leak through as the
+    authorized host — rpartition(':') on the raw target string is what the
+    proxy actually authorizes against, so this proves that stays correct."""
+    server, port = destination
+    proxy = ScopeEnforcingProxy(_scope(), capability="crawl")
+    await proxy.start()
+    try:
+        # A client can't literally put "user@host" before the CONNECT target
+        # per spec, but a target that merely *contains* the seed as a
+        # substring must not be treated as authorized by anything looser
+        # than an exact host match.
+        response = await _raw_connect_request(proxy.port, f"{SEED}.{OOS}", port)
+    finally:
+        await proxy.stop()
+    assert b"403" in response
+    assert server.hits == []
+
+
+@pytest.mark.asyncio
+async def test_plain_http_userinfo_confusion_authorizes_real_host_only(destination) -> None:
+    """GET http://seed@oos/ — the authorized-looking string before '@' is
+    userinfo, not the host; the real host (oos) must be denied, and an
+    authorized-looking host used as userinfo must not smuggle an OOS host
+    through."""
+    server, port = destination
+    proxy = ScopeEnforcingProxy(_scope(), capability="crawl")
+    await proxy.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy.port)
+        url = f"http://{SEED}@127.0.0.1:{port}/"
+        writer.write(
+            f"GET {url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode()
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(4096), timeout=5)
+        writer.close()
+    finally:
+        await proxy.stop()
+
+    # The real host here is 127.0.0.1 (not in scope, SEED is a domain) — the
+    # userinfo-looking SEED prefix must not authorize it.
+    assert b"403" in response
+    assert server.hits == []
