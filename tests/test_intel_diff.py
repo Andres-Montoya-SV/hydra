@@ -173,3 +173,158 @@ def test_intel_relationship_history_tracks_certificate_rotation(tmp_path) -> Non
     assert any(c["change_type"] == "CERTIFICATE_DISAPPEARED" for c in diff.certificate_rotations)
     assert diff.new_entities
     assert diff.new_evidence or diff.removed_evidence or diff.new_observations
+
+
+def test_intel_relationship_confidence_change_is_reported(tmp_path) -> None:
+    """Same relationship_id, HIGH -> MEDIUM confidence, must show up as a change,
+    not be silently dropped because it's neither a new nor a removed relationship."""
+    from core.intel.engine import IntelEngine, IntelRunConfig
+    from core.intel.model import ConfidenceBand
+
+    store = AssetStore(tmp_path / "db.sqlite")
+    sans = ["example.com", "www.example.com"]
+    fp = "c" * 64
+
+    def _snap(run_id: str, *, confidence: ConfidenceBand):
+        engine = IntelEngine(
+            IntelRunConfig(
+                run_id=run_id,
+                seed_domains=["example.com", "www.example.com"],
+                collected_domains={"example.com", "www.example.com"},
+                observed_at="2026-01-01T00:00:00Z",
+            )
+        )
+        engine.ingest_ct_records(
+            [
+                {
+                    "id": "1",
+                    "name_value": "\n".join(sans),
+                    "fingerprint_sha256": fp,
+                    "query_domain": "example.com",
+                }
+            ]
+        )
+        engine.correlate()
+        # Confidence is under the diff's test, not the correlation heuristic
+        # (already covered elsewhere) — force it so the scenario is exact.
+        for rel in engine.relationships.values():
+            rel.confidence = confidence
+        return engine.snapshot()
+
+    store.create_run(
+        ScanRun(run_id="conf-a", started_at="2026-01-01T00:00:00Z", targets=["example.com"])
+    )
+    store.persist_registry("conf-a", {}, intel=_snap("conf-a", confidence=ConfidenceBand.HIGH))
+    store.finish_run("conf-a", host_count=1, alive_count=0, warnings=[], errors=[])
+
+    store.create_run(
+        ScanRun(run_id="conf-b", started_at="2026-01-02T00:00:00Z", targets=["example.com"])
+    )
+    store.persist_registry("conf-b", {}, intel=_snap("conf-b", confidence=ConfidenceBand.MEDIUM))
+    store.finish_run("conf-b", host_count=1, alive_count=0, warnings=[], errors=[])
+
+    diff = diff_runs(store, "conf-b", "conf-a")
+    assert diff is not None
+    assert not diff.new_relationships
+    assert not diff.removed_relationships
+    assert diff.changed_relationships
+    change = diff.changed_relationships[0]
+    assert change["change_type"] == "CONFIDENCE_DECREASED"
+    assert change["old_confidence"] == "HIGH"
+    assert change["new_confidence"] == "MEDIUM"
+
+
+def test_intel_relationship_evidence_change_is_reported(tmp_path) -> None:
+    """Same relationship_id, same confidence, genuinely different evidence content
+    (a third domain joins the shared certificate) must be reported as a change.
+
+    `evidence_id` itself is *not* usable as the change signal — it is derived
+    from an observation_id namespaced by run_id (`core/intel/engine.py:
+    _observe`), so it differs between any two runs even when nothing at all
+    changed. `_intel_relationship_diff` must compare the relationship's
+    content (`data`) instead, or every relationship would show as "changed"
+    on every re-scan regardless of anything real changing — this test would
+    fail against that naive implementation because the SHARES_CERTIFICATE
+    relationship between example.com and www.example.com keeps the exact
+    same relationship_id and confidence in both runs; only its
+    `san_cardinality`/`members` content changes.
+    """
+    from core.intel.engine import IntelEngine, IntelRunConfig
+    from core.intel.model import RelationshipType
+
+    store = AssetStore(tmp_path / "db.sqlite")
+    fp = "d" * 64
+
+    def _snap(run_id: str, sans: list[str]):
+        engine = IntelEngine(
+            IntelRunConfig(
+                run_id=run_id,
+                seed_domains=["example.com", "www.example.com", "extra.example.com"],
+                collected_domains=set(sans),
+                observed_at="2026-01-01T00:00:00Z",
+            )
+        )
+        engine.ingest_ct_records(
+            [
+                {
+                    "id": "1",
+                    "name_value": "\n".join(sans),
+                    "fingerprint_sha256": fp,
+                    "query_domain": "example.com",
+                }
+            ]
+        )
+        engine.correlate()
+        return engine.snapshot()
+
+    store.create_run(
+        ScanRun(run_id="ev-a", started_at="2026-01-01T00:00:00Z", targets=["example.com"])
+    )
+    store.persist_registry("ev-a", {}, intel=_snap("ev-a", ["example.com", "www.example.com"]))
+    store.finish_run("ev-a", host_count=1, alive_count=0, warnings=[], errors=[])
+
+    store.create_run(
+        ScanRun(run_id="ev-b", started_at="2026-01-02T00:00:00Z", targets=["example.com"])
+    )
+    store.persist_registry(
+        "ev-b",
+        {},
+        intel=_snap("ev-b", ["example.com", "www.example.com", "extra.example.com"]),
+    )
+    store.finish_run("ev-b", host_count=1, alive_count=0, warnings=[], errors=[])
+
+    diff = diff_runs(store, "ev-b", "ev-a")
+    assert diff is not None
+    shares_cert_changed = [
+        c
+        for c in diff.changed_relationships
+        if c["relationship_type"] == RelationshipType.SHARES_CERTIFICATE.value
+        and {c["source_entity"], c["target_entity"]}
+        == {"domain:example.com", "domain:www.example.com"}
+    ]
+    assert shares_cert_changed, (
+        "expected the example.com<->www.example.com SHARES_CERTIFICATE relationship "
+        "(same relationship_id in both runs) to show up as changed"
+    )
+    change = shares_cert_changed[0]
+    assert change["change_type"] == "EVIDENCE_CHANGED"
+    assert change["old_confidence"] == change["new_confidence"]
+    # evidence_id is still reported for reference but is not the change signal.
+    assert change["old_evidence_id"] != change["new_evidence_id"]
+
+    # And a scan producing byte-identical CT input must NOT report a spurious
+    # change just because evidence_id is namespaced by run_id.
+    store.create_run(
+        ScanRun(run_id="ev-c", started_at="2026-01-03T00:00:00Z", targets=["example.com"])
+    )
+    store.persist_registry(
+        "ev-c",
+        {},
+        intel=_snap("ev-c", ["example.com", "www.example.com", "extra.example.com"]),
+    )
+    store.finish_run("ev-c", host_count=1, alive_count=0, warnings=[], errors=[])
+    stable_diff = diff_runs(store, "ev-c", "ev-b")
+    assert stable_diff is not None
+    assert stable_diff.new_relationships == []
+    assert stable_diff.removed_relationships == []
+    assert stable_diff.changed_relationships == []

@@ -535,6 +535,39 @@ class MyToolPlugin(BaseToolPlugin):
   failures, that is usually a network/resolver limit (GCS uses a fixed host and
   often still works) — re-run from a network with normal public DNS.
 
+### Network boundary — what is actually enforced
+
+Full detail, exact code citations, and how each claim was verified:
+[`docs/FINAL_SECURITY_AUDIT.md`](docs/FINAL_SECURITY_AUDIT.md) and
+[`docs/NETWORK_BOUNDARY_AUDIT.md`](docs/NETWORK_BOUNDARY_AUDIT.md). Summary:
+
+**Guaranteed by Hydra** (application-level, verified against real binaries/browsers, not mocks):
+no active-collection plugin can make a network/subprocess call without an attached
+`CollectionScope` (all 19 active-collection plugins are covered by one test); every HTTP redirect
+hop httpx follows is individually authorized before the request; every browser request —
+document, iframe, every subresource type, and WebSocket, including `window.open()` popups — is
+authorized before the connection, fail-closed on any error evaluating the policy; katana,
+hakrawler, and nuclei are routed through a local scope-enforcing proxy
+(`core/collection/crawler_proxy.py`) for every connection they make beyond their authorized seed
+list, so a tool that discovers and follows a link or redirect on its own still cannot reach an
+out-of-scope host.
+
+**Guaranteed only when the tool itself supports it**: the crawler proxy authorizes by destination
+host, not by TLS content — `CONNECT` tunnels are never decrypted or inspected, only the tunnel
+target is checked. nuclei's interactsh OOB channel is disabled by default
+(`NUCLEI_ENABLE_INTERACTSH=false`) because it legitimately needs to contact third-party
+ProjectDiscovery infrastructure that per-target scope confinement cannot distinguish from an
+unauthorized destination; enabling it means accepting that specific traffic is unproxied.
+
+**Requires external network isolation** (outside anything Hydra's own code can enforce): a tool
+that ignores its own configured `-proxy` — a bug, or a raw-socket code path bypassing its
+configured HTTP transport — is invisible to the confinement proxy. Nothing at the OS/process
+level stops this; closing it needs a network-namespaced or firewalled sandbox around the whole
+Hydra process, which is an operational choice, not a Hydra feature. DNS resolution is not
+proxied by `STRICT_OPSEC` either — see `check-opsec`'s DNS-leak check, which reports this
+honestly as informational, not a guarantee. **Hydra does not claim universal process-level or
+OS-level network confinement**, and no documentation here should be read as claiming it.
+
 ### Strict OPSEC mode
 
 Set both values before scanning:

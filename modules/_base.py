@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from core.models import PipelineContext, ToolStatus
 from core.plugin_base import PluginResult, ReconPlugin
 from utils.files import read_lines
 from utils.security import validate_output_path, validate_safe_filename
 from utils.subprocess import run_command, run_command_to_file
+
+if TYPE_CHECKING:
+    from core.collection.crawler_proxy import ScopeEnforcingProxy
 
 _RETRY_PATTERN = re.compile(r"retrying|retry\s*#?\s*\d+|attempt\s*#?\s*\d+", re.IGNORECASE)
 
@@ -266,3 +272,40 @@ class BaseToolPlugin(ReconPlugin):
         from core.intel.scope import authorize_plugin_input
 
         return authorize_plugin_input(context, input_path, self.name)
+
+    @asynccontextmanager
+    async def _crawler_confinement(
+        self, context: PipelineContext
+    ) -> AsyncIterator[ScopeEnforcingProxy]:
+        """Start a local scope-enforcing proxy for tools that discover and
+        request URLs on their own (katana, hakrawler, nuclei) — a gated
+        input file only constrains what Hydra hands them, not what they
+        request next. Use ``proxy.proxy_url`` as the tool's ``-proxy`` flag.
+
+        Every connection is authorized against this run's CollectionScope
+        before Hydra connects anywhere; an unauthorized destination gets a
+        proxy-level refusal and is never reached. See
+        core/collection/crawler_proxy.py for what this does and does not
+        cover (no TLS interception; CONNECT tunnels are authorized by
+        destination host, not decrypted content).
+        """
+        from core.collection.crawler_proxy import ScopeEnforcingProxy
+        from core.intel.scope import require_collection_scope
+
+        scope = require_collection_scope(context)
+        proxy = ScopeEnforcingProxy(scope, capability=self.capability or self.name)
+        await proxy.start()
+        try:
+            yield proxy
+        finally:
+            await proxy.stop()
+            if proxy.denied:
+                denied_hosts = sorted({item.host for item in proxy.denied if item.host})
+                preview = ", ".join(denied_hosts[:10])
+                if len(denied_hosts) > 10:
+                    preview += f" (+{len(denied_hosts) - 10} more)"
+                context.add_warning(
+                    f"{self.name}: confinement proxy blocked {len(proxy.denied)} "
+                    f"connection attempt(s) to out-of-scope host(s) the tool tried to "
+                    f"reach on its own: {preview}"
+                )

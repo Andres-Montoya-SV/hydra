@@ -68,6 +68,7 @@ class IntelQuery:
 
     def investigate(self, domain: str) -> dict[str, Any]:
         from core.intel.explain import explain_relationship
+        from core.intel.serialize import serialize_relationships
 
         entity = self.entity_by_domain(domain)
         eid = domain_entity_id(domain)
@@ -100,7 +101,15 @@ class IntelQuery:
         return {
             "entity": entity,
             "observations": self.observations(eid),
-            "relationships": relationships,
+            # Canonical serializer (core/intel/serialize.py) — same shape as
+            # cmd_relationships/reporter.py, so confidence/certificate/SAN
+            # fields are never independently reformatted per CLI surface.
+            "relationships": serialize_relationships(
+                relationships,
+                evidence_by_id=evidence_by_id,
+                entities_by_id=entity_cache,
+                run_id=self.run_id,
+            ),
             "evidence": evidence_rows,
             "indicators": self.indicators(domain),
             "certificates": self.certificates(domain),

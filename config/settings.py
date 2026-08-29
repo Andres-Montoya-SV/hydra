@@ -265,6 +265,15 @@ class Settings:
     max_relationships_per_signal: int = 64
     enable_followup_collection: bool = True
     cloud_bucket_enum_authorize_derived: bool = False
+    # nuclei's interactsh OOB polling contacts ProjectDiscovery's public
+    # collaborator servers directly — third-party infrastructure that is
+    # neither the target nor Hydra's own proxy. The crawler-confinement
+    # proxy (core/collection/crawler_proxy.py) authorizes every destination
+    # against CollectionScope, which would otherwise silently break OOB
+    # template detection. Default off (nuclei runs with -ni, no OOB
+    # templates); an operator who wants OOB detection and accepts that
+    # trade-off explicitly can opt in.
+    nuclei_enable_interactsh: bool = False
     webhook_url: str | None = None
 
     # Optional API credentials (never included in to_safe_dict)
@@ -524,6 +533,7 @@ class Settings:
             cloud_bucket_enum_authorize_derived=_bool(
                 os.getenv("CLOUD_BUCKET_ENUM_AUTHORIZE_DERIVED")
             ),
+            nuclei_enable_interactsh=_bool(os.getenv("NUCLEI_ENABLE_INTERACTSH")),
             webhook_url=os.getenv("WEBHOOK_URL", "").strip() or None,
             urlhaus_api_key=os.getenv("URLHAUS_API_KEY", "").strip() or None,
             custom_http_headers=_parse_headers(os.getenv("HTTP_CUSTOM_HEADERS")),

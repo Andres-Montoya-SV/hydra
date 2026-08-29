@@ -37,11 +37,21 @@ class HakrawlerPlugin(BaseToolPlugin):
 
         input_data = "\n".join(urls) + "\n"
 
-        args = self._argv(context, "-plain", "-depth", "2", "-insecure")
-
-        result = await self._execute(
-            context, args, output_path, input_data=input_data, allow_empty=True
-        )
+        # hakrawler has no built-in scope/exclude flag and follows redirects
+        # by default; a local scope-enforcing proxy is the only confinement
+        # available for hosts it decides to reach on its own.
+        async with self._crawler_confinement(context) as proxy:
+            # -plain doesn't exist on the currently-packaged hakrawler
+            # (github.com/hakluke/hakrawler) — plain URL-per-line is its
+            # default output with no flag needed; depth is -d, not -depth.
+            # Confirmed against the real installed binary's -h output; the
+            # plugin previously errored on every invocation with "flag
+            # provided but not defined: -plain" (masked because existing
+            # tests mock _execute and never actually invoke the binary).
+            args = self._argv(context, "-d", "2", "-insecure", "-proxy", proxy.proxy_url)
+            result = await self._execute(
+                context, args, output_path, input_data=input_data, allow_empty=True
+            )
         crawled = read_lines(output_path)
         write_jsonl(
             json_output,

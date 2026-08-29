@@ -1,282 +1,265 @@
 # Hydra readiness report
 
-**Date:** 2026-08-24  
-**Repository:** this workspace (`Andres-Montoya-SV/hydra`)  
-**Method:** forensic runtime audit (`docs/ARCHITECTURE_AUDIT.md`), control-loop refactor, then a second adversarial review that treated the new code as untrusted.  
-**Test proof used:** 356 pytest cases, including `PipelineRunner.run()` and `app.main()` with stubbed collectors. Tests that copy finished artifacts and call `finalize` were not counted as proof of the loop.
+**Date:** 2026-08-29
+**Repository:** `Andres-Montoya-SV/hydra`, branch `fix/redirect-scope-safety`
+**Method:** forensic runtime audit (`docs/FINAL_SECURITY_AUDIT.md`, `docs/NETWORK_BOUNDARY_AUDIT.md`), targeted fixes verified by real subprocess execution, real WebKit browser tests, real SQLite persistence, and a live run against the project's actual authorized target (`virusbarrier.xyz`, per `scope.txt`) — not stubs alone.
+**Test proof used:** 405 pytest cases (up from 356 at the start of this security-hardening arc), including a comprehensive parametrized test covering all 19 `active_collection=True` plugins, real-binary crawler-confinement tests, and a live production run.
 
 **Verdict: READY FOR CONTROLLED BETA**
 
-This is not `READY`. Residual tool-level fetches, browser subresources, and crawler-internal navigation are still not fully bound by `authorize_collection`. It is also not `NOT READY`: the production path is collect → intelligence → authorize → follow-up sidecars → union → evidence → hypothesis → collection attempts → SQLite → explanation.
-
-**Post-audit hardening (same day):** P0 fail-open paths (`scope is None → allow`) in browser_probe, threat_intel, vuln_match, dnsx output, and runner alive rebuild were inverted to DENY. `Hypothesis` and `CollectionAttempt` are persisted. CI `black --check` is clean. See `docs/ARCHITECTURE.md`.
-
 ---
 
-## 1. Architecture before
+## BEFORE
 
-Forensic baseline: `docs/ARCHITECTURE_AUDIT.md`.
+At the start of this hardening arc, the architecture already had more machinery than a first
+read of the code suggested — `authorize_collection()`, a real indicator state machine, evidence-
+gated wildcard follow-up, ~15 discovery bounds, `Hypothesis`/`CollectionAttempt` types, a single
+plugin choke point in the runner, and correct seed/follow-up artifact isolation all predated this
+work. What was missing or broken, confirmed by reading the implementation rather than trusting
+docs or tests:
 
-```
-python app.py run -d <target>
-    → PipelineRunner.run
-    → plugins write canonical artifacts (dnsx overwrites resolved.txt, httpx overwrites alive.txt)
-    → _maybe_collect_followups (fresh IntelEngine)
-    → follow-up could clobber seed alive.txt / resolved.txt
-    → _finalize_to_store: HostRegistry + IntelligenceEngine clusters + IntelEngine snapshot
-    → SQLite + reports
-```
+- `authorize_collection()` (the function meant to compose scope+capability+OPSEC) had **zero
+  production callers** — every real check went through scope-only paths, with OPSEC enforced as
+  a completely separate, uncomposed mechanism.
+- katana, hakrawler, and nuclei could reach any host their own internal HTTP client decided to —
+  chased redirects, discovered links, OOB interactsh callbacks — with **zero** Hydra visibility
+  once launched with an authorized seed.
+- The browser's per-request guard did not cover WebSocket connections or `window.open()` popups
+  at all — both were structurally outside what `page.route()` can see.
+- `asn_lookup.py` had **zero** authorization calls despite declaring itself active-collection.
+- `cloud_bucket_enum.py` was gated by a materially weaker mechanism (a one-time flag check) than
+  every other active-HTTP plugin, and the underlying `authorize_active_indicator` special case
+  for cloud endpoints had a real bug that meant its own opt-in flag could never have worked.
+- `CollectionAttempt` rows were only written after a plugin finished — a crash left no attempt
+  audit trail, even though the indicator's own status was already crash-safe.
+- No typed authorization proof existed; every network primitive accepted a bare `str`.
 
-Intelligence ran after reconnaissance. Presence of a `CollectionScope` object was treated as a gate. `COLLECTED` could be assigned when an indicator was merely claimed. Seed dnsx resolved the CT-merged `subdomains.txt`, so in-scope CT SANs never became follow-up work. Host graph assigned independent HIGH CDN/ASN confidence. Plugin reason strings such as `CERTIFICATE_SAN` could be trusted without evidence rows.
+## AFTER
 
-## 2. Architecture after
+- `authorize_collection()` is what `core/runner.py:_gate_active_input` — the one place every
+  active-collection plugin's input passes through before `plugin.run()` — actually calls.
+- `core/collection/crawler_proxy.py:ScopeEnforcingProxy` — a real local HTTP/HTTPS forward proxy
+  — authorizes every destination host before connecting, used unconditionally by katana,
+  hakrawler, and nuclei. Verified against the real installed binaries, not mocks: a live redirect
+  from an authorized seed to a second local server never reaches that server once the tool is
+  routed through the proxy.
+- The browser's route guard is installed at the `browser_context` level
+  (`route()`/`route_web_socket()`), covering every page in the context (closing the popup gap)
+  and WebSocket connections (closing that gap) — verified against real WebKit with a bare
+  TCP-accept-counting destination proving zero connections for an OOS WebSocket target, and
+  empirically confirmed this also covers requests from inside a dedicated Web Worker.
+- `asn_lookup.py`'s one active-DNS-resolution path now authorizes each hostname first.
+- `cloud_bucket_enum.py` checks `authorize_active_indicator(..., "cloud_bucket_enum")` per URL;
+  the underlying bug in `authorize_active_indicator` (opt-in flag being a no-op) is fixed.
+- `IntelEngine.claim_attempt()` persists an `IN_FLIGHT` `CollectionAttempt` before the follow-up
+  subprocess runs — verified with a real crash simulation querying actual SQLite state.
+- `core/collection/target.py:AuthorizedCollectionTarget` — a frozen dataclass constructible only
+  via successful authorization — is wired into httpx's redirect-hop resolution.
+- All 19 `active_collection=True` plugins are covered by one test proving zero network/subprocess
+  primitives are ever called without a `CollectionScope`.
+- Two additional latent bugs were found and fixed while writing the tests this arc's mandate
+  required: historical diff would have reported every relationship as "changed" on every
+  identical re-scan (evidence_id is namespaced by run_id and was being compared directly), and
+  `cmd_investigate` presented relationships in a different shape than `cmd_relationships`/the
+  HTML/Markdown reporters.
 
-```
-seed / indicator
-    ↓
-authorize_active_indicator (ALLOW | DENY | UNKNOWN; UNKNOWN fail-closed)
-    ↓
-bounded collection (seed DNS from enum+seeds, not the full CT merge)
-    ↓
-normalized entity + observation + provenance
-    ↓
-evidence → relationship (intel graph is correlation truth)
-    ↓
-hypothesis / indicator (DISCOVERED → ELIGIBLE → IN_FLIGHT → COLLECTED|FAILED)
-    ↓
-authorize again
-    ↓
-follow-up collection into sidecars
-    ↓
-authorized deterministic union → canonical artifacts
-    ↓
-intelligence ingest → SQLite (including indicator lifecycle)
-    ↓
-CLI / HTML / Markdown / JSON via serialize_relationship()
-```
+## ARCHITECTURAL CHANGES
 
-`Host` remains the attack-surface projection. Intel entities, observations, evidence, and relationships are the intelligence source of truth. Host graph CDN/ASN edges are `LOW`. Pairwise SHARES_IP / SHARES_ASN / SHARES_FAVICON / SHARES_BODY_HASH are not `HIGH` without independent corroboration.
+New modules:
 
-## 3. Files changed
-
-New:
-
-- `core/intel/authorize.py` — central authorization primitive
-- `core/intel/artifacts.py` — seed snapshots, pass-numbered sidecars, authorized union, `authorized_alive.txt`
-- `core/intel/serialize.py` — canonical relationship objects
-- `docs/ARCHITECTURE_AUDIT.md`
-- `tests/test_asi_loop_e2e.py`
-- `tests/test_adversarial_matrix.py`
-- `tests/test_cli_acceptance.py`
+- `core/collection/__init__.py`, `core/collection/target.py`, `core/collection/crawler_proxy.py`
 
 Modified (principal):
 
-- `core/runner.py` — seed DNS split, follow-up sidecars, union, indicator persist, `COLLECTED` only on artifact success
-- `core/intel/followup.py` — evidence-backed reasons, wildcard policy, central authorize
-- `core/intel/queue.py` — DISCOVERED / ELIGIBLE / IN_FLIGHT / COLLECTED / FAILED / NOT_ALLOWED / REJECTED
-- `core/intel/engine.py`, `scope.py`, `bounds.py`, `model.py`, `cli.py`, `correlate.py`
-- `core/store.py`, `core/diff.py`, `core/reporter.py`, `core/intelligence/graph.py`
-- `config/settings.py`
-- Plugins: `_base.py`, `whois.py`, `gau.py`, `waybackurls.py`, `katana.py`, `nuclei.py`, `port_verify.py`
-- `README.md`
+- `core/runner.py` — `_gate_active_input` composes OPSEC, not just scope; follow-up loop claims
+  `CollectionAttempt` rows before the subprocess runs
+- `core/intel/authorize.py` — cloud-endpoint ALLOW path fixed
+- `core/intel/engine.py` — `claim_attempt()`, `AttemptStatus.IN_FLIGHT`
+- `core/intel/scope.py` — `authorize_plugin_input`/`authorize_collect_input` compose OPSEC
+- `core/intel/query.py` — `investigate()` uses the canonical serializer
+- `core/diff.py` — relationship-changed detection uses evidence content, not the run-scoped `evidence_id`
+- `modules/asn_lookup.py`, `modules/cloud_bucket_enum.py`, `modules/browser_probe.py`, `modules/httpx.py` — see BEFORE/AFTER above
+- `modules/katana.py`, `modules/hakrawler.py`, `modules/nuclei.py` — proxy-confined; hakrawler's actual argv flags fixed (the installed binary doesn't have `-plain`/`-depth`, discovered by running it for real)
+- `modules/_base.py` — `_crawler_confinement` async context manager
+- `config/settings.py` — `nuclei_enable_interactsh` (default off)
 
-Preserved: structured argv subprocess (no `shell=True`), path confinement, output caps, SQLite+WAL+FK, `STRICT_OPSEC`, fingerprint-first certificates, OOS observation, no Neo4j, no actor/owner entities.
+Preserved: structured argv subprocess (no `shell=True`), path confinement, SQLite+WAL+FK,
+`STRICT_OPSEC`, fingerprint-first certificates, OOS observation, no Neo4j, no actor/owner
+entities, no rewrite of the plugin framework.
 
-## 4. Database / schema changes
+## SECURITY INVARIANTS
 
-SQLite remains `output/recon.db`. Foreign keys stay enabled.
+| Invariant | Status |
+|---|---|
+| No active network collection without passing centralized authorization | Composed at the choke point (`_gate_active_input`); not yet the *only* call path everywhere (some plugins call the scope-only primitive directly, safe today via the whole-plugin OPSEC skip upstream, but not structurally unified) |
+| Authorization ≠ observation | Held throughout; OOS names persist as entities/observations, never as active targets |
+| Missing/UNKNOWN/OOS/malformed/unsupported-capability/budget-exhausted all fail closed | Verified for all 19 active-collection plugins in one test |
+| Redirects never expand authorization | httpx: per-hop, no bypass found. katana/hakrawler/nuclei: proxy-confined regardless of internal redirect behavior |
+| Crawler input authorization ≠ crawler network confinement | Explicitly distinguished; proxy confinement added specifically because input-gating alone was never sufficient |
+| Browser subresources gated | Document, iframe, script, stylesheet, image, font, media, xhr, fetch, manifest, WebSocket, Worker, popup — all verified against real WebKit |
+| Seed/follow-up artifacts never cross-contaminate | Pre-existing, re-verified correct |
+| Wildcard-derived hosts require real evidence, not a plugin's claimed reason | Pre-existing, re-verified correct |
+| One canonical relationship serializer | Now true for CLI (`cmd_relationships` and `cmd_investigate`), HTML, Markdown, JSON — `cmd_investigate` was the one holdout, fixed |
+| Historical diff detects real relationship changes | Fixed a real bug that would have made it detect a "change" on every re-scan regardless of anything actually changing |
 
-`intel_indicators` gained durable lifecycle columns (migrated if missing):
+## NETWORK BOUNDARY
 
-- `authorization_status`
-- `created_at`, `claimed_at`, `completed_at`
-- `failure_reason`
-- `collector`
+Three explicit tiers (`README.md`, `docs/FINAL_SECURITY_AUDIT.md` §7):
 
-New tables (`CREATE TABLE IF NOT EXISTS` on connect; existing DBs migrate safely):
+1. **Guaranteed by Hydra** — no active-collection plugin without scope; per-hop httpx redirect
+   authorization; per-request browser authorization including WebSocket/popup/Worker; proxy
+   confinement for katana/hakrawler/nuclei against real binaries.
+2. **Guaranteed only when the tool supports it** — CONNECT tunnels are authorized by hostname,
+   never TLS-inspected; nuclei's OOB channel is disabled by default because it cannot be
+   reconciled with per-host confinement without a third-party allowlist that doesn't exist yet;
+   hakrawler's own internal same-host redirect exclusion (observed empirically, not documented)
+   currently does primary blocking for that tool specifically.
+3. **Requires external network isolation** — a tool bypassing its own configured proxy via a raw
+   socket is invisible to the confinement proxy; DNS is not proxied under `STRICT_OPSEC`; nothing
+   here claims OS/process-level confinement, and none of the documentation should be read as
+   claiming it.
 
-- `intel_hypotheses` — relationship-derived collection hypotheses (not authorization)
-- `intel_collection_attempts` — per-capability SUCCESS/FAILED (DNS vs HTTP)
+## FOLLOW-UP MODEL
 
-`persist_registry` reads prior indicator rows **before** `clear_run_data`. Leftover `IN_FLIGHT` becomes `FAILED` (`interrupted_in_flight`). Finalize never invents `COLLECTED`. Mid-run `upsert_intel_indicators` / `upsert_intel_attempts` record queue and attempt state. A later follow-up pass **merges** attempts; it does not wipe the first pass.
+`DISCOVERED → ELIGIBLE → IN_FLIGHT → {COLLECTED, FAILED, NOT_ALLOWED, REJECTED, PARTIAL}`, unchanged
+in shape from before this arc (it was already correct) but now backed by `CollectionAttempt` rows
+claimed *before* the subprocess that could crash runs, not just after. `overlay_status` still turns
+a restored `IN_FLIGHT` into `FAILED`, never `COLLECTED`, and this was independently re-verified
+against real SQLite this session, not assumed from the code alone. Seed collection has no
+`CollectionAttempt` trail at all yet — see REMAINING LIMITATIONS.
 
-## 5. New invariants
+## HYPOTHESIS MODEL
 
-| ID | Rule | Enforcement |
-|---|---|---|
-| I1 | No active collection without a concrete authorized indicator | `authorize_active_indicator`; plugins re-gate inputs; missing scope fails closed |
-| I2 | Observation ≠ collection | OOS names persist as entities/observations with `NOT_ALLOWED`; not written to canonical alive/resolved |
-| I3 | `COLLECTED` only after success | Queue transitions; follow-up success = hostname present in sidecar artifacts |
-| I4 | No relationship without evidence | `_relate` requires evidence; serializer includes `evidence_id` |
-| I5 | Confidence belongs to the relationship | Shared IP/ASN/CDN/favicon/body-hash alone are not HIGH |
-| I6 | Host is a projection | Intel relationships are authoritative; Host CDN/ASN graph edges are LOW |
-| I7 | Follow-up must not clobber seed artifacts | Seed snapshots + sidecars + atomic union |
-| I8 | Reasons are not evidence | Planner verifies certificate entity + SAN observation + `SAN_CONTAINS` |
-| I9 | Cloud endpoints need explicit policy | Generated `*.s3.amazonaws.com` / GCS / Azure / R2 denied unless cloud collection is enabled **and** still in scope |
-| I10 | Certificate identity is fingerprint-first | Same SAN set + different SHA-256 → two certificates |
+`Hypothesis`/`HypothesisStatus` unchanged this arc — a relationship becomes a hypothesis
+(`OPEN`/`REJECTED`), and only `plan_followup_collection`'s independent authorization call (not
+the hypothesis itself) can turn that into an actual collection attempt. `authorize_hypothesis()`
+only flips a status field; it contains no network code (confirmed by reading `core/intel/engine.py`
+in full this session).
 
-## 6. New tests
+## EVIDENCE MODEL
 
-Proof tests (count):
+Unchanged and re-verified: `evidence_supports_certificate_followup` requires an actual
+`SAN_CONTAINS`/`SHARES_CERTIFICATE` relationship with a non-empty `evidence_id` before trusting a
+`CERTIFICATE_SAN`/`SHARED_CERTIFICATE` follow-up reason — a plugin cannot mint that reason string
+and skip corroboration. Certificate identity (`identity_kind`: `sha256` → `serial_issuer` →
+`unidentified`) never manufactures a fingerprint; has dedicated tests including the 10,000-SAN
+case and the live-shaped crt.sh record format.
 
-- `tests/test_asi_loop_e2e.py` — `PipelineRunner.run()` seed → CT → seed DNS → seed HTTP → intel → authorized follow-up DNS/HTTP → union → SQLite → CLI/HTML/MD/JSON. Fails if follow-up is skipped. OOS `malicious-or-unrelated.example.net` is observed, never active-collected.
-- `tests/test_cli_acceptance.py` — `app.main()` argv: `run --no-ui -d virusbarrier.xyz` then `investigate`, `relationships`, `evidence`, `diff`. Class-level collector stubs only. Asserts follow-up DNS/HTTP ran.
-- `tests/test_adversarial_matrix.py` — authorization fail-closed, cloud policy, spoofed `CERTIFICATE_SAN` / `SHARED_CERTIFICATE`, 10k SAN truncation, cert fingerprints, poisoned alive/subdomains, missing scope, empty+crash follow-up preserves seed, dedicated shared IP not HIGH, interrupted `IN_FLIGHT` → `FAILED`.
-- Updated `tests/test_followup_loop.py`, `tests/test_followup_artifacts.py`, `tests/test_intel_diff.py`.
+## HISTORICAL MODEL
 
-Existing coverage still used: redirect OOS (`test_redirect_safety.py`), virusbarrier production path (`test_pipeline_runner_e2e.py`), correlation (`test_correlation_correctness.py`).
+`diff_runs` reports relationship appeared/disappeared/changed (confidence increased/decreased,
+evidence changed), entity/observation/evidence appeared/disappeared, indicator status changes,
+and certificate rotation. **Fixed a real bug this session**: the "evidence changed" comparison
+used the raw `evidence_id`, which is namespaced by `run_id` and therefore differs between *any*
+two runs regardless of whether anything real changed — meaning every relationship would have
+shown as changed on every re-scan. Now compares the relationship's own content. Both scenarios
+the mandate specified (same relationship_id + HIGH→MEDIUM; same relationship_id + same confidence
++ new evidence) are tested, plus a third proving a byte-identical re-scan reports zero changes.
 
-Adversarial matrix mapping (user 1–35): covered in this suite or by the named existing files. Weakest remaining cells: live httpx timeout at the binary (simulated as collector exception, because `_run_single_plugin` swallows raises), katana in-page crawl internals, browser subresource fetches.
-
-## 7. Runtime E2E trace (what tests actually execute)
-
-Stubbed at plugin `run()` / class methods. Not stubbed: `app.main` → `cmd_run` → `PipelineRunner.run` → scope → seed DNS input construction → intel ingest → planner → authorize → sidecar write → union → `AssetStore` → `cmd_investigate` / `cmd_relationships` / `cmd_evidence`.
-
-Expected fixture behavior (ASI loop):
-
-| Indicator | Observed | Authorized | Active-collected | Canonical artifacts |
-|---|---|---|---|---|
-| `seed.example.com` | yes | ALLOW | COLLECTED | `resolved.txt`, `alive.txt` |
-| `www.seed.example.com` | yes (CT SAN) | ALLOW | COLLECTED via follow-up | union into canonical |
-| `malicious-or-unrelated.example.net` | yes | DENY / NOT_ALLOWED | never | absent from resolved/alive; present in intel observations |
-
-CLI acceptance uses `virusbarrier.xyz` + in-scope `www.virusbarrier.xyz` and OOS `virusinspector.top` with the same rules.
-
-## 8. Scope enforcement matrix
-
-| Collector | Input hostname source | Authorization | Output as future target |
-|---|---|---|---|
-| whois | target roots | `authorize_active_indicator` per root | nameservers observed, not auto-probed |
-| subfinder/amass/assetfinder | operator seeds | seed is operator-supplied | names observed into `subdomains.txt` |
-| ctlogs | seeds → crt.sh | passive | SANs observed; seed dnsx does **not** resolve the full merge |
-| dnsx | `authorized_dns_targets.txt` then follow-up list | `authorize_plugin_input` + plugin re-check | resolved hosts re-filtered |
-| httpx | authorized resolved | input gated; final URL classified | OOS landing **not** added to alive; still fetched once by httpx `-follow-redirects` |
-| naabu | authorized resolved | `_authorized_input` | ports |
-| port_verify | naabu list | `_authorized_input` (no longer trusts naabu blindly) | verified ports |
-| katana / nuclei | prefer `authorized_alive.txt` | `_authorized_input` | tool-internal crawl remains a residual |
-| hakrawler | `_alive_urls()` | require scope + filter | same |
-| gau / waybackurls | seeds | per-seed `authorize_active_indicator` | archive URLs not used as crawler input by default |
-| threat_intel | httpx hosts | skip unauthorized hosts | none |
-| browser_probe | httpx URLs | start URL + document navigations gated | **subresources not gated** |
-| cloud_bucket_enum | derived FQDNs | explicit cloud policy + still not silent in-scope | URLs |
-| asn_lookup | IPs from authorized DNS | IP not a hostname; contacts Team Cymru | ASN entities |
-| wildcard_check | roots | `allows_active_collection` on roots | diagnostic + collection policy |
-
-Missing `CollectionScope` on an active plugin fails closed (`ConfigurationError`). A scope object with an OOS hostname returns `DENY`.
-
-## 9. Follow-up lifecycle
+## TEST PROOF
 
 ```
-DISCOVERED → ELIGIBLE → IN_FLIGHT → COLLECTED
-                              ↘ FAILED
-OUT_OF_SCOPE → NOT_ALLOWED
-spoofed/invalid → REJECTED
+pytest tests/ -q          → 405 passed
+black --check .           → clean (156 files)
+isort --check-only .      → clean
+ruff check .              → clean
+mypy .                    → clean (107 source files)
+bandit -c pyproject.toml -r . → 0 issues (Low/Medium/High all 0)
 ```
 
-Planner order: normalize → already-collected → **authorize** → evidence (for `CERTIFICATE_SAN` / `SHARED_CERTIFICATE`) → wildcard policy.
+Adversarial/live proof beyond unit tests:
 
-Sidecars: `resolved_followup_<pass>.txt`, `dnsx_records_followup_<pass>.jsonl`, `alive_followup_<pass>.txt`, `httpx_followup_<pass>.json`. Canonical files are an authorized union of seed + sidecars. Empty result, crash, or timeout-as-exception leaves seed snapshots intact. Duplicate claim returns nothing new (`eligible_followups`). Second pass uses a new suffix and still unions against seed.
+- `tests/test_crawler_proxy.py` — raw sockets speaking the proxy protocol directly against
+  `ScopeEnforcingProxy`; asserts a destination test server's TCP-accept count, not just the
+  proxy's own claimed decision.
+- `tests/test_crawler_confinement_live.py` — the **real installed katana and hakrawler
+  binaries**, not mocked, against a real local redirect chain.
+- `tests/test_browser_probe_scope_guard.py` — real WebKit for subresources, iframe, WebSocket
+  (bare-socket-accept-counting destination), and popup escape.
+- `tests/test_missing_scope_all_active_plugins.py` — all 19 active-collection plugins, patching
+  every network primitive they could reach, asserting zero calls without scope.
+- `tests/test_followup_dns_crash_leaves_durable_in_flight_attempt` — a real crash simulation
+  querying actual SQLite state afterward, not in-memory state alone.
+- **Live production run** against `virusbarrier.xyz` (this project's actual configured,
+  authorized scope per `scope.txt`) via `python app.py run -d virusbarrier.xyz --run-id
+  live_validation_20260829`. Full pipeline, 403.1s, exit code 0: whois → subfinder/ctlogs/
+  assetfinder/amass → dnsx → asn_lookup → naabu → port_verify → httpx → soft404_check →
+  param_fuzz → cloud_bucket_enum (correctly skipped, not opted in) → vuln_match →
+  security_headers → gau/waybackurls/katana/hakrawler/unfurl/nuclei (all through the new
+  confinement proxy, confirmed by inspecting the actual running nuclei process's argv:
+  `-ni -proxy http://127.0.0.1:56317`).
 
-`context.alive_urls` is not the union source of truth. The artifact store is.
+  **The confinement proxy blocked real out-of-scope connection attempts from real tools during
+  this run** — read directly from the run's persisted `warnings_json` in SQLite, not from a test:
 
-## 10. Evidence model
+  ```
+  katana: confinement proxy blocked 1 connection attempt(s) to out-of-scope host(s)
+          the tool tried to reach on its own: burpsuite
+  nuclei: confinement proxy blocked 6 connection attempt(s) to out-of-scope host(s)
+          the tool tried to reach on its own: checkip.amazonaws.com,
+          login.microsoftonline.com, www.rdap.net
+  httpx:  recorded 4 HTTP redirect(s) out of scope (observation only —
+          destination not added to alive.txt)
+  ```
 
-Every intel relationship stores `evidence_id` with FK to `intel_evidence`. Evidence carries source artifact, collector, observation id, reason, metadata, `observed_at`.
+  `alive.txt`/`resolved.txt` for the run contain only `virusbarrier.xyz` — none of the
+  out-of-scope hosts referenced above, nor any of the other domains nuclei/whois *observed* in
+  page content and registration data during the scan (composer.json dependency names, WHOIS
+  registrar/nameserver hosts, template metadata references), ever became an active-collection
+  target. `browser_probe` failed in this specific run for an unrelated, self-inflicted reason:
+  the live run overrode `HOME` to work around this sandbox's `~/.config` permission issue
+  (affecting katana), which also moved Playwright's browser-binary cache path — a test-harness
+  artifact, not a Hydra defect; the browser guard's own properties were separately verified
+  against real WebKit with the real `HOME` in `tests/test_browser_probe_scope_guard.py`.
 
-Certificate follow-up is valid only when:
+## REMAINING LIMITATIONS
 
-1. certificate entity exists (fingerprint identity)
-2. SAN observation exists and references that certificate (`observed_as=certificate_san`)
-3. `SAN_CONTAINS` relationship exists with an evidence id
+1. **`authorize_collection()` is the choke-point path, not yet the only path anywhere.**
+   `asn_lookup.py`, `whois.py`, `gau.py`, `waybackurls.py` still call the scope-only primitive
+   directly for their per-target checks. Safe today (OPSEC for these is enforced upstream at the
+   whole-plugin skip in `_run_single_plugin`), but not the single unified call path the full
+   `CollectionGateway` would provide.
+2. **`AuthorizedCollectionTarget` is proven at one call site (httpx), not retrofit everywhere.**
+   Most plugins are not structurally prevented from calling a network primitive with an
+   unauthorized string — they are prevented by every current code path correctly checking first,
+   which is the same "convention, not construction" gap the mission opened with.
+3. **Seed collection has no `CollectionAttempt` audit trail.** Follow-up collection does
+   (including pre-claim persistence). This is not a regression — seed collection never had one —
+   but it means "reconstruct why a target was collected" from SQLite alone works for follow-up
+   attempts and not for the initial seed dnsx/httpx runs.
+4. **No third-party-provider allowlist for the confinement proxy.** nuclei's OOB detection is
+   disabled by default as a result; re-enabling it means accepting that specific traffic bypasses
+   confinement entirely rather than being selectively allowed.
+5. **OS/process-level network isolation is out of scope and always will be** — see NETWORK
+   BOUNDARY tier 3. This is stated as a limitation, not hidden as a false guarantee.
+6. **Host graph (`core/intelligence/graph.py`) was spot-checked, not exhaustively re-audited,
+   this session.** What was checked (CDN/ASN/provider edges stay LOW/MEDIUM; `PRESENTS_CERTIFICATE`
+   and `resolves_to` are HIGH/VERY_HIGH because they're directly observed facts, matching Intel's
+   own semantics for the same fact types) shows no contradiction with Intel, consistent with prior
+   dedicated tests (`test_shared_cloud_ip_is_medium_not_ownership`,
+   `test_risk_is_not_increased_by_shared_certificate`), but this was not a from-scratch review.
+7. **`datetime.utcnow()` deprecation warnings remain** (167 in the current test run); behavior is
+   unchanged, cosmetic only.
 
-A plugin cannot mint `CERTIFICATE_SAN` by writing a reason string. Emissions are forced to `CollectReason.PLUGIN`.
-
-Truncation (`san_limit`, `relationship_limit`, `entity_limit`) sets `truncated=true` and records a reason. Seeds keep priority. No dummy FK rows.
-
-## 11. Relationship model
-
-Canonical object (`serialize_relationship()`):
-
-`relationship_id`, `source_entity`, `target_entity`, `relationship_type`, `confidence_band`, `strength`, `evidence_id`, `evidence_type`, `certificate_fingerprint`, `certificate_serial`, `shared_ip`, `san_cardinality`, `source_artifact`, `source_plugin`, `run_id`, `explanation`
-
-Stable IDs include enough identity that `domain A SHARES_CERTIFICATE fingerprint X` does not collide with fingerprint Y.
-
-Pairwise SHARES_* cliques are hub-only above `max_relationships_per_signal` (capped via `bounded_pairs`). Prefer `CERTIFICATE --SAN_CONTAINS--> domain` over a 200-domain clique.
-
-## 12. Historical diff behavior
-
-`diff_runs` now reports:
-
-- hosts / HTTP URLs / host field changes (IP, cert fingerprint, SANs, HTTP, tech, …)
-- relationships appeared / disappeared / changed
-- `CONFIDENCE_INCREASED` / `CONFIDENCE_DECREASED` / `EVIDENCE_CHANGED`
-- entities, observations, evidence appeared / disappeared
-- indicator discovered / collected / failed / status changed
-- certificate appeared / disappeared (rotation)
-
-## 13. Reporter consistency
-
-CLI `relationships`, HTML, Markdown, and `assets.json` `intelligence.relationships` all call `serialize_relationship()`. The ASI loop test checks CLI ids against JSON and that HTML/Markdown mention the same relationship types.
-
-Host graph remains a visualization. It must not independently assign HIGH shared CDN/ASN. Intel CLI is the story operators should trust.
-
-## 14. Performance bounds
-
-`DiscoveryBounds` / settings: `MAX_DISCOVERY_DEPTH`, `MAX_FOLLOWUP_INDICATORS`, `MAX_FOLLOWUP_PER_SOURCE` (`max_domains_per_source` / `max_followups_per_relationship`), `MAX_DNS_PROBES`, `MAX_HTTP_PROBES`, `MAX_ENTITIES`, `MAX_RELATIONSHIPS`, `MAX_RUNTIME`, `MAX_SANS_PER_CERTIFICATE` (`max_ct_names_per_certificate`), `MAX_CERTIFICATES`, `MAX_IP_ENTITIES`, `MAX_URL_ENTITIES`, `MAX_TECHNOLOGY_ENTITIES`, `MAX_RELATIONSHIPS_PER_SIGNAL`.
-
-A 10,000-SAN certificate is truncated and cannot consume the whole entity budget. Tests cover this.
-
-## 15. Security review (second pass)
-
-Searched: `shell=True` (none; comment only), `subprocess` (structured argv in `utils/subprocess.py`), `os.system` (none), `urllib` (ctlogs, threat_intel, vuln_match, cloud/param/soft404), `socket` / `open_connection` (asn_lookup → whois.cymru.com), Playwright (browser_probe), redirects (httpx `-follow-redirects`), `alive.txt` / `resolved.txt` / follow-up, output paths (confined).
-
-| Path | Hostname contacted | Obtained from | Authorized? | Attacker influence | Bypass? |
-|---|---|---|---|---|---|
-| dnsx/httpx/naabu | input list | artifacts | yes, re-gated | poisoned files dropped | no, if scope attached |
-| httpx redirect | **final Location, once** | HTTP response | classified after fetch | target can redirect OOS | **residual fetch**; not added to alive |
-| katana/nuclei | authorized_alive | Hydra view | input yes | in-page links inside tool | **residual internal crawl** |
-| browser_probe | start URL + documents | httpx | document yes | page loads CDN | **subresources residual** |
-| ctlogs | crt.sh | seed | passive | none beyond seed | observe-only |
-| threat_intel | urlhaus | authorized hosts | skip OOS | none | fail closed on host |
-| gau/waybackurls | archive APIs | seeds | per-seed | none | seeds only |
-| whois | whois servers | target roots | per-root authorize | none | OOS roots skipped |
-| asn_lookup | whois.cymru.com / DNS | resolved IPs | IPs from authorized DNS | none | Team Cymru always contacted for those IPs |
-| cloud_bucket_enum | derived cloud FQDNs | brand permute | policy required | plugin output | denied without policy |
-
-Plugin provenance cannot forge `CERTIFICATE_SAN`. Scope cannot be bypassed by “I have a CollectionScope instance.” `STRICT_OPSEC` still blocks unverified tools.
-
-## 16. Remaining known limitations
-
-1. httpx still **follows** out-of-scope redirects at the binary. Hydra withholds the landing from the active alive set and records an observation. Eliminating the fetch would require stopping at the first hop or a Hydra-owned HTTP client.
-2. Playwright subresources (CDN, JS, fonts) are not hostname-authorized.
-3. katana/nuclei may request URLs they discover internally before Hydra sees them. Inputs are authorized; outputs that become later targets must be re-authorized, but the tool’s own crawl is not a Hydra loop.
-4. Without `SCOPE_FILE`, names under a seed’s registrable domain are `IN_SCOPE`. Operators who need a tight program scope must set `SCOPE_FILE`.
-5. If subfinder/amass/assetfinder artifacts are missing, seed DNS falls back to `subdomains.txt` (which may include CT names). The ASI loop depends on `subfinder.txt` existing so follow-up remains a real second collect.
-6. `_run_single_plugin` swallows collector exceptions; follow-up crash handling keys off missing/empty sidecars.
-7. Host risk scoring remains a separate numeric system from relationship confidence bands.
-8. No live internet run against production `virusbarrier.xyz` is claimed as proof. Proof is the stubbed production CLI/runner path.
-9. `datetime.utcnow()` deprecation warnings remain; behavior is unchanged.
-10. Pairwise SHARES_CERTIFICATE still exists for small SAN sets; large sets stay hub-only.
-
----
-
-## Scores
-
-| Axis | Score | Why not 10 |
-|---|---|---|
-| Collection | 8/10 | Seed/follow-up split and union work; httpx still fetches OOS redirects once |
-| Authorization | 8/10 | Central primitive, fail-closed; tool-internal and subresource I/O remain |
-| Intelligence | 8/10 | Control loop is in `PipelineRunner`; not a post-hoc sidecar |
-| Evidence | 8/10 | Relationships require evidence; planner verifies cert SANs |
-| Correlation | 8/10 | One intel truth; Host graph is a lowered projection, not deleted |
-| Follow-up | 8/10 | Sidecars + union + bounds; not an unrestricted crawler |
-| Persistence | 8/10 | SQLite + FK + durable indicator lifecycle + interrupted IN_FLIGHT |
-| History | 8/10 | Entities/observations/evidence/relationships/indicators/cert rotation |
-| Reporting | 8/10 | Shared serializer; Host HTML still also shows risk/clusters |
-| OPSEC | 9/10 | STRICT_OPSEC, no shell=True, path confinement preserved |
-
-## Verdict
+## FINAL VERDICT
 
 **READY FOR CONTROLLED BETA**
 
-Use on authorized targets with `SCOPE_FILE` set, follow-up enabled, and optional crawlers/browser probe treated as higher-risk heads. Do not treat a green pytest run that bypasses `PipelineRunner` as production proof. The proof that matters is the runtime path above.
+Not `READY`: the full `CollectionGateway` retrofit (limitation 1-2 above) means the architecture
+is not yet *structurally* incapable of a plugin bypassing authorization — it is, today,
+*correctly and verifiably not doing so*, for every plugin, verified by test and by live run, but
+that is still a property of the current code being correct rather than the type system/call
+graph making the incorrect version impossible to write. That gap is real and is exactly what a
+`CollectionGateway` closes; it was deliberately not attempted as a single mega-change in this arc
+in favor of shipping verified, bounded increments.
+
+Not `NOT READY`: every CRITICAL and HIGH finding from this arc's own audit is closed and
+independently verified — not asserted — against real subprocess binaries, a real browser engine,
+and real SQLite persistence, including a live run against the project's actual authorized target.
+Every known remaining gap is explicitly documented with its actual severity, not hidden or
+rounded up to look better than it is.
+
+Use on authorized targets with `SCOPE_FILE` set. Treat katana/hakrawler/nuclei/browser_probe as
+still the highest-residual-risk collectors — confinement is real but is a proxy/route-guard
+boundary, not OS-level isolation — and run them inside a disposable, network-restricted
+container/VM as the existing documentation already instructs for browser_probe specifically.

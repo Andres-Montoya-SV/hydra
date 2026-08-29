@@ -226,6 +226,27 @@ def _intel_history_diff(
     }
 
 
+_VOLATILE_EVIDENCE_DATA_KEYS = frozenset({"observed_at"})
+
+
+def _evidence_content_fingerprint(row: dict[str, Any]) -> str:
+    """Content-based stand-in for "did the evidence backing this relationship change".
+
+    `evidence_id` is not usable for this: it is derived from an
+    `observation_id` that is itself namespaced by `run_id`
+    (`core/intel/engine.py:_observe`), so it is guaranteed to differ between
+    *any* two runs even when nothing about the underlying observation
+    changed at all — comparing it directly would report every relationship
+    as "changed" on every re-scan. Comparing the relationship's own `data`
+    payload instead (minus known run-scoped/volatile keys) reports a change
+    only when something about the evidence actually did.
+    """
+    data = dict(row.get("data") or {})
+    for key in _VOLATILE_EVIDENCE_DATA_KEYS:
+        data.pop(key, None)
+    return json.dumps(data, sort_keys=True, default=str)
+
+
 def _intel_relationship_diff(
     store: AssetStore, previous_run_id: str, current_run_id: str
 ) -> dict[str, list[dict[str, Any]]]:
@@ -239,7 +260,7 @@ def _intel_relationship_diff(
         old = previous[rid]
         new = current[rid]
         confidence_changed = old.get("confidence") != new.get("confidence")
-        evidence_changed = old.get("evidence_id") != new.get("evidence_id")
+        evidence_changed = _evidence_content_fingerprint(old) != _evidence_content_fingerprint(new)
         if confidence_changed or evidence_changed:
             change_type = "RELATIONSHIP_CHANGED"
             if confidence_changed and not evidence_changed:

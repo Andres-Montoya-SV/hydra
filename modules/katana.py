@@ -60,7 +60,13 @@ class KatanaPlugin(BaseToolPlugin):
         for key, value in headers.items():
             args.extend(["-H", f"{key}: {value}"])
 
-        result = await self._execute_self_output(context, args, output_path, allow_empty=True)
+        # katana follows redirects and discovers links on its own; a gated
+        # -list only constrains its starting seeds, not what it decides to
+        # request next. Route it through a local scope-enforcing proxy so
+        # any host it reaches for on its own is authorized first.
+        async with self._crawler_confinement(context) as proxy:
+            args.extend(["-proxy", proxy.proxy_url])
+            result = await self._execute_self_output(context, args, output_path, allow_empty=True)
         records = read_jsonl(output_path)
         urls = [str(record.get("url", "")) for record in records if record.get("url")]
         if not urls:

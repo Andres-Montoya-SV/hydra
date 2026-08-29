@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+from core.collection.target import AuthorizedCollectionTarget
 from core.intel.model import CollectionStatus, ScopeStatus
 from core.intel.scope import (
     CollectionScope,
@@ -194,12 +195,15 @@ class HttpxPlugin(BaseToolPlugin):
             if not location:
                 break
             next_url = location if "://" in location else urljoin(current_url, location)
-            if not allows_active_collection(next_url, scope):
+            target = AuthorizedCollectionTarget.authorize(
+                next_url, scope, capability="http_probe", operation="httpx_redirect_hop"
+            )
+            if target is None:
                 blocked_target = next_url
                 break
             hop += 1
             hop_record = await self._fetch_single_hop(
-                context, next_url, suffix=suffix, record_index=record_index, hop=hop
+                context, target, suffix=suffix, record_index=record_index, hop=hop
             )
             if hop_record is None:
                 # Follow-up request failed/produced nothing usable — stop where
@@ -224,15 +228,20 @@ class HttpxPlugin(BaseToolPlugin):
     async def _fetch_single_hop(
         self,
         context: PipelineContext,
-        url: str,
+        target: AuthorizedCollectionTarget,
         *,
         suffix: str,
         record_index: int,
         hop: int,
     ) -> dict | None:
-        """Issue the httpx request for one already-authorized redirect hop."""
+        """Issue the httpx request for one already-authorized redirect hop.
+
+        Takes the authorization proof itself, not a bare URL string — there
+        is no way to call this with a destination that was not actually
+        checked by `AuthorizedCollectionTarget.authorize()`.
+        """
         hop_output = self._output_path(context, f"httpx_hop{suffix}_{record_index}_{hop}.json")
-        args = self._build_args(context, None, hop_output, target_url=url)
+        args = self._build_args(context, None, hop_output, target_url=target.raw)
         result = await self._execute_self_output(context, args, hop_output, allow_empty=True)
         records = read_jsonl(hop_output) if hop_output.exists() else []
         try:
