@@ -99,6 +99,16 @@ def cmd_indicators(db_path: Path, domain: str, run_id: str | None) -> int:
     return 0
 
 
+def cmd_explain_collection(db_path: Path, identifier: str, run_id: str | None) -> int:
+    """Reconstruct why (or why not) `identifier` was collected, from SQLite alone."""
+    _, query, resolved = open_query(db_path, run_id, domain=identifier)
+    payload = query.explain_collection(identifier)
+    payload["run_id"] = resolved
+    print_json(payload)
+    query.conn.close()
+    return 0
+
+
 def cmd_diff_runs(db_path: Path, run_a: str, run_b: str | None = None) -> int:
     from core.diff import diff_runs
 

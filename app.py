@@ -129,6 +129,15 @@ def build_parser() -> argparse.ArgumentParser:
     ind_p.add_argument("domain")
     ind_p.add_argument("--run-id")
 
+    explain_p = subparsers.add_parser(
+        "explain-collection",
+        help="Reconstruct why an indicator was (or wasn't) collected, from SQLite alone (no rescan)",
+    )
+    explain_p.add_argument(
+        "identifier", help="indicator_id, collection_attempt_id, or raw indicator value"
+    )
+    explain_p.add_argument("--run-id")
+
     diff_p = subparsers.add_parser(
         "diff",
         help="Field-level diff of two persisted runs, or latest two finished runs for a domain",
@@ -325,6 +334,7 @@ def cmd_intel(args: argparse.Namespace, settings: Settings) -> int:
         cmd_certificates,
         cmd_diff_runs,
         cmd_evidence,
+        cmd_explain_collection,
         cmd_graph,
         cmd_indicators,
         cmd_investigate,
@@ -359,6 +369,8 @@ def cmd_intel(args: argparse.Namespace, settings: Settings) -> int:
         return cmd_certificates(db_path, domain, run_id)
     if args.command == "indicators":
         return cmd_indicators(db_path, domain, run_id)
+    if args.command == "explain-collection":
+        return cmd_explain_collection(db_path, args.identifier, run_id)
     return 1
 
 
@@ -417,6 +429,7 @@ def main() -> int:
             "evidence",
             "certificates",
             "indicators",
+            "explain-collection",
             "diff",
         }:
             return cmd_intel(args, settings)

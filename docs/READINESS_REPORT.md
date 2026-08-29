@@ -2,8 +2,8 @@
 
 **Date:** 2026-08-29
 **Repository:** `Andres-Montoya-SV/hydra`, branch `fix/redirect-scope-safety`
-**Method:** forensic runtime audit (`docs/FINAL_SECURITY_AUDIT.md`, `docs/NETWORK_BOUNDARY_AUDIT.md`), targeted fixes verified by real subprocess execution, real WebKit browser tests, real SQLite persistence, and a live run against the project's actual authorized target (`virusbarrier.xyz`, per `scope.txt`) — not stubs alone.
-**Test proof used:** 432 pytest cases (up from 356 at the start of this security-hardening arc), including a comprehensive parametrized test covering all 19 `active_collection=True` plugins, real-binary crawler-confinement tests, a live production run, and a real-SQLite round trip proving the new per-destination network authorization audit trail.
+**Method:** forensic runtime audit (`docs/FINAL_SECURITY_AUDIT.md`, `docs/NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_BOUNDARY_AUDIT.md`), targeted fixes verified by real subprocess execution, real WebKit browser tests, real SQLite persistence, a real raw-socket bypass demonstration, and a live run against the project's actual authorized target (`virusbarrier.xyz`, per `scope.txt`) — not stubs alone.
+**Test proof used:** 439 pytest cases (up from 356 at the start of this security-hardening arc), including a comprehensive parametrized test covering all 19 `active_collection=True` plugins, real-binary crawler-confinement tests, a live production run, a real-SQLite round trip proving the per-destination network authorization audit trail, a real subprocess proving the confinement proxy's raw-socket-bypass limit, and a real-SQLite round trip proving `explain-collection` reconstructs the full causal chain.
 
 **Verdict: READY FOR CONTROLLED BETA**
 
@@ -68,6 +68,16 @@ docs or tests:
   resolver, letting the CLI answer "was this host actually contacted, why, under which
   authorization" from SQLite alone, for the two components that make individual per-destination
   decisions. See `docs/NETWORK_BOUNDARY_AUDIT.md` §11.
+- `python app.py explain-collection <indicator_id|attempt_id|value>` — reconstructs the full
+  causal chain (indicator → hypothesis/authorization → evidence → collection attempts → network
+  requests) from SQLite alone, no rescan. `core/intel/query.py:IntelQuery.explain_collection`.
+- `PROXY_VERIFIED_TOOLS` (`core/collection/crawler_proxy.py`) and an `UNTRUSTED_NETWORK_TOOL`
+  warning (`modules/_base.py:_crawler_confinement`) — the confinement proxy cannot stop a
+  collector that opens a raw socket instead of using its configured `-proxy` (proven concretely
+  with a real subprocess, `tests/test_untrusted_network_bypass.py`, not merely asserted). Any
+  future collector wired into `_crawler_confinement` that isn't in the verified set
+  (`katana`/`hakrawler`/`nuclei`, each proven live) now gets an explicit warning instead of a
+  silent, unverified confinement claim.
 
 ## ARCHITECTURAL CHANGES
 
@@ -83,6 +93,11 @@ Modified (principal):
   `context.metadata["network_requests"]` into `intel_network_requests`
 - `core/store.py` — `intel_network_requests` table/indexes, `record_network_requests`/
   `get_network_requests`
+- `core/intel/query.py` — `explain_collection()` and its private lookup helpers
+- `core/intel/cli.py`, `app.py` — `explain-collection` subcommand wired end to end
+- `core/collection/crawler_proxy.py` — `PROXY_VERIFIED_TOOLS`
+- `modules/_base.py` — `_crawler_confinement` emits `UNTRUSTED_NETWORK_TOOL` for any collector
+  not in `PROXY_VERIFIED_TOOLS`
 - `core/intel/authorize.py` — cloud-endpoint ALLOW path fixed
 - `core/intel/engine.py` — `claim_attempt()`, `AttemptStatus.IN_FLIGHT`
 - `core/intel/scope.py` — `authorize_plugin_input`/`authorize_collect_input` compose OPSEC
@@ -169,8 +184,8 @@ the mandate specified (same relationship_id + HIGH→MEDIUM; same relationship_i
 ## TEST PROOF
 
 ```
-pytest tests/ -q          → 432 passed
-black --check .           → clean (159 files)
+pytest tests/ -q          → 439 passed
+black --check .           → clean (161 files)
 isort --check-only .      → clean
 ruff check .              → clean
 mypy .                    → clean (108 source files)
@@ -195,6 +210,17 @@ Adversarial/live proof beyond unit tests:
   SQLite file via `AssetStore.record_network_requests`/`get_network_requests`, asserting the
   persisted `network_attempted`/`network_completed` flags are consistent with the `ALLOW`/`DENY`
   decision for every row (never `network_attempted=1` on a `DENY` row).
+- `tests/test_untrusted_network_bypass.py` — a real subprocess opening a real raw
+  `socket.connect()` to a real local server, with `HTTP_PROXY`/`HTTPS_PROXY` set exactly as Hydra
+  would set them for a confined tool, proving the connection reaches the server anyway (an
+  application-level proxy cannot intercept a client that never consults it) — plus real-plugin
+  assertions that `HttpxPlugin` (not in `PROXY_VERIFIED_TOOLS`) gets an `UNTRUSTED_NETWORK_TOOL`
+  warning from `_crawler_confinement` and `KatanaPlugin` (verified live) does not.
+- `tests/test_explain_collection_cli.py` — drives the real `IntelEngine` (hypothesis creation,
+  `claim_attempt`/`record_attempt`) and a real `intel_network_requests` insert through real
+  SQLite, then asserts `explain-collection` reconstructs the full chain for an authorized
+  follow-up target, correctly reports "no indicator/hypothesis/attempt" for a purely-denied
+  redirect target, and resolves by `collection_attempt_id` as well as by raw value.
 - **Live production run** against `virusbarrier.xyz` (this project's actual configured,
   authorized scope per `scope.txt`) via `python app.py run -d virusbarrier.xyz --run-id
   live_validation_20260829`. Full pipeline, 403.1s, exit code 0: whois → subfinder/ctlogs/
@@ -261,6 +287,37 @@ Adversarial/live proof beyond unit tests:
    not — a forensic-completeness gap (those plugins' authorization is still correctly enforced
    and independently tested; they simply leave no per-destination row in this specific table),
    not an authorization bypass. See `docs/NETWORK_BOUNDARY_AUDIT.md` §11.
+9. **`ScopeEnforcingProxy` cannot stop a raw-socket bypass — proven, not just disclosed.**
+   `tests/test_untrusted_network_bypass.py` shows a subprocess with the confinement proxy's
+   environment variables set anyway reaches an out-of-scope server directly, because a raw
+   `socket.connect()` never consults `HTTP_PROXY`/`HTTPS_PROXY`. This is a structural limit of any
+   application-level proxy, not a bug to fix. The mitigation actually shipped is classification,
+   not false confinement: `PROXY_VERIFIED_TOOLS` (`core/collection/crawler_proxy.py`) names only
+   katana/hakrawler/nuclei — each individually proven live to honor `-proxy`
+   (`test_crawler_confinement_live.py`) — and any future collector wired into
+   `_crawler_confinement` outside that set gets an explicit `UNTRUSTED_NETWORK_TOOL` warning
+   instead of inheriting an unverified confinement claim. True OS/process-level containment
+   (network namespace, firewall egress rule, container policy) remains outside Hydra's own code
+   and always will be — see NETWORK BOUNDARY tier 3.
+
+## PROVEN / PARTIALLY PROVEN / UNPROVEN
+
+| Claim | Status | Evidence |
+|---|---|---|
+| No active-collection plugin runs without `CollectionScope` | **PROVEN** | `test_missing_scope_all_active_plugins.py`, all 19 plugins |
+| httpx never auto-follows redirects; every hop is individually authorized | **PROVEN** | `test_redirect_safety.py`, `test_url_normalization_adversarial.py`, real local redirect chains |
+| katana/hakrawler/nuclei cannot reach an OOS host **through their own HTTP client** | **PROVEN** | `test_crawler_proxy.py` (raw sockets), `test_crawler_confinement_live.py` (real binaries), live production run |
+| katana/hakrawler/nuclei cannot reach an OOS host **under any circumstance, including a raw-socket bypass** | **UNPROVEN — and now proven false** | `test_untrusted_network_bypass.py` demonstrates a raw socket bypasses the proxy entirely; this was never claimed as proven, and is now explicitly disproven rather than left ambiguous |
+| Browser subresources (script/image/xhr/fetch/WebSocket/popup/Worker) cannot reach an OOS host | **PROVEN** | `test_browser_probe_scope_guard.py`, real WebKit |
+| Cloud-derived hostnames require per-hostname authorization, not a blanket provider rule | **PROVEN** | prior turn's `authorize_active_indicator` fix + regression test |
+| Wildcard-derived hosts require real SAN evidence, not a plugin's claimed reason string | **PROVEN** | `evidence_supports_certificate_followup`, existing dedicated tests |
+| Follow-up state machine is crash-safe (`IN_FLIGHT` never silently becomes `COLLECTED`) | **PROVEN** | real crash-simulation test querying actual SQLite |
+| Seed vs. follow-up artifacts never cross-contaminate | **PROVEN** | pre-existing, re-verified |
+| One canonical relationship serializer across CLI/HTML/Markdown/JSON | **PROVEN** | `cmd_investigate`/`cmd_relationships` agreement test |
+| Historical diff detects real changes, not `run_id`-namespacing artifacts | **PROVEN** | fixed bug + 3-scenario regression test |
+| "Why was this hostname collected?" answerable from SQLite alone | **PROVEN for follow-up collection; UNPROVEN for seed collection** | `explain-collection` + `test_explain_collection_cli.py` walk the full chain for follow-up indicators; seed collection has no `CollectionAttempt`/hypothesis row to walk (documented limitation, unchanged this turn) |
+| Every active-collection plugin's authorization is structurally impossible to skip (not just currently correct) | **UNPROVEN** | the `CollectionGateway`/`AuthorizedCollectionTarget`-everywhere retrofit remains open; today's correctness is verified by test and live run, not enforced by the type system at every call site |
+| `intel_network_requests` covers every network-issuing component | **PARTIALLY PROVEN** | covers `ScopeEnforcingProxy` and httpx's redirect resolver (the two finest-grained per-destination deciders); dnsx/naabu/asn_lookup/cloud_bucket_enum/browser_probe make correctly-authorized calls but leave no row in this specific table |
 
 ## FINAL VERDICT
 
@@ -279,7 +336,9 @@ This is the single reason the verdict is not `READY`.
 **P2:** seed collection has no `CollectionAttempt` trail (limitation 3); no third-party-provider
 allowlist for nuclei OOB (limitation 4); host-graph module spot-checked, not exhaustively
 re-audited (limitation 6); `datetime.utcnow()` deprecation noise (limitation 7);
-`intel_network_requests` coverage is partial (limitation 8).
+`intel_network_requests` coverage is partial (limitation 8); the confinement proxy cannot stop a
+raw-socket bypass, mitigated by explicit `PROXY_VERIFIED_TOOLS` classification rather than a false
+guarantee (limitation 9, now proven with a real test rather than only disclosed in prose).
 
 **NETWORK ENFORCEMENT COVERAGE:** all active-collection plugins gate on `CollectionScope` before
 running (19/19, one parametrized test); katana/hakrawler/nuclei additionally confined at the
@@ -291,12 +350,15 @@ durably recorded in `intel_network_requests`, independent of the coarser per-plu
 `intel_collection_attempts` table.
 
 **UNPROVEN PATHS:** a tool bypassing its own configured `-proxy` via a raw socket outside its
-HTTP client is invisible to `ScopeEnforcingProxy` (application-level proxy, not OS-level
-isolation); DNS resolution itself is not proxied under `STRICT_OPSEC`; no allowlisted
-third-party OOB provider path exists, so nuclei interactsh stays opt-in and unconfined when
-enabled.
+HTTP client is invisible to `ScopeEnforcingProxy` — this is no longer merely disclosed, it is
+demonstrated with a real subprocess and a real server in `tests/test_untrusted_network_bypass.py`
+(application-level proxy, not OS-level isolation; mitigated by `PROXY_VERIFIED_TOOLS`
+classification, not by a false confinement claim); DNS resolution itself is not proxied under
+`STRICT_OPSEC`; no allowlisted third-party OOB provider path exists, so nuclei interactsh stays
+opt-in and unconfined when enabled; seed collection (as opposed to follow-up) has no
+`CollectionAttempt` trail for `explain-collection` to walk.
 
-**TEST COUNT:** 432 passed (0 failed, 0 xfail, 0 skipped-as-hidden-failure), up from 356 at the
+**TEST COUNT:** 439 passed (0 failed, 0 xfail, 0 skipped-as-hidden-failure), up from 356 at the
 start of this arc — verified with `pytest tests/ -q` run to completion, plus a clean `black`,
 `isort`, `ruff`, `mypy`, and `bandit` pass across the full repository.
 
@@ -305,11 +367,16 @@ actual authorized scope per `scope.txt`) completed in 403.1s, exit 0, with the c
 blocking real live out-of-scope connection attempts from real katana/nuclei processes — read
 directly from the run's persisted SQLite `warnings_json`, not from a mock. Crawler confinement is
 additionally verified against the real installed katana and hakrawler binaries in a controlled
-local redirect chain, and the browser guard against real WebKit.
+local redirect chain, the browser guard against real WebKit, and — this turn — a real subprocess
+proving the one thing the confinement proxy cannot do (stop a raw-socket bypass), so the "real
+network" proof this turn includes a real demonstration of the boundary's actual edge, not only of
+its successes.
 
-**KNOWN LIMITATIONS:** see the eight items enumerated above (REMAINING LIMITATIONS) — none of
+**KNOWN LIMITATIONS:** see the nine items enumerated above (REMAINING LIMITATIONS) — none of
 them constitute a known, currently-exploitable authorization bypass; each is either a structural
-robustness gap (P1) or a documented, deliberately-scoped-out boundary (P2).
+robustness gap (P1) or a documented, deliberately-scoped-out boundary (P2), and limitation 9 is
+now backed by a passing test that would fail if the boundary were ever silently claimed to be
+stronger than it is.
 
 Use on authorized targets with `SCOPE_FILE` set. Treat katana/hakrawler/nuclei/browser_probe as
 still the highest-residual-risk collectors — confinement is real but is a proxy/route-guard

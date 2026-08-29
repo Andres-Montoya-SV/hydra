@@ -39,6 +39,21 @@ logger = get_logger("crawler_proxy")
 _CONNECT_TIMEOUT = 10.0
 _READ_CHUNK = 65536
 
+# Tools whose real installed binaries have been verified live (not just by
+# reading their docs) to route every outbound connection through `-proxy`:
+# tests/test_crawler_confinement_live.py drives the actual katana/hakrawler
+# binaries against a local redirect chain and asserts the unauthorized
+# target's connection counter stays at zero.
+#
+# This proxy is an application-level HTTP/HTTPS forward proxy. It has no way
+# to stop a process that ignores its `-proxy` configuration and opens a raw
+# socket directly — see tests/test_untrusted_network_bypass.py, which proves
+# this concretely rather than merely asserting it. Any collector added to
+# `modules/_base.py:_crawler_confinement` that is NOT in this set gets an
+# explicit `UNTRUSTED_NETWORK_TOOL` warning instead of a silent, unverified
+# claim of confinement.
+PROXY_VERIFIED_TOOLS = frozenset({"katana", "hakrawler", "nuclei"})
+
 
 @dataclass
 class DeniedConnection:

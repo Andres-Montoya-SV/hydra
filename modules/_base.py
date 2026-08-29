@@ -289,8 +289,21 @@ class BaseToolPlugin(ReconPlugin):
         cover (no TLS interception; CONNECT tunnels are authorized by
         destination host, not decrypted content).
         """
-        from core.collection.crawler_proxy import ScopeEnforcingProxy
+        from core.collection.crawler_proxy import PROXY_VERIFIED_TOOLS, ScopeEnforcingProxy
         from core.intel.scope import require_collection_scope
+
+        if self.name not in PROXY_VERIFIED_TOOLS:
+            # Honest labeling, not a false guarantee: the proxy is started
+            # (it costs nothing and may still help), but this tool's actual
+            # respect for `-proxy` has not been verified against its real
+            # binary the way katana/hakrawler/nuclei have. See
+            # core/collection/crawler_proxy.py:PROXY_VERIFIED_TOOLS.
+            context.add_warning(
+                f"{self.name}: UNTRUSTED_NETWORK_TOOL — this collector is not in "
+                f"PROXY_VERIFIED_TOOLS; its adherence to the confinement proxy has "
+                f"not been verified against its real binary, so it must not be "
+                f"treated as scope-confined"
+            )
 
         scope = require_collection_scope(context)
         proxy = ScopeEnforcingProxy(scope, capability=self.capability or self.name)
