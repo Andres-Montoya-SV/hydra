@@ -118,7 +118,7 @@ async def test_httpx_redirect_hop_resists_url_confusion(
     plugin = HttpxPlugin(settings)
     requested: list[str] = []
 
-    async def fake_fetch(context, target, *, suffix, record_index, hop):
+    async def fake_fetch(context, target, *, suffix, record_index, hop, confinement_proxy_url=""):
         requested.append(target.raw)
         return None
 

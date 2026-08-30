@@ -88,10 +88,31 @@ class BrowserProbePlugin(BaseToolPlugin):
         self.update_status(context, ToolStatus.RUNNING)
         records: list[dict[str, object]] = []
 
-        async with async_playwright() as playwright:
+        # Route the browser's OWN network stack (not just the JS-visible
+        # `route()`/`route_web_socket()` guard installed per-context below)
+        # through Hydra's local confinement proxy — the same mechanism
+        # already proven live for katana/hakrawler/nuclei/httpx
+        # (core/collection/crawler_proxy.py). `route()` decides abort/continue
+        # from a hostname-string scope check; it does not itself resolve DNS
+        # or pin the actual destination IP. Launching WebKit with `proxy=`
+        # means DNS resolution and connection-pinning happen at the proxy for
+        # every browser-issued connection, closing the same DNS-rebinding/
+        # TOCTOU gap this turn already closed for httpx. See
+        # docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
+        async with (
+            self._crawler_confinement(context) as confinement_proxy,
+            async_playwright() as playwright,
+        ):
             launch_options: dict[str, object] = {"headless": True}
             if self.settings.outbound_proxy_url:
+                # External OPSEC-hiding proxy takes priority, same documented
+                # trade-off as httpx: chaining the local confinement proxy in
+                # front of an external proxy is out of scope this turn, so
+                # the DNS-rebinding/TOCTOU guarantee does not apply in this
+                # specific configuration.
                 launch_options["proxy"] = _playwright_proxy(self.settings.outbound_proxy_url)
+            else:
+                launch_options["proxy"] = _playwright_proxy(confinement_proxy.proxy_url)
             browser = await playwright.webkit.launch(**launch_options)
             try:
                 for target in targets:

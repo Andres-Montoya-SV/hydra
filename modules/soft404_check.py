@@ -70,14 +70,23 @@ class Soft404CheckPlugin(BaseToolPlugin):
         semaphore = asyncio.Semaphore(self.settings.soft404_concurrency)
         records: list[dict[str, object]] = []
 
-        async def probe(target: dict[str, str]) -> dict[str, object]:
-            async with semaphore:
-                return await asyncio.to_thread(self._probe_host, context, target)
+        # Route these urllib-based requests through Hydra's local confinement
+        # proxy — same DNS-rebinding/TOCTOU reasoning as httpx/browser_probe
+        # (core/collection/crawler_proxy.py): `allows_active_collection`
+        # above validated a hostname string; without the proxy, urllib does
+        # its own independent DNS resolution and connection when `_probe_host`
+        # actually runs. See docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
+        async with self._crawler_confinement(context) as confinement_proxy:
+            proxy_url = self.settings.outbound_proxy_url or confinement_proxy.proxy_url
 
-        results = await asyncio.gather(
-            *(probe(target) for target in targets),
-            return_exceptions=True,
-        )
+            async def probe(target: dict[str, str]) -> dict[str, object]:
+                async with semaphore:
+                    return await asyncio.to_thread(self._probe_host, context, target, proxy_url)
+
+            results = await asyncio.gather(
+                *(probe(target) for target in targets),
+                return_exceptions=True,
+            )
         soft_hosts: list[str] = []
         for target, result in zip(targets, results, strict=False):
             if isinstance(result, Exception):
@@ -110,15 +119,16 @@ class Soft404CheckPlugin(BaseToolPlugin):
             message=f"Soft-404 detected on {len(soft_hosts)}/{len(targets)} host(s)",
         )
 
-    def _probe_host(self, context: PipelineContext, target: dict[str, str]) -> dict[str, object]:
+    def _probe_host(
+        self, context: PipelineContext, target: dict[str, str], proxy_url: str | None
+    ) -> dict[str, object]:
         base_url = target["url"]
         canary_path = f"/zzqq-{_random_token()}-nonexistent-path-{random.randint(1000, 9999)}"  # nosec B311  # canary path, not cryptography
         canary_url = urljoin(base_url.rstrip("/") + "/", canary_path.lstrip("/"))
         timeout = self.settings.soft404_timeout
-        proxy = self.settings.outbound_proxy_url
 
-        root = http_get(base_url, timeout=timeout, proxy_url=proxy)
-        canary = http_get(canary_url, timeout=timeout, proxy_url=proxy)
+        root = http_get(base_url, timeout=timeout, proxy_url=proxy_url)
+        canary = http_get(canary_url, timeout=timeout, proxy_url=proxy_url)
         detected = _is_soft_404(root.status_code, root.body, canary.status_code, canary.body)
 
         raw_artifact = self._write_raw_artifact(

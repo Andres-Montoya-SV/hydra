@@ -82,10 +82,9 @@ class CloudBucketEnumPlugin(BaseToolPlugin):
         return "Built-in (stdlib urllib) — opt-in active probe"
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
-        from core.intel.authorize import authorize_active_indicator
         from core.intel.scope import require_collection_scope
 
-        scope = require_collection_scope(context)
+        require_collection_scope(context)
         if not self.settings.cloud_bucket_enum_authorize_derived:
             return self._skip(
                 "Cloud-derived endpoints (*.s3.amazonaws.com, storage.googleapis.com, "
@@ -107,8 +106,33 @@ class CloudBucketEnumPlugin(BaseToolPlugin):
 
         delay = max(0, self.settings.cloud_bucket_enum_delay_ms) / 1000.0
         timeout = self.settings.cloud_bucket_enum_timeout
-        proxy = self.settings.outbound_proxy_url
         raw_lines: list[str] = []
+
+        # Route these urllib-based requests through Hydra's local confinement
+        # proxy — same DNS-rebinding/TOCTOU reasoning as httpx/browser_probe/
+        # soft404_check (core/collection/crawler_proxy.py): `authorize_active_
+        # indicator` below validates a hostname string per candidate; without
+        # the proxy, urllib does its own independent DNS resolution and
+        # connection when the request actually runs.
+        async with self._crawler_confinement(context) as confinement_proxy:
+            return await self._run_probes(
+                context, confinement_proxy.proxy_url, delay, timeout, raw_lines, brands
+            )
+
+    async def _run_probes(
+        self,
+        context: PipelineContext,
+        confinement_proxy_url: str,
+        delay: float,
+        timeout: int,
+        raw_lines: list[str],
+        brands: list[str],
+    ) -> PluginResult:
+        from core.intel.authorize import authorize_active_indicator
+        from core.intel.scope import require_collection_scope
+
+        scope = require_collection_scope(context)
+        proxy = self.settings.outbound_proxy_url or confinement_proxy_url
 
         # Calibrate "does not exist" per provider with a random canary name.
         # Alphanumeric only, ≤24 chars: Azure storage-account labels reject

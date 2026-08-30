@@ -216,6 +216,19 @@ class ParamFuzzPlugin(BaseToolPlugin):
         )
         self.update_status(context, ToolStatus.RUNNING)
 
+        # Route these urllib-based requests through Hydra's local confinement
+        # proxy — same DNS-rebinding/TOCTOU reasoning as httpx/browser_probe/
+        # soft404_check/cloud_bucket_enum (core/collection/crawler_proxy.py):
+        # `allows_active_collection` above validated a hostname string per
+        # URL; without the proxy, urllib does its own independent DNS
+        # resolution and connection when the request actually runs.
+        async with self._crawler_confinement(context) as confinement_proxy:
+            proxy_url = self.settings.outbound_proxy_url or confinement_proxy.proxy_url
+            return await self._fuzz_urls(context, urls, proxy_url)
+
+    async def _fuzz_urls(
+        self, context: PipelineContext, urls: list[str], proxy_url: str
+    ) -> PluginResult:
         positives: list[dict[str, object]] = []
         invalid_baselines: list[dict[str, object]] = []
         hosts_with_invalid_baseline: set[str] = set()
@@ -237,7 +250,7 @@ class ParamFuzzPlugin(BaseToolPlugin):
                 http_get,
                 url,
                 timeout=timeout,
-                proxy_url=self.settings.outbound_proxy_url,
+                proxy_url=proxy_url,
             )
             total_probes += 1
             record_lines.append(
@@ -279,7 +292,7 @@ class ParamFuzzPlugin(BaseToolPlugin):
                     http_get,
                     probe_url,
                     timeout=timeout,
-                    proxy_url=self.settings.outbound_proxy_url,
+                    proxy_url=proxy_url,
                 )
                 total_probes += 1
                 influences = significant_response_change(

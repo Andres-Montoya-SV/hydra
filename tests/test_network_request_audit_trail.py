@@ -81,7 +81,7 @@ async def test_httpx_redirect_hop_decisions_land_in_sqlite(tmp_path) -> None:
     plugin = HttpxPlugin(settings)
     scope = _scope()
 
-    async def fake_fetch(context, target, *, suffix, record_index, hop):
+    async def fake_fetch(context, target, *, suffix, record_index, hop, confinement_proxy_url=""):
         return None  # denies never reach this; allow-path doesn't need real data here
 
     plugin._fetch_single_hop = fake_fetch  # type: ignore[method-assign]

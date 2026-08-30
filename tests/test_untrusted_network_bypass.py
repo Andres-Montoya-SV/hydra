@@ -108,11 +108,18 @@ def test_raw_socket_bypass_is_not_stopped_by_the_confinement_proxy(evil_server: 
 
 
 def test_only_live_verified_tools_are_treated_as_proxy_confined() -> None:
-    """`PROXY_VERIFIED_TOOLS` must name exactly the tools whose real binaries
-    were driven through the live confinement test — not be silently widened
-    to cover a tool nobody has actually verified against its real binary.
+    """`PROXY_VERIFIED_TOOLS` must name exactly the tools whose real binaries/
+    engines were driven through the live confinement test — not be silently
+    widened to cover a tool nobody has actually verified. `httpx` and
+    `browser_probe` joined this turn: `tests/test_httpx_confinement_live.py`
+    drives the real installed httpx binary through the real proxy, and
+    `tests/test_browser_confinement_live.py` drives real WebKit through it
+    via Playwright's launch-time `proxy=` option — both in ALLOW and DENY
+    (including a DNS-rebinding scenario) directions.
     """
-    assert PROXY_VERIFIED_TOOLS == frozenset({"katana", "hakrawler", "nuclei"})
+    assert PROXY_VERIFIED_TOOLS == frozenset(
+        {"katana", "hakrawler", "nuclei", "httpx", "browser_probe"}
+    )
 
 
 @pytest.mark.asyncio
@@ -120,14 +127,16 @@ async def test_unverified_tool_gets_untrusted_network_tool_warning(tmp_path) -> 
     """Any plugin using `_crawler_confinement` whose name is not in
     `PROXY_VERIFIED_TOOLS` must get an explicit `UNTRUSTED_NETWORK_TOOL`
     warning rather than silently inheriting an unverified confinement claim.
-    `HttpxPlugin` never calls `_crawler_confinement` in its own `run()` — it
+    `NaabuPlugin` never calls `_crawler_confinement` in its own `run()` — it
     is reused here purely as a real, already-registered plugin instance
-    whose name ("httpx") is not in the verified set, to exercise the guard
+    whose name ("naabu") is not in the verified set, to exercise the guard
     without registering a new fake plugin class (which would pollute
     `ReconPlugin._registry` for every other test in the same process).
     """
+    from modules.naabu import NaabuPlugin
+
     settings = Settings(project_root=tmp_path)
-    plugin = HttpxPlugin(settings)
+    plugin = NaabuPlugin(settings)
     assert plugin.name not in PROXY_VERIFIED_TOOLS
 
     output_dir = tmp_path / "run"
@@ -144,7 +153,7 @@ async def test_unverified_tool_gets_untrusted_network_tool_warning(tmp_path) -> 
         pass
 
     assert any("UNTRUSTED_NETWORK_TOOL" in w for w in context.warnings)
-    assert any("httpx" in w for w in context.warnings)
+    assert any("naabu" in w for w in context.warnings)
 
 
 @pytest.mark.asyncio
@@ -165,6 +174,30 @@ async def test_verified_tool_gets_no_untrusted_network_tool_warning(tmp_path) ->
         output_dir=output_dir,
         collection_scope=scope,
         run_id="trusted-tool",
+    )
+
+    async with plugin._crawler_confinement(context):
+        pass
+
+    assert not any("UNTRUSTED_NETWORK_TOOL" in w for w in context.warnings)
+
+
+@pytest.mark.asyncio
+async def test_httpx_is_now_verified_and_gets_no_untrusted_network_tool_warning(tmp_path) -> None:
+    """`httpx` joined `PROXY_VERIFIED_TOOLS` this turn — confirms it does not
+    get flagged, mirroring the katana case above."""
+    settings = Settings(project_root=tmp_path)
+    plugin = HttpxPlugin(settings)
+    assert plugin.name in PROXY_VERIFIED_TOOLS
+
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    scope = CollectionScope.from_seeds(["seed.trusted-httpx-test.internal"])
+    context = PipelineContext(
+        targets=[DomainTarget(domain="seed.trusted-httpx-test.internal")],
+        output_dir=output_dir,
+        collection_scope=scope,
+        run_id="trusted-httpx-tool",
     )
 
     async with plugin._crawler_confinement(context):

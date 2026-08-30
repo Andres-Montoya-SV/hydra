@@ -1,9 +1,9 @@
 # Hydra readiness report
 
-**Date:** 2026-08-29
+**Date:** 2026-08-30
 **Repository:** `Andres-Montoya-SV/hydra`, branch `fix/redirect-scope-safety`
-**Method:** forensic runtime audit (`docs/FINAL_SECURITY_AUDIT.md`, `docs/NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_BOUNDARY_AUDIT.md`), targeted fixes verified by real subprocess execution, real WebKit browser tests, real SQLite persistence, real DNS resolution against the actual authorized target, a real raw-socket bypass demonstration, and a live run against the project's actual authorized target (`virusbarrier.xyz`, per `scope.txt`) — not stubs alone.
-**Test proof used:** 476 pytest cases (up from 356 at the start of this security-hardening arc), including a comprehensive parametrized test covering all 19 `active_collection=True` plugins, real-binary crawler-confinement tests, a live production run, a real-SQLite round trip proving the per-destination network authorization audit trail, a real subprocess proving the confinement proxy's raw-socket-bypass limit, a real-SQLite round trip proving `explain-collection` reconstructs the full causal chain, and a new destination-IP/SSRF policy test suite (real local servers proving the DNS-rebinding/TOCTOU fix connects to the validated IP, not a fresh lookup) plus a manual real-DNS check against `virusbarrier.xyz` confirming the new layer doesn't break the actual production target.
+**Method:** forensic runtime audit (`docs/FINAL_SECURITY_AUDIT.md`, `docs/NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md`), targeted fixes verified by real subprocess execution, real WebKit browser tests, real SQLite persistence, real DNS resolution against the actual authorized target, a real raw-socket bypass demonstration, and a live run against the project's actual authorized target (`virusbarrier.xyz`, per `scope.txt`) — not stubs alone.
+**Test proof used:** 484 pytest cases (up from 356 at the start of this security-hardening arc). This turn's addition: `ScopeEnforcingProxy` — previously a crawler-specific mechanism — is now the shared connection-level enforcement point for httpx (seed probe + every redirect hop), browser_probe (Playwright's own launch-time `proxy=`, not just the JS-visible route() guard), and the urllib-based `soft404_check`/`param_fuzz`/`cloud_bucket_enum`, closing the DNS-rebinding/TOCTOU gap for all of them — each verified against a real binary/engine/local server, not mocks, including a live check against `virusbarrier.xyz` that caught the real httpx binary attempting 15 real out-of-scope connections and blocked every one.
 
 **Verdict: READY FOR CONTROLLED BETA**
 
@@ -92,6 +92,27 @@ docs or tests:
   DNS-rebinding/TOCTOU gap: it previously re-resolved the hostname a second time at connect,
   a window where DNS could legitimately answer differently than what was just checked; it now
   connects to the exact IP `validate_destination_ips_async()` validated.
+- **`ScopeEnforcingProxy` generalized from a crawler-specific mechanism into the shared
+  connection-level enforcement point (this turn, `docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md`).**
+  Before this turn, `AuthorizedCollectionTarget`'s destination-IP check (above) validated one DNS
+  answer for an httpx redirect hop, then the real httpx binary independently resolved and
+  connected a *second* time on its own — the exact DNS-rebinding/TOCTOU gap the mission named.
+  Same story for browser_probe (Playwright's `route()` decides abort/continue from a hostname
+  string; it never itself resolves or pins the destination IP) and for the urllib-based
+  `soft404_check`/`param_fuzz`/`cloud_bucket_enum`. Fixed by routing all of them through the same,
+  already-proven `ScopeEnforcingProxy`: httpx via `-proxy` (now unconditional, not just under
+  `strict_opsec`), browser_probe via Playwright's launch-time `proxy=` option (WebKit's own
+  network stack, not just the JS-visible route() layer), and the three urllib plugins via
+  `core/http_probe.py:http_get`'s existing (previously unused-by-default) `proxy_url` parameter.
+  `PROXY_VERIFIED_TOOLS` grew from `{katana, hakrawler, nuclei}` to include `httpx` and
+  `browser_probe`, each verified live against a real binary/engine and a real local server in both
+  directions (authorized target reached; in-scope hostname resolving to a private IP gets zero
+  connections). A live check against `virusbarrier.xyz` caught the real httpx binary attempting 15
+  real out-of-scope connections during a normal probe and blocked every one. The one deliberately
+  unclosed case: when an external OPSEC-hiding proxy (`OUTBOUND_PROXY_URL`) is configured, httpx
+  and browser_probe route through *that* instead — chaining Hydra's local proxy in front of an
+  external one was scoped out this turn as a materially larger feature, documented as a limitation,
+  not silently dropped.
 
 ## ARCHITECTURAL CHANGES
 
@@ -120,7 +141,15 @@ Modified (principal):
 - `core/collection/audit.py`, `core/store.py` — `NetworkRequestRecord.resolved_ip` /
   `intel_network_requests.resolved_ip` column (additive migration for existing databases)
 - `modules/httpx.py` — rejects `file:`/`ftp:`/`gopher:`/`data:`/`javascript:`/`blob:` redirect
-  schemes before authorization; redirect-hop denials now report the specific gate that failed
+  schemes before authorization; redirect-hop denials now report the specific gate that failed;
+  `run()`/`_fetch_single_hop()` now wrap the real httpx subprocess in `_crawler_confinement`
+  (this turn) so both the seed probe and every redirect hop are proxy-pinned, not just
+  Python-authorized
+- `modules/browser_probe.py` — WebKit now launched with `proxy=` pointed at the confinement proxy
+  by default (this turn); external `OUTBOUND_PROXY_URL` still takes priority when configured
+- `modules/soft404_check.py`, `modules/param_fuzz.py`, `modules/cloud_bucket_enum.py` — all three
+  now route their `core/http_probe.py:http_get()` calls through `_crawler_confinement` (this
+  turn) instead of leaving `proxy_url=None` outside strict-OPSEC mode
 - `core/intel/authorize.py` — cloud-endpoint ALLOW path fixed
 - `core/intel/engine.py` — `claim_attempt()`, `AttemptStatus.IN_FLIGHT`
 - `core/intel/scope.py` — `authorize_plugin_input`/`authorize_collect_input` compose OPSEC
@@ -331,22 +360,31 @@ Adversarial/live proof beyond unit tests:
    environment variables set anyway reaches an out-of-scope server directly, because a raw
    `socket.connect()` never consults `HTTP_PROXY`/`HTTPS_PROXY`. This is a structural limit of any
    application-level proxy, not a bug to fix. The mitigation actually shipped is classification,
-   not false confinement: `PROXY_VERIFIED_TOOLS` (`core/collection/crawler_proxy.py`) names only
-   katana/hakrawler/nuclei — each individually proven live to honor `-proxy`
-   (`test_crawler_confinement_live.py`) — and any future collector wired into
+   not false confinement: `PROXY_VERIFIED_TOOLS` (`core/collection/crawler_proxy.py`) now names
+   five components — katana/hakrawler/nuclei (prior turns) plus **httpx and browser_probe (this
+   turn)** — each individually proven live to route through the proxy
+   (`test_crawler_confinement_live.py`, `test_httpx_confinement_live.py`,
+   `test_browser_confinement_live.py`) — and any future collector wired into
    `_crawler_confinement` outside that set gets an explicit `UNTRUSTED_NETWORK_TOOL` warning
    instead of inheriting an unverified confinement claim. True OS/process-level containment
    (network namespace, firewall egress rule, container policy) remains outside Hydra's own code
    and always will be — see NETWORK BOUNDARY tier 3.
-10. **Destination-IP/SSRF validation covers two call sites, not every connection Hydra makes.**
-    `core/collection/ssrf.py` is wired into `AuthorizedCollectionTarget` (httpx redirect hops) and
-    `ScopeEnforcingProxy` (crawler confinement) — the two places a connection is made to a
-    hostname a plugin didn't type in directly. The operator's own initial seed request
-    (`modules/httpx.py`'s first probe, `dnsx`, `naabu`, and the rest of the plugin table in
-    `docs/FINAL_NETWORK_BOUNDARY_AUDIT.md`) and `browser_probe.py`'s route guard are not
-    destination-IP validated — an operator-supplied seed that itself resolves to an internal
-    address is not blocked by this layer. This is the same bounded-increment scoping this whole
-    arc has used throughout, stated explicitly rather than left to be discovered.
+10. **Destination-IP/SSRF validation now covers six components, up from two — substantially
+    closed this turn, not fully closed.** `ScopeEnforcingProxy` — generalized this turn from a
+    crawler-specific mechanism into the shared connection-level enforcement point
+    (`docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md`) — now backs katana/hakrawler/nuclei (prior turns),
+    httpx's seed probe and every redirect hop, browser_probe's entire WebKit network stack (not
+    just the JS-visible route() layer), and the urllib-based `soft404_check`/`param_fuzz`/
+    `cloud_bucket_enum`. Each addition verified live: real binary/engine, real local server, both
+    the authorized-reaches-through and in-scope-hostname-resolving-to-a-private-IP-gets-zero-
+    connections directions. **Still not covered:** dnsx/naabu (DNS-query and TCP-connect-scan
+    operations where an independent DNS/IP validation step doesn't apply the same way — see the
+    audit doc's classification), asn_lookup/whois/gau/waybackurls/threat_intel/vuln_match/ctlogs
+    (all connect to fixed, hardcoded third-party endpoints, not target-derived destinations — the
+    SSRF concern doesn't apply to them by construction, confirmed by re-reading each one this
+    turn, not assumed). **Deliberately not closed:** when `OUTBOUND_PROXY_URL` (external
+    OPSEC-hiding proxy) is configured, httpx and browser_probe route through *that* instead of the
+    local confinement proxy — chaining the two was scoped out as a materially larger feature.
 
 ## PROVEN / PARTIALLY PROVEN / UNPROVEN
 
@@ -366,9 +404,10 @@ Adversarial/live proof beyond unit tests:
 | "Why was this hostname collected?" answerable from SQLite alone | **PROVEN for follow-up collection; UNPROVEN for seed collection** | `explain-collection` + `test_explain_collection_cli.py` walk the full chain for follow-up indicators; seed collection has no `CollectionAttempt`/hypothesis row to walk (documented limitation, unchanged this turn) |
 | Every active-collection plugin's authorization is structurally impossible to skip (not just currently correct) | **UNPROVEN** | the `CollectionGateway`/`AuthorizedCollectionTarget`-everywhere retrofit remains open; today's correctness is verified by test and live run, not enforced by the type system at every call site |
 | `intel_network_requests` covers every network-issuing component | **PARTIALLY PROVEN** | covers `ScopeEnforcingProxy` and httpx's redirect resolver (the two finest-grained per-destination deciders); dnsx/naabu/asn_lookup/cloud_bucket_enum/browser_probe make correctly-authorized calls but leave no row in this specific table |
-| An in-scope hostname that resolves to a private/loopback/link-local/CGNAT/metadata address is denied by default (the "allowed.example → 10.0.0.1" SSRF scenario) | **PROVEN for httpx redirect hops and crawler confinement; UNPROVEN for the initial seed request and the browser** | `test_ssrf_destination_policy.py` — real local server receives zero connections by default, a real connection once explicitly opted in via `allow_private_network_targets`; not wired into the seed httpx probe, dnsx/naabu, or `browser_probe.py` |
-| DNS-rebinding/TOCTOU between authorization and connection is mitigated for the crawler proxy | **PROVEN** | `test_ssrf_destination_policy.py` spies on `asyncio.open_connection`'s actual arguments and proves the proxy connects to the IP already validated, never re-resolving the hostname a second time |
+| An in-scope hostname that resolves to a private/loopback/link-local/CGNAT/metadata address is denied by default (the "allowed.example → 10.0.0.1" SSRF scenario) | **PROVEN for httpx (seed + redirects), crawler confinement, browser_probe, and the urllib-based plugins; UNPROVEN only for dnsx/naabu's own resolution/scan primitives** | `test_ssrf_destination_policy.py`, `test_httpx_confinement_live.py`, `test_browser_confinement_live.py`, `test_urllib_confinement_live.py` — real local server receives zero connections by default across all four, a real connection once explicitly opted in via `allow_private_network_targets` |
+| DNS-rebinding/TOCTOU between authorization and connection is mitigated | **PROVEN for the crawler proxy, httpx, browser_probe, and the urllib-based plugins — the six components generalized onto `ScopeEnforcingProxy` this turn** | `test_ssrf_destination_policy.py` spies on `asyncio.open_connection`'s actual arguments (crawler proxy); `test_httpx_confinement_live.py`/`test_browser_confinement_live.py`/`test_urllib_confinement_live.py` each prove a real client reaches zero connections when the confinement proxy's resolver reports a private IP for an in-scope hostname |
 | IPv4-mapped IPv6 literals (`::ffff:10.0.0.1`) are classified against the same IPv4 blocklist | **PROVEN** | a real bypass found while writing this turn's own audit doc, fixed the same turn, with 3 dedicated cases in `test_ssrf_destination_policy.py` |
+| `ScopeEnforcingProxy` is the common connection-level enforcement mechanism across crawlers, HTTP probing, and the browser — not a crawler-specific solution | **PROVEN** | `PROXY_VERIFIED_TOOLS` now spans katana/hakrawler/nuclei/httpx/browser_probe, each individually verified live this arc; the three urllib-based plugins share the identical `http_get(..., proxy_url=...)` mechanism, verified via `test_urllib_confinement_live.py` |
 
 ## FINAL VERDICT
 
@@ -390,35 +429,40 @@ re-audited (limitation 6); `datetime.utcnow()` deprecation noise (limitation 7);
 `intel_network_requests` coverage is partial (limitation 8); the confinement proxy cannot stop a
 raw-socket bypass, mitigated by explicit `PROXY_VERIFIED_TOOLS` classification rather than a false
 guarantee (limitation 9, now proven with a real test rather than only disclosed in prose);
-destination-IP/SSRF validation covers httpx redirects and crawler confinement but not the initial
-seed request or the browser (limitation 10).
+destination-IP/SSRF validation now covers six components (up from two) but not dnsx/naabu's own
+primitives, and not the external-OPSEC-proxy configuration for httpx/browser_probe (limitation 10,
+substantially closed this turn, not fully closed).
 
 **NETWORK ENFORCEMENT COVERAGE:** all active-collection plugins gate on `CollectionScope` before
-running (19/19, one parametrized test); katana/hakrawler/nuclei additionally confined at the
-socket level by `ScopeEnforcingProxy` regardless of internal redirect/crawl behavior; httpx
-authorizes every redirect hop individually before requesting it; browser_probe authorizes every
-resource type including WebSocket/popup/Worker at the browser-context level. Per-destination
-decisions from the two finest-grained components (crawler proxy, httpx redirects) are now also
-durably recorded in `intel_network_requests`, independent of the coarser per-plugin
-`intel_collection_attempts` table. **New this turn:** those same two components now also validate
-the *resolved destination IP*, not just the hostname string — an in-scope hostname that resolves
-to a loopback/RFC1918/link-local/CGNAT/metadata/multicast/reserved address (including IPv4-mapped
-IPv6 literals) is denied by default, and the crawler proxy connects to the exact IP it validated
-rather than re-resolving the hostname at connect time (closing a real DNS-rebinding/TOCTOU gap).
+running (19/19, one parametrized test). **`ScopeEnforcingProxy` — generalized this turn from a
+crawler-specific mechanism into the shared connection-level enforcement point
+(`docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md`) — now backs six components**: katana/hakrawler/nuclei
+(prior turns), httpx's seed probe and every redirect hop, browser_probe's entire WebKit network
+stack (Playwright's launch-time `proxy=`, not just the JS-visible `route()` layer), and the
+urllib-based `soft404_check`/`param_fuzz`/`cloud_bucket_enum` (`core/http_probe.py:http_get`'s
+`proxy_url` parameter, previously unused outside strict-OPSEC mode). Every one of these connects
+to the exact resolved IP the proxy validated, not a fresh, independent resolution at connect time
+— closing the DNS-rebinding/TOCTOU gap for all six, not just the crawlers. Destination-IP/SSRF
+validation (loopback/RFC1918/link-local/CGNAT/metadata/multicast/reserved, including IPv4-mapped
+IPv6 literals) applies at every one of these six points. A live check against `virusbarrier.xyz`
+caught the real httpx binary attempting 15 real out-of-scope connections during a normal probe and
+blocked every one — read from `context.metadata["network_requests"]`, not asserted.
 
-**UNPROVEN PATHS:** a tool bypassing its own configured `-proxy` via a raw socket outside its
-HTTP client is invisible to `ScopeEnforcingProxy` — this is no longer merely disclosed, it is
-demonstrated with a real subprocess and a real server in `tests/test_untrusted_network_bypass.py`
-(application-level proxy, not OS-level isolation; mitigated by `PROXY_VERIFIED_TOOLS`
-classification, not by a false confinement claim); DNS resolution itself is not proxied under
-`STRICT_OPSEC`; no allowlisted third-party OOB provider path exists, so nuclei interactsh stays
-opt-in and unconfined when enabled; seed collection (as opposed to follow-up) has no
-`CollectionAttempt` trail for `explain-collection` to walk; an operator-supplied seed hostname
-that itself resolves to a private/internal address is not blocked by the new destination-IP layer
-(only redirect hops and crawler-discovered connections are); `browser_probe.py` does not validate
-destination IPs at all.
+**UNPROVEN PATHS:** a tool bypassing its own configured proxy via a raw socket outside its HTTP
+client is invisible to `ScopeEnforcingProxy` — demonstrated with a real subprocess and a real
+server in `tests/test_untrusted_network_bypass.py` (application-level proxy, not OS-level
+isolation; mitigated by `PROXY_VERIFIED_TOOLS` classification, not by a false confinement claim);
+DNS resolution itself is not proxied under `STRICT_OPSEC`; no allowlisted third-party OOB provider
+path exists, so nuclei interactsh stays opt-in and unconfined when enabled; seed collection (as
+opposed to follow-up) has no `CollectionAttempt` trail for `explain-collection` to walk; when an
+external OPSEC-hiding proxy (`OUTBOUND_PROXY_URL`) is configured, httpx and browser_probe route
+through *that* instead of the local confinement proxy, so the DNS-rebinding/TOCTOU guarantee does
+not apply in that specific configuration (documented, not hidden — chaining the two proxies was
+scoped out this turn as a materially larger feature); dnsx/naabu's own DNS-query/TCP-scan
+primitives are not destination-IP validated (their operations don't fit the same
+resolve-then-connect shape — see the audit doc's classification, not an oversight).
 
-**TEST COUNT:** 476 passed (0 failed, 0 xfail, 0 skipped-as-hidden-failure), up from 356 at the
+**TEST COUNT:** 484 passed (0 failed, 0 xfail, 0 skipped-as-hidden-failure), up from 356 at the
 start of this arc — verified with `pytest tests/ -q` run to completion, plus a clean `black`,
 `isort`, `ruff`, `mypy`, and `bandit` pass across the full repository.
 
@@ -427,17 +471,22 @@ actual authorized scope per `scope.txt`) completed in 403.1s, exit 0, with the c
 blocking real live out-of-scope connection attempts from real katana/nuclei processes — read
 directly from the run's persisted SQLite `warnings_json`, not from a mock. Crawler confinement is
 additionally verified against the real installed katana and hakrawler binaries in a controlled
-local redirect chain, the browser guard against real WebKit, a real subprocess proving the one
-thing the confinement proxy cannot do (stop a raw-socket bypass), and — this turn — real local TCP
-servers proving the new destination-IP/SSRF layer actually blocks (and, opted in, actually allows)
-a real connection, plus a real DNS resolution against `virusbarrier.xyz` confirming the new layer
-doesn't silently break the one target this project actually scans.
+local redirect chain; a real subprocess proves the one thing the confinement proxy cannot do (stop
+a raw-socket bypass). **This turn:** a direct `HttpxPlugin.run()` invocation against
+`virusbarrier.xyz` recorded the confinement proxy blocking 15 real out-of-scope connection
+attempts the real httpx binary tried on its own while the authorized connection (resolved IP
+`34.75.127.116`) completed successfully; three new live test files
+(`test_httpx_confinement_live.py`, `test_browser_confinement_live.py`,
+`test_urllib_confinement_live.py`) each prove, against a real binary/engine/local server, that an
+in-scope hostname resolving to a private IP gets zero real connections through the newly-wired
+confinement path.
 
 **KNOWN LIMITATIONS:** see the ten items enumerated above (REMAINING LIMITATIONS) — none of
 them constitute a known, currently-exploitable authorization bypass; each is either a structural
 robustness gap (P1) or a documented, deliberately-scoped-out boundary (P2). Limitation 9 (raw-socket
-bypass) and limitation 10 (destination-IP coverage) are both backed by passing tests that would
-fail if either boundary were ever silently claimed to be stronger than it actually is.
+bypass) and limitation 10 (destination-IP/TOCTOU coverage, substantially expanded this turn from 2
+to 6 components) are both backed by passing tests that would fail if either boundary were ever
+silently claimed to be stronger than it actually is.
 
 Use on authorized targets with `SCOPE_FILE` set. Treat katana/hakrawler/nuclei/browser_probe as
 still the highest-residual-risk collectors — confinement is real but is a proxy/route-guard

@@ -94,6 +94,7 @@ class HttpxPlugin(BaseToolPlugin):
         json_output: Path,
         *,
         target_url: str | None = None,
+        confinement_proxy_url: str | None = None,
     ) -> list[str]:
         """Build httpx argv.
 
@@ -101,6 +102,15 @@ class HttpxPlugin(BaseToolPlugin):
         destination itself before Hydra gets a chance to authorize it. httpx
         only reports the `Location` header (`-location`); the caller decides,
         hop by hop, whether to issue a follow-up request via `target_url`.
+
+        `confinement_proxy_url` (`ScopeEnforcingProxy.proxy_url`, started by
+        the caller via `self._crawler_confinement(context)`) routes httpx's
+        own DNS resolution and connection through Hydra's local proxy —
+        without it, `AuthorizedCollectionTarget`'s destination-IP validation
+        (`core/collection/ssrf.py`) checks one resolution while httpx
+        performs a second, independent one when it actually connects, which
+        is exactly the DNS-rebinding/TOCTOU gap the proxy closes for
+        katana/hakrawler/nuclei already. See docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
         """
         args = [str(self.resolved_binary(context))]
         if target_url is not None:
@@ -134,8 +144,20 @@ class HttpxPlugin(BaseToolPlugin):
 
         if not self.settings.strict_opsec:
             args.extend(["-ip", "-cname", "-tls-probe", "-tls-grab"])
+            if confinement_proxy_url:
+                args.extend(["-proxy", confinement_proxy_url])
         elif self.settings.outbound_proxy_url:
+            # External OPSEC-hiding proxy takes priority over local
+            # confinement here: chaining Hydra's local proxy in front of an
+            # external proxy (so both the SSRF check AND the IP-hiding
+            # guarantee hold at once) is out of scope this turn — the
+            # DNS-rebinding/TOCTOU protection `confinement_proxy_url`
+            # otherwise provides does not apply in this specific
+            # configuration. Documented, not hidden — see
+            # docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
             args.extend(["-proxy", self.settings.outbound_proxy_url])
+        elif confinement_proxy_url:
+            args.extend(["-proxy", confinement_proxy_url])
 
         headers = self.settings.merged_headers()
         for key, value in headers.items():
@@ -159,15 +181,27 @@ class HttpxPlugin(BaseToolPlugin):
         if not input_path.exists() or input_path.stat().st_size == 0:
             return PluginResult(success=False, message="No hosts to probe")
 
-        args = self._build_args(context, input_path, json_output)
-        # httpx writes JSONL via -o; must not capture stdout (would overwrite -o file)
-        result = await self._execute_self_output(context, args, json_output, allow_empty=True)
+        # Route httpx's own DNS resolution and connections through Hydra's
+        # local confinement proxy — the same mechanism already proven live
+        # for katana/hakrawler/nuclei (core/collection/crawler_proxy.py).
+        # Without this, `AuthorizedCollectionTarget`'s destination-IP check
+        # validates one DNS answer while httpx independently resolves and
+        # connects a second time — a DNS-rebinding/TOCTOU window. See
+        # docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
+        async with self._crawler_confinement(context) as proxy:
+            args = self._build_args(
+                context, input_path, json_output, confinement_proxy_url=proxy.proxy_url
+            )
+            # httpx writes JSONL via -o; must not capture stdout (would overwrite -o file)
+            result = await self._execute_self_output(context, args, json_output, allow_empty=True)
 
-        records = read_jsonl(json_output) if json_output.exists() else []
-        resolved_records = [
-            await self._resolve_authorized_redirects(context, record, scope, suffix, index)
-            for index, record in enumerate(records)
-        ]
+            records = read_jsonl(json_output) if json_output.exists() else []
+            resolved_records = [
+                await self._resolve_authorized_redirects(
+                    context, record, scope, suffix, index, proxy.proxy_url
+                )
+                for index, record in enumerate(records)
+            ]
         annotated, alive_urls, redirect_obs = authorize_httpx_records(
             resolved_records, scope, raw_artifact=json_output.name
         )
@@ -209,6 +243,7 @@ class HttpxPlugin(BaseToolPlugin):
         scope: CollectionScope,
         suffix: str,
         record_index: int,
+        confinement_proxy_url: str = "",
     ) -> dict:
         """Walk a redirect chain hop by hop, authorizing each destination before
         httpx is allowed to request it.
@@ -265,7 +300,12 @@ class HttpxPlugin(BaseToolPlugin):
                 break
             hop += 1
             hop_record = await self._fetch_single_hop(
-                context, target, suffix=suffix, record_index=record_index, hop=hop
+                context,
+                target,
+                suffix=suffix,
+                record_index=record_index,
+                hop=hop,
+                confinement_proxy_url=confinement_proxy_url,
             )
             _record_hop_decision(
                 context,
@@ -304,15 +344,26 @@ class HttpxPlugin(BaseToolPlugin):
         suffix: str,
         record_index: int,
         hop: int,
+        confinement_proxy_url: str = "",
     ) -> dict | None:
         """Issue the httpx request for one already-authorized redirect hop.
 
         Takes the authorization proof itself, not a bare URL string — there
         is no way to call this with a destination that was not actually
-        checked by `AuthorizedCollectionTarget.authorize()`.
+        checked by `AuthorizedCollectionTarget.authorize()`. Routed through
+        `confinement_proxy_url` for the same DNS-rebinding/TOCTOU reason as
+        the initial request (`run()`) — the Python-level check above
+        validates one DNS answer; the proxy independently resolves,
+        validates, and pins the actual connection to that same answer.
         """
         hop_output = self._output_path(context, f"httpx_hop{suffix}_{record_index}_{hop}.json")
-        args = self._build_args(context, None, hop_output, target_url=target.raw)
+        args = self._build_args(
+            context,
+            None,
+            hop_output,
+            target_url=target.raw,
+            confinement_proxy_url=confinement_proxy_url,
+        )
         result = await self._execute_self_output(context, args, hop_output, allow_empty=True)
         records = read_jsonl(hop_output) if hop_output.exists() else []
         try:
