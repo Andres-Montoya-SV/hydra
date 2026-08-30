@@ -15,7 +15,7 @@ from core.assets import normalize_domain
 from core.domain import parse_hostname
 from core.exceptions import ConfigurationError
 from core.intel.model import ScopeStatus
-from core.scope import host_in_scope, load_scope_patterns
+from core.scope import host_in_scope, load_scope_patterns, split_scope_patterns
 from utils.files import read_lines, write_lines
 
 
@@ -25,6 +25,12 @@ class CollectionScope:
 
     seed_domains: tuple[str, ...] = ()
     scope_patterns: tuple[str, ...] = ()
+    # Explicit path-level denials, e.g. from a `!bancoplata.mx/*/whistleblowing`
+    # SCOPE_FILE line: (domain, path_glob) pairs. Take priority over any
+    # positive domain/wildcard match — a program can authorize a whole
+    # wildcard while still explicitly excluding a specific path. See
+    # `core/scope.py:url_path_excluded`.
+    path_exclusions: tuple[tuple[str, str], ...] = ()
     cloud_collection_allowed: bool = False
     # Explicit operator opt-in required before a resolved destination IP in a
     # private/loopback/link-local/CGNAT/metadata range is ever connected to
@@ -47,9 +53,11 @@ class CollectionScope:
         loaded: list[str] = list(patterns or [])
         if scope_file is not None and scope_file.exists():
             loaded.extend(load_scope_patterns(scope_file))
+        positive, exclusions = split_scope_patterns(loaded)
         return cls(
             seed_domains=normalized,
-            scope_patterns=tuple(loaded),
+            scope_patterns=tuple(positive),
+            path_exclusions=tuple(exclusions),
             cloud_collection_allowed=cloud_collection_allowed,
             allow_private_network_targets=allow_private_network_targets,
         )

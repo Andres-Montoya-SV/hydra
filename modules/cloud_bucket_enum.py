@@ -133,6 +133,7 @@ class CloudBucketEnumPlugin(BaseToolPlugin):
             capability=self.capability,
             context=context,
             upstream_proxy_url=self.settings.outbound_proxy_url or None,
+            extra_headers=self.settings.merged_headers(),
         ) as gateway:
             return await self._run_probes(context, gateway, delay, timeout, raw_lines, brands)
 

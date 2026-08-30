@@ -92,10 +92,12 @@ class CollectionGateway:
         capability: str,
         context: object | None = None,
         upstream_proxy_url: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.scope = scope
         self.capability = capability
         self.context = context
+        self.extra_headers = dict(extra_headers) if extra_headers else {}
         self._proxy = ScopeEnforcingProxy(
             scope, capability=capability, upstream_proxy_url=upstream_proxy_url
         )
@@ -162,7 +164,11 @@ class CollectionGateway:
             )
         # core/http_probe.py:http_get is a blocking urllib call.
         response = await asyncio.to_thread(
-            _http_get, target.raw, timeout=timeout, proxy_url=self._proxy.proxy_url
+            _http_get,
+            target.raw,
+            timeout=timeout,
+            proxy_url=self._proxy.proxy_url,
+            extra_headers=self.extra_headers or None,
         )
         self.audit.append(
             GatewayAuditEntry(

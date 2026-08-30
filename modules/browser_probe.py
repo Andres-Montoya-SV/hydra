@@ -123,6 +123,7 @@ class BrowserProbePlugin(BaseToolPlugin):
                                 target,
                                 context=context,
                                 timeout_seconds=self.settings.browser_probe_timeout,
+                                extra_headers=self.settings.merged_headers(),
                             )
                         )
                     except Exception as exc:
@@ -174,6 +175,7 @@ async def _probe_target(
     *,
     context: PipelineContext,
     timeout_seconds: int,
+    extra_headers: dict[str, str] | None = None,
 ) -> dict[str, object]:
     browser_context = await browser.new_context(
         user_agent=_IPHONE_USER_AGENT,
@@ -185,6 +187,12 @@ async def _probe_target(
         timezone_id="UTC",
         accept_downloads=False,
         service_workers="block",
+        # Program-mandated researcher identification (e.g. X-HackerOne-Research)
+        # and any other operator-configured header — applied to every request
+        # WebKit makes in this context, same as httpx/param_fuzz/
+        # cloud_bucket_enum via Settings.merged_headers(). Suppressed under
+        # strict OPSEC by merged_headers() itself, not here.
+        extra_http_headers=extra_headers or {},
     )
     try:
         blocked_counts: dict[str, int] = {}

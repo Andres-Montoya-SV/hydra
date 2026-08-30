@@ -132,6 +132,10 @@ All settings live in `.env`. Key variables:
 | `OUTPUT_DIRECTORY` | Run output base directory | `output` |
 | `X_HACKERONE_RESEARCHER` | HackerOne researcher header value | — |
 | `HTTP_CUSTOM_HEADERS` | Additional headers (JSON or `Header: val` pairs) | — |
+| `RESEARCHER_ATTRIBUTION_HEADER` | Program-mandated attribution header, any name (`"Name: value"`, e.g. `X-HackerOne-Research: your_h1_handle`) — sent with every active request against the target itself, never to fixed third parties (OSV.dev, crt.sh, WHOIS, URLhaus) | — |
+| `SCOPE_FILE` | Domain/wildcard scope, plus `!domain/path-glob` path exclusions — see `scope.example.txt` | — |
+| `OWNED_DOMAINS` | Comma-separated domains you own — anything else triggers external-target-mode | — |
+| `EXTERNAL_TARGET_MODE` | Force conservative defaults regardless of `OWNED_DOMAINS` (also: `run --external`) | `false` |
 | `TIMEOUT` | Subprocess timeout (seconds) | `300` |
 | `THREADS` | Default thread count | `50` |
 | `HTTPX_THREADS` | httpx concurrency | `50` |

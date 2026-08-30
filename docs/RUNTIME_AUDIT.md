@@ -220,6 +220,30 @@ Pending (later prompt, not this one): whether missing `SCOPE_FILE` should mean �
 
 If `collection_scope` is missing entirely, `require_collection_scope` fails closed for active `_output_path` / `_authorized_input`. Production `run()` always attaches a scope object.
 
+### 5.3b `SCOPE_FILE` path exclusions (new: scope is host **and** path aware)
+
+A `SCOPE_FILE` line prefixed with `!` (`!bancoplata.mx/*/whistleblowing`) excludes that
+path from an otherwise-authorized domain/wildcard, even a wildcard that would otherwise
+cover it. Parsed by `core/scope.py:split_scope_patterns` into
+`CollectionScope.path_exclusions` (kept separate from the ordinary `scope_patterns`
+tuple used by `host_in_scope`), matched by `core/scope.py:url_path_excluded`
+(hostname exact-or-subdomain + `fnmatch` path glob, `*` also matches `/`).
+
+Enforced in `core/intel/authorize.py:authorize_active_indicator`, immediately after
+hostname parsing and **before** the cloud-endpoint opt-in gate and ordinary
+domain/wildcard matching — every caller already funneling through this one function
+inherits it: `allows_active_collection` (browser_probe's route guard, real decrypted
+URL+path), `AuthorizedCollectionTarget.authorize()` (httpx redirect hops, and every
+`CollectionGateway` plugin: soft404_check, param_fuzz, cloud_bucket_enum), and
+`ScopeEnforcingProxy._authorize_with_reason` for **plain-HTTP** crawler traffic (the
+path is visible to the proxy there, unlike inside a `CONNECT` tunnel).
+
+Only ever matches a full URL — a bare hostname indicator has no path to exclude, so it
+is unaffected (same as before this feature). Does **not** apply to HTTPS crawler
+traffic tunneled via `CONNECT`: that byte-for-byte splice has no TLS interception, so
+no code path — old or new — has ever seen the decrypted path there; this is the same
+pre-existing limitation as every other CONNECT-target check, not a new gap.
+
 ### 5.4 This change set: httpx stops fetching before authorizing
 
 Part B (§5.2) removed the OOS destination from `alive.txt`, but the underlying gap the third independent review flagged was structural: `authorize_httpx_records` is a **filter on results**, not a barrier in front of the request. As long as `HttpxPlugin._build_args` passed `-follow-redirects`, the real HTTP GET to the unauthorized host happened before any Hydra code ran — authorization could only decide what to do with a fetch that had already occurred.

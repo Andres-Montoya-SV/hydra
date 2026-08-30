@@ -2,21 +2,86 @@
 
 from __future__ import annotations
 
+import fnmatch
 from pathlib import Path
+from urllib.parse import urlparse
 
 from core.assets import normalize_domain
 from core.domain import parse_hostname
 
 
 def load_scope_patterns(path: Path) -> list[str]:
-    """Load non-empty, non-comment scope lines from a text file."""
+    """Load non-empty, non-comment scope lines from a text file.
+
+    A line may be a positive domain/wildcard pattern (`*.example.com`) or an
+    explicit path exclusion prefixed with `!` (`!example.com/*/whistleblowing`)
+    — see `split_scope_patterns`. Exclusion lines keep their original path
+    case (URL paths are case-sensitive); only the domain part of a positive
+    pattern is lowercased, as before.
+    """
     patterns: list[str] = []
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        patterns.append(line.lower().rstrip("."))
+        if line.startswith("!"):
+            patterns.append("!" + line[1:].strip())
+        else:
+            patterns.append(line.lower().rstrip("."))
     return patterns
+
+
+def split_scope_patterns(patterns: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Split raw scope lines into (positive domain patterns, path exclusions).
+
+    A path exclusion line looks like `!domain/path-glob`, e.g.
+    `!bancoplata.mx/*/whistleblowing`. The domain part is matched the same
+    way a positive scope entry is (exact host or any subdomain); the path
+    part is matched against the URL path with shell-glob semantics
+    (`fnmatch`), where `*` also matches `/` — a broader match only ever
+    *excludes* more, which is the safe direction for a deny rule.
+    """
+    positive: list[str] = []
+    exclusions: list[tuple[str, str]] = []
+    for pattern in patterns:
+        if not pattern.startswith("!"):
+            positive.append(pattern)
+            continue
+        body = pattern[1:].strip()
+        domain_part, _, path_part = body.partition("/")
+        domain = normalize_domain(domain_part)
+        if not domain:
+            continue
+        path_glob = "/" + path_part if path_part else "/*"
+        exclusions.append((domain, path_glob))
+    return positive, exclusions
+
+
+def url_path_excluded(url: str, exclusions: list[tuple[str, str]]) -> bool:
+    """True when `url`'s hostname+path matches an explicit path exclusion.
+
+    Only meaningful for a real URL (scheme + path) — a bare hostname or
+    `host:port` indicator carries no path to exclude and never matches here,
+    same as a path exclusion never applying to non-URL discovery data.
+    """
+    if not exclusions:
+        return False
+    text = (url or "").strip()
+    if "://" not in text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    host = normalize_domain(parsed.hostname or "")
+    if not host:
+        return False
+    path = parsed.path or "/"
+    for domain, path_glob in exclusions:
+        if host == domain or host.endswith("." + domain):
+            if fnmatch.fnmatch(path, path_glob):
+                return True
+    return False
 
 
 def host_in_scope(host: str, patterns: list[str]) -> bool:

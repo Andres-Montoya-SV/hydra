@@ -31,11 +31,22 @@ def http_get(
     proxy_url: str | None = None,
     user_agent: str = _DEFAULT_UA,
     max_body: int = _MAX_BODY,
+    extra_headers: dict[str, str] | None = None,
 ) -> ResponseSnapshot:
-    """GET ``url`` and return status/body/error without raising."""
+    """GET ``url`` and return status/body/error without raising.
+
+    ``extra_headers`` (e.g. a program-mandated researcher attribution header —
+    see ``Settings.merged_headers()``) is merged on top of the default
+    ``User-Agent`` header. Never pass this for a fixed third-party endpoint
+    (OSV.dev, crt.sh, WHOIS, URLhaus) — it identifies the caller to the
+    *target*, which is meaningless (and unwanted noise) anywhere else.
+    """
+    headers = {"User-Agent": user_agent}
+    if extra_headers:
+        headers.update(extra_headers)
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": user_agent},
+        headers=headers,
         method="GET",
     )
     try:

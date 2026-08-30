@@ -55,6 +55,22 @@ class _CountingHandler(_QuietHandler):
         self.wfile.write(b"not found")
 
 
+class _HeaderCapturingHandler(_QuietHandler):
+    # `email.message.Message` (what `self.headers` actually is) has
+    # case-insensitive `.get()` — HTTP header names are case-insensitive per
+    # RFC 7230, and urllib's own client-side normalization does not preserve
+    # the exact case a caller passed in, so this must not be collapsed into a
+    # plain (case-sensitive) dict.
+    last_headers: object = None
+
+    def do_GET(self) -> None:  # noqa: N802
+        type(self).last_headers = self.headers
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+
 def _serve(handler_cls: type) -> tuple[socketserver.TCPServer, int, threading.Thread]:
     socketserver.TCPServer.allow_reuse_address = True
     httpd = socketserver.TCPServer(("127.0.0.1", 0), handler_cls)
@@ -62,6 +78,17 @@ def _serve(handler_cls: type) -> tuple[socketserver.TCPServer, int, threading.Th
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     return httpd, port, thread
+
+
+@pytest.fixture
+def header_capturing_server() -> Iterator[int]:
+    _HeaderCapturingHandler.last_headers = None
+    httpd, port, thread = _serve(_HeaderCapturingHandler)
+    try:
+        yield port
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=2)
 
 
 @pytest.fixture
@@ -105,6 +132,33 @@ async def test_soft404_reaches_authorized_target_through_confinement_proxy(
 
     assert result.success
     assert _CountingHandler.hits, "authorized target should have been reached through the proxy"
+
+
+@pytest.mark.asyncio
+async def test_soft404_sends_researcher_attribution_header_through_gateway(
+    tmp_path: Path, header_capturing_server: int
+) -> None:
+    """A program-mandated researcher header (Settings.merged_headers(), fed
+    through CollectionGateway(extra_headers=...)) must actually reach the
+    real target request — this is what several bug-bounty programs require
+    to distinguish authorized researcher traffic from a real attacker."""
+    url = f"http://127.0.0.1:{header_capturing_server}/"
+    scope = CollectionScope.from_seeds(
+        ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+    )
+    settings = Settings(
+        project_root=tmp_path,
+        enable_soft404_check=True,
+        researcher_attribution_header={"X-HackerOne-Research": "my_h1_handle"},
+    )
+    plugin = Soft404CheckPlugin(settings)
+    context = _context_for(tmp_path, scope, url)
+
+    result = await plugin.run(context, tmp_path / "unused")
+
+    assert result.success
+    assert _HeaderCapturingHandler.last_headers is not None
+    assert _HeaderCapturingHandler.last_headers.get("X-HackerOne-Research") == "my_h1_handle"
 
 
 @pytest.mark.asyncio

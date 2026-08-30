@@ -160,7 +160,9 @@ class ScopeEnforcingProxy:
     async def __aexit__(self, *exc: object) -> None:
         await self.stop()
 
-    async def _authorize_with_reason(self, host: str) -> tuple[bool, str, str]:
+    async def _authorize_with_reason(
+        self, host: str, *, indicator: str | None = None
+    ) -> tuple[bool, str, str]:
         """Return (allowed, reason, connect_ip).
 
         Two independent gates, in order: (1) is `host` a hostname/IP the
@@ -174,6 +176,15 @@ class ScopeEnforcingProxy:
         or DNS could legitimately answer differently between the two calls
         (rebinding) and silently reach an address gate (2) never actually
         checked.
+
+        `indicator`, when given, is the full absolute URL authorized instead
+        of the bare `host` — this is what lets a SCOPE_FILE path exclusion
+        (`!domain/path-glob`) apply to plain-HTTP crawler traffic, where the
+        path is actually visible to this proxy. For `CONNECT` (HTTPS) this is
+        never passed: the path is inside the encrypted tunnel this proxy
+        splices without TLS interception, so only the host-level check
+        applies there — the same pre-existing, honestly-documented limit as
+        every other scope check against a `CONNECT` target.
         """
         if not host:
             return False, "empty_host", ""
@@ -194,7 +205,7 @@ class ScopeEnforcingProxy:
             # denied" for GCS/Azure. See `core/intel/authorize.py:
             # _CLOUD_BUCKET_ENUM_OPERATIONS`.
             result = authorize_active_indicator(
-                host, self.scope, self.capability, "confinement_proxy_recheck"
+                indicator or host, self.scope, self.capability, "confinement_proxy_recheck"
             )
             allowed = result.allowed
         except Exception:
@@ -320,11 +331,17 @@ class ScopeEnforcingProxy:
             await self._handle_connect(target, writer, reader)
             return
 
-        parsed = urlparse(target if "://" in target else f"http://{host_header}{target}")
+        absolute_target = target if "://" in target else f"http://{host_header}{target}"
+        parsed = urlparse(absolute_target)
         host = parsed.hostname or host_header.split(":")[0]
         port = parsed.port or 80
 
-        allowed, reason, connect_ip = await self._authorize_with_reason(host)
+        # Plain HTTP: the path is visible to this proxy (unlike CONNECT), so
+        # pass the full absolute URL — this is what lets a SCOPE_FILE path
+        # exclusion apply here, not just the host.
+        allowed, reason, connect_ip = await self._authorize_with_reason(
+            host, indicator=absolute_target
+        )
         self._record(
             method=method,
             host=host or "",
@@ -343,7 +360,6 @@ class ScopeEnforcingProxy:
             await writer.drain()
             return
         self.allowed_hosts.append(host)
-        absolute_target = target if "://" in target else f"http://{host_header}{target}"
 
         try:
             if self.upstream_proxy_url:

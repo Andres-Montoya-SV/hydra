@@ -239,6 +239,54 @@ passing) plus two new tests proving `gateway.http_get()` rejects a raw string wi
 `TypeError` for each plugin's own `CollectionGateway` construction, mirroring
 `tests/test_collection_gateway.py`'s generic proof.
 
+## SCOPE_FILE path exclusions (new turn): scope is now path-aware, not just host-aware
+
+Before this turn, every authorization decision in this whole arc — `classify_scope`,
+`authorize_active_indicator`, `AuthorizedCollectionTarget`, `ScopeEnforcingProxy` — was
+purely hostname-based: an authorized domain/wildcard authorized *every path* under it.
+A real bug-bounty program's scope is frequently narrower than that: `*.bancoplata.mx`
+authorized in general, with `/*/whistleblowing` on that domain and `platacard.mx`
+explicitly carved out as out of scope regardless of the wildcard. There was no way to
+express that in a `SCOPE_FILE` at all.
+
+**The mechanism.** A `SCOPE_FILE` line prefixed with `!` (`!bancoplata.mx/*/whistleblowing`)
+is parsed by `core/scope.py:split_scope_patterns` into a `(domain, path_glob)` pair, kept
+on `CollectionScope.path_exclusions` — separate from the ordinary `scope_patterns` tuple,
+so `host_in_scope` never sees exclusion syntax as a (harmlessly inert) positive pattern.
+`core/scope.py:url_path_excluded` matches a full URL's hostname (exact or subdomain) and
+path (`fnmatch`, `*` also matches `/` — a broader glob only ever excludes *more*, the safe
+direction for a deny rule) against every configured exclusion.
+
+**Where it's enforced — the same single choke point as everything else in this arc.**
+`core/intel/authorize.py:authorize_active_indicator` checks `path_exclusions` immediately
+after hostname parsing, **before** the cloud-endpoint opt-in gate and before ordinary
+domain/wildcard matching — an exclusion wins over any positive match, including a
+wildcard, by construction, not by convention. Every caller that already funnels through
+this one function inherits path-exclusion enforcement automatically and for free:
+`allows_active_collection` (browser_probe's route guard — Playwright reports the real,
+decrypted request URL with path, so this is real enforcement, not a hostname
+approximation), `authorize_collection` → `AuthorizedCollectionTarget.authorize()` (httpx's
+redirect-hop authorization, and every `CollectionGateway`-based plugin: soft404_check,
+param_fuzz, cloud_bucket_enum), and — new this turn —
+`ScopeEnforcingProxy._authorize_with_reason`, extended to pass the full absolute URL
+(not just the bare host) for **plain-HTTP** crawler traffic (katana/hakrawler/nuclei/httpx
+via `-proxy`), since the path is actually visible to this proxy for a plain HTTP request
+in a way it structurally is not for a `CONNECT`-tunneled HTTPS one.
+
+**Honest limit, stated plainly.** A `CONNECT` tunnel (HTTPS, the overwhelming majority of
+real traffic) is spliced byte-for-byte with no TLS interception — this proxy has never
+seen the decrypted path for any check, host-level scope included, and path exclusions are
+no different: they simply do not apply to HTTPS crawler traffic that never goes through
+Python's own URL-aware authorization first. This is the same pre-existing, already-audited
+limitation as every other CONNECT-target check in this document, not a new gap introduced
+by this feature.
+
+Verified with `tests/test_scope_path_exclusions.py`: parsing/matching unit tests, direct
+`authorize_active_indicator`/`allows_active_collection`/`AuthorizedCollectionTarget`
+DENY/ALLOW tests, and two real-local-server tests driving `ScopeEnforcingProxy` directly
+over plain HTTP proving the excluded path never reaches the server while a sibling path on
+the same domain does.
+
 ## A real bug found by writing real tests, not assumed away (this turn)
 
 Adding live tests for `param_fuzz`/`cloud_bucket_enum` (see `PROXY_VERIFIED_TOOLS` above) —

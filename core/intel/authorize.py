@@ -19,6 +19,7 @@ from core.intel.scope import (
     indicator_hostname,
     scope_status_allows_collection,
 )
+from core.scope import url_path_excluded
 
 # Vendor cloud hostnames are never silently in-scope just because a seed brand
 # appears in a label. Active collection requires an explicit cloud policy.
@@ -128,6 +129,22 @@ def authorize_active_indicator(
             host,
             op,
             "hostname_not_collectable",
+        )
+    # Explicit path exclusions (`!domain/path-glob` SCOPE_FILE lines) take
+    # priority over every other check below, including the cloud-endpoint
+    # opt-in and ordinary domain/wildcard matching — a program can authorize
+    # `*.bancoplata.mx` broadly while still carving out a specific path as
+    # explicitly out of scope. Only ever matches when `indicator` is a full
+    # URL (a bare hostname has no path to exclude).
+    if collection_scope.path_exclusions and url_path_excluded(
+        indicator, list(collection_scope.path_exclusions)
+    ):
+        return AuthorizationResult(
+            AuthorizationDecision.DENY,
+            host,
+            op,
+            "excluded_path_out_of_scope",
+            ScopeStatus.OUT_OF_SCOPE,
         )
     if is_generated_cloud_endpoint(host):
         if not collection_scope.cloud_collection_allowed:

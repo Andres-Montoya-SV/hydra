@@ -158,9 +158,9 @@ class PipelineRunner:
         scope_path = self.settings.scope_file
         if not scope_path:
             return
-        from core.scope import load_scope_patterns, out_of_scope_targets
+        from core.scope import load_scope_patterns, out_of_scope_targets, split_scope_patterns
 
-        patterns = load_scope_patterns(scope_path)
+        patterns, _path_exclusions = split_scope_patterns(load_scope_patterns(scope_path))
         names = [t.domain for t in targets if getattr(t, "domain", None)]
         rejected = out_of_scope_targets(names, patterns)
         if rejected:
