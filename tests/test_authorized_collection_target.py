@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
+import pytest
+
 from core.collection.target import AuthorizedCollectionTarget
 from core.intel.scope import CollectionScope
 
 SEED = "app.example-target-test.internal"
 OOS = "evil.example-target-test.internal"
+
+
+@pytest.fixture(autouse=True)
+def _fake_public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`SEED`/`OOS` are synthetic `.internal` names that never resolve.
+
+    These tests exercise hostname/scope/OPSEC authorization, not the
+    destination-IP SSRF layer (`core/collection/ssrf.py`, tested on its own
+    in `tests/test_ssrf_destination_policy.py`) — stub DNS to a fixed
+    public-looking address so that orthogonal, real-DNS-dependent check
+    doesn't turn every synthetic-domain test here into a DNS-resolution
+    test by accident.
+    """
+    monkeypatch.setattr("core.collection.ssrf.resolve_hostname", lambda host: ["203.0.113.10"])
 
 
 def _scope() -> CollectionScope:

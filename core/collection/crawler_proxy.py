@@ -111,14 +111,25 @@ class ScopeEnforcingProxy:
     async def __aexit__(self, *exc: object) -> None:
         await self.stop()
 
-    def _authorized(self, host: str) -> bool:
-        return self._authorize_with_reason(host)[0]
+    async def _authorize_with_reason(self, host: str) -> tuple[bool, str, str]:
+        """Return (allowed, reason, connect_ip).
 
-    def _authorize_with_reason(self, host: str) -> tuple[bool, str]:
+        Two independent gates, in order: (1) is `host` a hostname/IP the
+        operator's `CollectionScope` authorizes at all (unchanged from
+        before this check existed); (2) does `host` actually resolve to a
+        destination outside the private/loopback/link-local/CGNAT/metadata
+        blocklist (`core/collection/ssrf.py`), unless
+        `scope.allow_private_network_targets` opts in. `connect_ip` is the
+        resolved address validated by gate (2) — callers must connect to
+        THIS address, not re-resolve `host` a second time at connect time,
+        or DNS could legitimately answer differently between the two calls
+        (rebinding) and silently reach an address gate (2) never actually
+        checked.
+        """
         if not host:
-            return False, "empty_host"
+            return False, "empty_host", ""
         if self.scope is None:
-            return False, "missing_collection_scope"
+            return False, "missing_collection_scope", ""
         try:
             allowed = allows_active_collection(host, self.scope)
         except Exception:
@@ -128,8 +139,18 @@ class ScopeEnforcingProxy:
                 host,
                 exc_info=True,
             )
-            return False, "authorization_error"
-        return allowed, ("in_scope" if allowed else "out_of_scope")
+            return False, "authorization_error", ""
+        if not allowed:
+            return False, "out_of_scope", ""
+
+        from core.collection.ssrf import validate_destination_ips_async
+
+        decision = await validate_destination_ips_async(
+            host, allow_private_network_targets=self.scope.allow_private_network_targets
+        )
+        if not decision.allowed:
+            return False, decision.reason, ""
+        return True, "in_scope", decision.connect_ip
 
     def _record(
         self,
@@ -139,6 +160,7 @@ class ScopeEnforcingProxy:
         port: int,
         allowed: bool,
         reason: str,
+        resolved_ip: str = "",
     ) -> None:
         self.audit.append(
             NetworkRequestRecord(
@@ -147,6 +169,7 @@ class ScopeEnforcingProxy:
                 method=method,
                 url=f"{host}:{port}" if host else "",
                 normalized_hostname=host,
+                resolved_ip=resolved_ip,
                 port=port,
                 decision="ALLOW" if allowed else "DENY",
                 reason=reason,
@@ -193,8 +216,15 @@ class ScopeEnforcingProxy:
         host = parsed.hostname or host_header.split(":")[0]
         port = parsed.port or 80
 
-        allowed, reason = self._authorize_with_reason(host)
-        self._record(method=method, host=host or "", port=port, allowed=allowed, reason=reason)
+        allowed, reason, connect_ip = await self._authorize_with_reason(host)
+        self._record(
+            method=method,
+            host=host or "",
+            port=port,
+            allowed=allowed,
+            reason=reason,
+            resolved_ip=connect_ip,
+        )
         if not allowed:
             self.denied.append(
                 DeniedConnection(host=host or "", capability=self.capability, method=method)
@@ -207,8 +237,12 @@ class ScopeEnforcingProxy:
         self.allowed_hosts.append(host)
 
         try:
+            # Connect to the IP already resolved and validated above, not a
+            # fresh `host` lookup — closes the DNS-rebinding/TOCTOU gap
+            # where a second resolution could legitimately answer
+            # differently than the one just checked.
             remote_reader, remote_writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=_CONNECT_TIMEOUT
+                asyncio.open_connection(connect_ip, port), timeout=_CONNECT_TIMEOUT
             )
         except OSError:
             writer.write(
@@ -237,8 +271,15 @@ class ScopeEnforcingProxy:
     ) -> None:
         host, _, port_str = target.rpartition(":")
         port = int(port_str) if port_str.isdigit() else 443
-        allowed, reason = self._authorize_with_reason(host)
-        self._record(method="CONNECT", host=host, port=port, allowed=allowed, reason=reason)
+        allowed, reason, connect_ip = await self._authorize_with_reason(host)
+        self._record(
+            method="CONNECT",
+            host=host,
+            port=port,
+            allowed=allowed,
+            reason=reason,
+            resolved_ip=connect_ip,
+        )
         if not allowed:
             self.denied.append(
                 DeniedConnection(host=host, capability=self.capability, method="CONNECT")
@@ -249,8 +290,13 @@ class ScopeEnforcingProxy:
         self.allowed_hosts.append(host)
 
         try:
+            # Connect to the already-validated IP, not a fresh `host`
+            # lookup — see the identical comment in `_route`. The client's
+            # own TLS ClientHello (SNI) flows through the splice unchanged,
+            # so pinning the TCP connection to this IP is transparent to
+            # certificate validation, which happens at the client, not here.
             remote_reader, remote_writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=_CONNECT_TIMEOUT
+                asyncio.open_connection(connect_ip, port), timeout=_CONNECT_TIMEOUT
             )
         except OSError:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")

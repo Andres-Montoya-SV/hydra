@@ -31,6 +31,7 @@ class NetworkRequestRecord:
     capability: str = ""
     method: str = "GET"
     normalized_hostname: str = ""
+    resolved_ip: str = ""
     port: int | None = None
     redirect_hop: int = 0
     network_attempted: bool = False
@@ -49,6 +50,7 @@ class NetworkRequestRecord:
             "method": self.method,
             "url": self.url,
             "normalized_hostname": self.normalized_hostname,
+            "resolved_ip": self.resolved_ip,
             "port": self.port,
             "redirect_hop": self.redirect_hop,
             "decision": self.decision,

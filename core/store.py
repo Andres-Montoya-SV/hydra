@@ -396,6 +396,7 @@ CREATE TABLE IF NOT EXISTS intel_network_requests (
     method TEXT,
     url TEXT NOT NULL,
     normalized_hostname TEXT,
+    resolved_ip TEXT,
     port INTEGER,
     redirect_hop INTEGER DEFAULT 0,
     decision TEXT NOT NULL,
@@ -553,6 +554,9 @@ class AssetStore:
                 "completed_at": "ALTER TABLE intel_indicators ADD COLUMN completed_at TEXT",
                 "failure_reason": "ALTER TABLE intel_indicators ADD COLUMN failure_reason TEXT",
                 "collector": "ALTER TABLE intel_indicators ADD COLUMN collector TEXT",
+            },
+            "intel_network_requests": {
+                "resolved_ip": "ALTER TABLE intel_network_requests ADD COLUMN resolved_ip TEXT",
             },
         }
         for table, migrations in table_migrations.items():
@@ -815,10 +819,10 @@ class AssetStore:
             conn.executemany(
                 """INSERT OR REPLACE INTO intel_network_requests
                    (run_id, request_id, collector, capability, method, url,
-                    normalized_hostname, port, redirect_hop, decision, reason,
+                    normalized_hostname, resolved_ip, port, redirect_hop, decision, reason,
                     network_attempted, network_completed, response_status,
                     response_location, parent_request_id, observed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         run_id,
@@ -828,6 +832,7 @@ class AssetStore:
                         str(r.get("method") or ""),
                         str(r.get("url") or ""),
                         str(r.get("normalized_hostname") or ""),
+                        str(r.get("resolved_ip") or ""),
                         r.get("port"),
                         int(r.get("redirect_hop") or 0),
                         str(r.get("decision") or ""),

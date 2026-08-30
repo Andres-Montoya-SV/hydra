@@ -103,7 +103,9 @@ async def test_katana_redirect_escape_is_blocked_by_confinement_proxy(
         context = PipelineContext(
             targets=[DomainTarget(domain="127.0.0.1")],
             output_dir=output_dir,
-            collection_scope=CollectionScope.from_seeds(["127.0.0.1"], patterns=["127.0.0.1"]),
+            collection_scope=CollectionScope.from_seeds(
+                ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+            ),
         )
         context.alive_urls = [seed_url]
 
@@ -156,7 +158,9 @@ async def test_hakrawler_redirect_escape_is_blocked_by_confinement_proxy(
         context = PipelineContext(
             targets=[DomainTarget(domain="127.0.0.1")],
             output_dir=output_dir,
-            collection_scope=CollectionScope.from_seeds(["127.0.0.1"], patterns=["127.0.0.1"]),
+            collection_scope=CollectionScope.from_seeds(
+                ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+            ),
         )
         context.alive_urls = [seed_url]
 

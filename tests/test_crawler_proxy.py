@@ -107,7 +107,9 @@ async def test_connect_to_out_of_scope_host_is_denied_and_never_connects(destina
 @pytest.mark.asyncio
 async def test_connect_to_authorized_host_is_forwarded(destination) -> None:
     server, port = destination
-    scope = CollectionScope.from_seeds(["127.0.0.1"], patterns=["127.0.0.1"])
+    scope = CollectionScope.from_seeds(
+        ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+    )
     proxy = ScopeEnforcingProxy(scope, capability="crawl")
     await proxy.start()
     try:
@@ -146,7 +148,9 @@ async def test_plain_http_post_body_is_forwarded_intact_to_authorized_host(desti
     parses Content-Length, it just pipes bytes, so this proves that actually
     works rather than assuming it from the implementation."""
     server, port = destination
-    scope = CollectionScope.from_seeds(["127.0.0.1"], patterns=["127.0.0.1"])
+    scope = CollectionScope.from_seeds(
+        ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+    )
     proxy = ScopeEnforcingProxy(scope, capability="crawl")
     await proxy.start()
     body = b'{"template": "fuzz-payload", "value": "x" * 500}'

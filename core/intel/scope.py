@@ -26,6 +26,12 @@ class CollectionScope:
     seed_domains: tuple[str, ...] = ()
     scope_patterns: tuple[str, ...] = ()
     cloud_collection_allowed: bool = False
+    # Explicit operator opt-in required before a resolved destination IP in a
+    # private/loopback/link-local/CGNAT/metadata range is ever connected to
+    # (core/collection/ssrf.py). Default False: an in-scope hostname that
+    # resolves to such an address is denied, not silently allowed, because
+    # it is in scope by name.
+    allow_private_network_targets: bool = False
 
     @classmethod
     def from_seeds(
@@ -35,6 +41,7 @@ class CollectionScope:
         patterns: list[str] | None = None,
         scope_file: Path | None = None,
         cloud_collection_allowed: bool = False,
+        allow_private_network_targets: bool = False,
     ) -> CollectionScope:
         normalized = tuple(normalize_domain(s) for s in seeds if normalize_domain(s))
         loaded: list[str] = list(patterns or [])
@@ -44,6 +51,7 @@ class CollectionScope:
             seed_domains=normalized,
             scope_patterns=tuple(loaded),
             cloud_collection_allowed=cloud_collection_allowed,
+            allow_private_network_targets=allow_private_network_targets,
         )
 
 

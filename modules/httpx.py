@@ -28,6 +28,11 @@ from utils.security import atomic_write_text, validate_output_path
 # active-collection target — it is never fetched unless authorized first.
 _REDIRECT_CONFIDENCE = 95
 
+# A redirect Location outside these schemes is never followed, regardless of
+# what CollectionScope says about any hostname portion it might parse out —
+# file:/ftp:/gopher:/data:/javascript:/blob: are not an HTTP follow-up hop.
+_ALLOWED_REDIRECT_SCHEMES = frozenset({"http", "https"})
+
 
 def _record_hop_decision(
     context: object,
@@ -37,6 +42,7 @@ def _record_hop_decision(
     allowed: bool,
     reason: str,
     completed: bool = False,
+    resolved_ips: tuple[str, ...] = (),
 ) -> None:
     """Append one redirect-hop authorization decision to the durable
     `intel_network_requests` audit trail (core/collection/audit.py)."""
@@ -51,6 +57,7 @@ def _record_hop_decision(
             method="GET",
             url=url,
             normalized_hostname=(parsed.hostname or "") if parsed else "",
+            resolved_ip=resolved_ips[0] if resolved_ips else "",
             port=parsed.port if parsed else None,
             redirect_hop=redirect_hop,
             decision="ALLOW" if allowed else "DENY",
@@ -228,7 +235,22 @@ class HttpxPlugin(BaseToolPlugin):
             if not location:
                 break
             next_url = location if "://" in location else urljoin(current_url, location)
-            target = AuthorizedCollectionTarget.authorize(
+            next_scheme = urlparse(next_url).scheme.lower() if "://" in next_url else ""
+            if next_scheme and next_scheme not in _ALLOWED_REDIRECT_SCHEMES:
+                # A redirect to file:/ftp:/gopher:/data:/javascript:/blob: is
+                # never a same-capability HTTP follow-up hop, regardless of
+                # what CollectionScope says about the hostname portion (which
+                # may not even exist for these schemes).
+                blocked_target = next_url
+                _record_hop_decision(
+                    context,
+                    url=next_url,
+                    redirect_hop=hop + 1,
+                    allowed=False,
+                    reason=f"blocked_scheme:{next_scheme}",
+                )
+                break
+            target, deny_reason = AuthorizedCollectionTarget.authorize_verbose(
                 next_url, scope, capability="http_probe", operation="httpx_redirect_hop"
             )
             if target is None:
@@ -238,7 +260,7 @@ class HttpxPlugin(BaseToolPlugin):
                     url=next_url,
                     redirect_hop=hop + 1,
                     allowed=False,
-                    reason="out_of_scope",
+                    reason=deny_reason,
                 )
                 break
             hop += 1
@@ -252,6 +274,7 @@ class HttpxPlugin(BaseToolPlugin):
                 allowed=True,
                 reason="in_scope",
                 completed=hop_record is not None,
+                resolved_ips=target.resolved_ips,
             )
             if hop_record is None:
                 # Follow-up request failed/produced nothing usable — stop where

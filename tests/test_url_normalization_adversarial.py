@@ -25,6 +25,21 @@ from modules.httpx import HttpxPlugin
 SCOPE = CollectionScope.from_seeds(["allowed.test"], patterns=["allowed.test"])
 
 
+@pytest.fixture(autouse=True)
+def _fake_public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`allowed.test` is a synthetic `.test` name that never resolves. These
+    cases exercise hostname/URL-confusion authorization, not the
+    destination-IP SSRF layer (tested on its own in
+    tests/test_ssrf_destination_policy.py) — stub DNS to a fixed
+    public-looking address so that orthogonal, real-DNS-dependent check
+    doesn't turn a URL-confusion test into a DNS-resolution test by
+    accident. IP-literal cases in this file (127.0.0.1, ::1) are denied by
+    hostname/scope classification before this stub is ever consulted, so
+    they still exercise real, unmodified behavior.
+    """
+    monkeypatch.setattr("core.collection.ssrf.resolve_hostname", lambda host: ["203.0.113.10"])
+
+
 @pytest.mark.parametrize(
     "indicator,expected,label",
     [
