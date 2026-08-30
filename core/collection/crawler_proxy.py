@@ -26,6 +26,7 @@ for the boundary this does and does not draw.
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -69,7 +70,27 @@ class DeniedConnection:
 
 
 class ScopeEnforcingProxy:
-    """One-shot local proxy instance: start, hand `proxy_url` to a subprocess, stop."""
+    """One-shot local proxy instance: start, hand `proxy_url` to a subprocess, stop.
+
+    `upstream_proxy_url`, when set, chains this proxy in front of an
+    operator-configured external (typically OPSEC-hiding/rotating) proxy:
+
+        collector -> ScopeEnforcingProxy -> upstream_proxy_url -> Internet
+
+    instead of the collector talking to the external proxy directly. Every
+    destination still passes `_authorize_with_reason` (scope + this proxy's
+    own best-effort SSRF check) *before* Hydra ever forwards a CONNECT/GET to
+    the upstream proxy — an unauthorized destination is refused here and
+    never reaches the external proxy at all. What this does NOT provide once
+    chained: the destination-IP pinning `_authorize_with_reason` normally
+    guarantees. The upstream proxy resolves the target hostname itself, from
+    its own network location — Hydra cannot observe or control that
+    resolution, so the DNS-rebinding/TOCTOU protection this proxy provides in
+    its normal (unchained) mode does not extend past the upstream hop. This
+    is a structural property of using an external proxy at all, not a bug:
+    Hydra's own socket only ever touches the configured upstream proxy in
+    this mode, never the target directly.
+    """
 
     def __init__(
         self,
@@ -77,10 +98,12 @@ class ScopeEnforcingProxy:
         *,
         capability: str,
         host: str = "127.0.0.1",
+        upstream_proxy_url: str | None = None,
     ) -> None:
         self.scope = scope
         self.capability = capability
         self.host = host
+        self.upstream_proxy_url = upstream_proxy_url
         self._server: asyncio.AbstractServer | None = None
         self.port = 0
         self.denied: list[DeniedConnection] = []
@@ -157,6 +180,49 @@ class ScopeEnforcingProxy:
         if not decision.allowed:
             return False, decision.reason, ""
         return True, "in_scope", decision.connect_ip
+
+    async def _open_upstream_tunnel(
+        self, target_host: str, target_port: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """CONNECT through `self.upstream_proxy_url` to `target_host:target_port`.
+
+        Raises `OSError` on any failure (connection refused, non-2xx
+        response) — callers must treat that exactly like a direct-connect
+        failure (502 to the client), never as success.
+        """
+        upstream = urlparse(self.upstream_proxy_url)
+        upstream_host = upstream.hostname or ""
+        upstream_port = upstream.port or (443 if upstream.scheme == "https" else 80)
+        reader, writer = await asyncio.open_connection(upstream_host, upstream_port)
+        try:
+            request_lines = [f"CONNECT {target_host}:{target_port} HTTP/1.1"]
+            request_lines.append(f"Host: {target_host}:{target_port}")
+            if upstream.username:
+                credentials = f"{upstream.username}:{upstream.password or ''}"
+                token = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+                request_lines.append(f"Proxy-Authorization: Basic {token}")
+            request_lines.append("")
+            request_lines.append("")
+            writer.write("\r\n".join(request_lines).encode("latin1"))
+            await writer.drain()
+            status_line = await asyncio.wait_for(reader.readline(), timeout=_CONNECT_TIMEOUT)
+            status_parts = status_line.decode("latin1", errors="replace").strip().split(" ")
+            status_code = status_parts[1] if len(status_parts) > 1 else ""
+            if status_code != "200":
+                raise OSError(
+                    f"upstream proxy CONNECT to {target_host}:{target_port} refused: "
+                    f"{status_line.decode('latin1', errors='replace').strip()}"
+                )
+            # Drain the rest of the upstream proxy's CONNECT response headers.
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=_CONNECT_TIMEOUT)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+        except Exception:
+            with _SuppressCloseErrors():
+                writer.close()
+            raise
+        return reader, writer
 
     def _record(
         self,
@@ -241,15 +307,29 @@ class ScopeEnforcingProxy:
             await writer.drain()
             return
         self.allowed_hosts.append(host)
+        absolute_target = target if "://" in target else f"http://{host_header}{target}"
 
         try:
-            # Connect to the IP already resolved and validated above, not a
-            # fresh `host` lookup — closes the DNS-rebinding/TOCTOU gap
-            # where a second resolution could legitimately answer
-            # differently than the one just checked.
-            remote_reader, remote_writer = await asyncio.wait_for(
-                asyncio.open_connection(connect_ip, port), timeout=_CONNECT_TIMEOUT
-            )
+            if self.upstream_proxy_url:
+                # Chained mode: forward to the upstream (external OPSEC)
+                # proxy using the same absolute-URI request line a client
+                # would send it directly — Hydra already authorized `host`
+                # above; the upstream proxy resolves and connects from its
+                # own network location (see class docstring for exactly what
+                # is and isn't validated in this mode).
+                upstream = urlparse(self.upstream_proxy_url)
+                remote_reader, remote_writer = await asyncio.wait_for(
+                    asyncio.open_connection(upstream.hostname, upstream.port or 80),
+                    timeout=_CONNECT_TIMEOUT,
+                )
+            else:
+                # Connect to the IP already resolved and validated above,
+                # not a fresh `host` lookup — closes the DNS-rebinding/
+                # TOCTOU gap where a second resolution could legitimately
+                # answer differently than the one just checked.
+                remote_reader, remote_writer = await asyncio.wait_for(
+                    asyncio.open_connection(connect_ip, port), timeout=_CONNECT_TIMEOUT
+                )
         except OSError:
             writer.write(
                 b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -259,12 +339,22 @@ class ScopeEnforcingProxy:
         self.audit[-1].network_completed = True
 
         try:
-            path = parsed.path or "/"
-            if parsed.query:
-                path += f"?{parsed.query}"
-            remote_writer.write(f"{method} {path} HTTP/1.1\r\n".encode("latin1"))
-            for line in header_lines:
-                remote_writer.write(line)
+            if self.upstream_proxy_url:
+                upstream = urlparse(self.upstream_proxy_url)
+                remote_writer.write(f"{method} {absolute_target} HTTP/1.1\r\n".encode("latin1"))
+                for line in header_lines:
+                    remote_writer.write(line)
+                if upstream.username:
+                    credentials = f"{upstream.username}:{upstream.password or ''}"
+                    token = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+                    remote_writer.write(f"Proxy-Authorization: Basic {token}\r\n".encode("latin1"))
+            else:
+                path = parsed.path or "/"
+                if parsed.query:
+                    path += f"?{parsed.query}"
+                remote_writer.write(f"{method} {path} HTTP/1.1\r\n".encode("latin1"))
+                for line in header_lines:
+                    remote_writer.write(line)
             remote_writer.write(b"\r\n")
             await remote_writer.drain()
             await self._splice(reader, writer, remote_reader, remote_writer)
@@ -296,14 +386,25 @@ class ScopeEnforcingProxy:
         self.allowed_hosts.append(host)
 
         try:
-            # Connect to the already-validated IP, not a fresh `host`
-            # lookup — see the identical comment in `_route`. The client's
-            # own TLS ClientHello (SNI) flows through the splice unchanged,
-            # so pinning the TCP connection to this IP is transparent to
-            # certificate validation, which happens at the client, not here.
-            remote_reader, remote_writer = await asyncio.wait_for(
-                asyncio.open_connection(connect_ip, port), timeout=_CONNECT_TIMEOUT
-            )
+            if self.upstream_proxy_url:
+                # Chained mode: CONNECT through the upstream (external OPSEC)
+                # proxy using the ORIGINAL hostname — it resolves and
+                # connects from its own network location. Hydra already
+                # authorized `host` above by its own scope/SSRF checks; see
+                # the class docstring for exactly what this mode does and
+                # does not validate (the upstream's own resolution is
+                # outside Hydra's visibility, by the nature of using an
+                # external proxy at all).
+                remote_reader, remote_writer = await self._open_upstream_tunnel(host, port)
+            else:
+                # Connect to the already-validated IP, not a fresh `host`
+                # lookup — see the identical comment in `_route`. The client's
+                # own TLS ClientHello (SNI) flows through the splice unchanged,
+                # so pinning the TCP connection to this IP is transparent to
+                # certificate validation, which happens at the client, not here.
+                remote_reader, remote_writer = await asyncio.wait_for(
+                    asyncio.open_connection(connect_ip, port), timeout=_CONNECT_TIMEOUT
+                )
         except OSError:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
             await writer.drain()

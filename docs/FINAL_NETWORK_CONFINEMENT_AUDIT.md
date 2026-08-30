@@ -40,9 +40,9 @@ the client.
 | Crawler discovery (katana/hakrawler/nuclei) | `modules/katana.py`/`hakrawler.py`/`nuclei.py` via `_crawler_confinement` | URLs discovered internally by the tool | Yes (`ScopeEnforcingProxy._authorize_with_reason` → `allows_active_collection`) | Yes (`core/collection/ssrf.py`, since prior turn) | **No** — proxy connects to the IP it just resolved+validated, never re-resolves | Yes — pinned to `connect_ip` | No (unless the binary opens a raw socket bypassing `-proxy` entirely — see UNTRUSTED_NETWORK_TOOL below) | TARGET_COLLECTION | **GUARANTEED** (for traffic that respects `-proxy`) |
 | httpx seed probe | `modules/httpx.py:run()` | gated input file | Yes (`authorize_plugin_input`) | Yes — **new this turn**, via the confinement proxy | **No** — new this turn; httpx now launched with `-proxy <ScopeEnforcingProxy>` unconditionally (default mode and strict-opsec-without-external-proxy mode) | Yes — pinned to `connect_ip` | No (same raw-socket caveat as any subprocess) | TARGET_COLLECTION | **GUARANTEED** |
 | httpx redirect hop | `modules/httpx.py:_resolve_authorized_redirects`/`_fetch_single_hop` | `Location` header, walked hop-by-hop | Yes (`AuthorizedCollectionTarget.authorize_verbose`) | Yes, twice: once in Python (`core/collection/ssrf.py`, prior turn) as a fast pre-check, once at the proxy (this turn) as the actual connection gate | **No** — the proxy connection is what's pinned; the Python pre-check is defense-in-depth, not the enforcement boundary | Yes | No | TARGET_COLLECTION | **GUARANTEED** |
-| httpx via external OPSEC proxy (`strict_opsec` + `OUTBOUND_PROXY_URL` set) | `modules/httpx.py:_build_args` | operator-configured external proxy | Yes (hostname check still runs) | Python-level only — the external proxy resolves independently at its own network location | Yes — this is the one documented exception | Not by Hydra (the external proxy decides) | Not by *Hydra's own socket* (which only ever touches the configured proxy) | TARGET_COLLECTION | **PROXY_CONFINED at the hostname layer only — DNS-rebinding protection does not apply in this specific configuration; documented, not hidden** |
+| httpx via external OPSEC proxy (`strict_opsec` + `OUTBOUND_PROXY_URL` set) | `modules/httpx.py` → `_crawler_confinement` → `ScopeEnforcingProxy(upstream_proxy_url=...)` | operator-configured external proxy | Yes — Hydra's own scope check runs *before* anything is forwarded to the external proxy (**closed this turn**; httpx no longer talks to `OUTBOUND_PROXY_URL` directly at all) | Hydra-side (best-effort, own resolution) only — the external proxy still resolves independently at its own network location once the CONNECT/GET is forwarded to it | Yes, past the upstream hop — this is now a scoped, documented property of using an external proxy at all, not an unclosed gap: Hydra's own socket never touches the target directly in this mode | Not the final hop (the external proxy decides that) | Not by *Hydra's own socket* (which only ever touches the configured upstream proxy) | TARGET_COLLECTION | **GUARANTEED at the authorization layer (an unauthorized destination never reaches the external proxy); PROXY_CONFINED, not IP-pinned, past the upstream hop — inherent to chaining through an external proxy, not a bug** |
 | browser_probe navigation/subresources | `modules/browser_probe.py:run()` | httpx-alive URL + everything the loaded page references | Yes (`browser_context.route()`/`route_web_socket()` → `allows_active_collection`) | Yes — **new this turn**, via `playwright.webkit.launch(proxy=confinement_proxy.proxy_url)` | **No** — new this turn | Yes — WebKit's own network stack connects through the proxy, not just the JS-visible `route()` layer | No (same raw-socket caveat if WebKit itself had an internal bypass, which live testing did not find) | TARGET_COLLECTION | **GUARANTEED** |
-| browser_probe via external OPSEC proxy | `modules/browser_probe.py:run()` | operator-configured external proxy | Yes | Python/route()-level only, same documented exception as httpx | Yes | Not by Hydra's own socket | Not by Hydra's own socket | TARGET_COLLECTION | **PROXY_CONFINED at the hostname layer only — same documented exception** |
+| browser_probe via external OPSEC proxy | `modules/browser_probe.py:run()` → `ScopeEnforcingProxy(upstream_proxy_url=...)` | operator-configured external proxy | Yes — same chaining fix as httpx (**closed this turn**) | Hydra-side only, same as httpx | Yes, past the upstream hop — same scoped, documented property as httpx | Not the final hop | Not by Hydra's own socket | TARGET_COLLECTION | **GUARANTEED at the authorization layer; PROXY_CONFINED past the upstream hop, same as httpx** |
 | soft404_check / param_fuzz / cloud_bucket_enum (urllib via `core/http_probe.py:http_get`) | `modules/soft404_check.py`, `modules/param_fuzz.py`, `modules/cloud_bucket_enum.py` | already-alive host / candidate cloud bucket hostname | Yes (`allows_active_collection`/`authorize_active_indicator` per URL) | Yes — **new this turn**, via `http_get(url, proxy_url=confinement_proxy.proxy_url)` | **No** — new this turn | Yes | No | TARGET_COLLECTION | **GUARANTEED** |
 | DNS resolution (dnsx, seed + follow-up) | `modules/dnsx.py`, `core/intel/followup.py` | gated input / eligible follow-up indicator | Yes | N/A — a DNS *query about* the hostname is not itself a connection to a resolved destination | N/A | N/A | No | TARGET_COLLECTION (query only) | **GUARANTEED** (authorization-wise; SSRF policy doesn't apply to a resolution query with no follow-on connection) |
 | Port scan (naabu) | `modules/naabu.py` | gated input file | Yes | No | N/A (naabu does its own TCP connect scanning against ports on an already-authorized host string, not attacker-influenced) | No | Same raw-socket caveat as any subprocess | TARGET_COLLECTION | **INPUT_GATED_ONLY** |
@@ -81,20 +81,45 @@ assumed*, so this classification doesn't apply to them the same way; their proxy
 is proven the same way browser_probe's is — a live test against a real server — and is
 documented as such rather than silently folded into `PROXY_VERIFIED_TOOLS`.
 
-## The one deliberately unclosed exception: external OPSEC proxy chaining
+## OPSEC proxy chaining (closed this turn)
 
-When `STRICT_OPSEC=true` and `OUTBOUND_PROXY_URL` is configured, httpx and
-browser_probe both route through the **external** operator-configured proxy instead
-of Hydra's local confinement proxy — chaining "Hydra's local proxy in front of an
-external proxy" (so both the SSRF check and the IP-hiding guarantee hold
-simultaneously) is a materially larger feature (proxy-of-proxy chaining, likely
-requiring the local proxy to speak whatever protocol the upstream proxy expects) that
-was explicitly scoped out this turn rather than half-built. In this specific
-configuration, Hydra's own socket only ever touches the configured external proxy —
-the SSRF/rebinding concern about Hydra's own machine reaching an internal address
-does not apply the same way, since Hydra never resolves or connects to the target
-directly at all in that mode; the external proxy does, from its own network location,
-outside Hydra's visibility either way.
+Previously documented as a deliberate exception: when `STRICT_OPSEC=true` and
+`OUTBOUND_PROXY_URL` was configured, httpx and browser_probe routed through the
+**external** operator-configured proxy *directly*, bypassing Hydra's local
+confinement proxy entirely. A prior turn's mission explicitly overrode that scoping
+decision and made closing it mandatory. Fixed by adding `upstream_proxy_url` to
+`ScopeEnforcingProxy` (`core/collection/crawler_proxy.py`): the topology is now
+
+```
+collector -> ScopeEnforcingProxy -> upstream_proxy_url (OUTBOUND_PROXY_URL) -> Internet
+```
+
+never `collector -> upstream_proxy_url -> Internet` directly. httpx, browser_probe, and
+the three urllib-based plugins all removed their own separate "use the external proxy
+directly" branch and now unconditionally go through `_crawler_confinement`
+(`modules/_base.py`), which passes `Settings.outbound_proxy_url` as
+`upstream_proxy_url` to the local proxy. Hydra's scope + best-effort SSRF check
+(`_authorize_with_reason`) always runs *before* a CONNECT/GET is ever forwarded to the
+external proxy — an unauthorized destination never reaches it.
+
+**What this does and does not provide, stated exactly as the mission demanded:** the
+external proxy still resolves the target hostname itself, from its own network
+location, once Hydra forwards the request to it — Hydra cannot observe or control that
+resolution, so the destination-IP *pinning* `ScopeEnforcingProxy` normally guarantees
+does not extend past the upstream hop. This is a structural property of using an
+external proxy at all (Hydra's own socket only ever touches the configured upstream
+proxy in this mode, never the target directly), not a partial implementation.
+
+Verified three ways: `tests/test_opsec_proxy_chaining.py` proves, with a second real
+`ScopeEnforcingProxy` instance standing in as the external proxy, that (1) an
+authorized destination is actually forwarded through and reached, with the external
+proxy showing exactly that one connection; (2) an out-of-scope destination is refused
+by Hydra's own proxy and the external proxy shows **zero** activity for it; (3) an
+in-scope hostname resolving (per Hydra's own resolver) to a private IP is refused the
+same way, before ever reaching the external proxy. A fourth, manual check drove the
+**real installed httpx binary** through this exact chain (`httpx -proxy <Hydra proxy>`
+→ chained external proxy → real destination server) and confirmed the real destination
+was reached with the external proxy correctly logging the forwarded connection.
 
 ## Raw-socket bypass: honestly unresolvable by an application-level proxy
 
@@ -108,6 +133,39 @@ five components individually proven live; any other collector wired into
 (`modules/_base.py`) instead of a silent, unverified confinement claim. True OS/process-
 level containment (network namespace, egress firewall rule, container policy) remains
 outside Hydra's own code, stated as a limitation, not hidden as a guarantee.
+
+## Static architectural guard (new this turn): security by construction, not convention
+
+Every fix in this multi-turn arc — httpx's own DNS resolution bypassing validation,
+browser_probe's WebKit connecting outside `route()`'s visibility, three urllib plugins
+never using the confinement proxy by default — was found by manual/forensic audit, one
+per turn. Nothing stopped the *next* one from being introduced silently.
+`tests/test_no_bypass_network_primitives.py` closes that specific gap: it statically
+scans every `modules/*.py` file (AST-based, not a regex) for a direct import of
+`requests`/`aiohttp`/`urllib.request`, or a direct call to
+`socket.socket`/`socket.create_connection`/`asyncio.open_connection`/
+`asyncio.start_server`/`asyncio.open_unix_connection`, and **fails the test suite**
+unless that file is in an explicit allowlist with a stated reason (the four
+`THIRD_PARTY_OBSERVATION` modules — `ctlogs.py`, `threat_intel.py`, `vuln_match.py`,
+`asn_lookup.py` — each connects to a fixed, hardcoded endpoint, verified by re-reading
+every one this turn).
+
+This is deliberately narrow — an import/call-site scanner, not a data-flow analysis of
+whether a given URL is target-derived. It cannot prove a new collector's destination is
+safe. What it guarantees: a future contributor cannot add `requests.get(target_url)`
+to a new collector module and have it pass the test suite silently — the guard fails,
+naming the exact file and primitive, forcing a human decision (fix it, or add an
+allowlist entry with a reason a reviewer can evaluate) before it ships. Two tests prove
+the scanner isn't a no-op: one plants a synthetic `requests.get(url)` file and confirms
+it's flagged; another plants `import asyncio; asyncio.open_connection(...)` (proving
+call-site detection, not just import-site — `asyncio` itself is imported everywhere
+legitimately, so only the specific attribute-access call is prohibited).
+
+**Honest limit:** this is a regression guard, not a sandbox. It does not stop
+`getattr(requests, "get")(url)`, a dynamically constructed import, or a new raw
+primitive this list doesn't yet name. It raises the cost of reintroducing a known bug
+class from "nobody notices" to "a human must explicitly justify it in a diff reviewers
+can see" — that is the entire, deliberately bounded claim.
 
 ## What was checked and found already correct (not touched)
 

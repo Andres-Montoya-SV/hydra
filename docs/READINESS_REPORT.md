@@ -3,7 +3,7 @@
 **Date:** 2026-08-30
 **Repository:** `Andres-Montoya-SV/hydra`, branch `fix/redirect-scope-safety`
 **Method:** forensic runtime audit (`docs/FINAL_SECURITY_AUDIT.md`, `docs/NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md`), targeted fixes verified by real subprocess execution, real WebKit browser tests, real SQLite persistence, real DNS resolution against the actual authorized target, a real raw-socket bypass demonstration, and a live run against the project's actual authorized target (`virusbarrier.xyz`, per `scope.txt`) — not stubs alone.
-**Test proof used:** 484 pytest cases (up from 356 at the start of this security-hardening arc). This turn's addition: `ScopeEnforcingProxy` — previously a crawler-specific mechanism — is now the shared connection-level enforcement point for httpx (seed probe + every redirect hop), browser_probe (Playwright's own launch-time `proxy=`, not just the JS-visible route() guard), and the urllib-based `soft404_check`/`param_fuzz`/`cloud_bucket_enum`, closing the DNS-rebinding/TOCTOU gap for all of them — each verified against a real binary/engine/local server, not mocks, including a live check against `virusbarrier.xyz` that caught the real httpx binary attempting 15 real out-of-scope connections and blocked every one.
+**Test proof used:** 491 pytest cases (up from 356 at the start of this security-hardening arc). This turn's additions: (1) `ScopeEnforcingProxy` now chains to an operator-configured external OPSEC proxy internally (`upstream_proxy_url`) instead of httpx/browser_probe talking to it directly — closing a previously-documented exception, verified with a synthetic external-proxy stand-in and the real httpx binary; (2) a static AST-based architectural guard (`tests/test_no_bypass_network_primitives.py`) that fails the suite if a future built-in collector imports a raw network primitive without an explicit, justified allowlist entry — the first mechanism in this arc that is actually structural (a build-time guarantee) rather than a runtime check someone could forget to call.
 
 **Verdict: READY FOR CONTROLLED BETA**
 
@@ -108,11 +108,28 @@ docs or tests:
   `browser_probe`, each verified live against a real binary/engine and a real local server in both
   directions (authorized target reached; in-scope hostname resolving to a private IP gets zero
   connections). A live check against `virusbarrier.xyz` caught the real httpx binary attempting 15
-  real out-of-scope connections during a normal probe and blocked every one. The one deliberately
-  unclosed case: when an external OPSEC-hiding proxy (`OUTBOUND_PROXY_URL`) is configured, httpx
-  and browser_probe route through *that* instead — chaining Hydra's local proxy in front of an
-  external one was scoped out this turn as a materially larger feature, documented as a limitation,
-  not silently dropped.
+  real out-of-scope connections during a normal probe and blocked every one.
+- **OPSEC proxy chaining (this turn, closes the exception noted above).** httpx and browser_probe
+  used to route through an external OPSEC-hiding proxy (`OUTBOUND_PROXY_URL`, when configured)
+  *directly*, bypassing Hydra's local confinement proxy entirely — the topology is now
+  `collector -> ScopeEnforcingProxy -> OUTBOUND_PROXY_URL -> Internet`, never the collector talking
+  to the external proxy on its own. `ScopeEnforcingProxy` gained `upstream_proxy_url`
+  (`core/collection/crawler_proxy.py`): Hydra's scope + best-effort SSRF check always runs before a
+  CONNECT/GET is forwarded to the external proxy, so an unauthorized destination never reaches it.
+  Honest limit, stated exactly: past that hop, the external proxy resolves the target itself from
+  its own network location — Hydra cannot pin that resolution, which is a property of using an
+  external proxy at all, not an incomplete implementation. Verified with a second real
+  `ScopeEnforcingProxy` standing in as the external proxy (proving forward/refuse in all three
+  required directions) and with the real httpx binary driven through the full chain.
+- **Static architectural guard (this turn, `tests/test_no_bypass_network_primitives.py`).** Every
+  fix in this arc was found by manual audit, one gap per turn — nothing stopped the next one from
+  being introduced silently. This AST-based test scans every `modules/*.py` file for a direct
+  import/call of a raw network primitive and fails the suite unless the file is explicitly
+  allowlisted with a reason. This is the first mechanism in the whole arc that is genuinely
+  structural rather than a convention: a future collector cannot add `requests.get(target_url)`
+  and pass the test suite silently. Honest limit: it's an import/call-site scanner, not a data-flow
+  proof that a destination is safe, and it can't catch every possible obfuscation of a raw call —
+  it raises the cost of regression, it doesn't make it impossible.
 
 ## ARCHITECTURAL CHANGES
 
@@ -382,9 +399,17 @@ Adversarial/live proof beyond unit tests:
     audit doc's classification), asn_lookup/whois/gau/waybackurls/threat_intel/vuln_match/ctlogs
     (all connect to fixed, hardcoded third-party endpoints, not target-derived destinations — the
     SSRF concern doesn't apply to them by construction, confirmed by re-reading each one this
-    turn, not assumed). **Deliberately not closed:** when `OUTBOUND_PROXY_URL` (external
-    OPSEC-hiding proxy) is configured, httpx and browser_probe route through *that* instead of the
-    local confinement proxy — chaining the two was scoped out as a materially larger feature.
+    turn, not assumed). **Closed this turn:** the external-OPSEC-proxy exception noted in a prior
+    version of this report — httpx/browser_probe routing directly through `OUTBOUND_PROXY_URL`,
+    bypassing local confinement — is fixed via `ScopeEnforcingProxy.upstream_proxy_url` chaining
+    (limitation 11 below covers what this chaining does and does not still guarantee).
+11. **OPSEC proxy chaining validates the hostname, not the final resolved IP, past the upstream
+    hop.** Once Hydra forwards an authorized CONNECT/GET to `OUTBOUND_PROXY_URL`, the external
+    proxy resolves and connects to the target from its own network location — Hydra cannot observe
+    or pin that resolution. This is a structural property of using an external proxy at all (Hydra
+    never touches the target directly in this mode), not an incomplete implementation, but it does
+    mean the DNS-rebinding/TOCTOU *pinning* guarantee (limitation 10, closed for the six directly-
+    connecting components) does not extend past the upstream hop when chaining is active.
 
 ## PROVEN / PARTIALLY PROVEN / UNPROVEN
 
@@ -421,7 +446,14 @@ real binaries/browser/SQLite, not asserted from reading the code.
 **P1:** the full `CollectionGateway` retrofit (limitations 1–2) — authorization is currently
 *correct everywhere it's checked*, not *structurally impossible to skip*; a future plugin could
 still call a network primitive with an unauthorized string without the type system stopping it.
-This is the single reason the verdict is not `READY`.
+This is the single reason the verdict is not `READY`. **Partially mitigated this turn**, not
+closed: `tests/test_no_bypass_network_primitives.py` (a new static AST-based guard) fails the
+build if a future `modules/*.py` file imports a raw network primitive without an explicit,
+justified allowlist entry — a real, build-time enforcement mechanism, not a runtime convention.
+It is still not the same guarantee as a typed `CollectionGateway` that makes the unsafe code
+un-writable in the first place (a determined contributor could still add a false allowlist
+justification, or use a call shape the scanner doesn't yet recognize) — the retrofit itself
+remains the open item.
 
 **P2:** seed collection has no `CollectionAttempt` trail (limitation 3); no third-party-provider
 allowlist for nuclei OOB (limitation 4); host-graph module spot-checked, not exhaustively
@@ -429,9 +461,10 @@ re-audited (limitation 6); `datetime.utcnow()` deprecation noise (limitation 7);
 `intel_network_requests` coverage is partial (limitation 8); the confinement proxy cannot stop a
 raw-socket bypass, mitigated by explicit `PROXY_VERIFIED_TOOLS` classification rather than a false
 guarantee (limitation 9, now proven with a real test rather than only disclosed in prose);
-destination-IP/SSRF validation now covers six components (up from two) but not dnsx/naabu's own
-primitives, and not the external-OPSEC-proxy configuration for httpx/browser_probe (limitation 10,
-substantially closed this turn, not fully closed).
+destination-IP/SSRF validation covers six components but not dnsx/naabu's own primitives
+(limitation 10); OPSEC proxy chaining (closed this turn) validates the hostname before forwarding
+but cannot pin the final resolved IP past the upstream hop — an inherent property of using an
+external proxy, not an incomplete implementation (limitation 11).
 
 **NETWORK ENFORCEMENT COVERAGE:** all active-collection plugins gate on `CollectionScope` before
 running (19/19, one parametrized test). **`ScopeEnforcingProxy` — generalized this turn from a
@@ -444,9 +477,11 @@ urllib-based `soft404_check`/`param_fuzz`/`cloud_bucket_enum` (`core/http_probe.
 to the exact resolved IP the proxy validated, not a fresh, independent resolution at connect time
 — closing the DNS-rebinding/TOCTOU gap for all six, not just the crawlers. Destination-IP/SSRF
 validation (loopback/RFC1918/link-local/CGNAT/metadata/multicast/reserved, including IPv4-mapped
-IPv6 literals) applies at every one of these six points. A live check against `virusbarrier.xyz`
-caught the real httpx binary attempting 15 real out-of-scope connections during a normal probe and
-blocked every one — read from `context.metadata["network_requests"]`, not asserted.
+IPv6 literals) applies at every one of these six points, and now applies whether or not an external
+OPSEC proxy is configured — chaining closes the gap where that configuration used to skip local
+confinement entirely. A live check against `virusbarrier.xyz` caught the real httpx binary
+attempting 15 real out-of-scope connections during a normal probe and blocked every one — read from
+`context.metadata["network_requests"]`, not asserted.
 
 **UNPROVEN PATHS:** a tool bypassing its own configured proxy via a raw socket outside its HTTP
 client is invisible to `ScopeEnforcingProxy` — demonstrated with a real subprocess and a real
@@ -454,15 +489,17 @@ server in `tests/test_untrusted_network_bypass.py` (application-level proxy, not
 isolation; mitigated by `PROXY_VERIFIED_TOOLS` classification, not by a false confinement claim);
 DNS resolution itself is not proxied under `STRICT_OPSEC`; no allowlisted third-party OOB provider
 path exists, so nuclei interactsh stays opt-in and unconfined when enabled; seed collection (as
-opposed to follow-up) has no `CollectionAttempt` trail for `explain-collection` to walk; when an
-external OPSEC-hiding proxy (`OUTBOUND_PROXY_URL`) is configured, httpx and browser_probe route
-through *that* instead of the local confinement proxy, so the DNS-rebinding/TOCTOU guarantee does
-not apply in that specific configuration (documented, not hidden — chaining the two proxies was
-scoped out this turn as a materially larger feature); dnsx/naabu's own DNS-query/TCP-scan
-primitives are not destination-IP validated (their operations don't fit the same
-resolve-then-connect shape — see the audit doc's classification, not an oversight).
+opposed to follow-up) has no `CollectionAttempt` trail for `explain-collection` to walk; once an
+authorized CONNECT/GET is forwarded to a configured external OPSEC proxy, that proxy resolves the
+target itself from its own network location, so the destination-IP *pinning* guarantee does not
+extend past that hop (the authorization/SSRF pre-check still runs, and still refuses an
+unauthorized destination before it ever reaches the external proxy — see limitation 11);
+dnsx/naabu's own DNS-query/TCP-scan primitives are not destination-IP validated (their operations
+don't fit the same resolve-then-connect shape — see the audit doc's classification, not an
+oversight); the new static architectural guard is an import/call-site scanner, not a data-flow
+proof — it raises the cost of a regression, it does not make one impossible.
 
-**TEST COUNT:** 484 passed (0 failed, 0 xfail, 0 skipped-as-hidden-failure), up from 356 at the
+**TEST COUNT:** 491 passed (0 failed, 0 xfail, 0 skipped-as-hidden-failure), up from 356 at the
 start of this arc — verified with `pytest tests/ -q` run to completion, plus a clean `black`,
 `isort`, `ruff`, `mypy`, and `bandit` pass across the full repository.
 
@@ -472,16 +509,18 @@ blocking real live out-of-scope connection attempts from real katana/nuclei proc
 directly from the run's persisted SQLite `warnings_json`, not from a mock. Crawler confinement is
 additionally verified against the real installed katana and hakrawler binaries in a controlled
 local redirect chain; a real subprocess proves the one thing the confinement proxy cannot do (stop
-a raw-socket bypass). **This turn:** a direct `HttpxPlugin.run()` invocation against
-`virusbarrier.xyz` recorded the confinement proxy blocking 15 real out-of-scope connection
-attempts the real httpx binary tried on its own while the authorized connection (resolved IP
-`34.75.127.116`) completed successfully; three new live test files
-(`test_httpx_confinement_live.py`, `test_browser_confinement_live.py`,
+a raw-socket bypass). A direct `HttpxPlugin.run()` invocation against `virusbarrier.xyz` recorded
+the confinement proxy blocking 15 real out-of-scope connection attempts the real httpx binary tried
+on its own while the authorized connection (resolved IP `34.75.127.116`) completed successfully;
+three live test files (`test_httpx_confinement_live.py`, `test_browser_confinement_live.py`,
 `test_urllib_confinement_live.py`) each prove, against a real binary/engine/local server, that an
-in-scope hostname resolving to a private IP gets zero real connections through the newly-wired
-confinement path.
+in-scope hostname resolving to a private IP gets zero real connections. **This turn:**
+`tests/test_opsec_proxy_chaining.py` proves the chaining fix with a second real `ScopeEnforcingProxy`
+standing in as the external proxy (authorized-forwarded, OOS-refused-before-forward,
+private-IP-refused-before-forward), and a manual check drove the real httpx binary through the
+full `httpx -> Hydra proxy -> external proxy -> real server` chain successfully.
 
-**KNOWN LIMITATIONS:** see the ten items enumerated above (REMAINING LIMITATIONS) — none of
+**KNOWN LIMITATIONS:** see the eleven items enumerated above (REMAINING LIMITATIONS) — none of
 them constitute a known, currently-exploitable authorization bypass; each is either a structural
 robustness gap (P1) or a documented, deliberately-scoped-out boundary (P2). Limitation 9 (raw-socket
 bypass) and limitation 10 (destination-IP/TOCTOU coverage, substantially expanded this turn from 2

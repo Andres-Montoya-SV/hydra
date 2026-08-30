@@ -103,16 +103,16 @@ class BrowserProbePlugin(BaseToolPlugin):
             self._crawler_confinement(context) as confinement_proxy,
             async_playwright() as playwright,
         ):
-            launch_options: dict[str, object] = {"headless": True}
-            if self.settings.outbound_proxy_url:
-                # External OPSEC-hiding proxy takes priority, same documented
-                # trade-off as httpx: chaining the local confinement proxy in
-                # front of an external proxy is out of scope this turn, so
-                # the DNS-rebinding/TOCTOU guarantee does not apply in this
-                # specific configuration.
-                launch_options["proxy"] = _playwright_proxy(self.settings.outbound_proxy_url)
-            else:
-                launch_options["proxy"] = _playwright_proxy(confinement_proxy.proxy_url)
+            # Always route through Hydra's local confinement proxy, never the
+            # external OPSEC proxy directly — `ScopeEnforcingProxy` chains to
+            # `Settings.outbound_proxy_url` internally when configured
+            # (`modules/_base.py:_crawler_confinement`), so WebKit never
+            # talks to the external proxy without Hydra's authorization/SSRF
+            # check running first.
+            launch_options: dict[str, object] = {
+                "headless": True,
+                "proxy": _playwright_proxy(confinement_proxy.proxy_url),
+            }
             browser = await playwright.webkit.launch(**launch_options)
             try:
                 for target in targets:

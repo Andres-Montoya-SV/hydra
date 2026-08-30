@@ -877,6 +877,15 @@ def test_provenance_omits_analyst_local_path() -> None:
 def test_httpx_strict_opsec_uses_proxy_without_direct_side_probes(
     tmp_path: Path,
 ) -> None:
+    """httpx never talks to `OUTBOUND_PROXY_URL` directly — it always routes
+    through Hydra's local confinement proxy, which chains to the external
+    proxy internally (`ScopeEnforcingProxy.upstream_proxy_url`,
+    `core/collection/crawler_proxy.py`) only after Hydra's own
+    authorization/SSRF check passes. `_build_args` receiving a
+    `confinement_proxy_url` (what `run()` actually passes — always the local
+    proxy address) is what proves this: the external proxy URL itself never
+    appears in httpx's own argv.
+    """
     settings = Settings(
         project_root=tmp_path,
         strict_opsec=True,
@@ -884,9 +893,15 @@ def test_httpx_strict_opsec_uses_proxy_without_direct_side_probes(
     )
     plugin = HttpxPlugin(settings)
     context = PipelineContext(output_dir=tmp_path, collection_scope=_SCOPE)
-    args = plugin._build_args(context, tmp_path / "hosts.txt", tmp_path / "httpx.json")
+    args = plugin._build_args(
+        context,
+        tmp_path / "hosts.txt",
+        tmp_path / "httpx.json",
+        confinement_proxy_url="http://127.0.0.1:54321",
+    )
     assert "-proxy" in args
-    assert "http://proxy.example:8080" in args
+    assert "http://127.0.0.1:54321" in args
+    assert "http://proxy.example:8080" not in args
     assert "-tls-grab" not in args
     assert "-tls-probe" not in args
     assert "-ip" not in args

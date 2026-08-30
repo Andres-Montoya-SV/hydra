@@ -223,7 +223,9 @@ class ParamFuzzPlugin(BaseToolPlugin):
         # URL; without the proxy, urllib does its own independent DNS
         # resolution and connection when the request actually runs.
         async with self._crawler_confinement(context) as confinement_proxy:
-            proxy_url = self.settings.outbound_proxy_url or confinement_proxy.proxy_url
+            # Always route through the confinement proxy — see the identical
+            # comment in modules/soft404_check.py.
+            proxy_url = confinement_proxy.proxy_url
             return await self._fuzz_urls(context, urls, proxy_url)
 
     async def _fuzz_urls(

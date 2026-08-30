@@ -77,7 +77,12 @@ class Soft404CheckPlugin(BaseToolPlugin):
         # its own independent DNS resolution and connection when `_probe_host`
         # actually runs. See docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
         async with self._crawler_confinement(context) as confinement_proxy:
-            proxy_url = self.settings.outbound_proxy_url or confinement_proxy.proxy_url
+            # Always route through the confinement proxy — it chains to
+            # `Settings.outbound_proxy_url` internally when configured
+            # (`core/collection/crawler_proxy.py`), so this urllib request
+            # never talks to the external proxy without Hydra's
+            # authorization/SSRF check running first.
+            proxy_url = confinement_proxy.proxy_url
 
             async def probe(target: dict[str, str]) -> dict[str, object]:
                 async with semaphore:

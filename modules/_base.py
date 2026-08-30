@@ -288,6 +288,17 @@ class BaseToolPlugin(ReconPlugin):
         core/collection/crawler_proxy.py for what this does and does not
         cover (no TLS interception; CONNECT tunnels are authorized by
         destination host, not decrypted content).
+
+        When `Settings.outbound_proxy_url` (the operator's external,
+        typically OPSEC-hiding proxy) is configured, this proxy chains in
+        front of it — `collector -> ScopeEnforcingProxy -> outbound_proxy_url
+        -> Internet` — instead of the collector talking to that external
+        proxy directly. Authorization always happens at this layer first;
+        the external proxy never receives a request for a destination Hydra
+        itself denied. See `ScopeEnforcingProxy`'s class docstring for what
+        the DNS-rebinding/TOCTOU guarantee does and does not cover once
+        chained (the external proxy resolves the target itself, from its own
+        network location — outside Hydra's visibility either way).
         """
         from core.collection.crawler_proxy import PROXY_VERIFIED_TOOLS, ScopeEnforcingProxy
         from core.intel.scope import require_collection_scope
@@ -306,7 +317,11 @@ class BaseToolPlugin(ReconPlugin):
             )
 
         scope = require_collection_scope(context)
-        proxy = ScopeEnforcingProxy(scope, capability=self.capability or self.name)
+        proxy = ScopeEnforcingProxy(
+            scope,
+            capability=self.capability or self.name,
+            upstream_proxy_url=self.settings.outbound_proxy_url or None,
+        )
         await proxy.start()
         try:
             yield proxy

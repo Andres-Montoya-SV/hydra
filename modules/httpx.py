@@ -144,19 +144,14 @@ class HttpxPlugin(BaseToolPlugin):
 
         if not self.settings.strict_opsec:
             args.extend(["-ip", "-cname", "-tls-probe", "-tls-grab"])
-            if confinement_proxy_url:
-                args.extend(["-proxy", confinement_proxy_url])
-        elif self.settings.outbound_proxy_url:
-            # External OPSEC-hiding proxy takes priority over local
-            # confinement here: chaining Hydra's local proxy in front of an
-            # external proxy (so both the SSRF check AND the IP-hiding
-            # guarantee hold at once) is out of scope this turn — the
-            # DNS-rebinding/TOCTOU protection `confinement_proxy_url`
-            # otherwise provides does not apply in this specific
-            # configuration. Documented, not hidden — see
-            # docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
-            args.extend(["-proxy", self.settings.outbound_proxy_url])
-        elif confinement_proxy_url:
+        # Always route through Hydra's local confinement proxy, never the
+        # external OPSEC proxy directly — `ScopeEnforcingProxy` chains to
+        # `Settings.outbound_proxy_url` internally when configured
+        # (`modules/_base.py:_crawler_confinement`), so httpx never talks to
+        # the external proxy without Hydra's authorization/SSRF check
+        # running first. See core/collection/crawler_proxy.py's class
+        # docstring for exactly what is (and isn't) validated once chained.
+        if confinement_proxy_url:
             args.extend(["-proxy", confinement_proxy_url])
 
         headers = self.settings.merged_headers()

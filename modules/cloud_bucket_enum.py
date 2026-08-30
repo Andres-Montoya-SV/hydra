@@ -132,7 +132,9 @@ class CloudBucketEnumPlugin(BaseToolPlugin):
         from core.intel.scope import require_collection_scope
 
         scope = require_collection_scope(context)
-        proxy = self.settings.outbound_proxy_url or confinement_proxy_url
+        # Always route through the confinement proxy — see the identical
+        # comment in modules/soft404_check.py.
+        proxy = confinement_proxy_url
 
         # Calibrate "does not exist" per provider with a random canary name.
         # Alphanumeric only, ≤24 chars: Azure storage-account labels reject
