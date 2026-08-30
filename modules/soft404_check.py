@@ -5,6 +5,13 @@ random nonexistent path on each live host. If the canary also returns 200
 with a body substantially identical to the site root, the server does not
 distinguish valid from invalid routes — status-code-based existence is
 unreliable (common on misconfigured WordPress, catch-all CDNs/balancers).
+
+Retrofitted onto `core/collection/gateway.py:CollectionGateway` — the
+demonstration call site for the structural pattern: `_probe_host` receives
+`AuthorizedCollectionTarget` objects, not raw URL strings, for both the root
+and the canary URL (the canary is derived from an authorized root by
+appending a random path, but is independently re-authorized rather than
+assumed safe by association).
 """
 
 from __future__ import annotations
@@ -16,11 +23,12 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from core.assets import normalize_domain
+from core.collection.gateway import CollectionGateway
+from core.collection.target import AuthorizedCollectionTarget
 from core.exceptions import ValidationError
-from core.http_probe import http_get
 from core.models import PipelineContext, ToolStatus
 from core.plugin_base import PluginResult
-from core.response_diff import bodies_near_identical, body_sha256
+from core.response_diff import ResponseSnapshot, bodies_near_identical, body_sha256
 from modules._base import BaseToolPlugin
 from utils.files import write_jsonl
 from utils.security import (
@@ -55,49 +63,49 @@ class Soft404CheckPlugin(BaseToolPlugin):
         return "Built-in (stdlib urllib)"
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
-        from core.intel.scope import allows_active_collection, require_collection_scope
+        from core.intel.scope import require_collection_scope
 
         scope = require_collection_scope(context)
-        targets = [
-            target
-            for target in _alive_targets(context)[: self.settings.soft404_max_hosts]
-            if allows_active_collection(str(target.get("host") or target.get("url") or ""), scope)
-        ]
-        if not targets:
-            return self._skip("No live HTTP services to probe for soft-404")
+        candidates = _alive_targets(context)[: self.settings.soft404_max_hosts]
 
         self.update_status(context, ToolStatus.RUNNING)
         semaphore = asyncio.Semaphore(self.settings.soft404_concurrency)
         records: list[dict[str, object]] = []
 
-        # Route these urllib-based requests through Hydra's local confinement
-        # proxy — same DNS-rebinding/TOCTOU reasoning as httpx/browser_probe
-        # (core/collection/crawler_proxy.py): `allows_active_collection`
-        # above validated a hostname string; without the proxy, urllib does
-        # its own independent DNS resolution and connection when `_probe_host`
-        # actually runs. See docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
-        async with self._crawler_confinement(context) as confinement_proxy:
-            # Always route through the confinement proxy — it chains to
-            # `Settings.outbound_proxy_url` internally when configured
-            # (`core/collection/crawler_proxy.py`), so this urllib request
-            # never talks to the external proxy without Hydra's
-            # authorization/SSRF check running first.
-            proxy_url = confinement_proxy.proxy_url
+        # CollectionGateway (core/collection/gateway.py) owns authorization +
+        # confinement-proxy lifecycle + the actual request together: `_probe_host`
+        # below receives an AuthorizedCollectionTarget, never a bare URL string,
+        # for both the root and the (separately re-authorized) canary URL.
+        async with CollectionGateway(
+            scope,
+            capability=self.capability,
+            context=context,
+            upstream_proxy_url=self.settings.outbound_proxy_url or None,
+        ) as gateway:
+            authorized: list[tuple[dict[str, str], AuthorizedCollectionTarget]] = []
+            for candidate in candidates:
+                target = gateway.authorize(candidate["url"], operation="soft404_root")
+                if target is not None:
+                    authorized.append((candidate, target))
+            if not authorized:
+                return self._skip("No live HTTP services to probe for soft-404")
 
-            async def probe(target: dict[str, str]) -> dict[str, object]:
+            async def probe(
+                candidate: dict[str, str], root_target: AuthorizedCollectionTarget
+            ) -> dict[str, object]:
                 async with semaphore:
-                    return await asyncio.to_thread(self._probe_host, context, target, proxy_url)
+                    return await self._probe_host(context, gateway, candidate, root_target)
 
             results = await asyncio.gather(
-                *(probe(target) for target in targets),
+                *(probe(candidate, root_target) for candidate, root_target in authorized),
                 return_exceptions=True,
             )
         soft_hosts: list[str] = []
-        for target, result in zip(targets, results, strict=False):
+        for (candidate, _root_target), result in zip(authorized, results, strict=False):
             if isinstance(result, Exception):
                 records.append(
                     {
-                        "host": target["host"],
+                        "host": candidate["host"],
                         "soft_404_detected": False,
                         "error": str(result)[:240],
                     }
@@ -121,24 +129,41 @@ class Soft404CheckPlugin(BaseToolPlugin):
             success=True,
             output_path=output_path,
             lines_produced=count,
-            message=f"Soft-404 detected on {len(soft_hosts)}/{len(targets)} host(s)",
+            message=f"Soft-404 detected on {len(soft_hosts)}/{len(authorized)} host(s)",
         )
 
-    def _probe_host(
-        self, context: PipelineContext, target: dict[str, str], proxy_url: str | None
+    async def _probe_host(
+        self,
+        context: PipelineContext,
+        gateway: CollectionGateway,
+        candidate: dict[str, str],
+        root_target: AuthorizedCollectionTarget,
     ) -> dict[str, object]:
-        base_url = target["url"]
+        base_url = root_target.raw
         canary_path = f"/zzqq-{_random_token()}-nonexistent-path-{random.randint(1000, 9999)}"  # nosec B311  # canary path, not cryptography
         canary_url = urljoin(base_url.rstrip("/") + "/", canary_path.lstrip("/"))
         timeout = self.settings.soft404_timeout
 
-        root = http_get(base_url, timeout=timeout, proxy_url=proxy_url)
-        canary = http_get(canary_url, timeout=timeout, proxy_url=proxy_url)
+        # The canary is derived from an already-authorized root URL, but it
+        # is a distinct URL and is independently re-authorized here rather
+        # than assumed safe by association with `root_target` — in practice
+        # this always passes (same hostname), but "the canary shares the
+        # root's hostname" is a code-reading assumption, not something this
+        # method should trust without checking.
+        canary_target = gateway.authorize(canary_url, operation="soft404_canary")
+
+        root = await gateway.http_get(root_target, timeout=timeout, operation="soft404_root")
+        if canary_target is not None:
+            canary = await gateway.http_get(
+                canary_target, timeout=timeout, operation="soft404_canary"
+            )
+        else:  # pragma: no cover - same hostname as an already-authorized root
+            canary = ResponseSnapshot(status_code=None, body=b"", error="canary_not_authorized")
         detected = _is_soft_404(root.status_code, root.body, canary.status_code, canary.body)
 
         raw_artifact = self._write_raw_artifact(
             context,
-            target["host"],
+            candidate["host"],
             base_url=base_url,
             canary_url=canary_url,
             root_status=root.status_code,
@@ -152,7 +177,7 @@ class Soft404CheckPlugin(BaseToolPlugin):
         )
 
         return {
-            "host": target["host"],
+            "host": candidate["host"],
             "base_url": base_url,
             "canary_url": canary_url,
             "root_status": root.status_code,

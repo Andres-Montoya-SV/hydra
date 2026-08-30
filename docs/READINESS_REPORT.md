@@ -3,7 +3,7 @@
 **Date:** 2026-08-30
 **Repository:** `Andres-Montoya-SV/hydra`, branch `fix/redirect-scope-safety`
 **Method:** forensic runtime audit (`docs/FINAL_SECURITY_AUDIT.md`, `docs/NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md`), targeted fixes verified by real subprocess execution, real WebKit browser tests, real SQLite persistence, real DNS resolution against the actual authorized target, a real raw-socket bypass demonstration, and a live run against the project's actual authorized target (`virusbarrier.xyz`, per `scope.txt`) — not stubs alone.
-**Test proof used:** 491 pytest cases (up from 356 at the start of this security-hardening arc). This turn's additions: (1) `ScopeEnforcingProxy` now chains to an operator-configured external OPSEC proxy internally (`upstream_proxy_url`) instead of httpx/browser_probe talking to it directly — closing a previously-documented exception, verified with a synthetic external-proxy stand-in and the real httpx binary; (2) a static AST-based architectural guard (`tests/test_no_bypass_network_primitives.py`) that fails the suite if a future built-in collector imports a raw network primitive without an explicit, justified allowlist entry — the first mechanism in this arc that is actually structural (a build-time guarantee) rather than a runtime check someone could forget to call.
+**Test proof used:** 502 pytest cases (up from 356 at the start of this security-hardening arc). This turn's additions: (1) `AuthorizedCollectionTarget`'s public constructor now unconditionally rejects direct construction (and `dataclasses.replace()`, which also calls `__init__`) — closing a real gap where the class's own docstring claimed "sealed" but a plain `@dataclass(frozen=True)` never actually prevented fabricating a capability by hand; (2) `core/collection/gateway.py:CollectionGateway`, a real object whose `http_get()` method only accepts that sealed type (runtime `isinstance`-checked, not just a type hint), migrated `modules/soft404_check.py` onto it as the concrete demonstration; (3) `ScopeEnforcingProxy` now chains to an operator-configured external OPSEC proxy internally (`upstream_proxy_url`) instead of httpx/browser_probe talking to it directly; (4) a static AST-based architectural guard (`tests/test_no_bypass_network_primitives.py`) that fails the suite if a future built-in collector imports a raw network primitive without an explicit, justified allowlist entry.
 
 **Verdict: READY FOR CONTROLLED BETA**
 
@@ -343,12 +343,23 @@ Adversarial/live proof beyond unit tests:
 1. **`authorize_collection()` is the choke-point path, not yet the only path anywhere.**
    `asn_lookup.py`, `whois.py`, `gau.py`, `waybackurls.py` still call the scope-only primitive
    directly for their per-target checks. Safe today (OPSEC for these is enforced upstream at the
-   whole-plugin skip in `_run_single_plugin`), but not the single unified call path the full
-   `CollectionGateway` would provide.
-2. **`AuthorizedCollectionTarget` is proven at one call site (httpx), not retrofit everywhere.**
-   Most plugins are not structurally prevented from calling a network primitive with an
-   unauthorized string — they are prevented by every current code path correctly checking first,
-   which is the same "convention, not construction" gap the mission opened with.
+   whole-plugin skip in `_run_single_plugin`), but not the single unified call path a fully
+   retrofitted `CollectionGateway` would provide.
+2. **`CollectionGateway` exists and is real, but retrofit at one call site (`soft404_check`), not
+   everywhere.** Two real things changed this turn, not just documentation: (a)
+   `AuthorizedCollectionTarget`'s public constructor now unconditionally raises — including against
+   `dataclasses.replace()` — closing an actual forgery gap a plain `@dataclass(frozen=True)` never
+   closed (any caller could previously hand-build a "valid-looking" authorized target for an
+   unauthorized hostname; four tests in `tests/test_authorized_collection_target.py` prove the
+   fix, including against a field set copied from a genuine target's own `dataclasses.asdict()`
+   output). (b) `core/collection/gateway.py:CollectionGateway.http_get()` only accepts that sealed
+   type — checked with a runtime `isinstance`, not just a type hint — and `modules/soft404_check.py`
+   was migrated onto it as the demonstration site (`_probe_host` now receives
+   `AuthorizedCollectionTarget` objects for both the root and its independently re-authorized
+   canary URL). `param_fuzz.py`/`cloud_bucket_enum.py` still call `core/http_probe.py:http_get(url,
+   ...)` with a bare string — connection-level confinement (proxy + SSRF) still applies to them,
+   the type-level guarantee does not yet. This is real, verified progress on the specific gap named
+   every prior turn — not the full retrofit, which remains the open item.
 3. **Seed collection has no `CollectionAttempt` audit trail.** Follow-up collection does
    (including pre-claim persistence). This is not a regression — seed collection never had one —
    but it means "reconstruct why a target was collected" from SQLite alone works for follow-up
@@ -444,16 +455,20 @@ callers of `authorize_collection()`, unconfined crawlers, fail-open browser guar
 real binaries/browser/SQLite, not asserted from reading the code.
 
 **P1:** the full `CollectionGateway` retrofit (limitations 1–2) — authorization is currently
-*correct everywhere it's checked*, not *structurally impossible to skip*; a future plugin could
-still call a network primitive with an unauthorized string without the type system stopping it.
-This is the single reason the verdict is not `READY`. **Partially mitigated this turn**, not
-closed: `tests/test_no_bypass_network_primitives.py` (a new static AST-based guard) fails the
-build if a future `modules/*.py` file imports a raw network primitive without an explicit,
-justified allowlist entry — a real, build-time enforcement mechanism, not a runtime convention.
-It is still not the same guarantee as a typed `CollectionGateway` that makes the unsafe code
-un-writable in the first place (a determined contributor could still add a false allowlist
-justification, or use a call shape the scanner doesn't yet recognize) — the retrofit itself
-remains the open item.
+*correct everywhere it's checked*, and now *structurally impossible to skip at the one call site
+retrofitted onto `CollectionGateway`* (`modules/soft404_check.py`), but not yet everywhere. This
+is the single reason the verdict is not `READY`. **Real progress this turn, not full closure**:
+`AuthorizedCollectionTarget` construction is now genuinely sealed (raises on direct construction
+and on `dataclasses.replace()`, closing a real forgery gap that existed since the class was
+introduced — its own docstring's "sealed" claim was not previously true); `CollectionGateway`
+exists as a real object whose `http_get()` runtime-rejects anything that isn't that sealed type;
+one plugin was migrated onto it end-to-end with real-server verification. `tests/test_no_bypass_
+network_primitives.py` (a static AST-based guard, also this turn) independently fails the build if
+a future `modules/*.py` file imports a raw network primitive without an explicit, justified
+allowlist entry. What remains open: `param_fuzz.py`, `cloud_bucket_enum.py`, and every other
+active-collection plugin still call authorization functions directly rather than being required to
+go through `CollectionGateway` — a determined contributor could still write new code that skips it,
+which is exactly why the verdict stays `CONTROLLED BETA`, not `READY`.
 
 **P2:** seed collection has no `CollectionAttempt` trail (limitation 3); no third-party-provider
 allowlist for nuclei OOB (limitation 4); host-graph module spot-checked, not exhaustively
@@ -499,7 +514,7 @@ don't fit the same resolve-then-connect shape — see the audit doc's classifica
 oversight); the new static architectural guard is an import/call-site scanner, not a data-flow
 proof — it raises the cost of a regression, it does not make one impossible.
 
-**TEST COUNT:** 491 passed (0 failed, 0 xfail, 0 skipped-as-hidden-failure), up from 356 at the
+**TEST COUNT:** 502 passed (0 failed, 0 xfail, 0 skipped-as-hidden-failure), up from 356 at the
 start of this arc — verified with `pytest tests/ -q` run to completion, plus a clean `black`,
 `isort`, `ruff`, `mypy`, and `bandit` pass across the full repository.
 
@@ -514,11 +529,15 @@ the confinement proxy blocking 15 real out-of-scope connection attempts the real
 on its own while the authorized connection (resolved IP `34.75.127.116`) completed successfully;
 three live test files (`test_httpx_confinement_live.py`, `test_browser_confinement_live.py`,
 `test_urllib_confinement_live.py`) each prove, against a real binary/engine/local server, that an
-in-scope hostname resolving to a private IP gets zero real connections. **This turn:**
+in-scope hostname resolving to a private IP gets zero real connections.
 `tests/test_opsec_proxy_chaining.py` proves the chaining fix with a second real `ScopeEnforcingProxy`
 standing in as the external proxy (authorized-forwarded, OOS-refused-before-forward,
 private-IP-refused-before-forward), and a manual check drove the real httpx binary through the
-full `httpx -> Hydra proxy -> external proxy -> real server` chain successfully.
+full `httpx -> Hydra proxy -> external proxy -> real server` chain successfully. **This turn:** a
+direct `Soft404CheckPlugin.run()` invocation against `virusbarrier.xyz` (the real authorized
+target, real DNS, real request through `CollectionGateway`) succeeded end to end, and the same
+plugin run against an out-of-scope host (`example.com`, not in that run's scope) skipped cleanly
+with zero requests issued — both read directly from the plugin's own return value, not asserted.
 
 **KNOWN LIMITATIONS:** see the eleven items enumerated above (REMAINING LIMITATIONS) — none of
 them constitute a known, currently-exploitable authorization bypass; each is either a structural

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from core.collection.target import AuthorizedCollectionTarget
@@ -93,3 +95,49 @@ def test_target_is_immutable() -> None:
     except Exception:
         raised = True
     assert raised, "AuthorizedCollectionTarget must be frozen — mutation must fail"
+
+
+def test_direct_construction_cannot_forge_a_capability() -> None:
+    """The exact attack this class exists to prevent: a plugin author (or a
+    malicious plugin) building an `AuthorizedCollectionTarget` by hand for a
+    hostname that was never actually checked against `CollectionScope`. A
+    plain `@dataclass(frozen=True)` would allow this — `frozen` only blocks
+    mutation *after* construction, not construction itself. This must raise,
+    not silently produce a usable, forged "authorization"."""
+    with pytest.raises(TypeError):
+        AuthorizedCollectionTarget(
+            raw=f"https://{OOS}/",
+            hostname=OOS,
+            scheme="https",
+            port=None,
+            capability="http_probe",
+            reason="fabricated",
+            scope_identity=(SEED,),
+        )
+
+
+def test_forging_with_every_plausible_field_combination_still_fails() -> None:
+    """Not just the empty/malformed case — even a field set that looks
+    exactly like a real authorized target's output must be rejected."""
+    real = AuthorizedCollectionTarget.authorize(
+        f"https://{SEED}/", _scope(), capability="http_probe"
+    )
+    assert real is not None
+    forged_fields = dataclasses.asdict(real)
+    forged_fields["hostname"] = OOS
+    forged_fields["raw"] = f"https://{OOS}/"
+    with pytest.raises(TypeError):
+        AuthorizedCollectionTarget(**forged_fields)
+
+
+def test_dataclasses_replace_cannot_forge_a_capability_either() -> None:
+    """`dataclasses.replace()` is the classic escape hatch for "frozen"
+    dataclasses — it still calls `__init__` under the hood, so a naive seal
+    (e.g. a sentinel default value) would leak through unchanged fields.
+    This must fail exactly like direct construction."""
+    real = AuthorizedCollectionTarget.authorize(
+        f"https://{SEED}/", _scope(), capability="http_probe"
+    )
+    assert real is not None
+    with pytest.raises(TypeError):
+        dataclasses.replace(real, hostname=OOS, raw=f"https://{OOS}/")

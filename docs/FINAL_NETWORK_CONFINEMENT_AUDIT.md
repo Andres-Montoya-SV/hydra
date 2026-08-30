@@ -43,7 +43,8 @@ the client.
 | httpx via external OPSEC proxy (`strict_opsec` + `OUTBOUND_PROXY_URL` set) | `modules/httpx.py` → `_crawler_confinement` → `ScopeEnforcingProxy(upstream_proxy_url=...)` | operator-configured external proxy | Yes — Hydra's own scope check runs *before* anything is forwarded to the external proxy (**closed this turn**; httpx no longer talks to `OUTBOUND_PROXY_URL` directly at all) | Hydra-side (best-effort, own resolution) only — the external proxy still resolves independently at its own network location once the CONNECT/GET is forwarded to it | Yes, past the upstream hop — this is now a scoped, documented property of using an external proxy at all, not an unclosed gap: Hydra's own socket never touches the target directly in this mode | Not the final hop (the external proxy decides that) | Not by *Hydra's own socket* (which only ever touches the configured upstream proxy) | TARGET_COLLECTION | **GUARANTEED at the authorization layer (an unauthorized destination never reaches the external proxy); PROXY_CONFINED, not IP-pinned, past the upstream hop — inherent to chaining through an external proxy, not a bug** |
 | browser_probe navigation/subresources | `modules/browser_probe.py:run()` | httpx-alive URL + everything the loaded page references | Yes (`browser_context.route()`/`route_web_socket()` → `allows_active_collection`) | Yes — **new this turn**, via `playwright.webkit.launch(proxy=confinement_proxy.proxy_url)` | **No** — new this turn | Yes — WebKit's own network stack connects through the proxy, not just the JS-visible `route()` layer | No (same raw-socket caveat if WebKit itself had an internal bypass, which live testing did not find) | TARGET_COLLECTION | **GUARANTEED** |
 | browser_probe via external OPSEC proxy | `modules/browser_probe.py:run()` → `ScopeEnforcingProxy(upstream_proxy_url=...)` | operator-configured external proxy | Yes — same chaining fix as httpx (**closed this turn**) | Hydra-side only, same as httpx | Yes, past the upstream hop — same scoped, documented property as httpx | Not the final hop | Not by Hydra's own socket | TARGET_COLLECTION | **GUARANTEED at the authorization layer; PROXY_CONFINED past the upstream hop, same as httpx** |
-| soft404_check / param_fuzz / cloud_bucket_enum (urllib via `core/http_probe.py:http_get`) | `modules/soft404_check.py`, `modules/param_fuzz.py`, `modules/cloud_bucket_enum.py` | already-alive host / candidate cloud bucket hostname | Yes (`allows_active_collection`/`authorize_active_indicator` per URL) | Yes — **new this turn**, via `http_get(url, proxy_url=confinement_proxy.proxy_url)` | **No** — new this turn | Yes | No | TARGET_COLLECTION | **GUARANTEED** |
+| soft404_check (via `CollectionGateway`) | `modules/soft404_check.py` | already-alive host + its derived canary URL | Yes — **structural this turn**: `_probe_host` receives `AuthorizedCollectionTarget` objects (both root and canary, independently authorized), never a raw URL string; `gateway.http_get()` raises `TypeError` on anything else | Yes, via the gateway's owned confinement proxy | No | Yes | No | TARGET_COLLECTION | **GUARANTEED, structurally** — see the `CollectionGateway` section below |
+| param_fuzz / cloud_bucket_enum (urllib via `core/http_probe.py:http_get`, not yet on the gateway) | `modules/param_fuzz.py`, `modules/cloud_bucket_enum.py` | already-alive host / candidate cloud bucket hostname | Yes (`allows_active_collection`/`authorize_active_indicator` per URL, checked before the URL string is handed to `http_get`) | Yes, via `_crawler_confinement`'s proxy | No | Yes | No | TARGET_COLLECTION | **GUARANTEED at the connection level, conventional (not structural) at the call site** — these two still call `http_get(url, ...)` with a bare string; only `soft404_check` was migrated onto `CollectionGateway` this turn as the demonstration site |
 | DNS resolution (dnsx, seed + follow-up) | `modules/dnsx.py`, `core/intel/followup.py` | gated input / eligible follow-up indicator | Yes | N/A — a DNS *query about* the hostname is not itself a connection to a resolved destination | N/A | N/A | No | TARGET_COLLECTION (query only) | **GUARANTEED** (authorization-wise; SSRF policy doesn't apply to a resolution query with no follow-on connection) |
 | Port scan (naabu) | `modules/naabu.py` | gated input file | Yes | No | N/A (naabu does its own TCP connect scanning against ports on an already-authorized host string, not attacker-influenced) | No | Same raw-socket caveat as any subprocess | TARGET_COLLECTION | **INPUT_GATED_ONLY** |
 | ASN lookup (target IP → ASN) | `modules/asn_lookup.py` | resolved target IPs, sent as WHOIS/DNS query *content* to `whois.cymru.com:43` (fixed) or Cymru's DNS zone (fixed) | Yes, for the hostname resolved | N/A for the resolution step; the actual TCP/UDP connection destination (`_CYMRU_WHOIS_HOST`) is a hardcoded constant, never target-derived | N/A | Yes — destination is a fixed constant | No | THIRD_PARTY_OBSERVATION (fixed destination; target data is query content, not the connection target) | **GUARANTEED** |
@@ -166,6 +167,65 @@ legitimately, so only the specific attribute-access call is prohibited).
 primitive this list doesn't yet name. It raises the cost of reintroducing a known bug
 class from "nobody notices" to "a human must explicitly justify it in a diff reviewers
 can see" — that is the entire, deliberately bounded claim.
+
+## Sealed `AuthorizedCollectionTarget` + `CollectionGateway` (new this turn)
+
+**The gap.** `AuthorizedCollectionTarget` was a plain `@dataclass(frozen=True)` — `frozen`
+blocks *mutation after construction*, not construction itself. Any caller could write
+`AuthorizedCollectionTarget(raw="https://evil.example", hostname="evil.example",
+scheme="https", port=None, capability="http_probe", reason="fabricated",
+scope_identity=(...))` directly and get an object indistinguishable from a real
+authorization proof — every downstream consumer (`_fetch_single_hop`, now
+`CollectionGateway.http_get`) would treat it as legitimate. The class's own docstring
+claimed "there is no public constructor path that skips the check," which was not true.
+
+**The fix.** `AuthorizedCollectionTarget.__post_init__` now unconditionally raises
+`TypeError`. Since `dataclasses.replace()` also always calls `__init__`
+(`cls(**changes)` under the hood), it fails identically — closing the classic escape
+hatch a naive sentinel-default "seal" would leave open (replace() carries forward
+unchanged field values, including a leaked sentinel, while overriding just the field
+an attacker wants to forge). The only way to obtain an instance is `_construct()`, a
+private classmethod that builds the object via `object.__new__` + direct
+`object.__setattr__`, bypassing `__init__` entirely — called only from
+`authorize_verbose()`. Four tests in `tests/test_authorized_collection_target.py`
+prove this: direct construction with a forged out-of-scope hostname raises; a forged
+field set copied from a *real* authorized target's own `dataclasses.asdict()` output
+(with just the hostname swapped) still raises; and `dataclasses.replace()` on a real
+target raises identically.
+
+**Honest limit, stated as plainly as the class's own docstring now does:** this is
+sealed against the threat model that matters here — a plugin author accidentally or
+conventionally fabricating a capability the way they'd construct any other dataclass.
+It is not sealed against a caller who deliberately imports and calls the
+leading-underscore `_construct()` classmethod with a hand-built field set — Python has
+no language construct that prevents that, and claiming otherwise would be a false
+guarantee. That level of deliberate circumvention is what code review and the static
+guard (`tests/test_no_bypass_network_primitives.py`) are for, not the type system.
+
+**`core/collection/gateway.py:CollectionGateway`.** The single object this whole arc's
+`AuthorizedCollectionTarget` design was building toward: `gateway.authorize(raw)`
+returns an `AuthorizedCollectionTarget | None` (the same fail-closed decision, unchanged);
+`gateway.http_get(target)` accepts *only* that sealed type — not `str` — checked with
+an explicit `isinstance` at runtime (not just a type hint a caller could `# type:
+ignore` past), and owns the confinement-proxy lifecycle so the actual request is
+routed through it automatically. `modules/soft404_check.py` was migrated onto it this
+turn as the concrete demonstration: `_probe_host` now receives `AuthorizedCollectionTarget`
+objects for both the root URL and its derived canary URL (independently
+re-authorized, not assumed safe by association with the root), and cannot construct a
+request from a bare string even if it wanted to. Verified with 8 new tests
+(`tests/test_collection_gateway.py`, including two proving `http_get` rejects a plain
+string and a hand-built fake-shaped object) plus the existing real-local-server suite
+(`tests/test_urllib_confinement_live.py`) and a real run against the actual
+authorized target `virusbarrier.xyz` (real DNS resolution, real request, real
+skip-with-zero-requests for an out-of-scope host).
+
+**Honest scope: this is one call site, not a full retrofit.** `param_fuzz.py` and
+`cloud_bucket_enum.py` still call `core/http_probe.py:http_get(url, ...)` with a bare
+string — connection-level confinement (proxy + SSRF) still applies to them via
+`_crawler_confinement`, but the *type-level* guarantee `CollectionGateway` provides
+does not yet. Retrofitting them is the same kind of bounded next increment this whole
+arc has repeatedly deferred rather than rushed; not doing it this turn is a stated
+scope decision, not an oversight.
 
 ## What was checked and found already correct (not touched)
 

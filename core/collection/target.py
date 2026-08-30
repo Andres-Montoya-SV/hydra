@@ -13,22 +13,39 @@ A network primitive that requires one of these — instead of ``url: str`` —
 cannot be handed an unauthorized destination and "forget" to check it,
 because there is no public constructor path that skips the check.
 
+**Sealed construction.** A plain ``@dataclass(frozen=True)`` is NOT sealed —
+anyone can call ``AuthorizedCollectionTarget(raw="https://evil.example",
+hostname="evil.example", ...)`` directly and get an object that looks
+identical to a real authorization proof; nothing about `frozen=True` stops
+construction, only mutation afterward. This class's public constructor
+(``__init__``, and therefore ``dataclasses.replace()``, which always calls
+it) unconditionally raises via ``__post_init__``. The only way to obtain an
+instance is ``_construct()``, a private classmethod that builds the object
+via ``object.__new__`` + direct attribute assignment, bypassing ``__init__``
+entirely — called only from ``authorize_verbose()`` below. This is "sealed"
+in the sense that matters for this codebase's threat model (a plugin author
+cannot accidentally or conventionally fabricate a capability the same way
+they'd construct any other dataclass); it is not sealed against a caller who
+deliberately imports and calls a leading-underscore private classmethod with
+a hand-built field set — Python has no construct for that, and pretending
+otherwise would be a false guarantee. The static guard
+(``tests/test_no_bypass_network_primitives.py``) and code review are what
+catch *that* level of deliberate circumvention.
+
 This does not replace ``authorize_collection``/``allows_active_collection``;
 plugins that already call them correctly do not need to change. It exists
 for call sites where making the authorization proof part of the type,
 rather than a convention every caller must remember to follow, is worth the
-extra step. Wired into one concrete call site so far —
-``modules/httpx.py``'s redirect-hop resolution (``_fetch_single_hop`` takes
-the target object itself, not a URL string). Retrofitting the rest of the
-plugins is the still-open ``CollectionGateway`` work, not done here; the
-browser guard (``modules/browser_probe.py``) still returns a plain bool,
-since Playwright's routing API only needs true/false to decide abort vs.
-continue and gains nothing from the richer type.
+extra step. Wired into ``modules/httpx.py``'s redirect-hop resolution and
+``core/collection/gateway.py:CollectionGateway`` (the shared entry point for
+the plugins retrofitted onto it — see that module for which ones and why the
+rest are not yet).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from typing import Any
 from urllib.parse import urlparse
 
 from core.intel.scope import CollectionScope
@@ -38,8 +55,10 @@ from core.intel.scope import CollectionScope
 class AuthorizedCollectionTarget:
     """Proof that `raw` was checked by `authorize_collection` and ALLOWed.
 
-    Immutable. The only way to obtain one is `AuthorizedCollectionTarget.authorize(...)`
-    returning non-None — there is no constructor that skips the check.
+    Immutable, and its own public constructor always rejects direct use —
+    see the module docstring for exactly what "sealed" means here. The only
+    way to obtain one is `AuthorizedCollectionTarget.authorize(...)` /
+    `.authorize_verbose(...)` returning non-None.
     """
 
     raw: str
@@ -50,6 +69,23 @@ class AuthorizedCollectionTarget:
     reason: str
     scope_identity: tuple[str, ...]
     resolved_ips: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        raise TypeError(
+            "AuthorizedCollectionTarget cannot be constructed directly (this "
+            "includes dataclasses.replace(), which also calls __init__) — "
+            "use AuthorizedCollectionTarget.authorize()/.authorize_verbose()."
+        )
+
+    @classmethod
+    def _construct(cls, **field_values: Any) -> AuthorizedCollectionTarget:
+        """The one path that actually produces an instance: bypasses
+        `__init__`/`__post_init__` via `object.__new__` + direct attribute
+        assignment. Private — called only from `authorize_verbose` below."""
+        obj = object.__new__(cls)
+        for f in fields(cls):
+            object.__setattr__(obj, f.name, field_values[f.name])
+        return obj
 
     @classmethod
     def authorize(
@@ -139,7 +175,7 @@ class AuthorizedCollectionTarget:
             if not decision.allowed:
                 return None, decision.reason
             resolved_ips = decision.resolved_ips
-        target = cls(
+        target = cls._construct(
             raw=raw,
             hostname=result.hostname,
             scheme=parsed.scheme if has_scheme else "",

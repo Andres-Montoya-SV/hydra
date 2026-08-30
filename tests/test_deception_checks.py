@@ -297,7 +297,15 @@ async def test_soft404_plugin_detects_matching_canary(settings: Settings, tmp_pa
 
         return ResponseSnapshot(200, body)
 
-    with patch("modules.soft404_check.http_get", side_effect=fake_get):
+    # Real requests now go through CollectionGateway (core/collection/gateway.py),
+    # which resolves the destination IP as part of authorization — stub that to
+    # a fixed public address so this test doesn't depend on real DNS for
+    # "example.com", and patch the gateway's own HTTP call, not a module-level
+    # name that no longer exists in modules/soft404_check.py.
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch("core.collection.gateway._http_get", side_effect=fake_get),
+    ):
         result = await plugin.run(context, output_dir / "alive.txt")
 
     assert result.success is True
@@ -326,7 +334,10 @@ async def test_soft404_plugin_clean_when_canary_is_404(settings: Settings, tmp_p
             return ResponseSnapshot(404, b"Not Found")
         return ResponseSnapshot(200, b"<html>real homepage</html>" * 30)
 
-    with patch("modules.soft404_check.http_get", side_effect=fake_get):
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch("core.collection.gateway._http_get", side_effect=fake_get),
+    ):
         result = await plugin.run(context, output_dir / "alive.txt")
 
     assert result.success is True
