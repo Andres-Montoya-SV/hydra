@@ -134,7 +134,7 @@ async def test_cloud_derived_endpoints_require_explicit_opt_in(
         collection_scope=CollectionScope.from_seeds(["metaversejustice.com"]),
     )
     plugin = CloudBucketEnumPlugin(settings)
-    with patch("modules.cloud_bucket_enum.http_get") as http_get:
+    with patch("core.collection.gateway._http_get") as http_get:
         result = await plugin.run(context, output_dir / "targets.txt")
     assert result.skipped
     http_get.assert_not_called()
@@ -168,7 +168,7 @@ async def test_cloud_enum_scope_object_governs_even_if_settings_flag_is_stale(
         collection_scope=CollectionScope.from_seeds(["metaversejustice.com"]),
     )
     plugin = CloudBucketEnumPlugin(settings)
-    with patch("modules.cloud_bucket_enum.http_get") as http_get:
+    with patch("core.collection.gateway._http_get") as http_get:
         result = await plugin.run(context, output_dir / "targets.txt")
     http_get.assert_not_called()
     assert result.success
@@ -182,7 +182,7 @@ async def test_cloud_enum_missing_scope_fails_closed(tmp_path: Path, settings: S
     settings.cloud_bucket_enum_authorize_derived = True
     context = PipelineContext(output_dir=tmp_path)
     plugin = CloudBucketEnumPlugin(settings)
-    with patch("modules.cloud_bucket_enum.http_get") as http_get:
+    with patch("core.collection.gateway._http_get") as http_get:
         with pytest.raises(ConfigurationError, match="fail closed"):
             await plugin.run(context, tmp_path / "targets.txt")
     http_get.assert_not_called()

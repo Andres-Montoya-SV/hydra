@@ -44,7 +44,7 @@ the client.
 | browser_probe navigation/subresources | `modules/browser_probe.py:run()` | httpx-alive URL + everything the loaded page references | Yes (`browser_context.route()`/`route_web_socket()` → `allows_active_collection`) | Yes — **new this turn**, via `playwright.webkit.launch(proxy=confinement_proxy.proxy_url)` | **No** — new this turn | Yes — WebKit's own network stack connects through the proxy, not just the JS-visible `route()` layer | No (same raw-socket caveat if WebKit itself had an internal bypass, which live testing did not find) | TARGET_COLLECTION | **GUARANTEED** |
 | browser_probe via external OPSEC proxy | `modules/browser_probe.py:run()` → `ScopeEnforcingProxy(upstream_proxy_url=...)` | operator-configured external proxy | Yes — same chaining fix as httpx (**closed this turn**) | Hydra-side only, same as httpx | Yes, past the upstream hop — same scoped, documented property as httpx | Not the final hop | Not by Hydra's own socket | TARGET_COLLECTION | **GUARANTEED at the authorization layer; PROXY_CONFINED past the upstream hop, same as httpx** |
 | soft404_check (via `CollectionGateway`) | `modules/soft404_check.py` | already-alive host + its derived canary URL | Yes — **structural this turn**: `_probe_host` receives `AuthorizedCollectionTarget` objects (both root and canary, independently authorized), never a raw URL string; `gateway.http_get()` raises `TypeError` on anything else | Yes, via the gateway's owned confinement proxy | No | Yes | No | TARGET_COLLECTION | **GUARANTEED, structurally** — see the `CollectionGateway` section below |
-| param_fuzz / cloud_bucket_enum (urllib via `core/http_probe.py:http_get`, not yet on the gateway) | `modules/param_fuzz.py`, `modules/cloud_bucket_enum.py` | already-alive host / candidate cloud bucket hostname | Yes (`allows_active_collection`/`authorize_active_indicator` per URL, checked before the URL string is handed to `http_get`) | Yes, via `_crawler_confinement`'s proxy | No | Yes | No | TARGET_COLLECTION | **GUARANTEED at the connection level, conventional (not structural) at the call site** — these two still call `http_get(url, ...)` with a bare string; only `soft404_check` was migrated onto `CollectionGateway` this turn as the demonstration site |
+| param_fuzz / cloud_bucket_enum (via `CollectionGateway`) | `modules/param_fuzz.py`, `modules/cloud_bucket_enum.py` | already-alive host + per-parameter probe URL / candidate cloud bucket hostname | Yes — **structural this turn**: every baseline, per-parameter probe, canary, and candidate URL is authorized via `gateway.authorize(raw, operation=...)`, returning an `AuthorizedCollectionTarget` — never a raw URL string reaches `gateway.http_get()`; `cloud_bucket_enum`'s `CollectionScope.cloud_collection_allowed` opt-in is enforced per-URL through the same `operation="cloud_bucket_enum"` label (`core/intel/authorize.py:_CLOUD_BUCKET_ENUM_OPERATIONS`), preserving the fix from the operation-string mismatch bug below without reintroducing it | Yes, via the gateway's owned confinement proxy | No | Yes | No | TARGET_COLLECTION | **GUARANTEED, structurally** — same pattern as `soft404_check` above |
 | DNS resolution (dnsx, seed + follow-up) | `modules/dnsx.py`, `core/intel/followup.py` | gated input / eligible follow-up indicator | Yes | N/A — a DNS *query about* the hostname is not itself a connection to a resolved destination | N/A | N/A | No | TARGET_COLLECTION (query only) | **GUARANTEED** (authorization-wise; SSRF policy doesn't apply to a resolution query with no follow-on connection) |
 | Port scan (naabu) | `modules/naabu.py` | gated input file | Yes | No | N/A (naabu does its own TCP connect scanning against ports on an already-authorized host string, not attacker-influenced) | No | Same raw-socket caveat as any subprocess | TARGET_COLLECTION | **INPUT_GATED_ONLY** |
 | ASN lookup (target IP → ASN) | `modules/asn_lookup.py` | resolved target IPs, sent as WHOIS/DNS query *content* to `whois.cymru.com:43` (fixed) or Cymru's DNS zone (fixed) | Yes, for the hostname resolved | N/A for the resolution step; the actual TCP/UDP connection destination (`_CYMRU_WHOIS_HOST`) is a hardcoded constant, never target-derived | N/A | Yes — destination is a fixed constant | No | THIRD_PARTY_OBSERVATION (fixed destination; target data is query content, not the connection target) | **GUARANTEED** |
@@ -221,13 +221,23 @@ string and a hand-built fake-shaped object) plus the existing real-local-server 
 authorized target `virusbarrier.xyz` (real DNS resolution, real request, real
 skip-with-zero-requests for an out-of-scope host).
 
-**Honest scope: this is one call site, not a full retrofit.** `param_fuzz.py` and
-`cloud_bucket_enum.py` still call `core/http_probe.py:http_get(url, ...)` with a bare
-string — connection-level confinement (proxy + SSRF) still applies to them via
-`_crawler_confinement`, but the *type-level* guarantee `CollectionGateway` provides
-does not yet. Retrofitting them is the same kind of bounded next increment this whole
-arc has repeatedly deferred rather than rushed; not doing it this turn is a stated
-scope decision, not an oversight.
+**Update (closing turn): `param_fuzz.py` and `cloud_bucket_enum.py` are now also on
+`CollectionGateway`** — the same structural pattern as `soft404_check`, no longer a
+deferred increment. `param_fuzz` authorizes every baseline URL and every one of its
+~130 per-parameter probe URLs independently (the probe is derived from an
+already-authorized baseline but re-authorized rather than assumed safe by
+association, mirroring `soft404_check`'s root/canary pattern). `cloud_bucket_enum`
+authorizes every canary and candidate bucket URL the same way, with its
+`Settings.cloud_bucket_enum_authorize_derived` entry-level opt-in (checked once, at
+plugin entry) staying a separate, coarser gate from the per-URL
+`CollectionScope.cloud_collection_allowed` check that `gateway.authorize(url,
+operation="cloud_bucket_enum")` now performs on every request — the same operation
+string the cloud-endpoint opt-in gate keys off (see the operation-string-mismatch bug
+below), not reintroduced by this migration. Verified against the existing real-local-
+server suite (`tests/test_urllib_confinement_live.py`, unchanged call shape, all
+passing) plus two new tests proving `gateway.http_get()` rejects a raw string with
+`TypeError` for each plugin's own `CollectionGateway` construction, mirroring
+`tests/test_collection_gateway.py`'s generic proof.
 
 ## A real bug found by writing real tests, not assumed away (this turn)
 

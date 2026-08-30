@@ -83,7 +83,15 @@ async def test_param_fuzz_detects_status_change_and_creates_finding(
             return ResponseSnapshot(500, b"error debug mode")
         return ResponseSnapshot(200, b"ok homepage content here")
 
-    with patch("modules.param_fuzz.http_get", side_effect=fake_get):
+    # Real requests now go through CollectionGateway (core/collection/gateway.py),
+    # which resolves the destination IP as part of authorization — stub that to
+    # a fixed public address so this test doesn't depend on real DNS for
+    # "example.com", and patch the gateway's own HTTP call, not a module-level
+    # name that no longer exists in modules/param_fuzz.py.
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch("core.collection.gateway._http_get", side_effect=fake_get),
+    ):
         # Shrink wordlist to keep the test fast
         with patch("modules.param_fuzz.PARAM_WORDLIST", ("id", "debug", "page")):
             plugin = ParamFuzzPlugin(settings)
@@ -115,7 +123,10 @@ async def test_param_fuzz_marks_reflected_as_medium(settings: Settings, tmp_path
             return ResponseSnapshot(200, body)
         return ResponseSnapshot(200, b"homepage without canary")
 
-    with patch("modules.param_fuzz.http_get", side_effect=fake_get):
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch("core.collection.gateway._http_get", side_effect=fake_get),
+    ):
         with patch("modules.param_fuzz.PARAM_WORDLIST", ("q",)):
             await ParamFuzzPlugin(settings).run(context, output_dir / "alive.txt")
 
@@ -148,7 +159,10 @@ async def test_param_fuzz_influence_without_reflection_has_no_context(
             return ResponseSnapshot(500, b"internal error page without canary token")
         return ResponseSnapshot(200, b"ok homepage content here")
 
-    with patch("modules.param_fuzz.http_get", side_effect=fake_get):
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch("core.collection.gateway._http_get", side_effect=fake_get),
+    ):
         with patch("modules.param_fuzz.PARAM_WORDLIST", ("debug",)):
             await ParamFuzzPlugin(settings).run(context, output_dir / "alive.txt")
 
@@ -178,7 +192,10 @@ async def test_param_fuzz_skips_host_when_baseline_rate_limited(
         calls.append(url)
         return ResponseSnapshot(429, b"<!DOCTYPE HTML><title>429 Too Many Requests</title>")
 
-    with patch("modules.param_fuzz.http_get", side_effect=fake_get):
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch("core.collection.gateway._http_get", side_effect=fake_get),
+    ):
         with patch("modules.param_fuzz.PARAM_WORDLIST", ("id", "page", "s", "q")):
             result = await ParamFuzzPlugin(settings).run(context, output_dir / "alive.txt")
 
@@ -227,7 +244,10 @@ async def test_param_fuzz_raw_artifact_never_embeds_analyst_home(
             return ResponseSnapshot(500, b"error debug mode")
         return ResponseSnapshot(200, b"ok homepage content here")
 
-    with patch("modules.param_fuzz.http_get", side_effect=fake_get):
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch("core.collection.gateway._http_get", side_effect=fake_get),
+    ):
         with patch("modules.param_fuzz.PARAM_WORDLIST", ("debug",)):
             await ParamFuzzPlugin(settings).run(context, output_dir / "alive.txt")
 
@@ -257,7 +277,10 @@ async def test_param_fuzz_continues_when_baseline_ok(settings: Settings, tmp_pat
             return ResponseSnapshot(500, b"error debug mode")
         return ResponseSnapshot(200, b"ok homepage content here")
 
-    with patch("modules.param_fuzz.http_get", side_effect=fake_get):
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch("core.collection.gateway._http_get", side_effect=fake_get),
+    ):
         with patch("modules.param_fuzz.PARAM_WORDLIST", ("id", "debug")):
             result = await ParamFuzzPlugin(settings).run(context, output_dir / "alive.txt")
 
@@ -293,9 +316,12 @@ async def test_param_fuzz_no_noise_when_unchanged(settings: Settings, tmp_path: 
     context.alive_urls = ["https://example.com/"]
     context.httpx_results = [{"url": "https://example.com/"}]
 
-    with patch(
-        "modules.param_fuzz.http_get",
-        return_value=ResponseSnapshot(200, b"stable body content"),
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch(
+            "core.collection.gateway._http_get",
+            return_value=ResponseSnapshot(200, b"stable body content"),
+        ),
     ):
         with patch("modules.param_fuzz.PARAM_WORDLIST", ("id", "page")):
             await ParamFuzzPlugin(settings).run(context, output_dir / "alive.txt")
@@ -363,7 +389,10 @@ async def test_cloud_bucket_enum_reports_private_and_public(
             )
         return ResponseSnapshot(404, b"<Code>NoSuchBucket</Code>")
 
-    with patch("modules.cloud_bucket_enum.http_get", side_effect=fake_get):
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch("core.collection.gateway._http_get", side_effect=fake_get),
+    ):
         # Limit candidates to speed up
         with patch(
             "modules.cloud_bucket_enum._candidate_buckets",
@@ -420,7 +449,10 @@ async def test_cloud_bucket_enum_dns_failure_warning_for_s3(
             )
         return ResponseSnapshot(404, b"<Code>NoSuchBucket</Code>")
 
-    with patch("modules.cloud_bucket_enum.http_get", side_effect=fake_get):
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch("core.collection.gateway._http_get", side_effect=fake_get),
+    ):
         with patch(
             "modules.cloud_bucket_enum._candidate_buckets",
             return_value=["example-backup"],
@@ -445,9 +477,12 @@ async def test_cloud_bucket_enum_nosuchbucket_silent(settings: Settings, tmp_pat
     context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
     context.targets = [DomainTarget(domain="example.com")]
 
-    with patch(
-        "modules.cloud_bucket_enum.http_get",
-        return_value=ResponseSnapshot(404, b"<Code>NoSuchBucket</Code>"),
+    with (
+        patch("core.collection.ssrf.resolve_hostname", return_value=["93.184.216.34"]),
+        patch(
+            "core.collection.gateway._http_get",
+            return_value=ResponseSnapshot(404, b"<Code>NoSuchBucket</Code>"),
+        ),
     ):
         with patch(
             "modules.cloud_bucket_enum._candidate_buckets",

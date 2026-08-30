@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from config.settings import Settings
+from core.collection.gateway import CollectionGateway
 from core.intel.scope import CollectionScope
 from core.models import DomainTarget, PipelineContext
 from modules.cloud_bucket_enum import CloudBucketEnumPlugin
@@ -182,6 +183,30 @@ async def test_param_fuzz_in_scope_hostname_resolving_private_ip_is_blocked(
         "an in-scope hostname that resolves to a private/loopback address "
         "must never be reached by the real urllib request"
     )
+
+
+@pytest.mark.asyncio
+async def test_param_fuzz_gateway_http_get_rejects_a_plain_string(
+    tmp_path: Path, target_server: int
+) -> None:
+    """Same structural guarantee `tests/test_collection_gateway.py` proves
+    generically, demonstrated at param_fuzz's own call site: the
+    `CollectionGateway` it constructs (`capability="param_fuzz"`) must
+    reject a raw string passed to `http_get()` with `TypeError` — never
+    silently forward it to `core/http_probe.py` — and the real server must
+    never see a connection for the rejected call."""
+    scope = CollectionScope.from_seeds(
+        ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+    )
+    async with CollectionGateway(scope, capability="param_fuzz") as gateway:
+        with pytest.raises(TypeError):
+            await gateway.http_get(
+                f"http://127.0.0.1:{target_server}/",  # type: ignore[arg-type]
+                timeout=5,
+            )
+    assert (
+        _CountingHandler.hits == []
+    ), "a raw string rejected by http_get() must never reach the real server"
 
 
 def _cloud_bucket_context(
@@ -351,3 +376,30 @@ async def test_cloud_bucket_enum_genuine_dns_failure_never_reports_false_exists(
         f"a real DNS-resolution failure must never be misclassified as an "
         f"existing bucket: {result.message}"
     )
+
+
+@pytest.mark.asyncio
+async def test_cloud_bucket_enum_gateway_http_get_rejects_a_plain_string(
+    tmp_path: Path, target_server: int
+) -> None:
+    """Same structural guarantee `tests/test_collection_gateway.py` proves
+    generically, demonstrated at cloud_bucket_enum's own call site: the
+    `CollectionGateway` it constructs (`capability="cloud_enum"`) must
+    reject a raw string passed to `http_get()` with `TypeError` — never
+    silently forward it to `core/http_probe.py` — and the real server must
+    never see a connection for the rejected call."""
+    scope = CollectionScope.from_seeds(
+        ["seed.cloud-live-test.internal"],
+        patterns=["seed.cloud-live-test.internal"],
+        cloud_collection_allowed=True,
+        allow_private_network_targets=True,
+    )
+    async with CollectionGateway(scope, capability="cloud_enum") as gateway:
+        with pytest.raises(TypeError):
+            await gateway.http_get(
+                f"http://reconprobe.s3.amazonaws.com:{target_server}/",  # type: ignore[arg-type]
+                timeout=5,
+            )
+    assert (
+        _CountingHandler.hits == []
+    ), "a raw string rejected by http_get() must never reach the real server"

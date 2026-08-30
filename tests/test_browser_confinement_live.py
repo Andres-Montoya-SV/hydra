@@ -80,12 +80,36 @@ def _context_for(tmp_path: Path, scope: CollectionScope, url: str) -> PipelineCo
     return context
 
 
+async def _require_webkit() -> None:
+    """Skip cleanly if the WebKit *binary* isn't installed — the module-level
+    `pytest.importorskip("playwright")` above only guards against the
+    `playwright` Python package being missing, not against `playwright
+    install webkit` never having been run. These tests drive the real
+    `BrowserProbePlugin.run()`, which launches WebKit deep inside
+    `modules/browser_probe.py`, so (unlike
+    `tests/test_browser_probe_scope_guard.py`, which launches WebKit
+    directly in the test body) a trial launch/close has to happen here,
+    before the plugin gets a chance to raise an uncaught
+    `BrowserType.launch: Executable doesn't exist` error instead of a skip.
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as playwright:
+        try:
+            browser = await playwright.webkit.launch(headless=True)
+        except Exception as exc:  # pragma: no cover - environment without webkit binary
+            pytest.skip(f"WebKit browser binary not available: {exc}")
+        else:
+            await browser.close()
+
+
 @pytest.mark.asyncio
 async def test_browser_probe_reaches_authorized_target_through_confinement_proxy(
     tmp_path: Path, target_server: int
 ) -> None:
     """Sanity check: real WebKit launched with `proxy=` pointed at the real
     confinement proxy must still reach an authorized destination."""
+    await _require_webkit()
     url = f"http://127.0.0.1:{target_server}/"
     scope = CollectionScope.from_seeds(
         ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
@@ -119,6 +143,7 @@ async def test_browser_probe_in_scope_hostname_resolving_private_ip_is_blocked(
         return ["127.0.0.1"]
 
     monkeypatch.setattr("core.collection.ssrf.resolve_hostname_async", _fake_resolve)
+    await _require_webkit()
 
     url = f"http://rebind.browser-live-test.internal:{target_server}/"
     scope = CollectionScope.from_seeds(["rebind.browser-live-test.internal"])
