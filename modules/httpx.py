@@ -265,7 +265,15 @@ class HttpxPlugin(BaseToolPlugin):
             if not location:
                 break
             next_url = location if "://" in location else urljoin(current_url, location)
-            next_scheme = urlparse(next_url).scheme.lower() if "://" in next_url else ""
+            # `urlparse` correctly extracts a scheme from both `scheme://netloc/...`
+            # and single-colon `scheme:opaque` forms (`javascript:`, `data:`,
+            # `vbscript:`, `about:` have no `//` at all) — gating this on
+            # `"://" in next_url` would silently skip the explicit scheme
+            # check for exactly those schemes, letting them fall through to
+            # hostname-based authorization instead (which happens to also
+            # deny them today, since they have no parseable hostname, but is
+            # the wrong check for the wrong reason and is fragile).
+            next_scheme = urlparse(next_url).scheme.lower()
             if next_scheme and next_scheme not in _ALLOWED_REDIRECT_SCHEMES:
                 # A redirect to file:/ftp:/gopher:/data:/javascript:/blob: is
                 # never a same-capability HTTP follow-up hop, regardless of

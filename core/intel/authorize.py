@@ -30,6 +30,21 @@ _CLOUD_ENDPOINT_SUFFIXES = (
     ".r2.cloudflarestorage.com",
 )
 
+# `modules/cloud_bucket_enum.py`'s own pre-check calls this function with
+# operation="cloud_bucket_enum" (its literal per-request operation label);
+# `ScopeEnforcingProxy`'s independent re-check (`core/collection/crawler_proxy.py`)
+# passes the plugin's declared `capability` instead ("cloud_enum",
+# `CloudBucketEnumPlugin.capability`) — both must be recognized here, or the
+# proxy's re-check falls through to ordinary registrable-domain scope
+# matching (which a generated bucket hostname can never pass) and denies
+# every candidate even when the operator explicitly opted in. This was a
+# real bug: cloud_bucket_enum's classifier treats a bare HTTP 403 (exactly
+# what the proxy's own denial looks like) as "bucket exists, access denied"
+# for GCS/Azure, so the mismatch silently turned every confined run into
+# mostly false-positive "existing bucket" results instead of an obvious
+# failure.
+_CLOUD_BUCKET_ENUM_OPERATIONS = frozenset({"cloud_bucket_enum", "cloud_enum"})
+
 
 class AuthorizationDecision(str, Enum):
     ALLOW = "ALLOW"
@@ -116,7 +131,7 @@ def authorize_active_indicator(
         )
     if is_generated_cloud_endpoint(host):
         if not collection_scope.cloud_collection_allowed:
-            if op != "cloud_bucket_enum":
+            if op not in _CLOUD_BUCKET_ENUM_OPERATIONS:
                 return AuthorizationResult(
                     AuthorizationDecision.DENY,
                     host,
@@ -131,7 +146,7 @@ def authorize_active_indicator(
                 "cloud_collection_policy_disabled",
                 ScopeStatus.OUT_OF_SCOPE,
             )
-        if op == "cloud_bucket_enum":
+        if op in _CLOUD_BUCKET_ENUM_OPERATIONS:
             # Explicitly opted in via the cloud policy. A generated bucket
             # hostname is never going to share a registrable domain with the
             # seed (that is the entire point of probing it) — falling

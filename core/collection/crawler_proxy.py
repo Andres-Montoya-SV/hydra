@@ -31,7 +31,8 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from core.collection.audit import NetworkRequestRecord
-from core.intel.scope import CollectionScope, allows_active_collection
+from core.intel.authorize import authorize_active_indicator
+from core.intel.scope import CollectionScope
 from core.logger import get_logger
 from core.provenance import utc_now_iso
 
@@ -40,17 +41,25 @@ logger = get_logger("crawler_proxy")
 _CONNECT_TIMEOUT = 10.0
 _READ_CHUNK = 65536
 
-# Tools whose real installed binaries/engines have been verified live (not
-# just by reading their docs) to route every outbound connection through
-# this proxy: tests/test_crawler_confinement_live.py drives the actual
-# katana/hakrawler binaries against a local redirect chain and asserts the
-# unauthorized target's connection counter stays at zero;
+# Tools/collectors verified live (not just by reading their docs or
+# assuming a shared code path is equivalent to being tested) to route every
+# outbound connection through this proxy: tests/test_crawler_confinement_live.py
+# drives the actual katana/hakrawler binaries against a local redirect chain
+# and asserts the unauthorized target's connection counter stays at zero;
 # tests/test_httpx_confinement_live.py does the same for the real installed
 # httpx binary via `-proxy`; tests/test_browser_confinement_live.py does the
-# same for real WebKit via Playwright's launch-time `proxy=` option — all
-# three cover both ALLOW (destination reached) and DENY (destination gets
-# zero connections) directions, including a DNS-rebinding scenario where an
-# in-scope *hostname* resolves to a private/loopback address.
+# same for real WebKit via Playwright's launch-time `proxy=` option;
+# tests/test_urllib_confinement_live.py does the same for the three built-in
+# Python collectors sharing `core/http_probe.py:http_get` (soft404_check,
+# param_fuzz, cloud_bucket_enum) — all six cover both ALLOW (destination
+# reached) and DENY (destination gets zero connections) directions, including
+# a DNS-rebinding scenario where an in-scope *hostname* resolves to a
+# private/loopback address. Assuming param_fuzz/cloud_bucket_enum were
+# equally verified just because they call the same function as soft404_check
+# would itself have been the wrong instinct: writing their dedicated live
+# tests surfaced a real, separate bug (see `core/intel/authorize.py:
+# _CLOUD_BUCKET_ENUM_OPERATIONS`) that a shared-code-path assumption would
+# have missed entirely.
 #
 # This proxy is an application-level HTTP/HTTPS forward proxy. It has no way
 # to stop a process that ignores its proxy configuration and opens a raw
@@ -59,7 +68,18 @@ _READ_CHUNK = 65536
 # `modules/_base.py:_crawler_confinement` that is NOT in this set gets an
 # explicit `UNTRUSTED_NETWORK_TOOL` warning instead of a silent, unverified
 # claim of confinement.
-PROXY_VERIFIED_TOOLS = frozenset({"katana", "hakrawler", "nuclei", "httpx", "browser_probe"})
+PROXY_VERIFIED_TOOLS = frozenset(
+    {
+        "katana",
+        "hakrawler",
+        "nuclei",
+        "httpx",
+        "browser_probe",
+        "soft404_check",
+        "param_fuzz",
+        "cloud_bucket_enum",
+    }
+)
 
 
 @dataclass
@@ -160,7 +180,23 @@ class ScopeEnforcingProxy:
         if self.scope is None:
             return False, "missing_collection_scope", ""
         try:
-            allowed = allows_active_collection(host, self.scope)
+            # `authorize_active_indicator` directly, with this proxy's own
+            # `capability` as the operation — NOT `allows_active_collection`,
+            # which hardcodes a generic "active_collection" operation label
+            # internally. That mismatch was a real bug: cloud_bucket_enum's
+            # own pre-check authorizes a generated bucket hostname via the
+            # explicit cloud-collection opt-in (operation="cloud_bucket_enum"),
+            # but the proxy's re-check using the generic label never matched
+            # that special case, fell through to ordinary registrable-domain
+            # scope matching (which a generated bucket hostname can never
+            # pass), and denied every candidate with a bare 403 — which the
+            # plugin's own classifier then misread as "bucket exists, access
+            # denied" for GCS/Azure. See `core/intel/authorize.py:
+            # _CLOUD_BUCKET_ENUM_OPERATIONS`.
+            result = authorize_active_indicator(
+                host, self.scope, self.capability, "confinement_proxy_recheck"
+            )
+            allowed = result.allowed
         except Exception:
             # A bug evaluating scope must block, never fall open.
             logger.warning(

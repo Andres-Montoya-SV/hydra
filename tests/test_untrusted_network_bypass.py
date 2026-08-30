@@ -108,17 +108,25 @@ def test_raw_socket_bypass_is_not_stopped_by_the_confinement_proxy(evil_server: 
 
 
 def test_only_live_verified_tools_are_treated_as_proxy_confined() -> None:
-    """`PROXY_VERIFIED_TOOLS` must name exactly the tools whose real binaries/
-    engines were driven through the live confinement test — not be silently
-    widened to cover a tool nobody has actually verified. `httpx` and
-    `browser_probe` joined this turn: `tests/test_httpx_confinement_live.py`
-    drives the real installed httpx binary through the real proxy, and
-    `tests/test_browser_confinement_live.py` drives real WebKit through it
-    via Playwright's launch-time `proxy=` option — both in ALLOW and DENY
-    (including a DNS-rebinding scenario) directions.
+    """`PROXY_VERIFIED_TOOLS` must name exactly the tools/collectors whose
+    real binaries/engines/mechanisms were driven through the live
+    confinement test — not be silently widened to cover one nobody has
+    actually verified, and not left out just because it shares a code path
+    with something that IS verified (that exact assumption would have missed
+    the real `cloud_bucket_enum`/`ScopeEnforcingProxy` authorization-operation
+    mismatch bug `tests/test_urllib_confinement_live.py` surfaced).
     """
     assert PROXY_VERIFIED_TOOLS == frozenset(
-        {"katana", "hakrawler", "nuclei", "httpx", "browser_probe"}
+        {
+            "katana",
+            "hakrawler",
+            "nuclei",
+            "httpx",
+            "browser_probe",
+            "soft404_check",
+            "param_fuzz",
+            "cloud_bucket_enum",
+        }
     )
 
 

@@ -3,7 +3,7 @@
 **Date:** 2026-08-30
 **Repository:** `Andres-Montoya-SV/hydra`, branch `fix/redirect-scope-safety`
 **Method:** forensic runtime audit (`docs/FINAL_SECURITY_AUDIT.md`, `docs/NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md`), targeted fixes verified by real subprocess execution, real WebKit browser tests, real SQLite persistence, real DNS resolution against the actual authorized target, a real raw-socket bypass demonstration, and a live run against the project's actual authorized target (`virusbarrier.xyz`, per `scope.txt`) — not stubs alone.
-**Test proof used:** 502 pytest cases (up from 356 at the start of this security-hardening arc). This turn's additions: (1) `AuthorizedCollectionTarget`'s public constructor now unconditionally rejects direct construction (and `dataclasses.replace()`, which also calls `__init__`) — closing a real gap where the class's own docstring claimed "sealed" but a plain `@dataclass(frozen=True)` never actually prevented fabricating a capability by hand; (2) `core/collection/gateway.py:CollectionGateway`, a real object whose `http_get()` method only accepts that sealed type (runtime `isinstance`-checked, not just a type hint), migrated `modules/soft404_check.py` onto it as the concrete demonstration; (3) `ScopeEnforcingProxy` now chains to an operator-configured external OPSEC proxy internally (`upstream_proxy_url`) instead of httpx/browser_probe talking to it directly; (4) a static AST-based architectural guard (`tests/test_no_bypass_network_primitives.py`) that fails the suite if a future built-in collector imports a raw network primitive without an explicit, justified allowlist entry.
+**Test proof used:** 516 pytest cases (up from 356 at the start of this security-hardening arc). This turn's additions: (1) a full real production-path run against `virusbarrier.xyz` re-verified end to end after all architectural changes since the last one (turn 4) — httpx still blocked 15 real out-of-scope connection attempts, `soft404_check` (now on `CollectionGateway`) ran cleanly; (2) writing dedicated live tests for `param_fuzz`/`cloud_bucket_enum` instead of assuming they were equally proven by sharing `soft404_check`'s call shape surfaced a real bug — `ScopeEnforcingProxy`'s own re-check used a generic operation label that never matched `cloud_bucket_enum`'s explicit cloud-opt-in path, so every confined run silently misreported ~67% of nonexistent candidate buckets as "existing" (a functionality bug, not a security bypass — nothing unauthorized was ever reached) — now fixed and covered by 8 new tests including a regression test proving a genuine DNS failure still never produces a false positive; (3) the mission's own named dangerous-redirect-scheme list (`javascript:`/`vbscript:`/`about:`/`data:`, none of which contain `://`) exposed that httpx's scheme check silently skipped those four and let hostname-based authorization deny them for the wrong reason instead — fixed to compute the scheme unconditionally; (4) `AuthorizedCollectionTarget`'s public constructor now unconditionally rejects direct construction (and `dataclasses.replace()`); (5) `core/collection/gateway.py:CollectionGateway` migrated `soft404_check` onto it; (6) a static AST-based architectural guard (`tests/test_no_bypass_network_primitives.py`).
 
 **Verdict: READY FOR CONTROLLED BETA**
 
@@ -421,6 +421,19 @@ Adversarial/live proof beyond unit tests:
     never touches the target directly in this mode), not an incomplete implementation, but it does
     mean the DNS-rebinding/TOCTOU *pinning* guarantee (limitation 10, closed for the six directly-
     connecting components) does not extend past the upstream hop when chaining is active.
+12. **`cloud_bucket_enum`'s Azure/GCS "not found" classification loses accuracy when the
+    destination-IP/SSRF layer denies a genuine DNS-resolution failure.** A generated bucket name
+    that genuinely doesn't exist normally produces a real NXDOMAIN, which the plugin's own
+    `_is_dns_failure` heuristic already treats as the expected "not taken" signal for Azure. Since
+    `ScopeEnforcingProxy` now resolves DNS *before* the request runs, that same NXDOMAIN is instead
+    caught by the proxy's own SSRF check and denied as `dns_resolution_failed` (correctly
+    fail-closed), which surfaces to `http_get` as a CONNECT-tunnel failure string
+    `_is_dns_failure` doesn't recognize — `_classify` reports `"unknown"` instead of `"not_found"`.
+    Verified this never degrades into a false `"exists_private"`/`"public_listable"` positive (the
+    property that actually matters for safety) via a dedicated regression test, but the accuracy of
+    this one heuristic is real, minor, and un-fixed — see
+    `docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md` for why a proper fix was scoped out this turn rather
+    than rushed via fragile string-matching on urllib's internal error text.
 
 ## PROVEN / PARTIALLY PROVEN / UNPROVEN
 
@@ -514,30 +527,31 @@ don't fit the same resolve-then-connect shape — see the audit doc's classifica
 oversight); the new static architectural guard is an import/call-site scanner, not a data-flow
 proof — it raises the cost of a regression, it does not make one impossible.
 
-**TEST COUNT:** 502 passed (0 failed, 0 xfail, 0 skipped-as-hidden-failure), up from 356 at the
+**TEST COUNT:** 516 passed (0 failed, 0 xfail, 0 skipped-as-hidden-failure), up from 356 at the
 start of this arc — verified with `pytest tests/ -q` run to completion, plus a clean `black`,
 `isort`, `ruff`, `mypy`, and `bandit` pass across the full repository.
 
-**REAL NETWORK VALIDATION:** a live production run against `virusbarrier.xyz` (this project's
-actual authorized scope per `scope.txt`) completed in 403.1s, exit 0, with the confinement proxy
-blocking real live out-of-scope connection attempts from real katana/nuclei processes — read
-directly from the run's persisted SQLite `warnings_json`, not from a mock. Crawler confinement is
-additionally verified against the real installed katana and hakrawler binaries in a controlled
-local redirect chain; a real subprocess proves the one thing the confinement proxy cannot do (stop
-a raw-socket bypass). A direct `HttpxPlugin.run()` invocation against `virusbarrier.xyz` recorded
-the confinement proxy blocking 15 real out-of-scope connection attempts the real httpx binary tried
-on its own while the authorized connection (resolved IP `34.75.127.116`) completed successfully;
-three live test files (`test_httpx_confinement_live.py`, `test_browser_confinement_live.py`,
-`test_urllib_confinement_live.py`) each prove, against a real binary/engine/local server, that an
-in-scope hostname resolving to a private IP gets zero real connections.
-`tests/test_opsec_proxy_chaining.py` proves the chaining fix with a second real `ScopeEnforcingProxy`
-standing in as the external proxy (authorized-forwarded, OOS-refused-before-forward,
-private-IP-refused-before-forward), and a manual check drove the real httpx binary through the
-full `httpx -> Hydra proxy -> external proxy -> real server` chain successfully. **This turn:** a
-direct `Soft404CheckPlugin.run()` invocation against `virusbarrier.xyz` (the real authorized
-target, real DNS, real request through `CollectionGateway`) succeeded end to end, and the same
-plugin run against an out-of-scope host (`example.com`, not in that run's scope) skipped cleanly
-with zero requests issued — both read directly from the plugin's own return value, not asserted.
+**REAL NETWORK VALIDATION:** a **full real production-path run** against `virusbarrier.xyz` (this
+project's actual authorized scope per `scope.txt`, run-id `live_validation_turn12`) was re-executed
+this turn — the first full end-to-end run since turn 4, i.e. the first time this exact pipeline was
+exercised after SSRF/destination-IP validation, OPSEC proxy chaining, the sealed
+`AuthorizedCollectionTarget`, and `CollectionGateway` all existed simultaneously. Exit 0. httpx's
+confinement proxy again blocked real out-of-scope connection attempts from the real binary
+(`cybermedic.buzz`, `defendervault.shop`, `safesentinel.lol`, `shieldvertex.mom`,
+`virusinspector.top`); katana blocked 1 (`burpsuite`-related host); nuclei blocked 6
+(`checkip.amazonaws.com`, `login.microsoftonline.com`, `www.rdap.net`); `soft404_check` (now on
+`CollectionGateway`) ran cleanly end to end against the real target. This same run is what
+surfaced the `param_fuzz: UNTRUSTED_NETWORK_TOOL` false-warning that led to finding and fixing the
+`cloud_bucket_enum`/`ScopeEnforcingProxy` authorization-mismatch bug documented above — a live run
+against the real target, not a synthetic test, is what caught it. A follow-up direct
+`CloudBucketEnumPlugin.run()` invocation against `virusbarrier.xyz` with cloud collection
+explicitly authorized confirmed the fix: 0 existing buckets reported (down from a nonsensical 106
+before the fix), against 159 real candidate probes. Crawler confinement is additionally verified
+against the real installed katana and hakrawler binaries in a controlled local redirect chain; a
+real subprocess proves the one thing the confinement proxy cannot do (stop a raw-socket bypass).
+`tests/test_opsec_proxy_chaining.py` proves the external-proxy-chaining fix with a second real
+`ScopeEnforcingProxy` standing in as the external proxy, and a manual check drove the real httpx
+binary through the full `httpx -> Hydra proxy -> external proxy -> real server` chain successfully.
 
 **KNOWN LIMITATIONS:** see the eleven items enumerated above (REMAINING LIMITATIONS) — none of
 them constitute a known, currently-exploitable authorization bypass; each is either a structural

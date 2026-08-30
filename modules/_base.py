@@ -304,17 +304,34 @@ class BaseToolPlugin(ReconPlugin):
         from core.intel.scope import require_collection_scope
 
         if self.name not in PROXY_VERIFIED_TOOLS:
-            # Honest labeling, not a false guarantee: the proxy is started
-            # (it costs nothing and may still help), but this tool's actual
-            # respect for `-proxy` has not been verified against its real
-            # binary the way katana/hakrawler/nuclei have. See
-            # core/collection/crawler_proxy.py:PROXY_VERIFIED_TOOLS.
-            context.add_warning(
-                f"{self.name}: UNTRUSTED_NETWORK_TOOL — this collector is not in "
-                f"PROXY_VERIFIED_TOOLS; its adherence to the confinement proxy has "
-                f"not been verified against its real binary, so it must not be "
-                f"treated as scope-confined"
-            )
+            if self.external_dependency:
+                # Honest labeling, not a false guarantee: the proxy is
+                # started (it costs nothing and may still help), but this
+                # EXTERNAL BINARY's actual respect for `-proxy` has not been
+                # verified against its real binary the way
+                # katana/hakrawler/nuclei/httpx have. See
+                # core/collection/crawler_proxy.py:PROXY_VERIFIED_TOOLS.
+                context.add_warning(
+                    f"{self.name}: UNTRUSTED_NETWORK_TOOL — this external binary is "
+                    f"not in PROXY_VERIFIED_TOOLS; its adherence to the confinement "
+                    f"proxy has not been verified against its real binary, so it "
+                    f"must not be treated as scope-confined"
+                )
+            else:
+                # A built-in (Python, no external binary) collector using
+                # this confinement mechanism directly rather than through
+                # CollectionGateway. The "verified against its real binary"
+                # framing above is inapplicable — there is no binary — but
+                # this specific plugin still hasn't been proven with its own
+                # dedicated live test the way soft404_check/param_fuzz/
+                # cloud_bucket_enum have (see tests/test_urllib_confinement_live.py).
+                context.add_warning(
+                    f"{self.name}: UNVERIFIED_BUILTIN_COLLECTOR — this built-in "
+                    f"Python collector is not in PROXY_VERIFIED_TOOLS; it has not "
+                    f"been proven with a dedicated live test against a real local "
+                    f"server the way other built-in collectors using this same "
+                    f"mechanism have"
+                )
 
         scope = require_collection_scope(context)
         proxy = ScopeEnforcingProxy(

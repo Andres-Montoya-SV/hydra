@@ -16,10 +16,13 @@ tricking naive host-parsing into authorizing the wrong destination.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from config.settings import Settings
 from core.intel.scope import CollectionScope, allows_active_collection
+from core.models import DomainTarget, PipelineContext
 from modules.httpx import HttpxPlugin
 
 SCOPE = CollectionScope.from_seeds(["allowed.test"], patterns=["allowed.test"])
@@ -136,3 +139,51 @@ async def test_httpx_redirect_hop_resists_url_confusion(
         assert requested, f"{label}: expected the authorized hop to actually be requested"
     else:
         assert requested == [], f"{label}: {location!r} must never reach the follow-up request"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "location",
+    [
+        "file:///etc/passwd",
+        "data:text/html,<script>evil</script>",
+        "javascript:alert(1)",
+        "vbscript:msgbox(1)",
+        "about:blank",
+        "gopher://oos.test/1",
+        "ftp://oos.test/secret",
+        "blob:https://oos.test/uuid",
+    ],
+)
+async def test_httpx_redirect_rejects_dangerous_schemes(location: str) -> None:
+    """Explicit scheme allowlist ({'http', 'https'}) — a redirect Location to
+    any other scheme is never followed, and the audit trail records exactly
+    why (`blocked_scheme:...`), distinct from a plain scope denial."""
+    settings = Settings(project_root=".")
+    plugin = HttpxPlugin(settings)
+    requested: list[str] = []
+
+    async def fake_fetch(context, target, *, suffix, record_index, hop, confinement_proxy_url=""):
+        requested.append(target.raw)
+        return None
+
+    plugin._fetch_single_hop = fake_fetch  # type: ignore[method-assign]
+    context = PipelineContext(
+        targets=[DomainTarget(domain="allowed.test")],
+        output_dir=Path("."),
+        collection_scope=SCOPE,
+    )
+    record = {
+        "input": "allowed.test",
+        "host": "allowed.test",
+        "url": "https://allowed.test/foo",
+        "status_code": 302,
+        "location": location,
+    }
+    await plugin._resolve_authorized_redirects(context, record, SCOPE, "", 0)
+
+    assert requested == [], f"{location!r} must never reach the follow-up request"
+    network_requests = context.metadata.get("network_requests") or []
+    assert network_requests, "the denial must be recorded in the audit trail"
+    assert network_requests[0]["decision"] == "DENY"
+    assert network_requests[0]["reason"].startswith("blocked_scheme:")

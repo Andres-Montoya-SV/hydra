@@ -60,9 +60,16 @@ the client.
 
 ## PROXY_VERIFIED_TOOLS (updated this turn)
 
-`core/collection/crawler_proxy.py:PROXY_VERIFIED_TOOLS` now lists **five** confirmed-live
-entries, up from three: `katana`, `hakrawler`, `nuclei` (prior turns), plus **`httpx`**
-and **`browser_probe`**, both added this turn after live verification:
+`core/collection/crawler_proxy.py:PROXY_VERIFIED_TOOLS` now lists **eight** confirmed-live
+entries, up from five: `katana`, `hakrawler`, `nuclei`, `httpx`, `browser_probe` (prior turns),
+plus **`soft404_check`, `param_fuzz`, and `cloud_bucket_enum`**, all three added this turn after
+each got its own dedicated live test — a prior version of this document argued they didn't need
+one because they share `soft404_check`'s exact `http_get(url, proxy_url=...)` call shape. That
+argument turned out to be wrong: writing `param_fuzz`'s and `cloud_bucket_enum`'s own live tests
+is exactly what surfaced the real `_CLOUD_BUCKET_ENUM_OPERATIONS` authorization-mismatch bug
+documented above, which a shared-code-path assumption would have missed entirely (the bug was in
+`ScopeEnforcingProxy`'s re-check, not in `http_get` — a layer the "shared call shape" argument
+never actually examined).
 
 - `tests/test_httpx_confinement_live.py` — the real installed httpx binary, routed
   through the real proxy via `-proxy`. Proves both directions (authorized target
@@ -71,16 +78,11 @@ and **`browser_probe`**, both added this turn after live verification:
 - `tests/test_browser_confinement_live.py` — real WebKit, launched by the real
   `BrowserProbePlugin.run()` with Playwright's `proxy=` launch option pointed at the
   real confinement proxy. Same two directions, real local server.
-- `tests/test_urllib_confinement_live.py` — the real `Soft404CheckPlugin.run()`
-  (representative of all three `http_get`-based plugins, which share the identical
-  call shape) against a real local server, same two directions.
-
-`soft404_check`/`param_fuzz`/`cloud_bucket_enum` are not external subprocess binaries
-(they are Hydra's own Python code calling `urllib.request` directly) — `PROXY_VERIFIED_TOOLS`
-specifically tracks *external binaries whose respect for a `-proxy` CLI flag can't be
-assumed*, so this classification doesn't apply to them the same way; their proxy usage
-is proven the same way browser_probe's is — a live test against a real server — and is
-documented as such rather than silently folded into `PROXY_VERIFIED_TOOLS`.
+- `tests/test_urllib_confinement_live.py` — the real `.run()` method of all three
+  `http_get`-based plugins (`soft404_check`, `param_fuzz`, `cloud_bucket_enum`) against a
+  real local server: authorized-reaches-through, in-scope-hostname-resolving-private-IP-
+  denied, `cloud_bucket_enum`'s cloud-opt-in-required and cloud-opt-in-granted cases, and
+  the genuine-DNS-failure-never-false-positives regression test for the bug above.
 
 ## OPSEC proxy chaining (closed this turn)
 
@@ -226,6 +228,98 @@ string — connection-level confinement (proxy + SSRF) still applies to them via
 does not yet. Retrofitting them is the same kind of bounded next increment this whole
 arc has repeatedly deferred rather than rushed; not doing it this turn is a stated
 scope decision, not an oversight.
+
+## A real bug found by writing real tests, not assumed away (this turn)
+
+Adding live tests for `param_fuzz`/`cloud_bucket_enum` (see `PROXY_VERIFIED_TOOLS` above) —
+rather than assuming they were equally proven because they share `soft404_check`'s exact
+`http_get(url, proxy_url=...)` call shape — surfaced a real, previously-undetected bug specific
+to `cloud_bucket_enum`, live-confirmed against a run against `virusbarrier.xyz` (which showed
+`param_fuzz: UNTRUSTED_NETWORK_TOOL` in its warnings, prompting the investigation) and then
+reproduced deterministically:
+
+**The bug.** `ScopeEnforcingProxy._authorize_with_reason` re-checked every destination via
+`allows_active_collection(host, scope)`, which internally calls `authorize_active_indicator(...,
+operation="active_collection", ...)` — a hardcoded, generic operation label. `cloud_bucket_enum.py`'s
+own pre-check correctly authorizes a generated bucket hostname via `authorize_active_indicator(url,
+scope, "cloud_bucket_enum", ...)`, which requires the *literal* operation string
+`"cloud_bucket_enum"` to unlock the explicit cloud-collection opt-in path (`CollectionScope.
+cloud_collection_allowed`). The proxy's generic re-check never supplied that string, so it always
+fell through to ordinary registrable-domain scope matching — which a generated bucket hostname
+(`{bucket}.s3.amazonaws.com`) can never pass — and denied every single candidate with a bare local
+403, **even when the operator had explicitly opted into cloud collection**.
+
+**The consequence.** `cloud_bucket_enum.py`'s own classifier (`_classify`) treats a bare HTTP 403
+with no distinguishing body as `"exists_private"` for GCS and Azure (a real cloud provider's
+access-denied signal looks exactly like this). Since the proxy's own denial *is* a bare 403, every
+GCS/Azure candidate that reached the confinement proxy was misclassified as an existing,
+access-restricted bucket — a live test run showed 106 "existing buckets" out of 159 candidates,
+an obviously-wrong ~67% hit rate. This was not a security bypass (nothing was ever actually
+reached that shouldn't have been — if anything the plugin was *more* restrictive than intended),
+but it silently made the plugin's actual output useless from the moment it was retrofitted onto
+the confinement proxy.
+
+**The fix.** `authorize_active_indicator`'s cloud-endpoint gate now accepts a small explicit set,
+`_CLOUD_BUCKET_ENUM_OPERATIONS = {"cloud_bucket_enum", "cloud_enum"}` (`core/intel/authorize.py`)
+— the plugin's own literal operation string, and its declared `capability` (`"cloud_enum"`, what
+`ScopeEnforcingProxy` actually has available to it). `ScopeEnforcingProxy._authorize_with_reason`
+now calls `authorize_active_indicator(host, self.scope, self.capability, "confinement_proxy_recheck")`
+directly instead of the generic `allows_active_collection`, so its re-check applies the exact same
+special-case logic the plugin's own pre-check does. A real run against `virusbarrier.xyz` with
+cloud collection explicitly authorized now correctly reports **0** existing buckets (verified: none
+of the 53 randomly-generated candidate names are real allocated buckets), not 106.
+
+**A related, non-security accuracy limitation surfaced by the same investigation, verified safe:**
+Azure and GCS candidate names that genuinely don't exist normally produce a real DNS NXDOMAIN —
+`cloud_bucket_enum.py`'s own `_is_dns_failure` already special-cases this as the expected "not
+taken" signal for Azure. With the destination-IP/SSRF layer now resolving DNS *before* `http_get`
+ever runs, a genuine NXDOMAIN is caught by `ScopeEnforcingProxy`'s own resolution and denied as
+`dns_resolution_failed` — correctly fail-closed — but the CONNECT tunnel failure this produces
+surfaces to `http_get` as `status_code=None, error="<urlopen error Tunnel connection failed: 403
+Forbidden>"`, a string `_is_dns_failure` doesn't recognize, so `_classify` reports `"unknown"`
+instead of the more informative `"not_found"`. Verified via
+`tests/test_urllib_confinement_live.py::test_cloud_bucket_enum_genuine_dns_failure_never_reports_false_exists`
+that this never degrades into a false `"exists_private"`/`"public_listable"` — the safety property
+that actually matters — even though the accuracy of the "not found" signal is diminished for this
+one heuristic. Not fixed this turn: doing so well means either fragile string-matching on urllib's
+internal error text, or a larger change to make the audit trail distinguish "denied for security
+reasons" from "the plugin's own DNS-failure heuristic," which is a real, bounded increment for a
+future turn, not a security gap today.
+
+## A second real bug found by adding the test the mission specifically asked for
+
+Adding an explicit test for the mission's own named dangerous-scheme list (`file:`, `data:`,
+`javascript:`, `vbscript:`, `about:`, plus the pre-existing `gopher:`/`ftp:`/`blob:`) surfaced
+that `modules/httpx.py`'s scheme check only looked at `urlparse(next_url).scheme` when `"://" in
+next_url` — true for `file://`, `gopher://`, `ftp://`, and `blob:https://...` (which embeds
+`://`), but **false** for `javascript:`, `data:`, `vbscript:`, and `about:`, none of which use a
+`//` authority component at all. Those four schemes silently skipped the explicit scheme check
+and fell through to ordinary hostname-based authorization instead — which still denied them today
+(they have no parseable hostname), so this was never an actual bypass, but it meant the *wrong*
+check was doing the denying, for the wrong reason, in a way that was fragile rather than
+guaranteed. Fixed by computing `urlparse(next_url).scheme` unconditionally — `urlparse` correctly
+extracts a scheme from both `scheme://netloc/...` and single-colon `scheme:opaque` forms. All 8
+dangerous schemes now produce the specific `blocked_scheme:...` audit reason, verified in
+`tests/test_url_normalization_adversarial.py::test_httpx_redirect_rejects_dangerous_schemes`
+(parametrized over all 8, asserting both zero requests issued and the exact audit-trail reason).
+
+## Host graph vs. Intel confidence: confirmed non-contradictory, not just spot-checked
+
+A prior turn's own "REMAINING LIMITATIONS" repeatedly listed this as "spot-checked, not
+exhaustively re-audited." This turn traced it to a definitive answer: `core/intelligence/
+clustering.py:compute_clusters` (the Host-cluster confidence assignment) imports
+`cluster_signal_confidence` directly from `core/intel/correlate.py` — the same module Intel's own
+relationship correlation uses — and that function's own docstring states its purpose plainly:
+"Map Host-view clusters onto the same named bands as IntelEngine." ASN/CDN/WAF/CIDR/favicon/
+body_hash all map to `ConfidenceBand.LOW` in that one shared function; large (≥20-member)
+certificate clusters are downgraded to `MEDIUM` instead of the default `HIGH` — matching this
+turn's mission's own explicit correlation-rules guidance without needing new code. Separately,
+`IntelEngine.to_infrastructure_graph()` derives its own graph edges directly from `self.
+relationships` using `band_score(rel.confidence)` — the identical confidence value already
+computed for the canonical Intel relationship, not an independent recomputation. There is one
+function computing Host-cluster confidence and one path deriving the Intel-projected graph's
+confidence from Intel's own relationships — not two competing correlation engines that could
+silently disagree.
 
 ## What was checked and found already correct (not touched)
 

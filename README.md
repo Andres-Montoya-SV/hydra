@@ -538,33 +538,55 @@ class MyToolPlugin(BaseToolPlugin):
 ### Network boundary — what is actually enforced
 
 Full detail, exact code citations, and how each claim was verified:
-[`docs/FINAL_SECURITY_AUDIT.md`](docs/FINAL_SECURITY_AUDIT.md) and
-[`docs/NETWORK_BOUNDARY_AUDIT.md`](docs/NETWORK_BOUNDARY_AUDIT.md). Summary:
+[`docs/FINAL_SECURITY_AUDIT.md`](docs/FINAL_SECURITY_AUDIT.md),
+[`docs/FINAL_NETWORK_BOUNDARY_AUDIT.md`](docs/FINAL_NETWORK_BOUNDARY_AUDIT.md), and
+[`docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md`](docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md). Summary:
 
-**Guaranteed by Hydra** (application-level, verified against real binaries/browsers, not mocks):
-no active-collection plugin can make a network/subprocess call without an attached
-`CollectionScope` (all 19 active-collection plugins are covered by one test); every HTTP redirect
-hop httpx follows is individually authorized before the request; every browser request —
-document, iframe, every subresource type, and WebSocket, including `window.open()` popups — is
-authorized before the connection, fail-closed on any error evaluating the policy; katana,
-hakrawler, and nuclei are routed through a local scope-enforcing proxy
-(`core/collection/crawler_proxy.py`) for every connection they make beyond their authorized seed
-list, so a tool that discovers and follows a link or redirect on its own still cannot reach an
-out-of-scope host.
+**Guaranteed by Hydra** (application-level, verified against real binaries/browsers/local
+servers, not mocks): no active-collection plugin can make a network/subprocess call without an
+attached `CollectionScope` (all 19 active-collection plugins are covered by one test). A single
+mechanism, `ScopeEnforcingProxy` (`core/collection/crawler_proxy.py`), is the connection-level
+enforcement point for six components — katana, hakrawler, nuclei, **httpx** (both the seed probe
+and every redirect hop), **browser_probe** (WebKit's own network stack via Playwright's
+launch-time `proxy=`, not just JS-visible `route()` interception), and the urllib-based
+`soft404_check`/`param_fuzz`/`cloud_bucket_enum` — so a tool that discovers or is redirected to a
+destination on its own still cannot reach an out-of-scope host. Beyond the hostname check, every
+one of these resolves the destination and validates the actual IP
+(`core/collection/ssrf.py`) against loopback/RFC1918/CGNAT/link-local/metadata/multicast/reserved
+ranges (IPv4 and IPv6, including IPv4-mapped IPv6 literals) before connecting to the exact
+resolved address — not a second, independent resolution at connect time, closing the DNS-rebinding/
+TOCTOU window a naive "authorize-then-connect" design would leave open. An operator-configured
+external OPSEC proxy (`OUTBOUND_PROXY_URL`) is never talked to directly by any of these six
+components — `ScopeEnforcingProxy` chains to it internally, so Hydra's own authorization always
+runs before anything is forwarded to it. `core/collection/gateway.py:CollectionGateway` — whose
+`http_get()` only accepts a sealed `AuthorizedCollectionTarget`, not a bare URL string, checked at
+runtime — is the structural (not just conventional) entry point for one plugin so far
+(`soft404_check`); `AuthorizedCollectionTarget`'s own constructor unconditionally rejects direct
+construction (including via `dataclasses.replace()`), closing a real forgery gap a plain frozen
+dataclass never closed. A static guard (`tests/test_no_bypass_network_primitives.py`) fails the
+test suite if a future built-in collector imports a raw network primitive without an explicit,
+justified exception.
 
-**Guaranteed only when the tool itself supports it**: the crawler proxy authorizes by destination
-host, not by TLS content — `CONNECT` tunnels are never decrypted or inspected, only the tunnel
-target is checked. nuclei's interactsh OOB channel is disabled by default
-(`NUCLEI_ENABLE_INTERACTSH=false`) because it legitimately needs to contact third-party
-ProjectDiscovery infrastructure that per-target scope confinement cannot distinguish from an
-unauthorized destination; enabling it means accepting that specific traffic is unproxied.
+**Guaranteed only when the tool itself supports it, or only past a boundary Hydra doesn't
+control**: the crawler proxy authorizes by destination host, not by TLS content — `CONNECT`
+tunnels are never decrypted or inspected, only the tunnel target is checked. nuclei's interactsh
+OOB channel is disabled by default (`NUCLEI_ENABLE_INTERACTSH=false`) because it legitimately
+needs to contact third-party ProjectDiscovery infrastructure that per-target scope confinement
+cannot distinguish from an unauthorized destination. Once an authorized request is chained through
+an external `OUTBOUND_PROXY_URL`, that proxy resolves and connects to the target from its own
+network location — Hydra's destination-IP pinning does not extend past that hop (Hydra's own
+socket never touches the target directly in this configuration either way). `param_fuzz.py` and
+`cloud_bucket_enum.py` still call the shared HTTP helper with a bare URL string rather than going
+through `CollectionGateway` — connection-level confinement still applies to them, the type-level
+guarantee does not yet.
 
 **Requires external network isolation** (outside anything Hydra's own code can enforce): a tool
 that ignores its own configured `-proxy` — a bug, or a raw-socket code path bypassing its
-configured HTTP transport — is invisible to the confinement proxy. Nothing at the OS/process
-level stops this; closing it needs a network-namespaced or firewalled sandbox around the whole
-Hydra process, which is an operational choice, not a Hydra feature. DNS resolution is not
-proxied by `STRICT_OPSEC` either — see `check-opsec`'s DNS-leak check, which reports this
+configured HTTP transport — is invisible to the confinement proxy, demonstrated concretely with a
+real subprocess in `tests/test_untrusted_network_bypass.py`, not merely asserted. Nothing at the
+OS/process level stops this; closing it needs a network-namespaced or firewalled sandbox around
+the whole Hydra process, which is an operational choice, not a Hydra feature. DNS resolution is
+not proxied by `STRICT_OPSEC` either — see `check-opsec`'s DNS-leak check, which reports this
 honestly as informational, not a guarantee. **Hydra does not claim universal process-level or
 OS-level network confinement**, and no documentation here should be read as claiming it.
 

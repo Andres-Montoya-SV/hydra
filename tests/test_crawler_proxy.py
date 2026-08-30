@@ -191,10 +191,10 @@ async def test_missing_scope_denies_every_connection() -> None:
 async def test_authorization_exception_denies_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     import core.collection.crawler_proxy as crawler_proxy_module
 
-    def boom(host: str, scope: object) -> bool:
+    def boom(host: str, scope: object, operation: str, reason: str) -> object:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(crawler_proxy_module, "allows_active_collection", boom)
+    monkeypatch.setattr(crawler_proxy_module, "authorize_active_indicator", boom)
 
     proxy = ScopeEnforcingProxy(_scope(), capability="crawl")
     await proxy.start()
