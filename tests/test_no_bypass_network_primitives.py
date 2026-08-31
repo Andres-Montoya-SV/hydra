@@ -59,7 +59,17 @@ ALLOWED_DIRECT_NETWORK_IMPORTS: dict[str, str] = {
 _EXEMPT_FILES = {"__init__.py", "_base.py"}
 
 _PROHIBITED_TOP_LEVEL_IMPORTS = {"requests", "aiohttp"}
-_PROHIBITED_DOTTED_IMPORTS = {"urllib.request"}
+# `core.http_probe.http_get` is Hydra's own low-level urllib primitive —
+# legitimate to call from *inside* `core/collection/gateway.py:
+# CollectionGateway.http_get()` (which type-checks its caller's argument as
+# `AuthorizedCollectionTarget` before ever reaching it), but a plugin
+# importing it directly would bypass that check entirely: `http_get()` itself
+# has no way to refuse a raw string, since CollectionGateway must hand it
+# one (the authorized target's own `.raw` field) after authorization has
+# already happened. `core/collection/gateway.py` lives outside `modules/`,
+# so this entry only ever fires on the bypass this guard exists to prevent —
+# a plugin reaching around CollectionGateway for the same primitive it wraps.
+_PROHIBITED_DOTTED_IMPORTS = {"urllib.request", "core.http_probe"}
 _PROHIBITED_CALLS = {
     ("socket", "socket"),
     ("socket", "create_connection"),
@@ -135,6 +145,26 @@ def test_guard_actually_fires_on_a_synthetic_bypass(tmp_path: Path) -> None:
     hits = _scan(bad_file)
     assert hits, "the guard failed to detect a direct `requests` import"
     assert "bad_collector.py" not in ALLOWED_DIRECT_NETWORK_IMPORTS
+
+
+def test_guard_detects_direct_import_of_hydras_own_http_probe_primitive(
+    tmp_path: Path,
+) -> None:
+    """The bypass this guard would otherwise miss entirely: `requests`/
+    `urllib.request` are prohibited, but nothing stopped a new module from
+    importing Hydra's *own* internal primitive (`core.http_probe.http_get`)
+    directly and calling it with a raw, unauthorized URL string — completely
+    skipping `CollectionGateway`'s `isinstance(target, AuthorizedCollectionTarget)`
+    check, since that check lives one layer up, not inside `http_get()` itself."""
+    bad_file = tmp_path / "bad_gateway_bypass_collector.py"
+    bad_file.write_text(
+        "from core.http_probe import http_get\n\n"
+        "def bad_collector(url):\n"
+        "    return http_get(url, timeout=5)\n"
+    )
+    hits = _scan(bad_file)
+    assert hits, "the guard failed to detect a direct core.http_probe import"
+    assert "bad_gateway_bypass_collector.py" not in ALLOWED_DIRECT_NETWORK_IMPORTS
 
 
 def test_guard_detects_raw_socket_and_asyncio_connection_calls(tmp_path: Path) -> None:

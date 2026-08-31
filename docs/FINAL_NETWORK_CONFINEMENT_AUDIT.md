@@ -483,3 +483,161 @@ as query data (an operator-authorization concern, since even the domain name
 itself is being disclosed to a third party), not a connection to authorize.
 No code change follows from this — the existing `INPUT_GATED_ONLY`
 disposition was already correct.
+
+---
+
+# FINAL ADVERSARIAL NETWORK-CONFINEMENT PROOF
+
+Everything below this line is a fresh, from-scratch forensic pass — every
+existing claim above (including this document's own prior sections) was
+treated as unverified until re-confirmed against current code and, where a
+claim concerns runtime behavior, a real running process. Sections 19–20 of
+the source prompt for this round (intelligence/correlation truth and
+reporting reproducibility) are explicitly out of scope — see "Known
+limitations" (Section L) for what was noticed but not evaluated.
+
+## A. Complete network primitive inventory
+
+Method: `grep -rl` across `core/`, `modules/`, `config/`, `utils/`, `app.py`,
+`ui/` for every primitive named in the audit brief (`socket`, `asyncio.open_*`/
+`start_server`, `urllib`, `requests`, `httpx`, `aiohttp`, `playwright`), plus a
+separate sweep for `subprocess`/`run_command` (external binaries). Every
+matching file was opened and read this round, not classified from its name.
+
+| # | Location | Primitive | Prod/Test | Destination controlled by Hydra? | Class |
+|---|---|---|---|---|---|
+| 1 | `core/collection/gateway.py:CollectionGateway.http_get()` | urllib (via `core/http_probe.py`) | Prod | Yes — only accepts `AuthorizedCollectionTarget` (runtime `isinstance` check) | **A** |
+| 2 | `core/http_probe.py:http_get()` | urllib | Prod (internal primitive) | N/A at this layer — protected by being unreachable except via #1, see Section 23 finding below | **A** (as of this round's fix) |
+| 3 | `modules/soft404_check.py` | via #1 | Prod | Yes | **A** |
+| 4 | `modules/param_fuzz.py` | via #1 | Prod | Yes | **A** |
+| 5 | `modules/cloud_bucket_enum.py` | via #1 | Prod | Yes, plus `cloud_collection_allowed` opt-in | **A** |
+| 6 | `modules/httpx.py` (subprocess binary + `AuthorizedCollectionTarget.authorize_verbose()` per redirect hop) | subprocess + `-proxy` | Prod | Yes | **B** |
+| 7 | `modules/browser_probe.py` (Playwright/WebKit) | `proxy=` + `route()` guard | Prod | Yes | **B** |
+| 8 | `modules/katana.py` (subprocess binary) | `-proxy` | Prod | Yes (connection-level); input pre-gated | **B** |
+| 9 | `modules/hakrawler.py` (subprocess binary) | `-proxy` | Prod | Yes (connection-level); input pre-gated | **B** |
+| 10 | `modules/nuclei.py` (subprocess binary) | `-proxy`, `-ni` unless opt-in | Prod | Yes (connection-level); input pre-gated | **B** |
+| 11 | `core/collection/whois_client.py` (native TCP:43) | `asyncio.open_connection` | Prod | Yes — every hop's IP validated via `core/collection/ssrf.py` before connecting | **B*** (not HTTP-proxyable; same SSRF mechanism applied directly per hop) |
+| 12 | `modules/naabu.py` (subprocess, raw TCP/SYN) | subprocess | Prod | Authorization-only; **not proxy-confinable at all** (architectural, documented) | **C** |
+| 13 | `modules/port_verify.py` (subprocess nmap) | subprocess | Prod | Same as #12 | **C** |
+| 14 | `modules/dnsx.py` (subprocess) | DNS query | Prod | Input-gated; DNS query has no "destination IP of the target" | **D** |
+| 15 | `modules/wildcard_check.py` (subprocess dnsx) | DNS query | Prod | Same as #14 | **D** |
+| 16 | `modules/ctlogs.py` | urllib, fixed crt.sh | Prod | Fixed destination; domain is query param | **F*** (fixed 3rd-party, not target-directed) |
+| 17 | `modules/threat_intel.py` | urllib, fixed URLhaus | Prod | Fixed destination; host is POST body | **F*** |
+| 18 | `modules/vuln_match.py` | urllib, fixed OSV.dev/WPScan | Prod | Fixed destination | **F*** |
+| 19 | `modules/asn_lookup.py` | `asyncio.open_connection` fixed `whois.cymru.com:43` + DNS zone | Prod | Fixed destination; IPs are query content | **F*** |
+| 20 | `modules/gau.py` | subprocess, internal archive APIs | Prod | Binary-internal, fixed-ish (archive.org/Common Crawl/OTX); domain is `--subs` argument | **F*** |
+| 21 | `modules/waybackurls.py` | subprocess, web.archive.org | Prod | Same as #20 | **F*** |
+| 22 | `modules/subfinder.py`/`amass.py`/`assetfinder.py` | subprocess, many internal OSINT sources | Prod | Binary-internal; `active_collection` not set (defaults False) | **F** (passive discovery, not Hydra-directed) |
+| 23 | `modules/anew.py`, `modules/unfurl.py` | subprocess, stdin/stdout only | Prod | No network at all | **F** |
+| 24 | `modules/security_headers.py` | none (reads existing httpx JSON) | Prod | No network at all | **F** |
+| 25 | `core/webhook.py` | urllib | Prod | Fixed/operator-configured URL, not target-derived | **F*** (`CONTROL_PLANE`) |
+| 26 | `core/opsec_check.py` | `socket.create_connection` (operator's own proxy), `socket.getaddrinfo("example.com", 443)` (hardcoded diagnostic) | Prod (diagnostic command only) | Operator-configured / hardcoded constant | **F*** (`CONTROL_PLANE`) |
+| 27 | `core/dependencies/validation.py` | `asyncio.create_subprocess_exec` (`<binary> --version`/`--help`) | Prod | Local process only, no network destination | **F** |
+| 28 | `IntelEngine`/correlation/SQLite/reporting | none | Prod | No network at all | **F** |
+| 29 | `tests/test_*_confinement_live.py`, `test_crawler_proxy.py`, `test_opsec_proxy_chaining.py`, `test_scope_path_exclusions.py`, `test_ssrf_destination_policy.py`, etc. | real local `socketserver`/`asyncio.start_server` | Test only | Local-only, ephemeral, adversarial harness | **E** |
+
+`*` marks a note on the classification, not a different letter than shown —
+the A–G taxonomy given for this audit has no clean bucket for "fixed,
+non-target-derived third-party API" or "operator-configured control-plane
+destination"; both get folded into **F** with an explicit annotation rather
+than invented new letters, consistent with `docs/ARCHITECTURE_AUDIT_2.md`'s
+own finding that this codebase's real shape needs one more label than a
+strict 4-way (there, 5-way) split provides. Row 11 (WHOIS) similarly isn't
+literally "ScopeEnforcingProxy controlled" (WHOIS isn't HTTP, so the HTTP
+forward proxy doesn't apply) but IS destination-IP-validated per hop by the
+identical mechanism `ScopeEnforcingProxy` itself calls — closer to B than to
+anything else on offer.
+
+## B. Runtime call graph (production paths, runner → socket)
+
+Traced this round by re-reading `core/runner.py:PipelineRunner.run()` top to
+bottom (not assumed from `docs/ARCHITECTURE_AUDIT_2.md`'s prior trace, though
+it agrees) — full stage order already documented there; the network-relevant
+chains are:
+
+```
+PipelineRunner.run()
+  → _run_plugin_chain(subfinder/assetfinder/amass)     → F (internal OSINT, not Hydra-directed)
+  → _run_single_plugin(dnsx)                            → D
+  → asn_lookup                                          → F*
+  → _run_plugin_chain(httpx)                             → B  (AuthorizedCollectionTarget per redirect hop, -proxy)
+  → optional/enrichment stage (parallel where independent):
+      ctlogs                                             → F*
+      katana / hakrawler / nuclei                        → B  (-proxy, PROXY_VERIFIED_TOOLS)
+      gau / waybackurls                                  → F*
+      unfurl                                             → F  (no network)
+      naabu → port_verify                                → C  (unproxyable, input-gated only)
+      browser_probe                                      → B  (proxy=, route() guard)
+      soft404_check / param_fuzz / cloud_bucket_enum      → A  (CollectionGateway)
+      threat_intel                                       → F*
+      vuln_match                                         → F*
+      security_headers                                   → F  (no network)
+      whois                                               → B* (native client, per-hop SSRF)
+  → IntelEngine.finalize() / SQLite persistence           → F
+  → _maybe_collect_followups() (re-enters authorization
+    for every follow-up indicator before the SAME plugins
+    above touch it again)                                → same classes as above, per plugin
+  → reporting (Markdown/HTML/JSON, core/reporter.py)      → F
+```
+
+## C. Authorization map
+
+| Path class | Authorization mechanism | Where enforced |
+|---|---|---|
+| A | `AuthorizedCollectionTarget.authorize()` (sealed, runtime `isinstance`-checked by `CollectionGateway.http_get()`) | `core/collection/target.py`, `core/collection/gateway.py` |
+| B (httpx) | `AuthorizedCollectionTarget.authorize_verbose()` per redirect hop, before the follow-up request; `-proxy` for anything the binary decides to fetch beyond the gated `-list` | `modules/httpx.py`, `core/collection/crawler_proxy.py` |
+| B (browser_probe) | `browser_request_decision()` → `allow_browser_navigation()` → `allows_active_collection()` for every resource type; `proxy=` for WebKit's own network stack | `modules/browser_probe.py`, `core/collection/crawler_proxy.py` |
+| B (katana/hakrawler/nuclei) | Gated `-list`/stdin input (`_authorized_input`) for the seed; `ScopeEnforcingProxy._authorize_with_reason()` (via `-proxy`) for anything discovered afterward | `modules/_base.py:_crawler_confinement`, `core/collection/crawler_proxy.py` |
+| B* (whois) | `core/collection/ssrf.py:validate_destination_ips_async()` per referral hop | `core/collection/whois_client.py` |
+| C (naabu/port_verify) | `_gate_active_input`/authorized target list only, before the scan starts — no per-connection check possible | `modules/naabu.py`, `modules/port_verify.py` |
+| D (dnsx/wildcard_check) | `authorize_plugin_input`/`allows_active_collection` on the name list before resolution | `modules/dnsx.py`, `modules/wildcard_check.py` |
+| F* (fixed third-party) | Authorizes *which target string* is disclosed as query data, not a connection | per-module (ctlogs/threat_intel/vuln_match/asn_lookup/gau/waybackurls) |
+
+Every path in classes A/B/B\* independently re-validates the **destination
+IP**, not just the hostname, via `core/collection/ssrf.py` — this is the
+DNS-rebinding/TOCTOU closure, re-verified live in Section G/I below.
+
+## D. External tool map — what Hydra can and cannot constrain
+
+| Tool | Input gated? | Internal navigation confined? | Mechanism | Residual risk |
+|---|---|---|---|---|
+| `httpx` | Yes | Yes — no `-follow-redirects`; each hop is re-authorized in Python before the next request | `AuthorizedCollectionTarget` + `-proxy` | Only a raw-socket bypass inside the binary itself (never observed; see `tests/test_untrusted_network_bypass.py`) |
+| `katana` | Yes | Yes — proxy-confined | `-proxy` | Same raw-socket caveat |
+| `hakrawler` | Yes | Yes — proxy-confined (also appears to refuse cross-host redirects internally without `-subs`, verified empirically, not from docs) | `-proxy` | Same raw-socket caveat |
+| `nuclei` | Yes | Yes — proxy-confined; interactsh OOB disabled by default | `-proxy`, `-ni` | Same raw-socket caveat; OOB opt-in is an explicit, documented exception |
+| `dnsx` / `wildcard_check` | Yes | N/A (DNS query, not a connection) | `authorize_plugin_input` | None beyond DNS's own nature |
+| `naabu` / `port_verify` | Yes | **No — architecturally impossible.** Raw TCP/SYN cannot be routed through an HTTP forward proxy. | Authorized input list only | **Documented, accepted residual** (confirmed still accurately reflected in this doc and `README.md` — see Section D confirmation below) |
+| `subfinder`/`amass`/`assetfinder` | Seed only | No visibility into internal per-source queries at all | N/A — not `active_collection` | Binary-internal OSINT queries are outside Hydra's observation, an inherent property of wrapping these tools, not a confinement gap (nothing here is target-*collection*, it's discovery) |
+| `gau`/`waybackurls` | Seed domain only | N/A — never connects to the target | N/A (F\*) | None — destination is never the target |
+| WHOIS (native client) | Root domain | Yes — every hop of its own referral chain (IANA → registry → registrar) is Hydra's own connection, SSRF-validated | `core/collection/whois_client.py` | None beyond the SSRF policy's own known blocklist scope |
+
+**naabu/port_verify confirmation** (per this round's explicit instruction to
+re-confirm, not re-litigate): `README.md` § Security Considerations and this
+document's own `naabu`/`port_verify` table rows (added last round) both still
+state the same thing verified here again — re-read both files this round,
+text unchanged and accurate, no drift found.
+
+### A real bypass-pattern gap found this round (Section 23), fixed immediately
+
+Searching specifically for `urlopen(...)`/direct primitive use "outside the
+gateway/proxy architecture" (per this round's Section 23) surfaced that
+`tests/test_no_bypass_network_primitives.py` — the static guard that fails
+CI if a `modules/*.py` file imports `requests`/`aiohttp`/`urllib.request` or
+calls a raw socket/asyncio primitive directly — did **not** cover a plugin
+importing `core.http_probe.http_get` directly. That function is Hydra's own
+internal urllib primitive, the one `CollectionGateway.http_get()` itself
+calls after checking its caller passed a real `AuthorizedCollectionTarget` —
+but nothing stopped a *different* module from importing it directly and
+calling `http_get(raw_url, ...)`, skipping that check entirely, since the
+check lives one layer up (in `CollectionGateway`), not inside `http_get()`
+itself (which structurally cannot refuse a plain string — `CollectionGateway`
+has to hand it one, `target.raw`, after authorization already happened).
+
+Verified no module currently does this (`grep` across `modules/`: zero
+hits other than the sanctioned `core/collection/gateway.py`, which lives
+outside `modules/` and is unaffected by this guard) — this was a **latent
+architectural gap** (class **G**, nothing preventing it), not an active
+bypass. Closed by adding `core.http_probe` to the guard's prohibited dotted
+imports, plus a new synthetic test proving the guard now catches it
+(`test_guard_detects_direct_import_of_hydras_own_http_probe_primitive`).
+Zero G-class paths remain in production as of this commit.
