@@ -231,7 +231,17 @@ async def test_threat_intel_never_discloses_injected_oos_host_as_query_data(
     this hostname" and "Hydra told a third party about this hostname"."""
     output_dir = tmp_path / "run"
     output_dir.mkdir()
-    scope = CollectionScope.from_seeds(["allowed.alive-integrity-test.internal"])
+    # Explicit exact-match `patterns=` (not left to the no-SCOPE_FILE "same
+    # registrable root" fallback) — "allowed.X" and "evil.X" are siblings
+    # under the same root here (".internal" isn't a recognized public
+    # suffix), so without an explicit pattern both would legitimately
+    # classify IN_SCOPE by Hydra's own documented fallback behavior. This
+    # matches the SEED/OOS convention used everywhere else in this suite
+    # (e.g. test_opsec_proxy_chaining.py's `patterns=[SEED]`).
+    scope = CollectionScope.from_seeds(
+        ["allowed.alive-integrity-test.internal"],
+        patterns=["allowed.alive-integrity-test.internal"],
+    )
     context = PipelineContext(
         targets=[DomainTarget(domain="allowed.alive-integrity-test.internal")],
         output_dir=output_dir,

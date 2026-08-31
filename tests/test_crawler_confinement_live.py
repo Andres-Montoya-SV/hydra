@@ -191,6 +191,44 @@ async def test_katana_oos_url_injected_into_input_never_reaches_the_real_server(
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(shutil.which("hakrawler") is None, reason="hakrawler binary not installed")
+async def test_hakrawler_oos_url_injected_into_input_never_reaches_the_real_server(
+    tmp_path: Path, oos_server: int
+) -> None:
+    """Same attack shape as the katana test above, against hakrawler: an
+    out-of-scope URL already sitting in alive.txt (a simulated leak from an
+    upstream module), not something hakrawler discovers on its own. hakrawler
+    reads stdin directly (`_alive_urls(context)`, not a `-list` file), so the
+    pre-filter layer here is `filter_authorized_indicators` inside
+    `_alive_urls` rather than an `authorized_katana_*` file — the real
+    destination server's hit count is what actually proves it, regardless of
+    which layer caught it."""
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    oos_url = f"http://localhost:{oos_server}/leaked"
+    write_lines(output_dir / "alive.txt", [oos_url], base_dir=output_dir)
+
+    settings = Settings(project_root=tmp_path)
+    context = PipelineContext(
+        targets=[DomainTarget(domain="127.0.0.1")],
+        output_dir=output_dir,
+        collection_scope=CollectionScope.from_seeds(
+            ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+        ),
+    )
+    context.alive_urls = [oos_url]
+
+    plugin = HakrawlerPlugin(settings)
+    result = await plugin.run(context, output_dir / "resolved.txt")
+
+    assert _CountingHandler.hits == [], (
+        "an out-of-scope URL already present in alive.txt (simulating a "
+        "leak from another module) must never reach the real server"
+    )
+    assert result.skipped or result.success
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("hakrawler") is None, reason="hakrawler binary not installed")
 async def test_hakrawler_redirect_escape_is_blocked_by_confinement_proxy(
     tmp_path: Path, oos_server: int
 ) -> None:
