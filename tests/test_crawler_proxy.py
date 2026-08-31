@@ -155,7 +155,9 @@ async def test_stop_waits_for_in_flight_connection_tasks(destination) -> None:
 
     await proxy.stop()
 
-    assert proxy._active_tasks == set(), "stop() must not return while a connection task is still running"
+    assert (
+        proxy._active_tasks == set()
+    ), "stop() must not return while a connection task is still running"
     writer.close()
 
 

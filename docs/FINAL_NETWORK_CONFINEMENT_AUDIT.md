@@ -46,7 +46,8 @@ the client.
 | soft404_check (via `CollectionGateway`) | `modules/soft404_check.py` | already-alive host + its derived canary URL | Yes — **structural this turn**: `_probe_host` receives `AuthorizedCollectionTarget` objects (both root and canary, independently authorized), never a raw URL string; `gateway.http_get()` raises `TypeError` on anything else | Yes, via the gateway's owned confinement proxy | No | Yes | No | TARGET_COLLECTION | **GUARANTEED, structurally** — see the `CollectionGateway` section below |
 | param_fuzz / cloud_bucket_enum (via `CollectionGateway`) | `modules/param_fuzz.py`, `modules/cloud_bucket_enum.py` | already-alive host + per-parameter probe URL / candidate cloud bucket hostname | Yes — **structural this turn**: every baseline, per-parameter probe, canary, and candidate URL is authorized via `gateway.authorize(raw, operation=...)`, returning an `AuthorizedCollectionTarget` — never a raw URL string reaches `gateway.http_get()`; `cloud_bucket_enum`'s `CollectionScope.cloud_collection_allowed` opt-in is enforced per-URL through the same `operation="cloud_bucket_enum"` label (`core/intel/authorize.py:_CLOUD_BUCKET_ENUM_OPERATIONS`), preserving the fix from the operation-string mismatch bug below without reintroducing it | Yes, via the gateway's owned confinement proxy | No | Yes | No | TARGET_COLLECTION | **GUARANTEED, structurally** — same pattern as `soft404_check` above |
 | DNS resolution (dnsx, seed + follow-up) | `modules/dnsx.py`, `core/intel/followup.py` | gated input / eligible follow-up indicator | Yes | N/A — a DNS *query about* the hostname is not itself a connection to a resolved destination | N/A | N/A | No | TARGET_COLLECTION (query only) | **GUARANTEED** (authorization-wise; SSRF policy doesn't apply to a resolution query with no follow-on connection) |
-| Port scan (naabu) | `modules/naabu.py` | gated input file | Yes | No | N/A (naabu does its own TCP connect scanning against ports on an already-authorized host string, not attacker-influenced) | No | Same raw-socket caveat as any subprocess | TARGET_COLLECTION | **INPUT_GATED_ONLY** |
+| Port scan (naabu) | `modules/naabu.py` | gated input file | Yes | No | N/A (naabu does its own TCP connect scanning against ports on an already-authorized host string, not attacker-influenced) | No | Same raw-socket caveat as any subprocess | TARGET_COLLECTION | **INPUT_GATED_ONLY — architecturally not proxy-confinable.** naabu performs raw TCP/SYN operations, which cannot be routed through an HTTP forward proxy at all; confinement here is authorization-only (target must already be in scope before the scan starts), never connection-pinned to a validated destination IP the way HTTP/WHOIS targets are. `NAABU_TARPIT_CHECK`/`NAABU_CONFIRM_OPEN_PORTS` are result-integrity controls (is this "open" port real), not a connection-level boundary. Closing this for real needs OS-level enforcement (a network namespace or firewall rule around the whole process) — out of scope for this sprint's application-level confinement work. |
+| Port verification (nmap) | `modules/port_verify.py` | naabu's already-open ports (`naabu.txt`) | Indirect only — relies on naabu's own upstream input gate; no per-host `allows_active_collection` check of its own | No | N/A, same reasoning as naabu | No | Same raw-socket/service-probe caveat as naabu | TARGET_COLLECTION | **INPUT_GATED_ONLY, same residual as naabu** — nmap's TCP-connect + service-detection probes are equally unproxyable; this is not a separate, worse gap than naabu's, just naabu's already-documented limitation inherited by its own downstream verifier. |
 | ASN lookup (target IP → ASN) | `modules/asn_lookup.py` | resolved target IPs, sent as WHOIS/DNS query *content* to `whois.cymru.com:43` (fixed) or Cymru's DNS zone (fixed) | Yes, for the hostname resolved | N/A for the resolution step; the actual TCP/UDP connection destination (`_CYMRU_WHOIS_HOST`) is a hardcoded constant, never target-derived | N/A | Yes — destination is a fixed constant | No | THIRD_PARTY_OBSERVATION (fixed destination; target data is query content, not the connection target) | **GUARANTEED** |
 | Cloud bucket enumeration destination itself (`*.s3.amazonaws.com` etc.) | `modules/cloud_bucket_enum.py` | generated bucket hostname (opt-in, `CLOUD_BUCKET_ENUM_AUTHORIZE_DERIVED`) | Yes, per-candidate (`authorize_active_indicator`) | Yes — new this turn (same `http_get`+proxy fix as soft404/param_fuzz above) | No | Yes | No | TARGET_COLLECTION | **GUARANTEED** |
 | WHOIS (registration lookup) | `modules/whois.py` | seed domain | Yes | No | N/A — subprocess-based external `whois` client, not urllib | Subprocess-internal | Same raw-socket caveat | TARGET_COLLECTION (registration metadata, not HTTP content) | **INPUT_GATED_ONLY** |
@@ -459,3 +460,26 @@ out-of-scope connection attempts** the real httpx binary tried to make on its ow
 `virusinspector.top`) while the authorized connection to `virusbarrier.xyz` (resolved
 IP `34.75.127.116`) completed successfully — read directly from
 `context.metadata["network_requests"]`/`context.warnings`, not asserted.
+
+## Decision record: `gau`/`waybackurls` do NOT belong on `CollectionGateway`
+
+`docs/ARCHITECTURE_AUDIT_2.md` (the network-capability audit for the
+"Sprint Final de Arquitectura de Colección") re-examined every plugin from
+first principles and initially tentative-listed `gau`/`waybackurls` alongside
+`katana`/`hakrawler`/`nuclei` as migration candidates. On inspection this was
+wrong, and is recorded here explicitly so a future round doesn't propose it
+again by the same mistake: `gau`/`waybackurls` are `THIRD_PARTY_OBSERVATION`
+(row above, already correctly classified before this sprint) — they never
+connect to the target at all. `gau --subs <domain>` and `waybackurls`'s stdin
+domain both query archive infrastructure (web.archive.org, Common Crawl, OTX,
+etc.) that the binaries themselves choose; the seed domain is the *query
+argument*, not a connection destination Hydra picks or could redirect through
+a target-scoped proxy. Routing them through `CollectionGateway` or
+`ScopeEnforcingProxy` would apply target-destination-authorization semantics
+to a connection that is never made to the target — exactly the anti-pattern
+this document already rejects for OSV.dev, crt.sh, and URLhaus. Their
+`active_collection=True` flag correctly gates *which domain strings* get sent
+as query data (an operator-authorization concern, since even the domain name
+itself is being disclosed to a third party), not a connection to authorize.
+No code change follows from this — the existing `INPUT_GATED_ONLY`
+disposition was already correct.

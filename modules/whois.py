@@ -1,4 +1,14 @@
-"""Domain registration intelligence using the system whois client."""
+"""Domain registration intelligence via a native WHOIS client Hydra controls
+directly (core/collection/whois_client.py) — not the system `whois` binary.
+
+The system client made its own referral-chain decisions (IANA -> registry ->
+registrar) and its own TCP connections outside Hydra's authorization/SSRF
+layer: only the original domain was ever authorized, never the one-to-two
+additional WHOIS-infrastructure hosts the binary silently contacted along the
+way. `query_whois_chain` follows the same referral chain but validates each
+hop's resolved IP first, exactly like every other active-collection network
+primitive in this codebase — see that module's docstring for the full
+reasoning."""
 
 from __future__ import annotations
 
@@ -6,6 +16,7 @@ import asyncio
 import re
 from pathlib import Path
 
+from core.collection.whois_client import query_whois_chain
 from core.domain import parse_hostname
 from core.models import PipelineContext, ToolStatus
 from core.plugin_base import PluginResult
@@ -34,18 +45,20 @@ class WhoisPlugin(BaseToolPlugin):
     name = "whois"
     display_name = "WHOIS"
     required = False
+    external_dependency = False
     stage_order = 5
     produces = ("domains",)
     capability = "registration"
     active_collection = True
-    install_hint_macos = "whois is included with macOS"
-    install_hint_linux = "sudo apt install whois"
 
     def is_enabled(self) -> bool:
         return self.settings.enable_whois
 
     def get_binary_path(self) -> Path:
-        return self.settings.whois_path
+        return Path("built-in")
+
+    def get_install_hint(self) -> str:
+        return "Built-in (native Python WHOIS client, no external binary required)"
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
         output_path = self._output_path(context, "whois.jsonl")
@@ -152,43 +165,71 @@ class WhoisPlugin(BaseToolPlugin):
     async def _query_with_retries(
         self, context: PipelineContext, domain: str
     ) -> tuple[int, str, str, str | None]:
-        """Run whois with a short per-attempt timeout and brief backoff retries.
+        """Follow the WHOIS referral chain (`query_whois_chain`) with a short
+        per-attempt timeout and brief backoff retries.
 
-        Returns ``(return_code, stdout, stderr, failure_kind)``. ``failure_kind``
-        is None on a usable response; otherwise a human-readable reason that
-        distinguishes timeout/no-response from explicit rate-limiting text.
+        Returns ``(return_code, stdout, stderr, failure_kind)`` — the exact
+        same shape the previous subprocess-based implementation returned, so
+        ``run()``'s consumption of this method (parsing, `whois.jsonl`/
+        `whois_raw.txt` output) needs no changes: ``stdout`` carries the
+        concatenated referral-chain raw text on success, ``stderr`` carries a
+        diagnostic on failure, ``return_code`` is 0/1. ``failure_kind`` is
+        None on a usable response; otherwise a human-readable reason —
+        including, new here, a hop in the chain being refused by SSRF/scope
+        validation (`core/collection/ssrf.py`) rather than followed blindly.
         """
         attempts = max(1, self.settings.whois_retries)
         delay = max(0, self.settings.whois_retry_delay_seconds)
+        timeout = self.settings.whois_timeout
         last_exc: Exception | None = None
-        last_code, last_out, last_err = 1, "", ""
+        last_raw = ""
+        last_blocked_reason = ""
 
         for attempt in range(1, attempts + 1):
             try:
-                return_code, stdout, stderr = await self._run_tool(
-                    context,
-                    self._argv(context, domain),
-                    timeout=self.settings.whois_timeout,
+                result = await asyncio.wait_for(
+                    query_whois_chain(domain, timeout=timeout), timeout=timeout
                 )
-            except Exception as exc:
+            except (TimeoutError, OSError) as exc:
                 last_exc = exc
                 if attempt < attempts and delay:
                     await asyncio.sleep(delay * attempt)
                 continue
 
-            last_code, last_out, last_err = return_code, stdout, stderr
-            raw = (stdout or "").strip() or (stderr or "").strip()
-            if raw:
-                rate_limit_msg = _detect_rate_limit(raw)
+            last_raw = result.raw.strip()
+            last_blocked_reason = result.blocked_reason
+
+            if result.blocked and not last_raw:
+                # Refused at the very first hop (IANA) — no partial data at
+                # all to fall back on. Never silently retried into a
+                # different, unvalidated path: a blocked hop is a fail-closed
+                # outcome, not a transient error to paper over.
+                if attempt < attempts and delay:
+                    await asyncio.sleep(delay * attempt)
+                continue
+
+            if last_raw:
+                rate_limit_msg = _detect_rate_limit(last_raw)
                 if rate_limit_msg:
                     if attempt < attempts:
-                        # Explicit throttle text — backoff and try once more.
                         await asyncio.sleep(delay * attempt)
                         continue
-                    return return_code, stdout, stderr, rate_limit_msg
-                return return_code, stdout, stderr, None
+                    return 0, last_raw, "", rate_limit_msg
+                if result.blocked:
+                    # Partial chain: earlier hop(s) produced usable text, but
+                    # a later hop was refused and the chain stopped there.
+                    # Keep the partial data — never discard a legitimate
+                    # observation — but surface exactly why it's incomplete.
+                    return (
+                        0,
+                        last_raw,
+                        f"referral chain stopped: {last_blocked_reason}",
+                        f"referral chain blocked partway: {last_blocked_reason}",
+                    )
+                return 0, last_raw, "", None
 
-            # Empty body: treat as no-response and retry.
+            # Empty body (not blocked, not rate-limited): treat as no
+            # response and retry.
             if attempt < attempts and delay:
                 await asyncio.sleep(delay * attempt)
 
@@ -201,26 +242,26 @@ class WhoisPlugin(BaseToolPlugin):
                     msg,
                     (
                         f"timeout/no response after {attempts} attempt(s) "
-                        f"(per-attempt limit {self.settings.whois_timeout}s): {msg}"
+                        f"(per-attempt limit {timeout}s): {msg}"
                     ),
                 )
             return 1, "", msg, f"query failed after {attempts} attempt(s): {msg}"
 
-        raw = (last_out or "").strip() or (last_err or "").strip()
-        if not raw:
+        if not last_raw:
+            reason = last_blocked_reason or "no response"
             return (
-                last_code,
-                last_out,
-                last_err,
+                1,
+                "",
+                reason,
                 (
                     f"timeout/no response after {attempts} attempt(s) "
-                    f"(per-attempt limit {self.settings.whois_timeout}s)"
+                    f"(per-attempt limit {timeout}s): {reason}"
                 ),
             )
-        rate_limit_msg = _detect_rate_limit(raw)
+        rate_limit_msg = _detect_rate_limit(last_raw)
         if rate_limit_msg:
-            return last_code, last_out, last_err, rate_limit_msg
-        return last_code, last_out, last_err, None
+            return 0, last_raw, "", rate_limit_msg
+        return 0, last_raw, "", None
 
 
 def _detect_rate_limit(raw: str) -> str | None:

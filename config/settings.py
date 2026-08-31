@@ -784,7 +784,6 @@ class Settings:
             "unfurl": self.unfurl_path,
             "anew": self.anew_path,
             "jq": self.jq_path,
-            "whois": self.whois_path,
             "port_verify": self.nmap_path,
         }
 

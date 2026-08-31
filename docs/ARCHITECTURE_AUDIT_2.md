@@ -41,7 +41,13 @@ app.py:main()
       14. Follow-up collection pass (bounded, `MAX_DISCOVERY_DEPTH`) —
           re-enters authorization for every follow-up indicator before any
           of the same active plugins touch it again
-      15. Reporting — HTML/JSON/CSV from persisted state only
+      15. Reporting — Markdown + HTML summary (`core/reporter.py`) and JSON
+          metadata, from persisted state only. Corrected from an earlier,
+          imprecise "HTML/JSON/CSV" characterization of this step:
+          `core/reporter.py` has no CSV writer at all (verified — only
+          `_write_markdown_overview`/`_write_html_summary`); `httpx.csv` is a
+          side artifact the `httpx` binary itself writes as part of its own
+          probe output (`modules/httpx.py`), not a Hydra report format.
 ```
 
 Confirmed by reading `core/runner.py:PipelineRunner.run()` end to end this

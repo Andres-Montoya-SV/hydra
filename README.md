@@ -579,10 +579,23 @@ needs to contact third-party ProjectDiscovery infrastructure that per-target sco
 cannot distinguish from an unauthorized destination. Once an authorized request is chained through
 an external `OUTBOUND_PROXY_URL`, that proxy resolves and connects to the target from its own
 network location — Hydra's destination-IP pinning does not extend past that hop (Hydra's own
-socket never touches the target directly in this configuration either way). `param_fuzz.py` and
-`cloud_bucket_enum.py` still call the shared HTTP helper with a bare URL string rather than going
-through `CollectionGateway` — connection-level confinement still applies to them, the type-level
-guarantee does not yet.
+socket never touches the target directly in this configuration either way). `soft404_check`,
+`param_fuzz`, `cloud_bucket_enum`, `httpx`, and `browser_probe` are all structurally confined
+through `CollectionGateway`/`ScopeEnforcingProxy` — no bare URL string reaches the underlying HTTP
+primitive for any of them. WHOIS registration lookups are a native Python TCP:43 client
+(`core/collection/whois_client.py`), not the system `whois` binary — every hop of the IANA →
+registry → registrar referral chain has its resolved IP validated against the same SSRF policy as
+HTTP targets before Hydra connects to it, and a blocked hop stops the chain there rather than being
+followed blindly.
+
+**Cannot be proxy-confined at all — authorization-only, not connection-pinned**: `naabu` and
+`port_verify` (nmap) perform raw TCP/SYN operations that cannot be routed through an HTTP forward
+proxy; their confinement is authorization-only (the target must be in scope before the scan
+starts), not connection-pinned the way HTTP/WHOIS targets are. A real destination-IP boundary for
+these two would require OS-level enforcement (a network namespace or firewall rule), which is out
+of scope for Hydra's own application-level confinement. `NAABU_TARPIT_CHECK` and
+`NAABU_CONFIRM_OPEN_PORTS` are result-integrity controls (is this "open" port real, not
+tarpit-fabricated) — they do not change this boundary.
 
 **Requires external network isolation** (outside anything Hydra's own code can enforce): a tool
 that ignores its own configured `-proxy` — a bug, or a raw-socket code path bypassing its
