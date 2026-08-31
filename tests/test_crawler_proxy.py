@@ -85,6 +85,24 @@ async def _raw_http_proxy_request(proxy_port: int, target_host: str, target_port
     return response
 
 
+async def _wait_until(predicate, *, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    """Poll `predicate()` until truthy or `timeout` elapses — see the
+    identical helper (and its full rationale) in
+    tests/test_opsec_proxy_chaining.py: a real TCP handshake completing on
+    the client side is not the same event as `_CountingHandler`'s own
+    single-threaded, non-threading `socketserver.TCPServer` actually being
+    scheduled to accept() and record the hit. Deterministic-as-possible
+    replacement for a fixed sleep, which just moves the race to a different
+    arbitrary point instead of removing it."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return bool(predicate())
+
+
 @pytest.mark.asyncio
 async def test_connect_to_out_of_scope_host_is_denied_and_never_connects(destination) -> None:
     server, port = destination
@@ -115,8 +133,7 @@ async def test_connect_to_authorized_host_is_forwarded(destination) -> None:
     await proxy.start()
     try:
         response = await _raw_connect_request(proxy.port, "127.0.0.1", port)
-        # give the destination server's thread a moment to record the hit
-        await asyncio.sleep(0.2)
+        await _wait_until(lambda: bool(server.hits))
     finally:
         await proxy.stop()
 
@@ -200,7 +217,7 @@ async def test_plain_http_post_body_is_forwarded_intact_to_authorized_host(desti
         ).encode("latin1") + body
         writer.write(request)
         await writer.drain()
-        await asyncio.sleep(0.2)
+        await _wait_until(lambda: body in b"".join(server.received))
         writer.close()
     finally:
         await proxy.stop()

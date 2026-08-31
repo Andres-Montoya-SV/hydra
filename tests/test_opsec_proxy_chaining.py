@@ -90,6 +90,29 @@ async def _raw_connect(proxy_port: int, target_host: str, target_port: int) -> b
     return response
 
 
+async def _wait_until(predicate, *, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    """Poll `predicate()` until it's truthy or `timeout` elapses.
+
+    `_CountingHandler`'s `server` is a plain (non-threading) `socketserver.
+    TCPServer`: its single background thread must itself be scheduled by the
+    OS to actually call `accept()`/`handle()` before `hits` is appended to —
+    a real TCP handshake completing (which is all `asyncio.open_connection`
+    on the *client* side guarantees) is not the same event as that. Under a
+    big, fully-loaded test suite, that scheduling can lag; a fixed sleep
+    would just move the race to a different, still-arbitrary point. Polling
+    up to a generous bound is nearly instant in the common case and only
+    slow in the genuinely-contended one, without ever silently proceeding on
+    a guess.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return bool(predicate())
+
+
 @pytest.mark.asyncio
 async def test_authorized_destination_is_forwarded_through_the_external_proxy(
     target_server,
@@ -123,6 +146,17 @@ async def test_authorized_destination_is_forwarded_through_the_external_proxy(
     await hydra_proxy.start()
     try:
         response = await _raw_connect(hydra_proxy.port, "127.0.0.1", port)
+        # The client-visible "200 Connection Established" only proves the
+        # TCP handshake to the real target completed (from
+        # asyncio.open_connection's perspective on the external proxy's
+        # side) — it says nothing about whether _CountingHandler's own
+        # single background thread has actually been scheduled to accept()
+        # and record the hit yet. stop() (correctly, since a prior turn)
+        # cancels any still-in-flight connection task, which would close
+        # that same socket out from under a hit that hasn't landed yet if
+        # torn down too early. Wait for the real, observable effect before
+        # tearing anything down, instead of assuming it already happened.
+        await _wait_until(lambda: bool(server.hits))
     finally:
         await hydra_proxy.stop()
         await external_proxy.stop()
