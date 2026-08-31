@@ -132,6 +132,64 @@ async def test_katana_redirect_escape_is_blocked_by_confinement_proxy(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("katana") is None, reason="katana binary not installed")
+async def test_katana_oos_url_injected_into_input_never_reaches_the_real_server(
+    tmp_path: Path, oos_server: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Different attack shape from the redirect-escape test above: instead of
+    katana discovering the OOS destination on its own mid-crawl, an
+    out-of-scope URL is already sitting in `alive.txt` — simulating a bug in
+    an upstream module (dnsx/httpx/etc.) leaking an unauthorized entry into a
+    shared artifact this plugin trusts as its seed list, rather than a
+    confinement failure specific to katana. Two independent layers should
+    both catch this: `_authorized_input` must never forward the OOS entry
+    into the `-list` file handed to the binary, and even if it somehow did,
+    `ScopeEnforcingProxy` must still refuse the connection. Only the real
+    destination server's hit count can actually prove which of those held —
+    or that neither did — so that is what this test checks.
+    """
+    fake_home = tmp_path / "home"
+    (fake_home / ".config").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    alive_path = output_dir / "alive.txt"
+    oos_url = f"http://localhost:{oos_server}/leaked"
+    write_lines(alive_path, [oos_url], base_dir=output_dir)
+
+    settings = Settings(project_root=tmp_path)
+    context = PipelineContext(
+        targets=[DomainTarget(domain="127.0.0.1")],
+        output_dir=output_dir,
+        # Scope authorizes only 127.0.0.1 — "localhost" (the injected OOS
+        # entry's host string) is a different, unauthorized name under this
+        # scope's real, unmodified classification, exactly like the redirect
+        # test above.
+        collection_scope=CollectionScope.from_seeds(
+            ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+        ),
+    )
+    context.alive_urls = [oos_url]
+
+    plugin = KatanaPlugin(settings)
+    result = await plugin.run(context, alive_path)
+
+    assert _CountingHandler.hits == [], (
+        "an out-of-scope URL already present in alive.txt (simulating a "
+        "leak from another module) must never reach the real server, "
+        "whether caught by the input-authorization pre-filter or the "
+        "confinement proxy"
+    )
+    # The pre-filter layer specifically: the authorized copy of the input
+    # file katana actually reads must not contain the OOS entry at all.
+    authorized_files = list(output_dir.glob("authorized_katana_*"))
+    for authorized_file in authorized_files:
+        assert oos_url not in authorized_file.read_text(encoding="utf-8")
+    assert result.skipped or result.success
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(shutil.which("hakrawler") is None, reason="hakrawler binary not installed")
 async def test_hakrawler_redirect_escape_is_blocked_by_confinement_proxy(
     tmp_path: Path, oos_server: int
