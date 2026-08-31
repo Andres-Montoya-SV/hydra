@@ -67,6 +67,26 @@ def test_classify_ip_covers_the_full_blocklist(ip: str, expect_allowed: bool, la
     assert (result == "allowed") == expect_allowed, f"{label}: got {result!r}"
 
 
+@pytest.mark.parametrize(
+    "ip,label",
+    [
+        # Exact addresses from the final adversarial audit's required matrix
+        # not already covered above by another member of the same block —
+        # specifically the literal network address and the top-of-range
+        # boundary for each RFC1918 block, where an off-by-one in a range
+        # comparison would actually show up (an arbitrary interior member
+        # like 10.1.2.3 would not catch a boundary bug).
+        ("0.0.0.0", "0.0.0.0/8 network address itself"),
+        ("127.0.0.2", "second loopback address, same /8 as 127.0.0.1"),
+        ("10.255.255.255", "top of RFC1918 10.0.0.0/8"),
+        ("172.31.255.254", "top of RFC1918 172.16.0.0/12"),
+        ("192.168.0.1", "bottom of RFC1918 192.168.0.0/16 (distinct octet from 192.168.1.1)"),
+    ],
+)
+def test_classify_ip_boundary_addresses_from_the_required_matrix(ip: str, label: str) -> None:
+    assert classify_ip(ip) != "allowed", f"{label}: {ip} must be blocked, got 'allowed'"
+
+
 # ---------------------------------------------------------------------------
 # Resolution-aware validation — DNS is monkeypatched (there is no real
 # network to control an authoritative "this hostname resolves to 10.0.0.1"
@@ -327,6 +347,22 @@ def loopback_server() -> Iterator[tuple[socketserver.TCPServer, int]]:
         thread.join(timeout=2)
 
 
+async def _wait_until(predicate, *, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    """Bounded poll on an observable condition — never a fixed sleep.
+
+    A completed client-side TCP handshake is not the same event as the
+    destination `socketserver.TCPServer` thread recording a hit. See the
+    identical helper in tests/test_crawler_proxy.py.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return bool(predicate())
+
+
 async def _raw_connect(proxy_port: int, target_host: str, target_port: int) -> bytes:
     reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
     writer.write(
@@ -389,9 +425,71 @@ async def test_real_connect_to_explicitly_opted_in_private_target_succeeds(
     await proxy.start()
     try:
         response = await _raw_connect(proxy.port, "rebind.ssrf-real-test.internal", port)
-        await asyncio.sleep(0.2)
+        await _wait_until(lambda: bool(server.hits))
     finally:
         await proxy.stop()
 
     assert b"200" in response
     assert server.hits, "the real server must be reached once explicitly opted in"
+
+
+# Section 14 required matrix: for every forbidden IP class, authorization
+# DENY must also mean ZERO real sockets. We cannot listen on RFC1918 /
+# metadata / IPv6 ULA from a unit test, so the destination-server oracle
+# for those classes is "open_connection was never called" — the same
+# primitive ScopeEnforcingProxy uses after a successful authorize. The
+# loopback case above is the one class we can actually host.
+_REQUIRED_FORBIDDEN_IPS = (
+    "127.0.0.1",
+    "127.0.0.2",
+    "10.0.0.1",
+    "10.255.255.255",
+    "172.16.0.1",
+    "172.31.255.254",
+    "192.168.0.1",
+    "169.254.169.254",
+    "100.64.0.1",
+    "224.0.0.1",
+    "0.0.0.0",
+    "::1",
+    "fc00::1",
+    "fe80::1",
+    "::ffff:127.0.0.1",
+    "::ffff:10.0.0.1",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_ip", _REQUIRED_FORBIDDEN_IPS)
+async def test_proxy_never_opens_a_socket_to_required_forbidden_ip(
+    monkeypatch: pytest.MonkeyPatch, blocked_ip: str
+) -> None:
+    async def _fake_resolve(host: str) -> list[str]:
+        return [blocked_ip]
+
+    monkeypatch.setattr("core.collection.ssrf.resolve_hostname_async", _fake_resolve)
+
+    connect_calls: list[tuple[str, int]] = []
+    real_open_connection = asyncio.open_connection
+
+    async def _spy_open_connection(host, port, **kwargs):
+        connect_calls.append((str(host), int(port)))
+        raise OSError("must never be reached for a forbidden destination IP")
+
+    monkeypatch.setattr(asyncio, "open_connection", _spy_open_connection)
+    try:
+        scope = CollectionScope.from_seeds(["matrix.ssrf-proxy-test.internal"])
+        proxy = ScopeEnforcingProxy(scope, capability="test")
+        allowed, reason, connect_ip = await proxy._authorize_with_reason(
+            "matrix.ssrf-proxy-test.internal"
+        )
+        assert allowed is False, f"{blocked_ip}: expected DENY, got ALLOW ({reason})"
+        assert connect_ip == ""
+        assert reason.startswith("blocked_"), f"{blocked_ip}: unexpected reason {reason!r}"
+        # The authorize path must not itself open a socket to the blocked IP.
+        assert connect_calls == [], (
+            f"{blocked_ip}: authorization opened a real socket "
+            f"{connect_calls} — DENY must be ZERO_CONNECTIONS"
+        )
+    finally:
+        monkeypatch.setattr(asyncio, "open_connection", real_open_connection)
