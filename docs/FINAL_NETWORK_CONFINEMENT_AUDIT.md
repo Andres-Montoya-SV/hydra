@@ -641,3 +641,237 @@ bypass. Closed by adding `core.http_probe` to the guard's prohibited dotted
 imports, plus a new synthetic test proving the guard now catches it
 (`test_guard_detects_direct_import_of_hydras_own_http_probe_primitive`).
 Zero G-class paths remain in production as of this commit.
+
+## E. Browser map
+
+```
+BrowserProbePlugin.run()
+  → _httpx_targets() re-filters CollectionScope (missing scope → skip)
+  → _crawler_confinement() starts ScopeEnforcingProxy
+  → playwright.webkit.launch(proxy=confinement_proxy.proxy_url)
+  → _install_scope_request_guard (context.route + route_web_socket)
+       → browser_request_decision → allow_browser_navigation
+            → missing scope = DENY
+            → allows_active_collection(url)
+  → page.goto(authorized)
+```
+
+Covered resource types (Playwright `resource_type`, real WebKit): document
+(including iframe navigation), script, image, stylesheet, font, xhr, fetch,
+websocket, beacon. An authorized page embedding `localhost` script/image/
+css/font/iframe/beacon produced **zero** hits on the evil destination
+server (`tests/test_subresource_escape_oracle.py::test_browser_probe_subresources_never_reach_evil`,
+5/5 consecutive runs with cached WebKit).
+
+DNS rebinding for the browser: an in-scope hostname resolving to loopback
+is refused by the proxy before WebKit connects
+(`tests/test_browser_confinement_live.py`).
+
+Honest limit: Playwright `proxy=` is an application-level HTTP proxy. A
+WebKit internal path that ignored launch-time proxy configuration would
+not be visible. Live testing did not find one. HTTPS `CONNECT` tunnels
+are authorized by host, not decrypted path.
+
+## F. SSRF matrix
+
+`core/collection/ssrf.py:classify_ip` + `ScopeEnforcingProxy` authorize
+path. For every address in the required matrix, authorization is DENY and
+`asyncio.open_connection` is never called
+(`tests/test_ssrf_destination_policy.py::test_proxy_never_opens_a_socket_to_required_forbidden_ip`).
+
+| IP | Resolution | Authorization | Proxy | Actual connection |
+|---|---|---|---|---|
+| 127.0.0.1 / 127.0.0.2 | stub / literal | DENY `blocked_range:127.0.0.0/8` | refuse | ZERO (live loopback server oracle) |
+| 10.0.0.1 / 10.255.255.255 | stub | DENY `10.0.0.0/8` | refuse | ZERO sockets |
+| 172.16.0.1 / 172.31.255.254 | stub | DENY `172.16.0.0/12` | refuse | ZERO sockets |
+| 192.168.0.1 | stub | DENY `192.168.0.0/16` | refuse | ZERO sockets |
+| 169.254.169.254 | stub | DENY `169.254.0.0/16` | refuse | ZERO sockets |
+| 100.64.0.1 | stub | DENY `100.64.0.0/10` | refuse | ZERO sockets |
+| 224.0.0.1 | stub | DENY `224.0.0.0/4` | refuse | ZERO sockets |
+| 0.0.0.0 | stub | DENY `0.0.0.0/8` | refuse | ZERO sockets |
+| ::1 | stub | DENY `::1/128` | refuse | ZERO sockets |
+| fc00::1 | stub | DENY `fc00::/7` | refuse | ZERO sockets |
+| fe80::1 | stub | DENY `fe80::/10` | refuse | ZERO sockets |
+| ::ffff:127.0.0.1 | stub | DENY (mapped → 127.0.0.1) | refuse | ZERO sockets |
+| ::ffff:10.0.0.1 | stub | DENY (mapped → 10.0.0.1) | refuse | ZERO sockets |
+
+TOCTOU/rebinding: `_authorize_with_reason` returns `connect_ip`;
+`asyncio.open_connection(connect_ip, port)` uses that IP, never a second
+lookup of the hostname. Proven by spy and by the live loopback-oracle
+test.
+
+## G. Redirect proof
+
+Authorized seed `127.0.0.1` → Location variants. Evil server = `localhost`
+(different hostname, same machine). Real installed `httpx` binary.
+
+| Variant | Authorized server | Evil server |
+|---|---|---|
+| Absolute `http://localhost:.../secret` | hit | ZERO (`test_httpx_confinement_live`) |
+| Scheme-relative `//localhost:.../secret` | hit | ZERO (`test_redirect_destination_oracle`) |
+| Relative `/relative-hop` (same host) | follow-up hit | n/a (authorization-preserving) |
+| `javascript:` / `vbscript:` / `data:` / `about:` / `file:` | hit (first hop only) | ZERO + `blocked_scheme:` audit |
+
+Production run (`python app.py run -d virusbarrier.xyz`, run-id
+`confinement-proof-20260831`): httpx observed 5 OOS redirect destinations
+(`cybermedic.buzz`, `defendervault.shop`, `safesentinel.lol`,
+`shieldvertex.mom`, `virusinspector.top`). All recorded
+`OUT_OF_SCOPE` / `NOT_ALLOWED`. Confinement proxy: **15 DENY**,
+`network_attempted=false`, `network_completed=false`. `alive.txt` contains
+only `https://virusbarrier.xyz`.
+
+## H. Crawler proof
+
+Authorized HTML page embeds `<a>`, `<script>`, `<img>`, `<link>`,
+`<iframe>` pointing at `localhost`. Real binaries:
+
+* katana — authorized page fetched; evil server ZERO
+* hakrawler — authorized page fetched; evil server ZERO
+* nuclei — same `-proxy` / `ScopeEnforcingProxy` path; not re-driven with
+  the default template corpus (unbounded). Flag enforcement:
+  `tests/test_crawler_proxy_flag_enforcement.py`.
+
+Redirect-escape (302 to `localhost`) already proven live for katana and
+hakrawler in `tests/test_crawler_confinement_live.py`.
+
+## I. DNS rebinding proof
+
+Allowed DNS answer A (public) vs forbidden answer B (loopback/RFC1918):
+the proxy connects only to the IP it just validated (`connect_ip`). A
+second lookup is not performed. Live: in-scope hostname resolving to
+127.0.0.1 → real local server receives ZERO connections (proxy, httpx
+binary, WebKit).
+
+## J. CollectionGateway coverage
+
+Internal target-directed HTTP collectors:
+
+| Plugin | Through gateway? | Can it HTTP without gateway? |
+|---|---|---|
+| soft404_check | Yes | No — `http_get` is the gateway method; static guard blocks `core.http_probe` import |
+| param_fuzz | Yes | No |
+| cloud_bucket_enum | Yes | No |
+
+Exceptions (not HTTP-to-target, not applicable):
+
+* httpx / katana / hakrawler / nuclei / browser_probe — Class B (proxy)
+* naabu / port_verify — Class C (raw TCP, unproxyable)
+* dnsx / wildcard_check — Class D
+* ctlogs / threat_intel / vuln_match / asn_lookup / gau / waybackurls —
+  Class F* (fixed third-party)
+* whois — Class B* (native TCP:43 + per-hop SSRF)
+* webhook / opsec_check — Class F* (control plane)
+
+Gateway coverage of applicable internal HTTP collectors: **100%**.
+
+`gateway.http_get("https://evil.example")` raises `TypeError`.
+`dataclasses.replace`, direct construction, and field-forged copies raise
+`TypeError`. `copy`/`deepcopy`/`pickle` cannot retarget an authorized
+object. `object.__new__` can allocate an empty instance — deliberate
+same-process execution, outside the plugin threat model.
+
+## K. Test evidence
+
+Adversarial confinement suite (164 tests + 1 skip without WebKit env):
+
+```
+.venv/bin/pytest tests/test_ssrf_destination_policy.py \
+  tests/test_crawler_proxy.py tests/test_crawler_confinement_live.py \
+  tests/test_httpx_confinement_live.py tests/test_urllib_confinement_live.py \
+  tests/test_redirect_destination_oracle.py tests/test_subresource_escape_oracle.py \
+  tests/test_alive_txt_integrity_matrix.py tests/test_followup_adversarial_oracle.py \
+  tests/test_opsec_proxy_chaining.py tests/test_collection_gateway.py \
+  tests/test_authorized_collection_target.py tests/test_no_bypass_network_primitives.py \
+  tests/test_untrusted_network_bypass.py tests/test_redirect_safety.py \
+  tests/test_crawler_proxy_flag_enforcement.py tests/test_followup_artifacts.py \
+  tests/test_adversarial_matrix.py
+```
+
+Results: **5/5 consecutive** — 164 passed, 1 skipped, 0 failed each run
+(~208s/run). The skip is
+`test_browser_probe_subresources_never_reach_evil` when
+`PLAYWRIGHT_BROWSERS_PATH` is unset.
+
+Browser destination-oracle suite with cached WebKit
+(`PLAYWRIGHT_BROWSERS_PATH=$HOME/Library/Caches/ms-playwright`):
+**5/5 consecutive** — 10 passed, 0 failed.
+
+xdist (`-n 2`), same confinement set plus browser tests:
+**2/2** — 174 passed, 0 failed.
+
+Complete suite (`.venv/bin/pytest` with WebKit path set):
+**5/5 consecutive** — 610 passed / 0 failed / 0 skipped each run
+(~230s/run).
+
+Production path:
+
+```
+SCOPE_FILE=tests/fixtures/virusbarrier/scope.txt \
+OWNED_DOMAINS=virusbarrier.xyz \
+.venv/bin/python app.py --no-banner -e output/confinement-proof.env \
+  run -d virusbarrier.xyz --no-ui --run-id confinement-proof-20260831
+```
+
+Repo-root `scope.txt` (Banco Plata) was **not** used. Output:
+`output/confinement-proof-20260831`. Seed
+`alive.txt`/`resolved.txt`/`subdomains.txt` contain only `virusbarrier.xyz`.
+SQLite `intel_network_requests`: 4 ALLOW (virusbarrier.xyz), 15 DENY
+(OOS, `network_completed=0`). Indicators: seed `COLLECTED`; OOS SANs
+`NOT_ALLOWED`.
+
+## L. Known limitations / out of scope for this audit
+
+### Honest residuals (not hidden; not treated as new findings)
+
+1. **naabu / port_verify** — raw SYN/TCP, architecturally unproxyable.
+   Input-gated only. Confirmed still documented here and in README.
+2. **Raw-socket bypass of `-proxy`** — an external binary that ignores
+   its proxy flag is invisible to `ScopeEnforcingProxy`. Proven in
+   `tests/test_untrusted_network_bypass.py`. OS-level confinement is
+   outside Hydra.
+3. **HTTPS CONNECT path exclusions** — no TLS interception; path
+   exclusions apply to plain HTTP and to Python/Playwright URL-aware
+   checks, not to encrypted CONNECT tunnels.
+4. **External OPSEC proxy chaining** — after Hydra ALLOWs and forwards,
+   the upstream proxy resolves independently. Hydra's own socket never
+   touches an unauthorized destination.
+5. **Fixed third-party / control-plane destinations (F\*)** — crt.sh,
+   URLhaus, OSV, WPScan, Cymru, archive binaries, webhook, OPSEC
+   diagnostics. Destination is not CollectionScope-derived. Taxonomy
+   has no cleaner letter.
+6. **Seed-path `intel_collection_attempts`** — follow-up writes attempt
+   rows; a seed-only production run reconstructs via
+   `intel_indicators` + `intel_network_requests` (0 attempt rows for
+   `confinement-proof-20260831` because every extra SAN was
+   `NOT_ALLOWED` and follow-up HTTP never started). Not a confinement
+   bypass.
+7. **Operational noise on the live run** — WHOIS rate-limited (plugin
+   FAILED, not COLLECTED); crt.sh HTTP 502 (0 CT records from that
+   API; SANs still observed from the live TLS certificate httpx
+   grabbed). Process exit 1 because WHOIS is recorded as an error.
+   Confinement still held.
+
+### Out of scope this audit (Sections 19–20 exclusion)
+
+* Host graph vs. Intel graph reconciliation
+* Certificate-as-evidence identity / SAN merging
+* Unified reporting serializer (`serialize_relationship` /
+  `relationship_view`)
+* Whether `IntelEngine.finalize()` treats `context.alive_urls` as the
+  correlation authority
+
+Noted while tracing, not evaluated, not blocking READY/NOT READY:
+
+* The Host table records OOS SAN names as `hosts` rows (observation).
+  Their `collection_status` is `NOT_ALLOWED`. This is Section 22
+  (observe ≠ collect), not a network-path failure.
+
+### Release gate
+
+No G-class production path remains. Destination-server oracles for
+HTTP, redirects, crawlers, browser subresources, SSRF/rebinding, poisoned
+`alive.txt`, and follow-up 302-to-evil all recorded ZERO unauthorized
+connections. Real `python app.py run` against `virusbarrier.xyz` recorded
+ZERO completed unauthorized connections.
+
+**Verdict: READY** (network confinement scope only).
