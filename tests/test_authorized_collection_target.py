@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+import pickle
 
 import pytest
 
@@ -141,3 +143,63 @@ def test_dataclasses_replace_cannot_forge_a_capability_either() -> None:
     assert real is not None
     with pytest.raises(TypeError):
         dataclasses.replace(real, hostname=OOS, raw=f"https://{OOS}/")
+
+
+def test_copy_and_deepcopy_cannot_retarget_an_authorized_object() -> None:
+    """copy/deepcopy of a frozen dataclass produce another instance of the
+    same class, but they do not let a caller swap the hostname: the
+    resulting object still points at the originally authorized host. A
+    caller who then tries to mutate it hits the frozen barrier. This is
+    conventional misuse, not a bypass."""
+    real = AuthorizedCollectionTarget.authorize(
+        f"https://{SEED}/", _scope(), capability="http_probe"
+    )
+    assert real is not None
+    cloned = copy.copy(real)
+    deep = copy.deepcopy(real)
+    assert cloned.hostname == SEED
+    assert deep.hostname == SEED
+    assert cloned.raw == real.raw
+    with pytest.raises(Exception):
+        cloned.hostname = OOS  # type: ignore[misc]
+    with pytest.raises(Exception):
+        deep.raw = f"https://{OOS}/"  # type: ignore[misc]
+
+
+def test_pickle_roundtrip_is_not_a_forgery_path() -> None:
+    """Pickle reconstructs via ``__new__`` + state restore, not ``__init__``.
+    That is deliberate same-process (or cross-process) reconstruction of an
+    already-authorized value, not a way to mint a new capability for an
+    unauthorized host. After unpickle the hostname is still the original
+    authorized one; there is no public hook to pickle an OOS hostname into
+    an AuthorizedCollectionTarget that authorize() never produced."""
+    real = AuthorizedCollectionTarget.authorize(
+        f"https://{SEED}/", _scope(), capability="http_probe"
+    )
+    assert real is not None
+    restored = pickle.loads(pickle.dumps(real))
+    assert isinstance(restored, AuthorizedCollectionTarget)
+    assert restored.hostname == SEED
+    assert restored.raw == real.raw
+    assert restored.hostname != OOS
+
+
+def test_object_new_without_authorize_is_not_a_usable_target() -> None:
+    """``object.__new__`` can allocate an instance (Python has no way to
+    stop that) but the resulting object has no authorized field values —
+    CollectionGateway.http_get() would still type-check it as the class,
+    which is why this is classified as deliberate same-process code
+    execution, outside the plugin threat model. Documented, not claimed
+    sealed."""
+    raw = object.__new__(AuthorizedCollectionTarget)
+    assert not hasattr(raw, "hostname") or getattr(raw, "hostname", None) != OOS
+    with pytest.raises(TypeError):
+        AuthorizedCollectionTarget(
+            raw=f"https://{OOS}/",
+            hostname=OOS,
+            scheme="https",
+            port=None,
+            capability="http_probe",
+            reason="object_new_forge",
+            scope_identity=(SEED,),
+        )
