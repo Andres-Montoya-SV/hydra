@@ -67,6 +67,7 @@ def oos_server(tmp_path: Path) -> Iterator[int]:
         yield port
     finally:
         httpd.shutdown()
+        httpd.server_close()
         thread.join(timeout=2)
 
 
@@ -131,6 +132,7 @@ async def _run_probe_page(
                 await browser.close()
     finally:
         httpd.shutdown()
+        httpd.server_close()
         thread.join(timeout=2)
     return blocked_counts
 
@@ -341,8 +343,10 @@ async def test_websocket_to_out_of_scope_host_never_connects(
                 await browser.close()
     finally:
         ws_httpd.shutdown()
+        ws_httpd.server_close()
         ws_thread.join(timeout=2)
         httpd.shutdown()
+        httpd.server_close()
         thread.join(timeout=2)
 
     assert accepted == []
@@ -393,6 +397,7 @@ async def test_window_open_popup_to_out_of_scope_host_is_blocked(
                 await browser.close()
     finally:
         httpd.shutdown()
+        httpd.server_close()
         thread.join(timeout=2)
 
     # The opener's own navigation was to the in-scope host; any blocked

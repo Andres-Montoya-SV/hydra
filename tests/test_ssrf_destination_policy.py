@@ -323,6 +323,7 @@ def loopback_server() -> Iterator[tuple[socketserver.TCPServer, int]]:
         yield server, port
     finally:
         server.shutdown()
+        server.server_close()
         thread.join(timeout=2)
 
 

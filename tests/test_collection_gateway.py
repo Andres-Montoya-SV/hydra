@@ -76,6 +76,7 @@ def target_server() -> Iterator[int]:
         yield port
     finally:
         server.shutdown()
+        server.server_close()
         thread.join(timeout=2)
 
 

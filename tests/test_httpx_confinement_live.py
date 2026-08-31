@@ -80,6 +80,7 @@ def oos_server() -> Iterator[int]:
         yield port
     finally:
         httpd.shutdown()
+        httpd.server_close()
         thread.join(timeout=2)
 
 
@@ -107,6 +108,7 @@ async def test_httpx_reaches_authorized_target_through_confinement_proxy(tmp_pat
         result = await plugin.run(context, hosts_path)
     finally:
         server.shutdown()
+        server.server_close()
         thread.join(timeout=2)
 
     assert _CountingHandler.hits, "authorized target should have been reached through the proxy"
@@ -140,6 +142,7 @@ async def test_httpx_redirect_escape_is_blocked_by_confinement_proxy(
         await plugin.run(context, hosts_path)
     finally:
         seed_httpd.shutdown()
+        seed_httpd.server_close()
         seed_thread.join(timeout=2)
 
     assert _CountingHandler.hits == [], (

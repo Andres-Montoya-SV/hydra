@@ -76,6 +76,7 @@ def oos_server() -> Iterator[int]:
         yield port
     finally:
         httpd.shutdown()
+        httpd.server_close()
         thread.join(timeout=2)
 
 
@@ -113,6 +114,7 @@ async def test_katana_redirect_escape_is_blocked_by_confinement_proxy(
         result = await plugin.run(context, alive_path)
     finally:
         seed_httpd.shutdown()
+        seed_httpd.server_close()
         seed_thread.join(timeout=2)
 
     assert _CountingHandler.hits == [], (
@@ -168,6 +170,7 @@ async def test_hakrawler_redirect_escape_is_blocked_by_confinement_proxy(
         result = await plugin.run(context, output_dir / "resolved.txt")
     finally:
         seed_httpd.shutdown()
+        seed_httpd.server_close()
         seed_thread.join(timeout=2)
 
     assert _CountingHandler.hits == [], (

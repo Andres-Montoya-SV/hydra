@@ -88,6 +88,7 @@ def header_capturing_server() -> Iterator[int]:
         yield port
     finally:
         httpd.shutdown()
+        httpd.server_close()
         thread.join(timeout=2)
 
 
@@ -99,6 +100,7 @@ def target_server() -> Iterator[int]:
         yield port
     finally:
         httpd.shutdown()
+        httpd.server_close()
         thread.join(timeout=2)
 
 

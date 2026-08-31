@@ -67,6 +67,7 @@ def evil_server() -> Iterator[int]:
         yield port
     finally:
         httpd.shutdown()
+        httpd.server_close()
         thread.join(timeout=2)
 
 
