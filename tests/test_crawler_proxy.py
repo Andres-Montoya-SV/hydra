@@ -127,6 +127,39 @@ async def test_connect_to_authorized_host_is_forwarded(destination) -> None:
 
 
 @pytest.mark.asyncio
+async def test_stop_waits_for_in_flight_connection_tasks(destination) -> None:
+    """Regression: `stop()` used to only close the listening socket —
+    `server.close()`/`wait_closed()` stop new connections but say nothing
+    about a connection-handling task already inside `_splice`. A caller that
+    treats a returned `stop()` as "this proxy instance is fully quiescent"
+    (every live test in this suite does exactly that in a `finally:` block)
+    could have a splice loop still running in the background afterward,
+    keeping sockets open past the point the caller — and pytest-asyncio's
+    function-scoped event loop teardown right after — assumed everything was
+    closed. `stop()` must not return until every task it spawned has too."""
+    server, port = destination
+    scope = CollectionScope.from_seeds(
+        ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+    )
+    proxy = ScopeEnforcingProxy(scope, capability="crawl")
+    await proxy.start()
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", proxy.port)
+    writer.write(f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode())
+    await writer.drain()
+    await asyncio.wait_for(reader.readline(), timeout=5)  # "HTTP/1.1 200 Connection Established"
+    # The CONNECT succeeded and the splice loop for it is now running as a
+    # background task owned by the proxy — this is the in-flight state
+    # `stop()` must account for, not a hypothetical.
+    assert proxy._active_tasks, "expected an in-flight connection-handling task after CONNECT"
+
+    await proxy.stop()
+
+    assert proxy._active_tasks == set(), "stop() must not return while a connection task is still running"
+    writer.close()
+
+
+@pytest.mark.asyncio
 async def test_plain_http_proxy_request_to_oos_host_is_denied_and_never_connects(
     destination,
 ) -> None:

@@ -131,6 +131,10 @@ class ScopeEnforcingProxy:
         # Durable audit trail (core/collection/audit.py) — every decision,
         # ALLOW and DENY alike, for persistence into intel_network_requests.
         self.audit: list[NetworkRequestRecord] = []
+        # Every `_handle_client` invocation registers itself here so `stop()`
+        # can guarantee no connection-handling task (including a still-open
+        # splice loop) outlives it — see `stop()` for why this matters.
+        self._active_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def proxy_url(self) -> str:
@@ -152,6 +156,23 @@ class ScopeEnforcingProxy:
         except Exception:
             logger.debug("crawler_proxy: error while closing server socket", exc_info=True)
         self._server = None
+        # `server.close()`/`wait_closed()` only stop the listening socket
+        # from accepting new connections — they do nothing about a
+        # connection-handling task already in flight (e.g. still inside
+        # `_splice`, pumping bytes between a client and an upstream/target
+        # socket). Without this, `await proxy.stop()` can return while that
+        # task keeps running in the background; if the caller's event loop
+        # is torn down shortly after (e.g. pytest-asyncio closing a
+        # function-scoped loop at test end), the task's sockets never get a
+        # clean, deterministic close — an intermittent, hard-to-reproduce
+        # source of state bleeding across test/process boundaries, not a
+        # leak this class should ever leave for the caller to worry about.
+        if self._active_tasks:
+            pending = list(self._active_tasks)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._active_tasks.clear()
 
     async def __aenter__(self) -> ScopeEnforcingProxy:
         await self.start()
@@ -300,13 +321,20 @@ class ScopeEnforcingProxy:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_tasks.add(task)
         try:
             await self._route(reader, writer)
+        except asyncio.CancelledError:
+            pass
         except Exception:
             logger.debug("crawler_proxy: connection handling error", exc_info=True)
         finally:
             with _SuppressCloseErrors():
                 writer.close()
+            if task is not None:
+                self._active_tasks.discard(task)
 
     async def _route(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request_line = await asyncio.wait_for(reader.readline(), timeout=_CONNECT_TIMEOUT)
