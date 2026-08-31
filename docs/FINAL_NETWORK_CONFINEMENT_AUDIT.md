@@ -727,9 +727,17 @@ Authorized HTML page embeds `<a>`, `<script>`, `<img>`, `<link>`,
 
 * katana — authorized page fetched; evil server ZERO
 * hakrawler — authorized page fetched; evil server ZERO
-* nuclei — same `-proxy` / `ScopeEnforcingProxy` path; not re-driven with
-  the default template corpus (unbounded). Flag enforcement:
-  `tests/test_crawler_proxy_flag_enforcement.py`.
+* nuclei — same `-proxy` / `ScopeEnforcingProxy` path. Flag enforcement:
+  `tests/test_crawler_proxy_flag_enforcement.py`. **Now also confirmed live
+  with the real, unbounded default template corpus** (production re-run,
+  `confinement-proof-final`, 2026-08-31): nuclei's own templates attempted
+  `checkip.amazonaws.com` (2x) and `login.microsoftonline.com` (2x) —
+  neither is virusbarrier.xyz or a subdomain of it. All 4 attempts recorded
+  `decision=DENY, reason=out_of_scope, network_attempted=0,
+  network_completed=0` in `intel_network_requests` — the confinement proxy
+  refused before ever opening a socket, exactly like the httpx redirect
+  destinations below. This closes the "not re-driven with the unbounded
+  template corpus" caveat this row previously carried.
 
 Redirect-escape (302 to `localhost`) already proven live for katana and
 hakrawler in `tests/test_crawler_confinement_live.py`.
