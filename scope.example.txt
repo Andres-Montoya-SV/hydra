@@ -9,9 +9,16 @@ www.metaversephone.com
 # otherwise-authorized domain/wildcard, e.g. a bug-bounty program that
 # authorizes the whole domain but explicitly excludes a whistleblowing or
 # legal-reporting endpoint. The domain part matches like an ordinary scope
-# entry (exact host or any subdomain); the path part is a glob ("*" also
-# matches "/", so a broader glob only ever excludes more, never less).
-# An exclusion always wins over any positive match, even a wildcard.
+# entry (exact host or any subdomain). The path part covers a whole SUBTREE,
+# not just that exact path: !bancoplata.mx/*/whistleblowing excludes
+# /es/whistleblowing AND everything beneath it (/es/whistleblowing/reportar,
+# /es/whistleblowing/formulario/paso2, ...) — the report mechanism a program
+# actually cares about almost always lives one or more segments below the
+# path it names, not at that literal URL. Matching is by whole path segment
+# ("/"-separated), so a different segment that merely starts with the same
+# text (/es/whistleblowing-info) is NOT excluded — segment equality, not
+# substring containment. An exclusion always wins over any positive match,
+# even a wildcard.
 *.bancoplata.mx
 *.platacard.mx
 !bancoplata.mx/*/whistleblowing

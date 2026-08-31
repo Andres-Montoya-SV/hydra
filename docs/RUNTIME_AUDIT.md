@@ -223,11 +223,20 @@ If `collection_scope` is missing entirely, `require_collection_scope` fails clos
 ### 5.3b `SCOPE_FILE` path exclusions (new: scope is host **and** path aware)
 
 A `SCOPE_FILE` line prefixed with `!` (`!bancoplata.mx/*/whistleblowing`) excludes that
-path from an otherwise-authorized domain/wildcard, even a wildcard that would otherwise
-cover it. Parsed by `core/scope.py:split_scope_patterns` into
+path **and its entire subtree** from an otherwise-authorized domain/wildcard, even a
+wildcard that would otherwise cover it — `/es/whistleblowing`, `/es/whistleblowing/reportar`,
+`/es/whistleblowing/formulario/paso2`, etc. are all excluded, not merely the literal
+named path. Parsed by `core/scope.py:split_scope_patterns` into
 `CollectionScope.path_exclusions` (kept separate from the ordinary `scope_patterns`
-tuple used by `host_in_scope`), matched by `core/scope.py:url_path_excluded`
-(hostname exact-or-subdomain + `fnmatch` path glob, `*` also matches `/`).
+tuple used by `host_in_scope`), matched by `core/scope.py:url_path_excluded`: hostname
+exact-or-subdomain, path by whole `/`-separated segment (each segment compared with
+`fnmatch`, so `*` matches one segment) as a subtree prefix — the URL path must have at
+least as many segments as the pattern and every corresponding leading segment must
+match; extra trailing segments are what makes it a subtree match, not a rejection. A
+first version compared the whole path string with a single `fnmatch.fnmatch(path, glob)`
+call, which only matched the *exact* named path and left every subpath — where the
+actual sensitive endpoint almost always lives — unexcluded; fixed before this document's
+current revision.
 
 Enforced in `core/intel/authorize.py:authorize_active_indicator`, immediately after
 hostname parsing and **before** the cloud-endpoint opt-in gate and ordinary

@@ -23,15 +23,20 @@ SCOPE_FILE=scope.txt python app.py run -d www.metaversejustice.com
 Without `SCOPE_FILE`, Hydra does not enforce program scope — that remains
 your responsibility.
 
-A `SCOPE_FILE` line prefixed with `!` excludes a specific path from an
-otherwise-authorized domain/wildcard, e.g. a program that authorizes
-`*.example.com` but carves out `/legal/whistleblowing` as explicitly out of
-scope:
+A `SCOPE_FILE` line prefixed with `!` excludes a path **and everything
+beneath it** from an otherwise-authorized domain/wildcard, e.g. a program
+that authorizes `*.example.com` but carves out the whole
+`/legal/whistleblowing` subtree as explicitly out of scope:
 
 ```
 *.example.com
 !example.com/legal/whistleblowing
 ```
+
+This excludes `/legal/whistleblowing`, `/legal/whistleblowing/report`, and
+any deeper subpath — not just that exact URL. A different path that merely
+starts with the same text (`/legal/whistleblowing-info`) is a distinct path
+segment and is **not** excluded.
 
 An exclusion always wins over a positive domain/wildcard match. See
 `scope.example.txt` for a full example.

@@ -253,9 +253,14 @@ express that in a `SCOPE_FILE` at all.
 is parsed by `core/scope.py:split_scope_patterns` into a `(domain, path_glob)` pair, kept
 on `CollectionScope.path_exclusions` — separate from the ordinary `scope_patterns` tuple,
 so `host_in_scope` never sees exclusion syntax as a (harmlessly inert) positive pattern.
-`core/scope.py:url_path_excluded` matches a full URL's hostname (exact or subdomain) and
-path (`fnmatch`, `*` also matches `/` — a broader glob only ever excludes *more*, the safe
-direction for a deny rule) against every configured exclusion.
+`core/scope.py:url_path_excluded` matches a full URL's hostname (exact or subdomain)
+against every configured exclusion, and the path as a **subtree prefix**: it excludes the
+named path and everything beneath it, matched by whole `/`-separated segment (each segment
+compared with `fnmatch`, so a `*` matches one segment, not an arbitrary run of characters)
+— not by a single exact-match `fnmatch.fnmatch(path, glob)` over the whole string, which
+would only ever protect the literal landing path and silently leave every subpath (almost
+always where the actual sensitive mechanism lives — a report form is rarely at the bare
+landing URL a program names) reachable. See "A third real bug" below.
 
 **Where it's enforced — the same single choke point as everything else in this arc.**
 `core/intel/authorize.py:authorize_active_indicator` checks `path_exclusions` immediately
@@ -286,6 +291,42 @@ Verified with `tests/test_scope_path_exclusions.py`: parsing/matching unit tests
 DENY/ALLOW tests, and two real-local-server tests driving `ScopeEnforcingProxy` directly
 over plain HTTP proving the excluded path never reaches the server while a sibling path on
 the same domain does.
+
+### A third real bug: the first version of `url_path_excluded` protected the wrong thing
+
+The initial implementation used `fnmatch.fnmatch(path, path_glob)` directly on the whole
+path string — an exact-match glob, not a prefix. Manually verified against a real scope
+before this was caught:
+
+```python
+allows_active_collection('https://bancoplata.mx/es/whistleblowing', scope)          # -> False (correct)
+allows_active_collection('https://bancoplata.mx/es/whistleblowing/reportar', scope) # -> True  (WRONG)
+```
+
+`/*/whistleblowing` only ever matched that exact path string; any additional segment
+(`/reportar`, `/submit`, `/formulario/paso2`, a query string) fell outside the glob and
+came back **authorized**. This is close to the worst possible shape for this specific bug:
+a bug-bounty program almost never marks the bare landing page as its sensitive exclusion —
+it marks a section, and the actual report-submission mechanism the exclusion exists to
+protect nearly always lives one or more segments deeper. The bug protected exactly the
+part that mattered least and left exposed exactly the part the exclusion was written for.
+
+**The fix.** `url_path_excluded` now splits both the URL path and the pattern into
+`/`-separated segments and requires every leading pattern segment to match (each segment
+compared independently with `fnmatch`, so a `*` matches one segment, never crosses a `/`)
+— the URL path may have any number of additional trailing segments beyond the pattern and
+still be excluded. Segment equality also fixes a second, smaller risk in the same
+direction: a URL that merely shares a text *prefix* with an excluded segment
+(`/es/whistleblowing-info` against a pattern ending in `whistleblowing`) is a different
+segment and is correctly never excluded — the fix is subtree-prefix by segment, not
+substring-prefix by character.
+
+Verified against the exact six cases manually checked during triage: the two-segment-deeper
+subpath and the query-string case are now excluded; the same-text-different-segment case
+and unrelated paths/hosts remain authorized. Same static architectural guard
+(`tests/test_no_bypass_network_primitives.py`) and every other exclusion-consuming call
+site (`authorize_active_indicator`, `ScopeEnforcingProxy`) needed no changes — the fix is
+fully contained in the one function that does the actual path comparison.
 
 ## A real bug found by writing real tests, not assumed away (this turn)
 

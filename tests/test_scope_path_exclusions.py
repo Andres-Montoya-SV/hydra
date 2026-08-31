@@ -102,6 +102,52 @@ def test_url_path_excluded_never_matches_a_bare_hostname() -> None:
     assert not url_path_excluded("bancoplata.mx", exclusions)
 
 
+def test_url_path_excluded_covers_the_full_subtree_not_just_the_exact_path() -> None:
+    """Regression for a real bug: the first implementation compared the whole
+    path with a single `fnmatch.fnmatch(path, glob)` call, which is an
+    *exact*-match glob — `/*/whistleblowing` matched only that literal path
+    string, so `/es/whistleblowing/reportar` (one segment deeper, exactly
+    where a program's actual report-submission mechanism usually lives) came
+    back authorized instead of excluded. `url_path_excluded` must exclude the
+    named path AND its entire subtree, matched by whole path segment (not
+    substring) so a same-text-prefixed sibling segment is never excluded."""
+    exclusions = [("bancoplata.mx", "/*/whistleblowing")]
+
+    # 1. Exact excluded path.
+    assert url_path_excluded("https://bancoplata.mx/es/whistleblowing", exclusions)
+    # 2. One segment deeper — this is the case that used to wrongly ALLOW.
+    assert url_path_excluded("https://bancoplata.mx/es/whistleblowing/reportar", exclusions)
+    # 3. Multiple segments deeper.
+    assert url_path_excluded("https://bancoplata.mx/es/whistleblowing/formulario/paso2", exclusions)
+    # 4. A DIFFERENT path segment that merely starts with the same text must
+    #    NOT be excluded — segment equality, not substring containment.
+    assert not url_path_excluded("https://bancoplata.mx/es/whistleblowing-info", exclusions)
+    # 5. Unrelated subdomain path — no relation to the exclusion at all.
+    assert not url_path_excluded("https://sub.bancoplata.mx/algo", exclusions)
+    # 6. Unrelated path on the same domain.
+    assert not url_path_excluded("https://bancoplata.mx/es/otra-cosa", exclusions)
+
+    # Trailing slash and a query string must not defeat the subtree match.
+    assert url_path_excluded("https://bancoplata.mx/es/whistleblowing/", exclusions)
+    assert url_path_excluded("https://bancoplata.mx/en/whistleblowing?ref=x", exclusions)
+
+
+def test_allows_active_collection_covers_the_full_subtree_end_to_end() -> None:
+    """Same six cases as above, through the real end-to-end path — this is
+    the exact shape of the manual verification script that surfaced the bug:
+    `allows_active_collection(url, scope)` against a real `CollectionScope`."""
+    scope = _bank_scope()
+
+    assert not allows_active_collection("https://bancoplata.mx/es/whistleblowing", scope)
+    assert not allows_active_collection("https://bancoplata.mx/es/whistleblowing/reportar", scope)
+    assert not allows_active_collection(
+        "https://bancoplata.mx/es/whistleblowing/formulario/paso2", scope
+    )
+    assert allows_active_collection("https://bancoplata.mx/es/whistleblowing-info", scope)
+    assert allows_active_collection("https://sub.bancoplata.mx/algo", scope)
+    assert allows_active_collection("https://bancoplata.mx/es/otra-cosa", scope)
+
+
 def test_collection_scope_from_seeds_parses_scope_file_exclusions(tmp_path: Path) -> None:
     scope_file = tmp_path / "scope.txt"
     scope_file.write_text(

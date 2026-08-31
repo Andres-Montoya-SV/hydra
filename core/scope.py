@@ -37,9 +37,10 @@ def split_scope_patterns(patterns: list[str]) -> tuple[list[str], list[tuple[str
     A path exclusion line looks like `!domain/path-glob`, e.g.
     `!bancoplata.mx/*/whistleblowing`. The domain part is matched the same
     way a positive scope entry is (exact host or any subdomain); the path
-    part is matched against the URL path with shell-glob semantics
-    (`fnmatch`), where `*` also matches `/` — a broader match only ever
-    *excludes* more, which is the safe direction for a deny rule.
+    part is matched against the URL path by segment (`/`-separated, each
+    segment compared with `fnmatch` — see `url_path_excluded`) as a
+    **subtree prefix**: the exclusion covers the named path and everything
+    beneath it, not merely that exact path string.
     """
     positive: list[str] = []
     exclusions: list[tuple[str, str]] = []
@@ -58,7 +59,27 @@ def split_scope_patterns(patterns: list[str]) -> tuple[list[str], list[tuple[str
 
 
 def url_path_excluded(url: str, exclusions: list[tuple[str, str]]) -> bool:
-    """True when `url`'s hostname+path matches an explicit path exclusion.
+    """True when `url`'s hostname+path falls under an explicit path
+    exclusion's subtree — not just an exact string match.
+
+    `!domain/path` excludes `path` **and everything beneath it**:
+    `!bancoplata.mx/*/whistleblowing` excludes `/es/whistleblowing`,
+    `/es/whistleblowing/reportar`, `/es/whistleblowing/formulario/paso2`,
+    and so on — a bug-bounty program almost never marks the landing page
+    itself as sensitive, it marks a section, and the actual report
+    mechanism usually lives one or more segments deeper. Matching by exact
+    string (`fnmatch.fnmatch(path, glob)` alone) would protect only the
+    literal landing path and silently leave every subpath — the part that
+    actually matters — reachable.
+
+    Matching is by whole path *segment* (split on `/`), each segment
+    compared with `fnmatch` (so a `*` in the pattern matches one segment,
+    not an arbitrary run of characters): the URL path must have at least as
+    many segments as the pattern, and every corresponding leading segment
+    must match. A path that merely shares a text *prefix* with a different,
+    unrelated segment (`/es/whistleblowing-info` against a pattern ending in
+    `whistleblowing`) is a different segment and is never excluded — segment
+    equality, not substring containment.
 
     Only meaningful for a real URL (scheme + path) — a bare hostname or
     `host:port` indicator carries no path to exclude and never matches here,
@@ -76,11 +97,18 @@ def url_path_excluded(url: str, exclusions: list[tuple[str, str]]) -> bool:
     host = normalize_domain(parsed.hostname or "")
     if not host:
         return False
-    path = parsed.path or "/"
+    path_segments = (parsed.path or "/").split("/")
     for domain, path_glob in exclusions:
-        if host == domain or host.endswith("." + domain):
-            if fnmatch.fnmatch(path, path_glob):
-                return True
+        if host != domain and not host.endswith("." + domain):
+            continue
+        glob_segments = path_glob.split("/")
+        if len(path_segments) < len(glob_segments):
+            continue
+        if all(
+            fnmatch.fnmatch(actual, pattern)
+            for actual, pattern in zip(path_segments, glob_segments, strict=False)
+        ):
+            return True
     return False
 
 
