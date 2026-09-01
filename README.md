@@ -150,6 +150,9 @@ All settings live in `.env`. Key variables:
 | `ENABLE_BROWSER_PROBE` | Compare httpx vs mobile WebKit destinations (opt-in, active) | `false` |
 | `ENABLE_THREAT_INTEL` | Check live hosts in URLhaus (requires Auth-Key) | `false` |
 | `URLHAUS_API_KEY` | Free key from https://auth.abuse.ch/ | — |
+| `ENABLE_PASSIVE_DNS` | Query passive DNS for out-of-scope certificate siblings observed via `ctlogs` (never resolves them directly) | `false` |
+| `SECURITYTRAILS_API_KEY` | Optional second passive-DNS provider (Mnemonic PassiveDNS is the no-key default) | — |
+| `PASSIVE_DNS_MAX_CANDIDATES` | Cap on certificate siblings queried per run | `25` |
 | `BROWSER_PROBE_MAX_HOSTS` | Maximum active browser navigations per run | `20` |
 | `STRICT_OPSEC` | Fail closed and permit verified proxy-routed components only | `false` |
 | `OUTBOUND_PROXY_URL` | Required HTTP(S) CONNECT proxy for strict mode | — |
@@ -340,6 +343,8 @@ output/20250629_143022/
 ├── wildcard_check.jsonl # Canary subdomain probe results (wildcard DNS detection)
 ├── soft404_check.jsonl # Canary path probe results (soft-404 / catch-all detection)
 ├── threat_intel.jsonl  # URLhaus reputation results (opt-in)
+├── passive_dns.jsonl   # Historical resolutions for out-of-scope certificate siblings (opt-in)
+├── passive_dns_raw.txt # Raw Mnemonic/SecurityTrails response bodies (audit trail)
 ├── browser_probe.jsonl # WebKit cloaking probe results (opt-in)
 ├── browser_probe_raw/  # Rendered HTML per host (audit trail for cloaking)
 ├── metadata.json       # Aggregated metadata

@@ -52,6 +52,13 @@ ALLOWED_DIRECT_NETWORK_IMPORTS: dict[str, str] = {
         "zone (raw UDP socket); target IPs are WHOIS/DNS query content, "
         "never the connection destination"
     ),
+    "passive_dns.py": (
+        "fixed api.mnemonic.no endpoint (urllib.request), and optionally "
+        "api.securitytrails.com when SECURITYTRAILS_API_KEY is set; the "
+        "out-of-scope certificate-sibling hostname is a query path/param, "
+        "never the connection destination — Hydra's own socket only ever "
+        "connects to the passive-DNS provider, never the sibling itself"
+    ),
 }
 
 # Infrastructure modules this guard doesn't apply to at all — they ARE the
