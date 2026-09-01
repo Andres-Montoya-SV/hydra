@@ -124,6 +124,10 @@ class BrowserProbePlugin(BaseToolPlugin):
                                 context=context,
                                 timeout_seconds=self.settings.browser_probe_timeout,
                                 extra_headers=self.settings.merged_headers(),
+                                user_agent=(
+                                    _IPHONE_USER_AGENT
+                                    + self.settings.attribution_user_agent_suffix()
+                                ),
                             )
                         )
                     except Exception as exc:
@@ -176,9 +180,15 @@ async def _probe_target(
     context: PipelineContext,
     timeout_seconds: int,
     extra_headers: dict[str, str] | None = None,
+    user_agent: str = _IPHONE_USER_AGENT,
 ) -> dict[str, object]:
     browser_context = await browser.new_context(
-        user_agent=_IPHONE_USER_AGENT,
+        # Program-mandated User-Agent attribution (e.g. Bugcrowd's "include
+        # 'bugcrowd' in your User-Agent") is appended onto _IPHONE_USER_AGENT
+        # by the caller (Settings.attribution_user_agent_suffix()), never
+        # substituted — replacing the real mobile-Safari UA would break the
+        # cloaking-detection fingerprint this plugin exists for.
+        user_agent=user_agent,
         is_mobile=True,
         has_touch=True,
         viewport={"width": 390, "height": 844},

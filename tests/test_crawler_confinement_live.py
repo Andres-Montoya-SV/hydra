@@ -59,6 +59,19 @@ def _make_redirect_handler(oos_port: int):
     return _RedirectHandler
 
 
+class _HeaderCapturingHandler(_QuietHandler):
+    # email.message.Message (self.headers) is case-insensitive by design —
+    # HTTP header names are case-insensitive per RFC 7230.
+    last_headers: object = None
+
+    def do_GET(self) -> None:  # noqa: N802
+        type(self).last_headers = self.headers
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+
 def _serve(handler_cls: type) -> tuple[socketserver.TCPServer, int, threading.Thread]:
     socketserver.TCPServer.allow_reuse_address = True
     httpd = socketserver.TCPServer(("127.0.0.1", 0), handler_cls)
@@ -72,6 +85,18 @@ def _serve(handler_cls: type) -> tuple[socketserver.TCPServer, int, threading.Th
 def oos_server() -> Iterator[int]:
     _CountingHandler.hits = []
     httpd, port, thread = _serve(_CountingHandler)
+    try:
+        yield port
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.fixture
+def header_capturing_server() -> Iterator[int]:
+    _HeaderCapturingHandler.last_headers = None
+    httpd, port, thread = _serve(_HeaderCapturingHandler)
     try:
         yield port
     finally:
@@ -278,3 +303,80 @@ async def test_hakrawler_redirect_escape_is_blocked_by_confinement_proxy(
     if result.output_path.exists():
         crawled = read_jsonl(result.output_path)
         assert not any("localhost" in str(r.get("url") or "") for r in crawled)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("katana") is None, reason="katana binary not installed")
+async def test_katana_sends_attribution_user_agent_through_real_request(
+    tmp_path: Path, header_capturing_server: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ATTRIBUTION_USER_AGENT (e.g. a Bugcrowd-mandated marker) must reach
+    the real target request — katana has no dedicated -user-agent flag, so
+    `modules/katana.py` sends it via `-H "User-Agent: ..."` (confirmed
+    against the installed binary's -h output); this proves that flag
+    actually changes what katana puts on the wire, not just that it was
+    added to argv."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".config").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    alive_path = output_dir / "alive.txt"
+    seed_url = f"http://127.0.0.1:{header_capturing_server}/"
+    write_lines(alive_path, [seed_url], base_dir=output_dir)
+
+    settings = Settings(
+        project_root=tmp_path,
+        attribution_user_agent="bugcrowd; cosmiccashew",
+    )
+    context = PipelineContext(
+        targets=[DomainTarget(domain="127.0.0.1")],
+        output_dir=output_dir,
+        collection_scope=CollectionScope.from_seeds(
+            ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+        ),
+    )
+    context.alive_urls = [seed_url]
+
+    plugin = KatanaPlugin(settings)
+    await plugin.run(context, alive_path)
+
+    assert _HeaderCapturingHandler.last_headers is not None, "katana never reached the server"
+    ua = _HeaderCapturingHandler.last_headers.get("User-Agent") or ""
+    assert "bugcrowd" in ua, f"expected attribution marker in real User-Agent, got {ua!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("hakrawler") is None, reason="hakrawler binary not installed")
+async def test_hakrawler_sends_attribution_user_agent_through_real_request(
+    tmp_path: Path, header_capturing_server: int
+) -> None:
+    """Same property as the katana test above, against hakrawler: no
+    dedicated UA flag, sent via `-h "User-Agent: ..."` (note: `-h`, not
+    `-H` — this binary's own flag casing, confirmed against its `-h`
+    output) — a real request must actually carry it."""
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    seed_url = f"http://127.0.0.1:{header_capturing_server}/"
+    write_lines(output_dir / "alive.txt", [seed_url], base_dir=output_dir)
+
+    settings = Settings(
+        project_root=tmp_path,
+        attribution_user_agent="bugcrowd; cosmiccashew",
+    )
+    context = PipelineContext(
+        targets=[DomainTarget(domain="127.0.0.1")],
+        output_dir=output_dir,
+        collection_scope=CollectionScope.from_seeds(
+            ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+        ),
+    )
+    context.alive_urls = [seed_url]
+
+    plugin = HakrawlerPlugin(settings)
+    await plugin.run(context, output_dir / "resolved.txt")
+
+    assert _HeaderCapturingHandler.last_headers is not None, "hakrawler never reached the server"
+    ua = _HeaderCapturingHandler.last_headers.get("User-Agent") or ""
+    assert "bugcrowd" in ua, f"expected attribution marker in real User-Agent, got {ua!r}"

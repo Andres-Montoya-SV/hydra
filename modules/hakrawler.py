@@ -49,6 +49,13 @@ class HakrawlerPlugin(BaseToolPlugin):
             # provided but not defined: -plain" (masked because existing
             # tests mock _execute and never actually invoke the binary).
             args = self._argv(context, "-d", "2", "-insecure", "-proxy", proxy.proxy_url)
+            # hakrawler has no dedicated UA flag either, and its only header
+            # mechanism is "-h" (not "-H") taking "Name: value;;Name2: value2"
+            # — confirmed against the installed binary's -h output. Previously
+            # set no headers of any kind.
+            user_agent = self.settings.effective_user_agent()
+            if user_agent:
+                args.extend(["-h", f"User-Agent: {user_agent}"])
             result = await self._execute(
                 context, args, output_path, input_data=input_data, allow_empty=True
             )

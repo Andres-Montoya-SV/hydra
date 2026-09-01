@@ -60,6 +60,12 @@ class KatanaPlugin(BaseToolPlugin):
         for key, value in headers.items():
             args.extend(["-H", f"{key}: {value}"])
 
+        # katana has no dedicated -user-agent/-ua flag (confirmed against
+        # the installed binary's -h output) — same as httpx, set via -H.
+        user_agent = self.settings.effective_user_agent()
+        if user_agent:
+            args.extend(["-H", f"User-Agent: {user_agent}"])
+
         # katana follows redirects and discovers links on its own; a gated
         # -list only constrains its starting seeds, not what it decides to
         # request next. Route it through a local scope-enforcing proxy so

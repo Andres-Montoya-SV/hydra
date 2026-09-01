@@ -1,16 +1,14 @@
 # Copy to scope.txt (gitignored) and edit for your program.
 # One authorized root or hostname per line. Optional *.example.com wildcards.
-metaversejustice.com
-www.metaversejustice.com
-metaversephone.com
-www.metaversephone.com
+example.com
+*.example.com
 
 # Path exclusions: a line starting with "!" carves a specific path out of an
 # otherwise-authorized domain/wildcard, e.g. a bug-bounty program that
 # authorizes the whole domain but explicitly excludes a whistleblowing or
 # legal-reporting endpoint. The domain part matches like an ordinary scope
 # entry (exact host or any subdomain). The path part covers a whole SUBTREE,
-# not just that exact path: !bancoplata.mx/*/whistleblowing excludes
+# not just that exact path: !example.com/*/whistleblowing excludes
 # /es/whistleblowing AND everything beneath it (/es/whistleblowing/reportar,
 # /es/whistleblowing/formulario/paso2, ...) — the report mechanism a program
 # actually cares about almost always lives one or more segments below the
@@ -19,7 +17,17 @@ www.metaversephone.com
 # text (/es/whistleblowing-info) is NOT excluded — segment equality, not
 # substring containment. An exclusion always wins over any positive match,
 # even a wildcard.
-*.bancoplata.mx
-*.platacard.mx
-!bancoplata.mx/*/whistleblowing
-!platacard.mx/*/whistleblowing
+*.example.com
+*.example-2.com
+!example.com/*/whistleblowing
+!example-2.com/*/whistleblowing
+
+# Whole-domain exclusion: a "!domain" line with NO path at all excludes that
+# domain entirely (and any further subdomain of it) — not just a path within
+# it. Real case: a *.example-3.com wildcard is authorized, but its own
+# community/support subdomain is explicitly carved out in full. Applies to
+# every collection path, including a bare hostname with no URL at all (DNS
+# resolution, a CT-log-observed name) — not only when a URL happens to be
+# present, unlike the path-specific exclusions above.
+*.example-3.com
+!community.example-3.com

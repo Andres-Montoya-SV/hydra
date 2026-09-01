@@ -125,3 +125,63 @@ class TestSettings:
         assert settings.merged_headers() == {}
         assert "hydra" not in settings.effective_user_agent().lower()
         assert "proxy.example" not in str(settings.to_safe_dict())
+
+    def test_attribution_user_agent_appended_to_effective_user_agent(
+        self, project_root: Path
+    ) -> None:
+        settings = Settings(
+            project_root=project_root,
+            user_agent="hydra/1.0",
+            attribution_user_agent="bugcrowd; cosmiccashew",
+        )
+        ua = settings.effective_user_agent()
+        assert ua.startswith("hydra/1.0")
+        assert "bugcrowd; cosmiccashew" in ua
+
+    def test_attribution_user_agent_absent_by_default(self, project_root: Path) -> None:
+        settings = Settings(project_root=project_root, user_agent="hydra/1.0")
+        assert settings.effective_user_agent() == "hydra/1.0"
+        assert settings.attribution_user_agent_suffix() == ""
+
+    def test_attribution_user_agent_suppressed_under_strict_opsec(self, project_root: Path) -> None:
+        """Same suppression precedent as researcher_attribution_header:
+        strict OPSEC means non-attributable probing, the opposite intent of
+        program-mandated self-identification — the two must not combine."""
+        settings = Settings(
+            project_root=project_root,
+            strict_opsec=True,
+            outbound_proxy_url="http://proxy.example:8080",
+            attribution_user_agent="bugcrowd; cosmiccashew",
+        )
+        assert settings.attribution_user_agent_suffix() == ""
+        assert "bugcrowd" not in settings.effective_user_agent()
+
+    def test_attribution_user_agent_coexists_with_researcher_header(
+        self, project_root: Path
+    ) -> None:
+        """A program requiring both mechanisms at once (header + UA) must
+        get both — the two settings are independent."""
+        settings = Settings(
+            project_root=project_root,
+            user_agent="hydra/1.0",
+            attribution_user_agent="bugcrowd; cosmiccashew",
+            researcher_attribution_header={"X-HackerOne-Research": "my_h1_handle"},
+        )
+        assert "bugcrowd" in settings.effective_user_agent()
+        assert settings.merged_headers()["X-HackerOne-Research"] == "my_h1_handle"
+
+    def test_attribution_user_agent_rejects_crlf_injection(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ATTRIBUTION_USER_AGENT", "bugcrowd\r\nX-Injected: evil")
+        with pytest.raises(ConfigurationError):
+            Settings.from_env(project_root=project_root)
+
+    def test_attribution_user_agent_not_leaked_in_safe_dict(self, project_root: Path) -> None:
+        settings = Settings(
+            project_root=project_root,
+            attribution_user_agent="bugcrowd; cosmiccashew",
+        )
+        safe = settings.to_safe_dict()
+        assert "cosmiccashew" not in str(safe)
+        assert safe["has_attribution_user_agent"] is True

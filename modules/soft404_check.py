@@ -82,6 +82,7 @@ class Soft404CheckPlugin(BaseToolPlugin):
             context=context,
             upstream_proxy_url=self.settings.outbound_proxy_url or None,
             extra_headers=self.settings.merged_headers(),
+            user_agent=self.settings.effective_user_agent(),
         ) as gateway:
             authorized: list[tuple[dict[str, str], AuthorizedCollectionTarget]] = []
             for candidate in candidates:

@@ -164,6 +164,38 @@ async def test_soft404_sends_researcher_attribution_header_through_gateway(
 
 
 @pytest.mark.asyncio
+async def test_soft404_sends_attribution_user_agent_through_gateway(
+    tmp_path: Path, header_capturing_server: int
+) -> None:
+    """ATTRIBUTION_USER_AGENT (Settings.effective_user_agent(), fed through
+    CollectionGateway(user_agent=...)) must reach the real target request —
+    this is Bugcrowd's own published requirement ("Include the string
+    'bugcrowd' in your User-Agent..."), the User-Agent-based counterpart to
+    the header-based test above. Before this, CollectionGateway never
+    passed a `user_agent` to core/http_probe.py:http_get() at all, so every
+    soft404_check/param_fuzz/cloud_bucket_enum request silently used
+    http_probe's own hardcoded default UA regardless of Settings."""
+    url = f"http://127.0.0.1:{header_capturing_server}/"
+    scope = CollectionScope.from_seeds(
+        ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+    )
+    settings = Settings(
+        project_root=tmp_path,
+        enable_soft404_check=True,
+        attribution_user_agent="bugcrowd; cosmiccashew",
+    )
+    plugin = Soft404CheckPlugin(settings)
+    context = _context_for(tmp_path, scope, url)
+
+    result = await plugin.run(context, tmp_path / "unused")
+
+    assert result.success
+    assert _HeaderCapturingHandler.last_headers is not None
+    ua = _HeaderCapturingHandler.last_headers.get("User-Agent") or ""
+    assert "bugcrowd" in ua, f"expected attribution marker in real User-Agent, got {ua!r}"
+
+
+@pytest.mark.asyncio
 async def test_soft404_in_scope_hostname_resolving_private_ip_is_blocked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_server: int
 ) -> None:

@@ -59,6 +59,20 @@ class _CountingHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class _HeaderCapturingHandler(http.server.BaseHTTPRequestHandler):
+    last_headers: object = None
+
+    def do_GET(self) -> None:  # noqa: N802
+        type(self).last_headers = self.headers
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
 def _serve() -> tuple[socketserver.TCPServer, int, threading.Thread]:
     socketserver.TCPServer.allow_reuse_address = True
     server = socketserver.TCPServer(("127.0.0.1", 0), _CountingHandler)
@@ -72,6 +86,27 @@ def _serve() -> tuple[socketserver.TCPServer, int, threading.Thread]:
 def target_server() -> Iterator[int]:
     _CountingHandler.hits = []
     server, port, thread = _serve()
+    try:
+        yield port
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def _serve_header_capturing() -> tuple[socketserver.TCPServer, int, threading.Thread]:
+    socketserver.TCPServer.allow_reuse_address = True
+    server = socketserver.TCPServer(("127.0.0.1", 0), _HeaderCapturingHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, port, thread
+
+
+@pytest.fixture
+def header_capturing_server() -> Iterator[int]:
+    _HeaderCapturingHandler.last_headers = None
+    server, port, thread = _serve_header_capturing()
     try:
         yield port
     finally:
@@ -151,6 +186,49 @@ async def test_http_get_reaches_the_real_authorized_destination(target_server: i
 
     assert response.status_code == 200
     assert _CountingHandler.hits
+
+
+@pytest.mark.asyncio
+async def test_http_get_uses_default_ua_when_no_user_agent_configured(
+    header_capturing_server: int,
+) -> None:
+    """Baseline: with no `user_agent=` passed to the gateway, the request
+    still goes out with *some* UA (core/http_probe.py's own default) — this
+    is what every soft404_check/param_fuzz/cloud_bucket_enum request sent
+    before CollectionGateway threaded Settings.effective_user_agent()
+    through, and must keep working unchanged."""
+    scope = CollectionScope.from_seeds(
+        ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+    )
+    async with CollectionGateway(scope, capability="http_verify") as gateway:
+        target = gateway.authorize(f"http://127.0.0.1:{header_capturing_server}/")
+        assert target is not None
+        await gateway.http_get(target, timeout=5)
+
+    assert _HeaderCapturingHandler.last_headers is not None
+    assert _HeaderCapturingHandler.last_headers.get("User-Agent")
+
+
+@pytest.mark.asyncio
+async def test_http_get_sends_configured_user_agent(header_capturing_server: int) -> None:
+    """The plumbing this turn's attribution-UA feature depends on: a
+    `user_agent=` passed to the gateway's constructor must be what the real
+    request actually carries — not http_probe's hardcoded default."""
+    scope = CollectionScope.from_seeds(
+        ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+    )
+    async with CollectionGateway(
+        scope, capability="http_verify", user_agent="hydra/1.0 (bugcrowd; cosmiccashew)"
+    ) as gateway:
+        target = gateway.authorize(f"http://127.0.0.1:{header_capturing_server}/")
+        assert target is not None
+        await gateway.http_get(target, timeout=5)
+
+    assert _HeaderCapturingHandler.last_headers is not None
+    assert (
+        _HeaderCapturingHandler.last_headers.get("User-Agent")
+        == "hydra/1.0 (bugcrowd; cosmiccashew)"
+    )
 
 
 @pytest.mark.asyncio

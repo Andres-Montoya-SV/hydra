@@ -13,9 +13,20 @@ traffic where the path is actually visible to the proxy — CONNECT/HTTPS
 remains host-level only, same pre-existing limit as everything else about a
 CONNECT tunnel).
 
-An exclusion only ever matches a full URL — a bare hostname has no path to
-exclude, so it can never trigger one; this is intentional, not a gap (there is
-nothing to fail closed against without a path).
+A *path-specific* exclusion (`!domain/some/real/path`) only ever matches a
+full URL — a bare hostname has no path to exclude, so it can never trigger
+one; that part is intentional, not a gap (there is nothing to fail closed
+against without a path). A *whole-domain* exclusion (`!domain`, no path at
+all — e.g. Linktree excluding `community.linktr.ee` from an otherwise
+authorized `*.linktr.ee`) is different: there is no path to reason about,
+so "exclude this domain" must apply to a bare-hostname indicator too (DNS
+resolution, a CT-log SAN observation, a plain `resolved.txt` line) — not
+only when a URL happens to be present. `host_fully_excluded` (core/scope.py)
+is what covers that case; `url_path_excluded` alone deliberately still never
+matches a bare hostname, for either kind of exclusion — see
+`test_url_path_excluded_never_matches_a_bare_hostname` below, which tests
+that lower-level function specifically, not the higher-level authorization
+functions this file also covers.
 """
 
 from __future__ import annotations
@@ -35,7 +46,12 @@ from core.http_probe import http_get
 from core.intel.authorize import authorize_active_indicator
 from core.intel.scope import CollectionScope, allows_active_collection
 from core.models import DomainTarget, PipelineContext
-from core.scope import load_scope_patterns, split_scope_patterns, url_path_excluded
+from core.scope import (
+    host_fully_excluded,
+    load_scope_patterns,
+    split_scope_patterns,
+    url_path_excluded,
+)
 from modules.browser_probe import allow_browser_navigation
 
 
@@ -48,6 +64,14 @@ def _bank_scope(**kwargs: object) -> CollectionScope:
             "!bancoplata.mx/*/whistleblowing",
             "!platacard.mx/*/whistleblowing",
         ],
+        **kwargs,
+    )
+
+
+def _linktree_scope(**kwargs: object) -> CollectionScope:
+    return CollectionScope.from_seeds(
+        ["linktr.ee"],
+        patterns=["*.linktr.ee", "!community.linktr.ee"],
         **kwargs,
     )
 
@@ -200,6 +224,88 @@ def test_allows_active_collection_denies_excluded_path() -> None:
     scope = _bank_scope()
     assert not allows_active_collection("https://bancoplata.mx/es/whistleblowing", scope)
     assert allows_active_collection("https://sub.bancoplata.mx/algo", scope)
+
+
+# ---------------------------------------------------------------------------
+# Whole-domain exclusion (`!domain`, no path at all) — the real Linktree
+# case: `*.linktr.ee` is authorized, but `community.linktr.ee` is carved out
+# entirely, with no path involved. Distinct from the path-specific
+# `!domain/path` exclusions above: `host_fully_excluded` (core/scope.py) is
+# the piece that makes this apply to a bare-hostname indicator too (DNS
+# resolution, a CT-log SAN), not just a URL.
+# ---------------------------------------------------------------------------
+
+
+def test_split_scope_patterns_domain_only_exclusion_has_no_explicit_path() -> None:
+    positive, exclusions = split_scope_patterns(["*.linktr.ee", "!community.linktr.ee"])
+    assert positive == ["*.linktr.ee"]
+    assert exclusions == [("community.linktr.ee", "/*")]
+
+
+def test_host_fully_excluded_matches_bare_hostname_and_its_subdomains() -> None:
+    exclusions = [("community.linktr.ee", "/*")]
+    assert host_fully_excluded("community.linktr.ee", exclusions)
+    # Conservative subtree rule, same principle as path exclusions: a further
+    # subdomain of the excluded domain is excluded too.
+    assert host_fully_excluded("sub.community.linktr.ee", exclusions)
+    assert not host_fully_excluded("otrosub.linktr.ee", exclusions)
+    assert not host_fully_excluded("linktr.ee", exclusions)
+
+
+def test_host_fully_excluded_does_not_fire_for_a_path_specific_exclusion() -> None:
+    """Regression: `!bancoplata.mx/*/whistleblowing` must not make the bare
+    domain itself unresolvable — only a real path-specific exclusion glob,
+    never the `/*` whole-domain sentinel, was given for it."""
+    exclusions = [("bancoplata.mx", "/*/whistleblowing")]
+    assert not host_fully_excluded("bancoplata.mx", exclusions)
+    assert not host_fully_excluded("www.bancoplata.mx", exclusions)
+
+
+def test_linktree_bare_hostname_excluded_even_with_no_url_at_all() -> None:
+    """The exact gap this fix closes: before it, a bare-hostname indicator —
+    what DNS resolution, a CT-log SAN, or a plain resolved.txt line actually
+    is — was never checked against a domain-only exclusion at all, because
+    `url_path_excluded` structurally requires a URL. `community.linktr.ee`
+    with no scheme, no path, nothing but the hostname, must still be denied."""
+    scope = _linktree_scope()
+    assert not allows_active_collection("community.linktr.ee", scope)
+
+
+def test_linktree_url_without_path_is_excluded() -> None:
+    scope = _linktree_scope()
+    assert not allows_active_collection("https://community.linktr.ee", scope)
+
+
+def test_linktree_url_with_path_is_also_excluded() -> None:
+    scope = _linktree_scope()
+    assert not allows_active_collection("https://community.linktr.ee/foro/algo", scope)
+
+
+def test_linktree_sibling_subdomain_remains_authorized() -> None:
+    scope = _linktree_scope()
+    assert allows_active_collection("otrosub.linktr.ee", scope)
+    assert allows_active_collection("https://otrosub.linktr.ee", scope)
+
+
+def test_linktree_deeper_subdomain_of_excluded_host_also_excluded() -> None:
+    """Conservative-by-default: `sub.community.linktr.ee` is a further
+    subdomain of the excluded `community.linktr.ee` — excluding more, not
+    less, when scope is ambiguous."""
+    scope = _linktree_scope()
+    assert not allows_active_collection("sub.community.linktr.ee", scope)
+
+
+def test_bancoplata_path_exclusion_regression_bare_domain_still_resolvable() -> None:
+    """No-regression check for the already-shipped Banco Plata feature: this
+    fix only adds behavior for domain-only exclusions, it must not make a
+    path-specific exclusion's own bare domain unresolvable."""
+    scope = _bank_scope()
+    assert allows_active_collection("bancoplata.mx", scope)
+    assert allows_active_collection("www.bancoplata.mx", scope)
+    assert allows_active_collection("https://bancoplata.mx/", scope)
+    assert not allows_active_collection("https://bancoplata.mx/es/whistleblowing", scope)
+    assert not allows_active_collection("https://bancoplata.mx/es/whistleblowing/reportar", scope)
+    assert allows_active_collection("https://bancoplata.mx/es/whistleblowing-info", scope)
 
 
 # ---------------------------------------------------------------------------

@@ -93,11 +93,17 @@ class CollectionGateway:
         context: object | None = None,
         upstream_proxy_url: str | None = None,
         extra_headers: dict[str, str] | None = None,
+        user_agent: str | None = None,
     ) -> None:
         self.scope = scope
         self.capability = capability
         self.context = context
         self.extra_headers = dict(extra_headers) if extra_headers else {}
+        # None means "use core/http_probe.py's own default" — pass
+        # Settings.effective_user_agent() to get Hydra's configured UA
+        # (including any program-mandated attribution suffix) instead of
+        # http_probe's hardcoded "HydraProbe/1.0" placeholder.
+        self.user_agent = user_agent
         self._proxy = ScopeEnforcingProxy(
             scope, capability=capability, upstream_proxy_url=upstream_proxy_url
         )
@@ -163,13 +169,14 @@ class CollectionGateway:
                 f"(from gateway.authorize()), got {type(target).__name__!r}"
             )
         # core/http_probe.py:http_get is a blocking urllib call.
-        response = await asyncio.to_thread(
-            _http_get,
-            target.raw,
-            timeout=timeout,
-            proxy_url=self._proxy.proxy_url,
-            extra_headers=self.extra_headers or None,
-        )
+        kwargs: dict[str, object] = {
+            "timeout": timeout,
+            "proxy_url": self._proxy.proxy_url,
+            "extra_headers": self.extra_headers or None,
+        }
+        if self.user_agent:
+            kwargs["user_agent"] = self.user_agent
+        response = await asyncio.to_thread(_http_get, target.raw, **kwargs)
         self.audit.append(
             GatewayAuditEntry(
                 hostname=target.hostname,

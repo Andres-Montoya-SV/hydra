@@ -112,6 +112,45 @@ def url_path_excluded(url: str, exclusions: list[tuple[str, str]]) -> bool:
     return False
 
 
+def host_fully_excluded(host: str, exclusions: list[tuple[str, str]]) -> bool:
+    """True when `host` (or any subdomain of it) falls under a **whole-domain**
+    exclusion — a `!domain` SCOPE_FILE line with no path at all (or an
+    explicit `!domain/*`, which means the same thing: every path excluded is
+    the whole domain excluded).
+
+    `url_path_excluded` above only ever fires for a real URL (scheme +
+    path) — a bare hostname indicator (what DNS resolution, a CT-log SAN
+    observation, or a plain `resolved.txt`/`subdomains.txt` line actually
+    is) structurally has no path to compare against a path glob, so it
+    always fell through as "not excluded" even for a program's explicit
+    `!community.linktr.ee` line — the exact real-world case (Linktree
+    excludes `community.linktr.ee` from an otherwise-authorized
+    `*.linktr.ee`) that surfaced this gap. A domain-only exclusion has no
+    such ambiguity: "exclude this domain" means exclude it from every
+    collection path, not only the ones that happen to carry a URL.
+
+    A path-*specific* exclusion (`!domain/some/real/path`) never matches
+    here — only the `/*` sentinel `split_scope_patterns` produces when no
+    path segment was given (or an explicit `/*` was), since a bare hostname
+    genuinely has no path to exclude in that case; `bancoplata.mx` itself
+    must stay resolvable even though `!bancoplata.mx/*/whistleblowing` is
+    excluded.
+
+    Conservative by design, same principle as the subtree rule above: a
+    further subdomain of the excluded domain (`sub.community.linktr.ee`) is
+    excluded too, not just the exact excluded name — in scope-exclusion
+    ambiguity, excluding more is safer than excluding less.
+    """
+    if not host:
+        return False
+    for domain, path_glob in exclusions:
+        if path_glob != "/*":
+            continue
+        if host == domain or host.endswith("." + domain):
+            return True
+    return False
+
+
 def host_in_scope(host: str, patterns: list[str]) -> bool:
     """True when ``host`` matches an exact entry or ``*.root`` wildcard."""
     domain = normalize_domain(host)
