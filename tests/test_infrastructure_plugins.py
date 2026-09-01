@@ -8,6 +8,7 @@ import pytest
 
 from config.settings import Settings
 from core.assets import Host, Port
+from core.collection.whois_client import WhoisChainResult
 from core.intel.scope import CollectionScope
 from core.models import DomainTarget, PipelineContext
 from core.parsers.registry import (
@@ -168,14 +169,14 @@ def test_whois_parser_simple_com_domain_unaffected_by_referral_fix(tmp_path: Pat
 
 @pytest.mark.asyncio
 async def test_whois_plugin_queries_root_domain_not_full_hostname(
-    settings: Settings, tmp_path: Path
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression test: WHOIS registries (Verisign for .com, and
     equivalents for other TLDs) index registrable/root domains only, never
-    subdomains. Passing "www.metaversejustice.com" straight to the `whois`
-    binary returns "No match for domain ..." and leaves the plugin with
-    only the generic IANA block about the .com TLD itself. The plugin must
-    always reduce each target to its root domain before querying.
+    subdomains. Querying "www.metaversejustice.com" directly returns "No
+    match for domain ..." and leaves the plugin with only the generic IANA
+    block about the .com TLD itself. The plugin must always reduce each
+    target to its root domain before querying.
     """
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
@@ -185,17 +186,17 @@ async def test_whois_plugin_queries_root_domain_not_full_hostname(
     plugin = WhoisPlugin(settings)
     queried_domains: list[str] = []
 
-    async def fake_run_tool(ctx: PipelineContext, args: list[str], **kwargs: object):
-        queried_domains.append(args[-1])
+    async def fake_query_whois_chain(domain: str, *, timeout: float) -> WhoisChainResult:
+        queried_domains.append(domain)
         raw = (
             "Domain Name: METAVERSEJUSTICE.COM\n"
             "Registrar: NameCheap, Inc.\n"
             "Creation Date: 2024-03-10T00:00:00Z\n"
             "Registry Expiry Date: 2027-03-10T00:00:00Z\n"
         )
-        return 0, raw, ""
+        return WhoisChainResult(hops=(), raw=raw, blocked=False)
 
-    plugin._run_tool = fake_run_tool  # bypass real subprocess execution
+    monkeypatch.setattr("modules.whois.query_whois_chain", fake_query_whois_chain)
     result = await plugin.run(context, output_dir / "resolved.txt")
 
     assert queried_domains == [
@@ -215,7 +216,7 @@ async def test_whois_plugin_queries_root_domain_not_full_hostname(
 
 @pytest.mark.asyncio
 async def test_whois_plugin_reduces_deep_subdomain_to_root_domain(
-    settings: Settings, tmp_path: Path
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A deeper subdomain (booking.staging.metaversejustice.com) must also
     collapse to the same root domain, not be queried as-is."""
@@ -227,11 +228,15 @@ async def test_whois_plugin_reduces_deep_subdomain_to_root_domain(
     plugin = WhoisPlugin(settings)
     queried_domains: list[str] = []
 
-    async def fake_run_tool(ctx: PipelineContext, args: list[str], **kwargs: object):
-        queried_domains.append(args[-1])
-        return 0, "Domain Name: METAVERSEJUSTICE.COM\nRegistrar: NameCheap, Inc.\n", ""
+    async def fake_query_whois_chain(domain: str, *, timeout: float) -> WhoisChainResult:
+        queried_domains.append(domain)
+        return WhoisChainResult(
+            hops=(),
+            raw="Domain Name: METAVERSEJUSTICE.COM\nRegistrar: NameCheap, Inc.\n",
+            blocked=False,
+        )
 
-    plugin._run_tool = fake_run_tool
+    monkeypatch.setattr("modules.whois.query_whois_chain", fake_query_whois_chain)
     await plugin.run(context, output_dir / "resolved.txt")
 
     assert queried_domains == ["metaversejustice.com"]
@@ -239,7 +244,7 @@ async def test_whois_plugin_reduces_deep_subdomain_to_root_domain(
 
 @pytest.mark.asyncio
 async def test_whois_plugin_uses_short_timeout_and_retries_on_timeout(
-    settings: Settings, tmp_path: Path
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """WHOIS must not inherit the global 300s timeout; retry with backoff."""
     settings.whois_timeout = 25
@@ -251,19 +256,19 @@ async def test_whois_plugin_uses_short_timeout_and_retries_on_timeout(
     context.targets = [DomainTarget(domain="metaversejustice.com")]
 
     plugin = WhoisPlugin(settings)
-    calls: list[int | None] = []
+    calls: list[float] = []
 
-    async def flaky_run_tool(ctx: PipelineContext, args: list[str], **kwargs: object):
-        calls.append(kwargs.get("timeout"))  # type: ignore[arg-type]
+    async def flaky_query_whois_chain(domain: str, *, timeout: float) -> WhoisChainResult:
+        calls.append(timeout)
         if len(calls) == 1:
             raise TimeoutError("Timed out after 25s")
-        return (
-            0,
-            "Domain Name: METAVERSEJUSTICE.COM\nRegistrar: NameCheap, Inc.\n",
-            "",
+        return WhoisChainResult(
+            hops=(),
+            raw="Domain Name: METAVERSEJUSTICE.COM\nRegistrar: NameCheap, Inc.\n",
+            blocked=False,
         )
 
-    plugin._run_tool = flaky_run_tool  # type: ignore[method-assign]
+    monkeypatch.setattr("modules.whois.query_whois_chain", flaky_query_whois_chain)
     result = await plugin.run(context, output_dir / "resolved.txt")
 
     assert result.success
@@ -273,7 +278,7 @@ async def test_whois_plugin_uses_short_timeout_and_retries_on_timeout(
 
 @pytest.mark.asyncio
 async def test_whois_plugin_distinguishes_rate_limit_from_timeout(
-    settings: Settings, tmp_path: Path
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings.whois_retries = 1
     settings.whois_retry_delay_seconds = 0
@@ -284,10 +289,12 @@ async def test_whois_plugin_distinguishes_rate_limit_from_timeout(
 
     plugin = WhoisPlugin(settings)
 
-    async def rate_limited_run_tool(ctx: PipelineContext, args: list[str], **kwargs: object):
-        return 0, "Rate limit exceeded. Try again later.\n", ""
+    async def rate_limited_query_whois_chain(domain: str, *, timeout: float) -> WhoisChainResult:
+        return WhoisChainResult(
+            hops=(), raw="Rate limit exceeded. Try again later.\n", blocked=False
+        )
 
-    plugin._run_tool = rate_limited_run_tool  # type: ignore[method-assign]
+    monkeypatch.setattr("modules.whois.query_whois_chain", rate_limited_query_whois_chain)
     result = await plugin.run(context, output_dir / "resolved.txt")
 
     assert not result.success
@@ -296,7 +303,7 @@ async def test_whois_plugin_distinguishes_rate_limit_from_timeout(
 
 @pytest.mark.asyncio
 async def test_whois_plugin_dedupes_targets_sharing_a_root_domain(
-    settings: Settings, tmp_path: Path
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """If the user passes both "www.example.com" and "example.com" as
     separate targets in the same run, the root domain must only be queried
@@ -313,15 +320,51 @@ async def test_whois_plugin_dedupes_targets_sharing_a_root_domain(
     plugin = WhoisPlugin(settings)
     queried_domains: list[str] = []
 
-    async def fake_run_tool(ctx: PipelineContext, args: list[str], **kwargs: object):
-        queried_domains.append(args[-1])
-        return 0, "Domain Name: EXAMPLE.COM\nRegistrar: NameCheap, Inc.\n", ""
+    async def fake_query_whois_chain(domain: str, *, timeout: float) -> WhoisChainResult:
+        queried_domains.append(domain)
+        return WhoisChainResult(
+            hops=(), raw="Domain Name: EXAMPLE.COM\nRegistrar: NameCheap, Inc.\n", blocked=False
+        )
 
-    plugin._run_tool = fake_run_tool
+    monkeypatch.setattr("modules.whois.query_whois_chain", fake_query_whois_chain)
     result = await plugin.run(context, output_dir / "resolved.txt")
 
     assert queried_domains == ["example.com"]
     assert result.lines_produced == 1
+
+
+@pytest.mark.asyncio
+async def test_whois_plugin_surfaces_a_blocked_referral_hop_without_discarding_partial_data(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the native WHOIS client's referral chain is blocked partway
+    (core/collection/whois_client.py: an intermediate hop resolved to a
+    private/loopback IP), the plugin must not silently succeed with a clean
+    record — the raw text already obtained is kept in whois_raw.txt, but no
+    parsed record is added to whois.jsonl, and a warning names why."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(exist_ok=True)
+    context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
+    context.targets = [DomainTarget(domain="example.com")]
+
+    plugin = WhoisPlugin(settings)
+
+    async def blocked_chain(domain: str, *, timeout: float) -> WhoisChainResult:
+        return WhoisChainResult(
+            hops=(),
+            raw="whois:        whois.private-registry.test\n",
+            blocked=True,
+            blocked_reason="blocked_range:10.0.0.0/8",
+        )
+
+    monkeypatch.setattr("modules.whois.query_whois_chain", blocked_chain)
+    result = await plugin.run(context, output_dir / "resolved.txt")
+
+    assert not result.success
+    assert read_jsonl(output_dir / "whois.jsonl") == []
+    raw_text = (output_dir / "whois_raw.txt").read_text(encoding="utf-8")
+    assert "whois.private-registry.test" in raw_text
+    assert any("referral chain" in w.lower() for w in context.warnings)
 
 
 @pytest.mark.asyncio
@@ -345,18 +388,30 @@ async def test_asn_lookup_warns_when_no_ips_available(settings: Settings, tmp_pa
 
 @pytest.mark.asyncio
 async def test_asn_collect_ips_falls_back_to_resolving_hostnames(
-    settings: Settings, tmp_path: Path
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When dnsx_records.jsonl is empty but resolved hostnames exist, resolve them."""
+    """When dnsx_records.jsonl is empty but resolved hostnames exist, resolve them —
+    but only the ones CollectionScope actually authorizes. This is the one place
+    asn_lookup performs active DNS resolution of its own; an out-of-scope entry in
+    ``context.resolved`` must never reach ``_resolve_hostnames`` at all."""
     output_dir = tmp_path / "output"
     output_dir.mkdir(exist_ok=True)
     (output_dir / "dnsx_records.jsonl").write_text("", encoding="utf-8")
     context = PipelineContext(output_dir=output_dir, collection_scope=_SCOPE)
-    context.resolved = ["localhost"]
+    context.resolved = ["example.com", "evil-out-of-scope.test"]
+
+    resolved_calls: list[list[str]] = []
+
+    async def fake_resolve(hostnames: list[str]) -> set[str]:
+        resolved_calls.append(list(hostnames))
+        return {"93.184.216.34"}
+
+    monkeypatch.setattr("modules.asn_lookup._resolve_hostnames", fake_resolve)
 
     ips = await _collect_ips(context)
-    assert ips  # at least 127.0.0.1 and/or ::1
-    assert any(ip.startswith("127.") or ip == "::1" for ip in ips)
+    assert ips == ["93.184.216.34"]
+    # The out-of-scope hostname was filtered before _resolve_hostnames was ever called.
+    assert resolved_calls == [["example.com"]]
 
 
 def test_format_exc_never_empty_for_bare_timeout_error() -> None:
@@ -865,6 +920,15 @@ def test_provenance_omits_analyst_local_path() -> None:
 def test_httpx_strict_opsec_uses_proxy_without_direct_side_probes(
     tmp_path: Path,
 ) -> None:
+    """httpx never talks to `OUTBOUND_PROXY_URL` directly — it always routes
+    through Hydra's local confinement proxy, which chains to the external
+    proxy internally (`ScopeEnforcingProxy.upstream_proxy_url`,
+    `core/collection/crawler_proxy.py`) only after Hydra's own
+    authorization/SSRF check passes. `_build_args` receiving a
+    `confinement_proxy_url` (what `run()` actually passes — always the local
+    proxy address) is what proves this: the external proxy URL itself never
+    appears in httpx's own argv.
+    """
     settings = Settings(
         project_root=tmp_path,
         strict_opsec=True,
@@ -872,9 +936,15 @@ def test_httpx_strict_opsec_uses_proxy_without_direct_side_probes(
     )
     plugin = HttpxPlugin(settings)
     context = PipelineContext(output_dir=tmp_path, collection_scope=_SCOPE)
-    args = plugin._build_args(context, tmp_path / "hosts.txt", tmp_path / "httpx.json")
+    args = plugin._build_args(
+        context,
+        tmp_path / "hosts.txt",
+        tmp_path / "httpx.json",
+        confinement_proxy_url="http://127.0.0.1:54321",
+    )
     assert "-proxy" in args
-    assert "http://proxy.example:8080" in args
+    assert "http://127.0.0.1:54321" in args
+    assert "http://proxy.example:8080" not in args
     assert "-tls-grab" not in args
     assert "-tls-probe" not in args
     assert "-ip" not in args

@@ -15,7 +15,7 @@ from core.assets import normalize_domain
 from core.domain import parse_hostname
 from core.exceptions import ConfigurationError
 from core.intel.model import ScopeStatus
-from core.scope import host_in_scope, load_scope_patterns
+from core.scope import host_in_scope, load_scope_patterns, split_scope_patterns
 from utils.files import read_lines, write_lines
 
 
@@ -25,6 +25,19 @@ class CollectionScope:
 
     seed_domains: tuple[str, ...] = ()
     scope_patterns: tuple[str, ...] = ()
+    # Explicit path-level denials, e.g. from a `!bancoplata.mx/*/whistleblowing`
+    # SCOPE_FILE line: (domain, path_glob) pairs. Take priority over any
+    # positive domain/wildcard match — a program can authorize a whole
+    # wildcard while still explicitly excluding a specific path. See
+    # `core/scope.py:url_path_excluded`.
+    path_exclusions: tuple[tuple[str, str], ...] = ()
+    cloud_collection_allowed: bool = False
+    # Explicit operator opt-in required before a resolved destination IP in a
+    # private/loopback/link-local/CGNAT/metadata range is ever connected to
+    # (core/collection/ssrf.py). Default False: an in-scope hostname that
+    # resolves to such an address is denied, not silently allowed, because
+    # it is in scope by name.
+    allow_private_network_targets: bool = False
 
     @classmethod
     def from_seeds(
@@ -33,12 +46,21 @@ class CollectionScope:
         *,
         patterns: list[str] | None = None,
         scope_file: Path | None = None,
+        cloud_collection_allowed: bool = False,
+        allow_private_network_targets: bool = False,
     ) -> CollectionScope:
         normalized = tuple(normalize_domain(s) for s in seeds if normalize_domain(s))
         loaded: list[str] = list(patterns or [])
         if scope_file is not None and scope_file.exists():
             loaded.extend(load_scope_patterns(scope_file))
-        return cls(seed_domains=normalized, scope_patterns=tuple(loaded))
+        positive, exclusions = split_scope_patterns(loaded)
+        return cls(
+            seed_domains=normalized,
+            scope_patterns=tuple(positive),
+            path_exclusions=tuple(exclusions),
+            cloud_collection_allowed=cloud_collection_allowed,
+            allow_private_network_targets=allow_private_network_targets,
+        )
 
 
 def classify_scope(
@@ -116,9 +138,15 @@ def scope_status_for(indicator: str, scope: CollectionScope) -> ScopeStatus:
 
 def allows_active_collection(indicator: str, scope: CollectionScope) -> bool:
     """Authoritative gate: True only when this indicator may be actively probed."""
-    if scope is None:
-        return False
-    return scope_status_allows_collection(scope_status_for(indicator, scope))
+    from core.intel.authorize import authorize_active_indicator
+
+    result = authorize_active_indicator(
+        indicator,
+        scope,
+        "active_collection",
+        "allows_active_collection",
+    )
+    return result.allowed
 
 
 def indicator_hostname(raw: str) -> str:
@@ -162,17 +190,44 @@ def authorize_collect_input(
     scope: CollectionScope,
     dest: Path,
     base_dir: Path,
+    capability: str = "",
+    strict_opsec: bool = False,
+    opsec_allowed: bool = True,
 ) -> tuple[Path, list[str], list[str]]:
     """Write ``dest`` with only authorized indicators.
 
     Returns (dest, kept, dropped). The source file is not modified so
     out-of-scope names remain available as intelligence observations.
+
+    Composes scope AND OPSEC via ``authorize_collection`` — not the
+    scope-only ``allows_active_collection`` — so this is the actual
+    authoritative decision path for every active-collection plugin's input,
+    matching ``authorize_collection``'s documented contract instead of a
+    parallel scope-only check that happens to agree with a separately
+    enforced plugin-level OPSEC gate by convention.
     """
+    from core.intel.authorize import authorize_collection
+
+    def _allowed(indicator: str) -> bool:
+        return authorize_collection(
+            indicator,
+            scope,
+            capability=capability or "active_collection",
+            strict_opsec=strict_opsec,
+            opsec_allowed=opsec_allowed,
+        ).allowed
+
     source_lines = read_lines(input_path) if input_path.exists() else []
-    kept = filter_authorized_indicators(source_lines, scope)
-    dropped = [
-        line for line in source_lines if line.strip() and not allows_active_collection(line, scope)
-    ]
+    kept: list[str] = []
+    seen: set[str] = set()
+    for raw in source_lines:
+        line = raw.strip()
+        if not line or line in seen:
+            continue
+        if _allowed(line):
+            kept.append(line)
+            seen.add(line)
+    dropped = [line for line in source_lines if line.strip() and not _allowed(line)]
     write_lines(dest, kept, base_dir=base_dir)
     return dest, kept, dropped
 
@@ -188,7 +243,15 @@ def require_collection_scope(context: object) -> CollectionScope:
     return scope
 
 
-def authorize_plugin_input(context: object, input_path: Path, plugin_name: str) -> Path:
+def authorize_plugin_input(
+    context: object,
+    input_path: Path,
+    plugin_name: str,
+    *,
+    capability: str = "",
+    strict_opsec: bool = False,
+    opsec_allowed: bool = True,
+) -> Path:
     """Re-check collector input immediately before active use.
 
     Missing CollectionScope is never a no-op. Discovery is not authorization.
@@ -208,6 +271,9 @@ def authorize_plugin_input(context: object, input_path: Path, plugin_name: str) 
         scope=scope,
         dest=dest,
         base_dir=Path(output_dir),
+        capability=capability or plugin_name,
+        strict_opsec=strict_opsec,
+        opsec_allowed=opsec_allowed,
     )
     if dropped:
         add_warning = getattr(context, "add_warning", None)

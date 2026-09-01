@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from core.models import PipelineContext, ToolStatus
 from core.plugin_base import PluginResult, ReconPlugin
 from utils.files import read_lines
 from utils.security import validate_output_path, validate_safe_filename
 from utils.subprocess import run_command, run_command_to_file
+
+if TYPE_CHECKING:
+    from core.collection.crawler_proxy import ScopeEnforcingProxy
 
 _RETRY_PATTERN = re.compile(r"retrying|retry\s*#?\s*\d+|attempt\s*#?\s*\d+", re.IGNORECASE)
 
@@ -49,15 +55,14 @@ class BaseToolPlugin(ReconPlugin):
 
     def _alive_urls(self, context: PipelineContext) -> list[str]:
         """Read alive URLs, re-checking scope. Discovery is not authorization."""
-        alive_path = self._output_path(context, "alive.txt")
+        authorized = self._output_path(context, "authorized_alive.txt")
+        alive_path = authorized if authorized.exists() else self._output_path(context, "alive.txt")
         if not alive_path.exists():
             return []
         urls = read_lines(alive_path)
-        scope = getattr(context, "collection_scope", None)
-        if scope is None:
-            return urls
-        from core.intel.scope import filter_authorized_indicators
+        from core.intel.scope import filter_authorized_indicators, require_collection_scope
 
+        scope = require_collection_scope(context)
         return filter_authorized_indicators(urls, scope)
 
     def _skip(self, message: str) -> PluginResult:
@@ -267,3 +272,90 @@ class BaseToolPlugin(ReconPlugin):
         from core.intel.scope import authorize_plugin_input
 
         return authorize_plugin_input(context, input_path, self.name)
+
+    @asynccontextmanager
+    async def _crawler_confinement(
+        self, context: PipelineContext
+    ) -> AsyncIterator[ScopeEnforcingProxy]:
+        """Start a local scope-enforcing proxy for tools that discover and
+        request URLs on their own (katana, hakrawler, nuclei) — a gated
+        input file only constrains what Hydra hands them, not what they
+        request next. Use ``proxy.proxy_url`` as the tool's ``-proxy`` flag.
+
+        Every connection is authorized against this run's CollectionScope
+        before Hydra connects anywhere; an unauthorized destination gets a
+        proxy-level refusal and is never reached. See
+        core/collection/crawler_proxy.py for what this does and does not
+        cover (no TLS interception; CONNECT tunnels are authorized by
+        destination host, not decrypted content).
+
+        When `Settings.outbound_proxy_url` (the operator's external,
+        typically OPSEC-hiding proxy) is configured, this proxy chains in
+        front of it — `collector -> ScopeEnforcingProxy -> outbound_proxy_url
+        -> Internet` — instead of the collector talking to that external
+        proxy directly. Authorization always happens at this layer first;
+        the external proxy never receives a request for a destination Hydra
+        itself denied. See `ScopeEnforcingProxy`'s class docstring for what
+        the DNS-rebinding/TOCTOU guarantee does and does not cover once
+        chained (the external proxy resolves the target itself, from its own
+        network location — outside Hydra's visibility either way).
+        """
+        from core.collection.crawler_proxy import PROXY_VERIFIED_TOOLS, ScopeEnforcingProxy
+        from core.intel.scope import require_collection_scope
+
+        if self.name not in PROXY_VERIFIED_TOOLS:
+            if self.external_dependency:
+                # Honest labeling, not a false guarantee: the proxy is
+                # started (it costs nothing and may still help), but this
+                # EXTERNAL BINARY's actual respect for `-proxy` has not been
+                # verified against its real binary the way
+                # katana/hakrawler/nuclei/httpx have. See
+                # core/collection/crawler_proxy.py:PROXY_VERIFIED_TOOLS.
+                context.add_warning(
+                    f"{self.name}: UNTRUSTED_NETWORK_TOOL — this external binary is "
+                    f"not in PROXY_VERIFIED_TOOLS; its adherence to the confinement "
+                    f"proxy has not been verified against its real binary, so it "
+                    f"must not be treated as scope-confined"
+                )
+            else:
+                # A built-in (Python, no external binary) collector using
+                # this confinement mechanism directly rather than through
+                # CollectionGateway. The "verified against its real binary"
+                # framing above is inapplicable — there is no binary — but
+                # this specific plugin still hasn't been proven with its own
+                # dedicated live test the way soft404_check/param_fuzz/
+                # cloud_bucket_enum have (see tests/test_urllib_confinement_live.py).
+                context.add_warning(
+                    f"{self.name}: UNVERIFIED_BUILTIN_COLLECTOR — this built-in "
+                    f"Python collector is not in PROXY_VERIFIED_TOOLS; it has not "
+                    f"been proven with a dedicated live test against a real local "
+                    f"server the way other built-in collectors using this same "
+                    f"mechanism have"
+                )
+
+        scope = require_collection_scope(context)
+        proxy = ScopeEnforcingProxy(
+            scope,
+            capability=self.capability or self.name,
+            upstream_proxy_url=self.settings.outbound_proxy_url or None,
+        )
+        await proxy.start()
+        try:
+            yield proxy
+        finally:
+            await proxy.stop()
+            from core.collection.audit import append_network_request
+
+            for record in proxy.audit:
+                record.collector = self.name
+                append_network_request(context, record)
+            if proxy.denied:
+                denied_hosts = sorted({item.host for item in proxy.denied if item.host})
+                preview = ", ".join(denied_hosts[:10])
+                if len(denied_hosts) > 10:
+                    preview += f" (+{len(denied_hosts) - 10} more)"
+                context.add_warning(
+                    f"{self.name}: confinement proxy blocked {len(proxy.denied)} "
+                    f"connection attempt(s) to out-of-scope host(s) the tool tried to "
+                    f"reach on its own: {preview}"
+                )

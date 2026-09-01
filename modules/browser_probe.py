@@ -19,6 +19,7 @@ from urllib.parse import urljoin, urlparse
 
 from core.assets import normalize_domain
 from core.exceptions import ValidationError
+from core.logger import get_logger
 from core.models import PipelineContext, ToolStatus
 from core.plugin_base import PluginResult
 from modules._base import BaseToolPlugin
@@ -29,6 +30,8 @@ from utils.security import (
     validate_output_path,
     validate_safe_filename,
 )
+
+logger = get_logger("browser_probe")
 
 _IPHONE_USER_AGENT = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
@@ -61,6 +64,9 @@ class BrowserProbePlugin(BaseToolPlugin):
         return "pip install -r requirements-optional.txt && playwright install webkit"
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
+        from core.intel.scope import require_collection_scope
+
+        require_collection_scope(context)
         try:
             from playwright.async_api import async_playwright
         except ImportError:
@@ -82,10 +88,31 @@ class BrowserProbePlugin(BaseToolPlugin):
         self.update_status(context, ToolStatus.RUNNING)
         records: list[dict[str, object]] = []
 
-        async with async_playwright() as playwright:
-            launch_options: dict[str, object] = {"headless": True}
-            if self.settings.outbound_proxy_url:
-                launch_options["proxy"] = _playwright_proxy(self.settings.outbound_proxy_url)
+        # Route the browser's OWN network stack (not just the JS-visible
+        # `route()`/`route_web_socket()` guard installed per-context below)
+        # through Hydra's local confinement proxy — the same mechanism
+        # already proven live for katana/hakrawler/nuclei/httpx
+        # (core/collection/crawler_proxy.py). `route()` decides abort/continue
+        # from a hostname-string scope check; it does not itself resolve DNS
+        # or pin the actual destination IP. Launching WebKit with `proxy=`
+        # means DNS resolution and connection-pinning happen at the proxy for
+        # every browser-issued connection, closing the same DNS-rebinding/
+        # TOCTOU gap this turn already closed for httpx. See
+        # docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
+        async with (
+            self._crawler_confinement(context) as confinement_proxy,
+            async_playwright() as playwright,
+        ):
+            # Always route through Hydra's local confinement proxy, never the
+            # external OPSEC proxy directly — `ScopeEnforcingProxy` chains to
+            # `Settings.outbound_proxy_url` internally when configured
+            # (`modules/_base.py:_crawler_confinement`), so WebKit never
+            # talks to the external proxy without Hydra's authorization/SSRF
+            # check running first.
+            launch_options: dict[str, object] = {
+                "headless": True,
+                "proxy": _playwright_proxy(confinement_proxy.proxy_url),
+            }
             browser = await playwright.webkit.launch(**launch_options)
             try:
                 for target in targets:
@@ -96,6 +123,7 @@ class BrowserProbePlugin(BaseToolPlugin):
                                 target,
                                 context=context,
                                 timeout_seconds=self.settings.browser_probe_timeout,
+                                extra_headers=self.settings.merged_headers(),
                             )
                         )
                     except Exception as exc:
@@ -111,10 +139,23 @@ class BrowserProbePlugin(BaseToolPlugin):
                                 "cloaking_suspected": False,
                                 "raw_artifact": None,
                                 "error": str(exc)[:240],
+                                "blocked_subresources": {},
+                                "blocked_subresources_total": 0,
                             }
                         )
             finally:
                 await browser.close()
+
+        for record in records:
+            blocked_total = record.get("blocked_subresources_total") or 0
+            if blocked_total:
+                context.add_warning(
+                    f"Browser Probe blocked {blocked_total} subresource request(s) "
+                    f"to host(s) outside CollectionScope while rendering "
+                    f"{record['host']} ({record.get('blocked_subresources')}). "
+                    "Page render may be visibly incomplete (missing scripts/"
+                    "images/styles/analytics) by scope policy, not a tool fault."
+                )
 
         output_path = self._output_path(context, "browser_probe.jsonl")
         count = write_jsonl(output_path, records, base_dir=context.output_dir)
@@ -134,6 +175,7 @@ async def _probe_target(
     *,
     context: PipelineContext,
     timeout_seconds: int,
+    extra_headers: dict[str, str] | None = None,
 ) -> dict[str, object]:
     browser_context = await browser.new_context(
         user_agent=_IPHONE_USER_AGENT,
@@ -145,8 +187,22 @@ async def _probe_target(
         timezone_id="UTC",
         accept_downloads=False,
         service_workers="block",
+        # Program-mandated researcher identification (e.g. X-HackerOne-Research)
+        # and any other operator-configured header — applied to every request
+        # WebKit makes in this context, same as httpx/param_fuzz/
+        # cloud_bucket_enum via Settings.merged_headers(). Suppressed under
+        # strict OPSEC by merged_headers() itself, not here.
+        extra_http_headers=extra_headers or {},
     )
     try:
+        blocked_counts: dict[str, int] = {}
+        # Installed on the context, not the page: a page-scoped route would
+        # leave any popup/new-tab page a hostile site opens via
+        # window.open() completely unguarded, since Playwright only applies
+        # page.route() to the one page it was called on. Context-level
+        # routing covers every page — and every WebSocket — created in this
+        # context, present or future.
+        await _install_scope_request_guard(browser_context, context, blocked_counts)
         page = await browser_context.new_page()
         await page.add_init_script(
             """
@@ -166,7 +222,6 @@ async def _probe_target(
 
         page.on("response", capture_response)
         error: str | None = None
-        await _install_scope_navigation_guard(page, context)
         try:
             await page.goto(
                 target["probe_url"],
@@ -197,6 +252,8 @@ async def _probe_target(
             "cloaking_suspected": cloaking,
             "raw_artifact": raw_artifact,
             "error": error,
+            "blocked_subresources": blocked_counts,
+            "blocked_subresources_total": sum(blocked_counts.values()),
         }
     finally:
         # Always torn down, even if page creation, script injection, or
@@ -230,34 +287,120 @@ async def _write_html_artifact(
 
 
 def allow_browser_navigation(url: str, context: PipelineContext) -> bool:
-    """Document navigations must re-check CollectionScope. Redirects are not authorization."""
+    """A request's destination host must be authorized under CollectionScope.
+
+    Despite the name (kept for backward compatibility — this is the same
+    check `browser_request_decision` uses for every resource type, not just
+    document navigation), it is not navigation-specific: it just answers
+    "is this host in scope". Redirects are not authorization.
+
+    Missing CollectionScope is DENY, never allow.
+    """
     from core.intel.scope import allows_active_collection
 
     scope = getattr(context, "collection_scope", None)
     if scope is None:
-        return True
+        return False
     return allows_active_collection(url, scope)
 
 
-async def _install_scope_navigation_guard(page: object, context: PipelineContext) -> None:
-    """Abort in-browser document navigations whose hostname is not authorized."""
-    if getattr(context, "collection_scope", None) is None:
-        return
+def browser_request_decision(request: object, context: PipelineContext) -> bool:
+    """True = allow the request, False = block it. Every resource type goes through here.
+
+    Playwright reports a `resource_type` per request: `document` (this
+    covers both the top-level page AND cross-origin `<iframe>` navigation —
+    Playwright sets `is_navigation_request()` for sub-frame navigations too,
+    confirmed against the pinned playwright version), plus subresource types
+    (`script`, `stylesheet`, `image`, `font`, `media`, `xhr`, `fetch`,
+    `websocket`, `manifest`, `other`, `texttrack`, `eventsource`, ...).
+
+    Hydra applies the same rule to all of them: the destination host must be
+    IN_SCOPE. Third-party subresources (CDN scripts, tracker pixels, web
+    fonts) are not allowed by default just because an in-scope page
+    references them — a visibly incomplete render (missing styles/images/
+    analytics) is the intended, safer outcome, not a bug. If a later prompt
+    wants a narrower allowlist for specific subresource types, it changes
+    this one function, not the guard's plumbing.
+    """
+    return allow_browser_navigation(request.url, context)
+
+
+async def _install_scope_request_guard(
+    browser_context: object, context: PipelineContext, blocked_counts: dict[str, int]
+) -> None:
+    """Route every request in the browser context through `browser_request_decision`.
+
+    Installed with `browser_context.route()`/`route_web_socket()`, not
+    `page.route()`: a page-scoped route only ever covers the one Page object
+    it was installed on, so a hostile page's `window.open()` popup — a new
+    Page Playwright creates in the same context — would otherwise carry no
+    route handler at all and could make fully unrestricted requests.
+    Context-level routing covers the main document, iframe/sub-frame
+    navigations, every HTTP subresource type, and any page opened later in
+    this context.
+
+    WebSocket connections are a separate Playwright interception surface —
+    `page.route()`/`browser_context.route()` do not see the WS upgrade at
+    all — so they are routed independently via `route_web_socket()`. A
+    routed WebSocket does not connect to the real server unless the handler
+    explicitly calls `connect_to_server()`, so simply not connecting when
+    unauthorized is itself the block; `close()` is called in addition so the
+    page sees a clean close rather than a hang.
+
+    Always install both. Missing CollectionScope blocks everything (fail
+    closed). An exception while evaluating the policy also blocks (fail
+    closed) — a bug in the scope check must never fall open into an
+    unauthorized request.
+
+    Blocked requests are tallied into `blocked_counts` by resource type
+    (`websocket` for WS connections) so the caller can report how much was
+    withheld by policy.
+    """
 
     async def guard(route: object) -> None:
+        request = route.request
         try:
-            request = route.request
-            if request.is_navigation_request() and not allow_browser_navigation(
-                request.url, context
-            ):
-                await route.abort("blockedbyclient")
-                return
+            allowed = browser_request_decision(request, context)
         except Exception:
-            await route.continue_()
+            logger.warning(
+                "browser_probe: request guard raised while evaluating %s (%s); "
+                "blocking (fail closed)",
+                getattr(request, "url", "<unknown>"),
+                getattr(request, "resource_type", "<unknown>"),
+                exc_info=True,
+            )
+            allowed = False
+
+        if not allowed:
+            resource_type = str(getattr(request, "resource_type", "") or "other")
+            blocked_counts[resource_type] = blocked_counts.get(resource_type, 0) + 1
+            await route.abort("blockedbyclient")
             return
         await route.continue_()
 
-    await page.route("**/*", guard)
+    async def websocket_guard(ws: object) -> None:
+        url = str(getattr(ws, "url", "") or "")
+        try:
+            allowed = allow_browser_navigation(url, context)
+        except Exception:
+            logger.warning(
+                "browser_probe: websocket guard raised while evaluating %s; "
+                "blocking (fail closed)",
+                url,
+                exc_info=True,
+            )
+            allowed = False
+
+        if not allowed:
+            blocked_counts["websocket"] = blocked_counts.get("websocket", 0) + 1
+            await ws.close(code=1008, reason="blocked by CollectionScope policy")
+            return
+        # Routed WebSockets default to not connecting to the server at all;
+        # an authorized destination must be explicitly wired through.
+        ws.connect_to_server()
+
+    await browser_context.route("**/*", guard)
+    await browser_context.route_web_socket("**/*", websocket_guard)
 
 
 def _httpx_targets(context: PipelineContext) -> list[dict[str, str]]:
@@ -277,17 +420,18 @@ def _httpx_targets(context: PipelineContext) -> list[dict[str, str]]:
             if "://" in input_raw
             else (f"https://{input_raw}" if input_raw else probe_url)
         )
-        if scope is not None:
-            if allows_active_collection(probe_url, scope):
-                pass
-            elif allows_active_collection(input_url, scope):
-                probe_url = input_url
-            else:
-                continue
+        if scope is None:
+            continue
+        if allows_active_collection(probe_url, scope):
+            pass
+        elif allows_active_collection(input_url, scope):
+            probe_url = input_url
+        else:
+            continue
         host = _url_host(str(record.get("input") or probe_url))
         if not host:
             continue
-        if scope is not None and not allows_active_collection(host, scope):
+        if not allows_active_collection(host, scope):
             continue
         explicit_final = str(record.get("final_url") or "")
         location = str(record.get("location") or "")

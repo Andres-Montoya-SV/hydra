@@ -26,11 +26,16 @@ from core.intel.correlate import (
     shares_certificate_confidence,
 )
 from core.intel.model import (
+    AttemptStatus,
+    CollectionAttempt,
+    CollectionCapability,
     CollectionStatus,
     CollectReason,
     ConfidenceBand,
     EntityType,
     Evidence,
+    Hypothesis,
+    HypothesisStatus,
     Indicator,
     IndicatorKind,
     IntelEntity,
@@ -66,6 +71,7 @@ class IntelRunConfig:
     collected_domains: set[str] = field(default_factory=set)
     emissions: list[dict[str, Any]] = field(default_factory=list)
     observed_at: str = ""
+    cloud_collection_allowed: bool = False
 
     def collection_scope(self) -> CollectionScope:
         return CollectionScope(
@@ -73,6 +79,7 @@ class IntelRunConfig:
                 normalize_domain(s) for s in self.seed_domains if normalize_domain(s)
             ),
             scope_patterns=tuple(self.scope_patterns),
+            cloud_collection_allowed=self.cloud_collection_allowed,
         )
 
 
@@ -84,6 +91,8 @@ class IntelSnapshot:
     evidence: dict[str, Evidence]
     relationships: dict[str, Relationship]
     indicators: list[Indicator]
+    hypotheses: list[Hypothesis] = field(default_factory=list)
+    collection_attempts: list[CollectionAttempt] = field(default_factory=list)
     truncated: bool = False
     truncation_reason: str | None = None
 
@@ -106,6 +115,8 @@ class IntelEngine:
         self.evidence: dict[str, Evidence] = {}
         self.relationships: dict[str, Relationship] = {}
         self.queue = IndicatorQueue(config.bounds)
+        self.hypotheses: dict[str, Hypothesis] = {}
+        self.attempts: list[CollectionAttempt] = []
         self._truncated = False
         self._truncation_reason: str | None = None
         seeds = [normalize_domain(s) for s in config.seed_domains if normalize_domain(s)]
@@ -136,6 +147,8 @@ class IntelEngine:
             evidence=self.evidence,
             relationships=self.relationships,
             indicators=self.queue.values(),
+            hypotheses=list(self.hypotheses.values()),
+            collection_attempts=list(self.attempts),
             truncated=self._truncated,
             truncation_reason=self._truncation_reason,
         )
@@ -160,6 +173,18 @@ class IntelEngine:
             and self._count_type(EntityType.IP_ADDRESS) >= self.bounds.max_ips
         ):
             self._mark_truncated("ip_limit")
+            return None
+        if (
+            entity.entity_type is EntityType.URL
+            and self._count_type(EntityType.URL) >= self.bounds.max_url_entities
+        ):
+            self._mark_truncated("entity_limit")
+            return None
+        if (
+            entity.entity_type is EntityType.TECHNOLOGY
+            and self._count_type(EntityType.TECHNOLOGY) >= self.bounds.max_technology_entities
+        ):
+            self._mark_truncated("entity_limit")
             return None
         if len(self.entities) >= self.bounds.max_entities:
             if entity.is_seed:
@@ -522,17 +547,12 @@ class IntelEngine:
             self._ingest_emission_followups(emission)
 
     def _ingest_emission_followups(self, emission: StructuredEmission) -> None:
-        """Queue follow-up kinds declared by the plugin. Scope still decides collection."""
+        """Queue plugin follow-ups. A reason string is never evidence."""
         if not emission.followups:
             return
-        reason = CollectReason.PLUGIN
         for item in emission.followups:
-            raw_reason = str(item.get("reason") or "")
-            try:
-                reason = CollectReason(raw_reason) if raw_reason else CollectReason.PLUGIN
-            except ValueError:
-                reason = CollectReason.PLUGIN
             values = [item.get("value")] if item.get("value") else list(emission.domains)
+            claimed_evidence = str(item.get("evidence_id") or "")
             for raw in values:
                 name = normalize_domain(str(raw or ""))
                 if not name:
@@ -540,17 +560,19 @@ class IntelEngine:
                 entity = self.entities.get(entity_id(EntityType.DOMAIN, name))
                 if entity is None:
                     continue
+                evidence_id = claimed_evidence if claimed_evidence in self.evidence else ""
                 self.queue.add(
                     kind=IndicatorKind.DOMAIN,
                     value=name,
                     depth=1,
                     parent_id=None,
-                    reason=reason,
+                    reason=CollectReason.PLUGIN,
                     scope_status=entity.scope_status,
-                    evidence_id="",
+                    evidence_id=evidence_id,
                     discovered_from="plugin_followup",
                     collected=entity.collection_status is CollectionStatus.COLLECTED,
                     is_seed=entity.is_seed,
+                    source_entity_id=entity.entity_id,
                 )
 
     def correlate(self) -> None:
@@ -559,6 +581,118 @@ class IntelEngine:
         self._correlate_shared_nameservers()
         self._correlate_shared_asn()
         self._correlate_http_identity()
+        self._emit_hypotheses()
+
+    def _emit_hypotheses(self) -> None:
+        """Relationships do not authorize collection. They may create hypotheses."""
+        collected = {normalize_domain(c) for c in self.config.collected_domains}
+        for rel in self.relationships.values():
+            if rel.relationship_type is not RelationshipType.SAN_CONTAINS:
+                continue
+            domain = rel.target_entity.removeprefix("domain:")
+            host = normalize_domain(domain)
+            if not host or host in collected:
+                continue
+            hid = stable_id("hypothesis", rel.relationship_id, host)
+            in_scope = allows_active_collection(host, self.scope)
+            status = HypothesisStatus.OPEN.value if in_scope else HypothesisStatus.REJECTED.value
+            rationale = (
+                "Observed SAN relationship; possible related infrastructure. "
+                "Not authorization to collect."
+                if in_scope
+                else "Observed SAN relationship is out of scope; not a collection command."
+            )
+            self.hypotheses[hid] = Hypothesis(
+                hypothesis_id=hid,
+                relationship_id=rel.relationship_id,
+                target_value=host,
+                evidence_id=rel.evidence_id,
+                confidence_band=rel.confidence.value,
+                status=status,
+                rationale=rationale,
+                depth=1,
+            )
+
+    def claim_attempt(
+        self,
+        value: str,
+        *,
+        capability: CollectionCapability,
+        collector: str,
+        reason: str = "claimed",
+    ) -> CollectionAttempt:
+        """Record an IN_FLIGHT attempt BEFORE the network operation runs.
+
+        `record_attempt()` alone only creates a row once the plugin has
+        already finished and its output was parsed — a crash between the
+        indicator being claimed (ELIGIBLE -> IN_FLIGHT) and that call leaves
+        the indicator lifecycle crash-safe (`IndicatorQueue.overlay_status`
+        turns a restored IN_FLIGHT into FAILED) but the `intel_collection_
+        attempts` audit table gets no row at all for that attempt. Calling
+        this immediately after claiming — before invoking the plugin, and
+        persisted (`_persist_indicators`) before the subprocess/network call
+        — means a crash there still leaves a durable IN_FLIGHT attempt
+        record instead of nothing.
+
+        Uses a distinct attempt_id (the reason is fixed to "claimed", not
+        the eventual outcome) so the completing `record_attempt()` call
+        writes its own SUCCESS/FAILED row alongside this one rather than
+        colliding with it — both are kept as a claimed-then-completed trail.
+        """
+        item = self.queue.get(IndicatorKind.DOMAIN, value)
+        indicator_id = item.indicator_id if item else stable_id("indicator", "DOMAIN", value)
+        attempt = CollectionAttempt(
+            attempt_id=stable_id("attempt", indicator_id, capability.value, collector, "claimed"),
+            indicator_id=indicator_id,
+            value=value,
+            capability=capability.value,
+            status=AttemptStatus.IN_FLIGHT.value,
+            reason=reason,
+            collector=collector,
+            observed_at=self.observed_at,
+        )
+        self.attempts.append(attempt)
+        return attempt
+
+    def record_attempt(
+        self,
+        value: str,
+        *,
+        capability: CollectionCapability,
+        success: bool,
+        collector: str,
+        reason: str,
+        artifact: str = "",
+    ) -> CollectionAttempt:
+        item = self.queue.get(IndicatorKind.DOMAIN, value)
+        indicator_id = item.indicator_id if item else stable_id("indicator", "DOMAIN", value)
+        attempt = CollectionAttempt(
+            attempt_id=stable_id("attempt", indicator_id, capability.value, collector, reason),
+            indicator_id=indicator_id,
+            value=value,
+            capability=capability.value,
+            status=AttemptStatus.SUCCESS.value if success else AttemptStatus.FAILED.value,
+            reason=reason,
+            collector=collector,
+            observed_at=self.observed_at,
+            artifact=artifact,
+        )
+        self.attempts.append(attempt)
+        return attempt
+
+    def authorize_hypothesis(self, hostname: str) -> None:
+        host = normalize_domain(hostname)
+        for hyp in self.hypotheses.values():
+            if hyp.target_value == host and hyp.status == HypothesisStatus.OPEN.value:
+                hyp.status = HypothesisStatus.AUTHORIZED_FOR_COLLECTION.value
+
+    def reject_hypothesis(self, hostname: str, *, reason: str = "") -> None:
+        host = normalize_domain(hostname)
+        for hyp in self.hypotheses.values():
+            if hyp.target_value == host and hyp.status == HypothesisStatus.OPEN.value:
+                hyp.status = HypothesisStatus.REJECTED.value
+                if reason:
+                    hyp.rationale = reason
 
     def eligible_followups(
         self, kind: IndicatorKind | None = IndicatorKind.DOMAIN
@@ -896,6 +1030,16 @@ class IntelEngine:
                 "san": name,
             },
         )
+        san_rel = next(
+            (
+                rel
+                for rel in self.relationships.values()
+                if rel.relationship_type is RelationshipType.SAN_CONTAINS
+                and rel.source_entity == cert.entity_id
+                and rel.target_entity == domain.entity_id
+            ),
+            None,
+        )
         collected = domain.collection_status is CollectionStatus.COLLECTED
         self.queue.add(
             kind=IndicatorKind.DOMAIN,
@@ -904,10 +1048,11 @@ class IntelEngine:
             parent_id=parent_id,
             reason=reason,
             scope_status=domain.scope_status,
-            evidence_id=name_obs.observation_id,
+            evidence_id=san_rel.evidence_id if san_rel else "",
             discovered_from=cert.entity_id,
             collected=collected,
             is_seed=domain.is_seed,
+            source_entity_id=cert.entity_id,
             priority=40 if domain.scope_status is ScopeStatus.IN_SCOPE else 90,
         )
 
@@ -1153,7 +1298,10 @@ class IntelEngine:
         unique = sorted(set(members))
         if len(unique) < 2 or hub_eid not in self.entities:
             return
-        pairs = bounded_pairs(unique)
+        cap = min(self.bounds.max_relationships_per_signal, 16)
+        from core.intel.correlate import bounded_pairs as _bounded
+
+        pairs = _bounded(unique, max_members=cap)
         if not pairs:
             return
         if len(self.relationships) + len(pairs) > self.bounds.max_relationships:

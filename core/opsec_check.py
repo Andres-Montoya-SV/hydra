@@ -181,6 +181,15 @@ def check_httpx_strict_args(settings) -> OpsecCheck:
     The side-probe flags (-ip, -cname, -tls-probe, -tls-grab) are intentional
     and harmless in normal mode — they only represent a promise-breaking leak
     when STRICT_OPSEC is actually enabled, so this check is a no-op otherwise.
+
+    httpx never talks to `OUTBOUND_PROXY_URL` directly — it always routes
+    through Hydra's local confinement proxy (`self._crawler_confinement`,
+    `modules/_base.py`), which chains to `OUTBOUND_PROXY_URL` internally when
+    configured (`ScopeEnforcingProxy.upstream_proxy_url`,
+    `core/collection/crawler_proxy.py`). This diagnostic runs before any
+    proxy is started, so it simulates the `confinement_proxy_url` `run()`
+    would supply rather than asserting on `OUTBOUND_PROXY_URL` appearing in
+    httpx's own argv directly (it never does, by design).
     """
     from modules.httpx import HttpxPlugin
 
@@ -193,7 +202,12 @@ def check_httpx_strict_args(settings) -> OpsecCheck:
 
     plugin = HttpxPlugin(settings)
     context = PipelineContext(output_dir=settings.project_root / settings.output_directory)
-    args = plugin._build_args(context, Path("hosts.txt"), Path("httpx.json"))
+    args = plugin._build_args(
+        context,
+        Path("hosts.txt"),
+        Path("httpx.json"),
+        confinement_proxy_url="http://127.0.0.1:0",
+    )
 
     leaky = [flag for flag in ("-ip", "-cname", "-tls-probe", "-tls-grab") if flag in args]
     if leaky:
@@ -202,16 +216,30 @@ def check_httpx_strict_args(settings) -> OpsecCheck:
             level="fail",
             message=f"httpx would still send: {', '.join(leaky)}",
         )
-    if settings.outbound_proxy_url and "-proxy" not in args:
+    if "-proxy" not in args:
         return OpsecCheck(
             name="httpx proxy routing",
             level="fail",
             message="httpx would not be invoked with -proxy despite strict mode being enabled",
         )
+    if settings.outbound_proxy_url and settings.outbound_proxy_url in args:
+        return OpsecCheck(
+            name="httpx proxy routing",
+            level="fail",
+            message=(
+                "httpx's own argv contains OUTBOUND_PROXY_URL directly — it must only ever "
+                "see Hydra's local confinement proxy, which chains to the external proxy "
+                "internally after authorization"
+            ),
+        )
     return OpsecCheck(
         name="httpx proxy routing",
         level="pass",
-        message="httpx will route through the configured proxy without direct TLS/IP/CNAME side-probes",
+        message=(
+            "httpx will route through Hydra's local confinement proxy (which chains to "
+            "OUTBOUND_PROXY_URL internally when configured) without direct TLS/IP/CNAME "
+            "side-probes"
+        ),
     )
 
 

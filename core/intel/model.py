@@ -34,13 +34,16 @@ class ScopeStatus(str, Enum):
 
 
 class CollectionStatus(str, Enum):
-    NOT_COLLECTED = "NOT_COLLECTED"
+    DISCOVERED = "DISCOVERED"
     ELIGIBLE = "ELIGIBLE"
     IN_FLIGHT = "IN_FLIGHT"
     COLLECTED = "COLLECTED"
+    FAILED = "FAILED"
     NOT_ALLOWED = "NOT_ALLOWED"
     REJECTED = "REJECTED"
-    FAILED = "FAILED"
+    PARTIAL = "PARTIAL"
+    # Entity projection: observed but not actively collected.
+    NOT_COLLECTED = "NOT_COLLECTED"
 
 
 class ConfidenceBand(str, Enum):
@@ -48,6 +51,7 @@ class ConfidenceBand(str, Enum):
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
     LOW = "LOW"
+    VERY_LOW = "VERY_LOW"
 
 
 class RelationshipType(str, Enum):
@@ -220,20 +224,122 @@ class Indicator:
     evidence_id: str
     priority: int = 100
     discovered_from: str = ""
+    normalized_value: str = ""
+    source_entity_id: str = ""
+    authorization_status: str = ""
+    created_at: str = ""
+    claimed_at: str = ""
+    completed_at: str = ""
+    failure_reason: str = ""
+    collector: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "indicator_id": self.indicator_id,
             "kind": self.kind.value,
             "value": self.value,
+            "normalized_value": self.normalized_value or self.value,
+            "source_entity_id": self.source_entity_id or self.discovered_from,
             "depth": self.depth,
             "parent_id": self.parent_id,
             "reason": self.reason.value,
             "scope_status": self.scope_status.value,
             "collection_status": self.collection_status.value,
+            "authorization_status": self.authorization_status,
             "evidence_id": self.evidence_id,
             "priority": self.priority,
             "discovered_from": self.discovered_from,
+            "created_at": self.created_at,
+            "claimed_at": self.claimed_at,
+            "completed_at": self.completed_at,
+            "failure_reason": self.failure_reason,
+            "collector": self.collector,
+        }
+
+
+class HypothesisStatus(str, Enum):
+    OPEN = "OPEN"
+    AUTHORIZED_FOR_COLLECTION = "AUTHORIZED_FOR_COLLECTION"
+    REJECTED = "REJECTED"
+    RESOLVED = "RESOLVED"
+
+
+class CollectionCapability(str, Enum):
+    DNS_RESOLUTION = "DNS_RESOLUTION"
+    HTTP_COLLECTION = "HTTP_COLLECTION"
+    PORT_SCAN = "PORT_SCAN"
+    BROWSER_NAVIGATION = "BROWSER_NAVIGATION"
+    PASSIVE_LOOKUP = "PASSIVE_LOOKUP"
+    URL_ARCHIVE = "URL_ARCHIVE"
+    REGISTRATION = "REGISTRATION"
+    CLOUD_ENUM = "CLOUD_ENUM"
+    REPUTATION = "REPUTATION"
+    CRAWL = "CRAWL"
+
+
+class AttemptStatus(str, Enum):
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
+    # Claimed and persisted before the network operation runs, so a crash
+    # between the claim and the completing record_attempt() call leaves a
+    # durable trace instead of no CollectionAttempt row at all.
+    IN_FLIGHT = "IN_FLIGHT"
+
+
+@dataclass
+class Hypothesis:
+    """A relationship is not a collection command. Hypotheses may become plans."""
+
+    hypothesis_id: str
+    relationship_id: str
+    target_value: str
+    evidence_id: str
+    confidence_band: str
+    status: str
+    rationale: str
+    depth: int = 1
+    kind: str = "RELATED_INFRASTRUCTURE"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "hypothesis_id": self.hypothesis_id,
+            "relationship_id": self.relationship_id,
+            "target_value": self.target_value,
+            "evidence_id": self.evidence_id,
+            "confidence_band": self.confidence_band,
+            "status": self.status,
+            "rationale": self.rationale,
+            "depth": self.depth,
+            "kind": self.kind,
+        }
+
+
+@dataclass
+class CollectionAttempt:
+    """One capability attempt against one indicator. Not the same as indicator.status."""
+
+    attempt_id: str
+    indicator_id: str
+    value: str
+    capability: str
+    status: str
+    reason: str
+    collector: str
+    observed_at: str
+    artifact: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "indicator_id": self.indicator_id,
+            "value": self.value,
+            "capability": self.capability,
+            "status": self.status,
+            "reason": self.reason,
+            "collector": self.collector,
+            "observed_at": self.observed_at,
+            "artifact": self.artifact,
         }
 
 

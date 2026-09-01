@@ -133,14 +133,51 @@ def test_runner_gates_before_plugin_invocation(tmp_path: Path, settings: Setting
     )
     runner = PipelineRunner(settings)
     for name in ("dnsx", "httpx", "naabu"):
-        plugin = type("P", (), {"name": name})()
+        plugin = type("P", (), {"name": name, "capability": name})()
         gated = runner._gate_active_input(context, plugin, source)
         assert OOS not in gated.read_text(encoding="utf-8")
         assert SEED in gated.read_text(encoding="utf-8")
+
     assert source.read_text(encoding="utf-8").splitlines() == [SEED, OOS]
     assert "dnsx" in ACTIVE_COLLECTION_PLUGINS
     assert "httpx" in ACTIVE_COLLECTION_PLUGINS
     assert "naabu" in ACTIVE_COLLECTION_PLUGINS
+
+
+def test_gate_active_input_composes_opsec_not_just_scope(
+    tmp_path: Path, settings: Settings
+) -> None:
+    """`_gate_active_input` must route through `authorize_collection` (scope
+    AND OPSEC), not the scope-only `allows_active_collection` — so an
+    in-scope indicator is still denied for a plugin STRICT_OPSEC does not
+    allow, even calling the gate directly and bypassing the separate
+    plugin-level STRICT_OPSEC skip in `_run_single_plugin`. That other check
+    already keeps a disallowed plugin from reaching this point in the real
+    pipeline; this proves the per-indicator gate is independently correct,
+    not merely correct by relying on that other check running first.
+    """
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    source = output_dir / "resolved.txt"
+    source.write_text(f"{SEED}\n", encoding="utf-8")
+    context = PipelineContext(
+        targets=[DomainTarget(domain=SEED)],
+        output_dir=output_dir,
+        collection_scope=_scope(),
+    )
+    settings.strict_opsec = True
+    settings.outbound_proxy_url = "http://proxy.example:8080"
+    runner = PipelineRunner(settings)
+
+    # naabu has no strict_opsec_allowed = True — not in STRICT_OPSEC_ALLOWED_PLUGINS.
+    naabu_plugin = type("P", (), {"name": "naabu", "capability": "port_scan"})()
+    denied = runner._gate_active_input(context, naabu_plugin, source)
+    assert denied.read_text(encoding="utf-8").strip() == ""
+
+    # httpx declares strict_opsec_allowed = True — scope alone still governs.
+    httpx_plugin = type("P", (), {"name": "httpx", "capability": "http_probe"})()
+    allowed = runner._gate_active_input(context, httpx_plugin, source)
+    assert SEED in allowed.read_text(encoding="utf-8")
     assert "ctlogs" not in ACTIVE_COLLECTION_PLUGINS
     assert "subfinder" not in ACTIVE_COLLECTION_PLUGINS
 

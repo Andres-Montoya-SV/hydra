@@ -60,6 +60,43 @@ class TestSettings:
         settings = Settings.from_env(project_root=project_root)
         assert settings.custom_http_headers["X-Test"] == "value"
 
+    def test_from_env_parses_researcher_attribution_header(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("RESEARCHER_ATTRIBUTION_HEADER", "X-HackerOne-Research: my_h1_handle")
+        settings = Settings.from_env(project_root=project_root)
+        assert settings.researcher_attribution_header == {"X-HackerOne-Research": "my_h1_handle"}
+        assert settings.merged_headers()["X-HackerOne-Research"] == "my_h1_handle"
+
+    def test_researcher_attribution_header_rejects_missing_colon(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("RESEARCHER_ATTRIBUTION_HEADER", "not-a-header-value")
+        with pytest.raises(ConfigurationError):
+            Settings.from_env(project_root=project_root)
+
+    def test_researcher_attribution_header_suppressed_under_strict_opsec(
+        self, project_root: Path
+    ) -> None:
+        settings = Settings(
+            project_root=project_root,
+            strict_opsec=True,
+            outbound_proxy_url="http://proxy.example:8080",
+            researcher_attribution_header={"X-HackerOne-Research": "my_h1_handle"},
+        )
+        assert settings.merged_headers() == {}
+
+    def test_to_safe_dict_flags_researcher_attribution_header_without_leaking_value(
+        self, project_root: Path
+    ) -> None:
+        settings = Settings(
+            project_root=project_root,
+            researcher_attribution_header={"X-HackerOne-Research": "my_h1_handle"},
+        )
+        safe = settings.to_safe_dict()
+        assert "my_h1_handle" not in str(safe)
+        assert safe["has_researcher_attribution_header"] is True
+
     def test_researcher_header_validation(
         self, project_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

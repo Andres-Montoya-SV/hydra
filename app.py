@@ -65,6 +65,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress the startup ASCII banner (also: HYDRA_NO_BANNER=1)",
     )
+    run_parser.add_argument(
+        "--external",
+        action="store_true",
+        help=(
+            "Force external-target-mode conservative defaults (lower rate limits; "
+            "confirm before running active modules) regardless of OWNED_DOMAINS. "
+            "Applied automatically when the target isn't in OWNED_DOMAINS."
+        ),
+    )
 
     subparsers.add_parser("check-tools", help="Check availability of recon tools")
     subparsers.add_parser("list-plugins", help="List registered tool plugins")
@@ -129,6 +138,15 @@ def build_parser() -> argparse.ArgumentParser:
     ind_p.add_argument("domain")
     ind_p.add_argument("--run-id")
 
+    explain_p = subparsers.add_parser(
+        "explain-collection",
+        help="Reconstruct why an indicator was (or wasn't) collected, from SQLite alone (no rescan)",
+    )
+    explain_p.add_argument(
+        "identifier", help="indicator_id, collection_attempt_id, or raw indicator value"
+    )
+    explain_p.add_argument("--run-id")
+
     diff_p = subparsers.add_parser(
         "diff",
         help="Field-level diff of two persisted runs, or latest two finished runs for a domain",
@@ -179,6 +197,74 @@ def _validate_cli_paths(args: argparse.Namespace) -> None:
         sanitize_run_id(args.run_id)
 
 
+def _external_mode_preflight(args: argparse.Namespace, settings: Settings) -> bool:
+    """Classify this run against OWNED_DOMAINS, apply conservative defaults
+    when it's targeting something outside that list, and require explicit
+    confirmation before running active modules directly against it — even
+    when they're already `true` in .env. Mutates `settings` in place.
+
+    A decline (interactive "N", or no terminal attached at all) disables
+    only the specific gated module(s) for this run rather than aborting the
+    whole pipeline — discovery/observation stages still proceed. Always
+    returns True today; the bool return keeps the call site ready for a
+    future case that should refuse to proceed at all.
+    """
+    from core.external_mode import (
+        EXTERNAL_MODE_GATED_FLAGS,
+        classify_run,
+        format_scope_summary,
+    )
+    from core.intel.scope import CollectionScope
+    from utils.validators import load_targets
+
+    if getattr(args, "external", False):
+        settings.external_target_mode = True
+
+    targets = load_targets(args.domain, args.targets_file, project_root=settings.project_root)
+    domain_names = [t.domain for t in targets]
+    if not classify_run(domain_names, settings):
+        return True  # owned domain(s) — no behavior change
+
+    changes = settings.apply_external_target_mode_defaults()
+    scope = CollectionScope.from_seeds(
+        domain_names,
+        scope_file=settings.scope_file,
+        cloud_collection_allowed=settings.cloud_bucket_enum_authorize_derived,
+    )
+    print(f"\n{'=' * 70}")
+    print("EXTERNAL TARGET MODE — target(s) not in OWNED_DOMAINS")
+    print("=" * 70)
+    print(format_scope_summary(scope, settings))
+    if changes:
+        print("  Conservative overrides applied:")
+        for change in changes:
+            print(f"    {change}")
+    active_gated = [name for name in EXTERNAL_MODE_GATED_FLAGS if getattr(settings, name)]
+    if active_gated:
+        print(
+            "\nActive module(s) that would send traffic directly at this target: "
+            + ", ".join(active_gated)
+        )
+        if not sys.stdin.isatty():
+            print(
+                "Non-interactive stdin — disabling these module(s) for this run "
+                "(fail closed). Re-run with a terminal attached to confirm, or "
+                "pass explicit flags in an automated context you control."
+            )
+            for name in active_gated:
+                setattr(settings, name, False)
+        else:
+            answer = input(
+                "Confirm running these active modules against this external " "target [y/N]: "
+            )
+            if answer.strip().lower() not in {"y", "yes"}:
+                print("Declined — disabling these module(s) for this run.")
+                for name in active_gated:
+                    setattr(settings, name, False)
+    print()
+    return True
+
+
 async def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
     """Execute the reconnaissance pipeline."""
     if not args.domain and not args.targets_file:
@@ -186,6 +272,9 @@ async def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
         return 1
 
     _validate_cli_paths(args)
+
+    if not _external_mode_preflight(args, settings):
+        return 1
 
     if args.no_ui:
         setup_logging(settings.log_level, settings.project_root / settings.logs_directory)
@@ -325,6 +414,7 @@ def cmd_intel(args: argparse.Namespace, settings: Settings) -> int:
         cmd_certificates,
         cmd_diff_runs,
         cmd_evidence,
+        cmd_explain_collection,
         cmd_graph,
         cmd_indicators,
         cmd_investigate,
@@ -359,6 +449,8 @@ def cmd_intel(args: argparse.Namespace, settings: Settings) -> int:
         return cmd_certificates(db_path, domain, run_id)
     if args.command == "indicators":
         return cmd_indicators(db_path, domain, run_id)
+    if args.command == "explain-collection":
+        return cmd_explain_collection(db_path, args.identifier, run_id)
     return 1
 
 
@@ -417,6 +509,7 @@ def main() -> int:
             "evidence",
             "certificates",
             "indicators",
+            "explain-collection",
             "diff",
         }:
             return cmd_intel(args, settings)

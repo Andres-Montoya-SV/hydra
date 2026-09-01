@@ -101,11 +101,10 @@ class DnsxPlugin(BaseToolPlugin):
             # is visible instead of being silently treated as "everything resolved".
             resolved_hosts = read_lines(input_path)
 
-        from core.intel.scope import filter_authorized_indicators
+        from core.intel.scope import filter_authorized_indicators, require_collection_scope
 
-        scope = getattr(context, "collection_scope", None)
-        if scope is not None:
-            resolved_hosts = filter_authorized_indicators(resolved_hosts, scope)
+        scope = require_collection_scope(context)
+        resolved_hosts = filter_authorized_indicators(resolved_hosts, scope)
 
         count = write_lines(output_path, resolved_hosts)
         # Follow-up writes a sidecar file. Replacing context.resolved here would

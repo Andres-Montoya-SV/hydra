@@ -9,6 +9,13 @@ domain or have explicit written authorization (e.g. a bug-bounty program).
 It detects whether a parameter *influences* the response (and whether a
 canary value is reflected). It does **not** inject SQL, XSS, path traversal,
 or any other exploit payload — the canary value is a fixed inert token.
+
+Retrofitted onto `core/collection/gateway.py:CollectionGateway` — the same
+structural pattern as `modules/soft404_check.py`: every baseline URL and
+every per-parameter probe URL is an `AuthorizedCollectionTarget`, never a
+raw string reaching `http_get`. The per-parameter candidate is derived from
+an already-authorized baseline (same hostname, different query string) but
+is independently re-authorized rather than assumed safe by association.
 """
 
 from __future__ import annotations
@@ -18,8 +25,9 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from core.assets import normalize_domain
+from core.collection.gateway import CollectionGateway
+from core.collection.target import AuthorizedCollectionTarget
 from core.exceptions import ValidationError
-from core.http_probe import http_get
 from core.models import PipelineContext, ToolStatus
 from core.plugin_base import PluginResult
 from core.response_diff import (
@@ -197,15 +205,11 @@ class ParamFuzzPlugin(BaseToolPlugin):
         return "Built-in (stdlib urllib) — opt-in active probe"
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
-        from core.intel.scope import allows_active_collection, require_collection_scope
+        from core.intel.scope import require_collection_scope
 
         scope = require_collection_scope(context)
-        urls = [
-            url
-            for url in _select_urls(context, self.settings.param_fuzz_max_urls_per_host)
-            if allows_active_collection(url, scope)
-        ]
-        if not urls:
+        candidate_urls = _select_urls(context, self.settings.param_fuzz_max_urls_per_host)
+        if not candidate_urls:
             return self._skip("No live HTTP URLs to fuzz for parameters")
 
         context.add_warning(
@@ -216,6 +220,34 @@ class ParamFuzzPlugin(BaseToolPlugin):
         )
         self.update_status(context, ToolStatus.RUNNING)
 
+        # CollectionGateway (core/collection/gateway.py) owns authorization +
+        # confinement-proxy lifecycle + the actual request together — see the
+        # identical pattern in modules/soft404_check.py. Every baseline URL
+        # becomes an AuthorizedCollectionTarget here; every per-parameter
+        # probe URL is independently re-authorized in `_fuzz_urls` before
+        # `gateway.http_get()` ever sees it.
+        async with CollectionGateway(
+            scope,
+            capability=self.capability,
+            context=context,
+            upstream_proxy_url=self.settings.outbound_proxy_url or None,
+            extra_headers=self.settings.merged_headers(),
+        ) as gateway:
+            authorized: list[AuthorizedCollectionTarget] = []
+            for url in candidate_urls:
+                target = gateway.authorize(url, operation="param_fuzz_baseline")
+                if target is not None:
+                    authorized.append(target)
+            if not authorized:
+                return self._skip("No live HTTP URLs to fuzz for parameters")
+            return await self._fuzz_urls(context, gateway, authorized)
+
+    async def _fuzz_urls(
+        self,
+        context: PipelineContext,
+        gateway: CollectionGateway,
+        baseline_targets: list[AuthorizedCollectionTarget],
+    ) -> PluginResult:
         positives: list[dict[str, object]] = []
         invalid_baselines: list[dict[str, object]] = []
         hosts_with_invalid_baseline: set[str] = set()
@@ -225,19 +257,17 @@ class ParamFuzzPlugin(BaseToolPlugin):
         timeout = self.settings.param_fuzz_timeout
         rel_delta = self.settings.param_fuzz_body_delta_pct / 100.0
 
-        for url in urls:
-            host = normalize_domain(urlparse(url).hostname or "") or "unknown"
+        for baseline_target in baseline_targets:
+            url = baseline_target.raw
+            host = baseline_target.hostname or "unknown"
             # Once a host's baseline is blocked, further URLs on that host are
             # almost certainly the same wall — don't burn the wordlist again.
             if host in hosts_with_invalid_baseline:
                 continue
 
             record_lines: list[str] = []
-            baseline = await asyncio.to_thread(
-                http_get,
-                url,
-                timeout=timeout,
-                proxy_url=self.settings.outbound_proxy_url,
+            baseline = await gateway.http_get(
+                baseline_target, timeout=timeout, operation="param_fuzz_baseline"
             )
             total_probes += 1
             record_lines.append(
@@ -275,11 +305,11 @@ class ParamFuzzPlugin(BaseToolPlugin):
 
             for param in PARAM_WORDLIST:
                 probe_url = _with_param(url, param, CANARY_VALUE)
-                candidate = await asyncio.to_thread(
-                    http_get,
-                    probe_url,
-                    timeout=timeout,
-                    proxy_url=self.settings.outbound_proxy_url,
+                probe_target = gateway.authorize(probe_url, operation="param_fuzz_probe")
+                if probe_target is None:
+                    continue
+                candidate = await gateway.http_get(
+                    probe_target, timeout=timeout, operation="param_fuzz_probe"
                 )
                 total_probes += 1
                 influences = significant_response_change(
@@ -337,7 +367,7 @@ class ParamFuzzPlugin(BaseToolPlugin):
         hit_count = len(positives)
         context.metadata["param_fuzz_probes"] = total_probes
         context.metadata["param_fuzz_hits"] = hit_count
-        context.metadata["param_fuzz_urls"] = len(urls)
+        context.metadata["param_fuzz_urls"] = len(baseline_targets)
         context.metadata["param_fuzz_urls_probed"] = probed_urls
         context.metadata["param_fuzz_wordlist_size"] = len(PARAM_WORDLIST)
         context.metadata["param_fuzz_baseline_invalid_hosts"] = [
@@ -369,8 +399,8 @@ class ParamFuzzPlugin(BaseToolPlugin):
             )
         else:
             message = (
-                f"Parameter discovery: {hit_count} hit(s) across {len(urls)} URL(s) "
-                f"({total_probes} total requests)"
+                f"Parameter discovery: {hit_count} hit(s) across {len(baseline_targets)} "
+                f"URL(s) ({total_probes} total requests)"
             )
         return PluginResult(
             success=True,

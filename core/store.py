@@ -339,9 +339,80 @@ CREATE TABLE IF NOT EXISTS intel_indicators (
     evidence_id TEXT,
     priority INTEGER DEFAULT 100,
     discovered_from TEXT,
+    authorization_status TEXT,
+    created_at TEXT,
+    claimed_at TEXT,
+    completed_at TEXT,
+    failure_reason TEXT,
+    collector TEXT,
     UNIQUE(run_id, indicator_id),
     FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
+
+CREATE TABLE IF NOT EXISTS intel_hypotheses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    hypothesis_id TEXT NOT NULL,
+    relationship_id TEXT,
+    target_value TEXT NOT NULL,
+    evidence_id TEXT,
+    confidence_band TEXT,
+    status TEXT,
+    rationale TEXT,
+    depth INTEGER DEFAULT 1,
+    kind TEXT,
+    UNIQUE(run_id, hypothesis_id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS intel_collection_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    indicator_id TEXT,
+    value TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    collector TEXT,
+    observed_at TEXT,
+    artifact TEXT,
+    UNIQUE(run_id, attempt_id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+
+-- Per-destination network authorization audit trail — finer-grained than
+-- intel_collection_attempts (one row per plugin capability attempt): one row
+-- per concrete network decision the crawler-confinement proxy or httpx's
+-- redirect-hop resolver actually made, ALLOW and DENY alike. Answers "was
+-- this host actually contacted, under which authorization, why" from SQLite
+-- alone, without re-reading warnings text.
+CREATE TABLE IF NOT EXISTS intel_network_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    collector TEXT NOT NULL,
+    capability TEXT,
+    method TEXT,
+    url TEXT NOT NULL,
+    normalized_hostname TEXT,
+    resolved_ip TEXT,
+    port INTEGER,
+    redirect_hop INTEGER DEFAULT 0,
+    decision TEXT NOT NULL,
+    reason TEXT,
+    network_attempted INTEGER NOT NULL DEFAULT 0,
+    network_completed INTEGER NOT NULL DEFAULT 0,
+    response_status INTEGER,
+    response_location TEXT,
+    parent_request_id TEXT,
+    observed_at TEXT,
+    UNIQUE(run_id, request_id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_intel_network_requests_run ON intel_network_requests(run_id, decision);
+CREATE INDEX IF NOT EXISTS idx_intel_network_requests_host ON intel_network_requests(run_id, normalized_hostname);
 
 CREATE INDEX IF NOT EXISTS idx_intel_entities_run ON intel_entities(run_id, entity_type);
 CREATE INDEX IF NOT EXISTS idx_intel_entities_key ON intel_entities(run_id, key);
@@ -476,6 +547,17 @@ class AssetStore:
                 "intel_truncated": "ALTER TABLE runs ADD COLUMN intel_truncated INTEGER DEFAULT 0",
                 "intel_truncation_reason": "ALTER TABLE runs ADD COLUMN intel_truncation_reason TEXT",
             },
+            "intel_indicators": {
+                "authorization_status": "ALTER TABLE intel_indicators ADD COLUMN authorization_status TEXT",
+                "created_at": "ALTER TABLE intel_indicators ADD COLUMN created_at TEXT",
+                "claimed_at": "ALTER TABLE intel_indicators ADD COLUMN claimed_at TEXT",
+                "completed_at": "ALTER TABLE intel_indicators ADD COLUMN completed_at TEXT",
+                "failure_reason": "ALTER TABLE intel_indicators ADD COLUMN failure_reason TEXT",
+                "collector": "ALTER TABLE intel_indicators ADD COLUMN collector TEXT",
+            },
+            "intel_network_requests": {
+                "resolved_ip": "ALTER TABLE intel_network_requests ADD COLUMN resolved_ip TEXT",
+            },
         }
         for table, migrations in table_migrations.items():
             existing = {
@@ -560,6 +642,9 @@ class AssetStore:
             "clusters",
             "graph_edges",
             "graph_nodes",
+            "intel_collection_attempts",
+            "intel_network_requests",
+            "intel_hypotheses",
             "intel_indicators",
             "intel_relationships",
             "intel_evidence",
@@ -577,6 +662,9 @@ class AssetStore:
         self, run_id: str, hosts: dict[str, Host], *, clusters=None, graph=None, intel=None
     ) -> None:
         """Persist full intelligence snapshot (replace child data for run)."""
+        prior_indicators = self.get_intel_indicators(run_id) if intel is not None else []
+        if intel is not None and prior_indicators:
+            _apply_prior_indicator_lifecycle(intel, prior_indicators)
         self.clear_run_data(run_id)
         with self._connect() as conn:
             for host in hosts.values():
@@ -639,6 +727,145 @@ class AssetStore:
                         run_id,
                     ),
                 )
+
+    def get_intel_indicators(self, run_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM intel_indicators WHERE run_id=?",
+                    (run_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [dict(row) for row in rows]
+
+    def upsert_intel_indicators(self, run_id: str, indicators) -> None:
+        """Persist indicator lifecycle without wiping the rest of the run."""
+        if not indicators:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_indicators
+                   (run_id, indicator_id, kind, value, depth, parent_id, reason,
+                    scope_status, collection_status, evidence_id, priority, discovered_from,
+                    authorization_status, created_at, claimed_at, completed_at,
+                    failure_reason, collector)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        i.indicator_id,
+                        i.kind.value,
+                        i.value,
+                        i.depth,
+                        i.parent_id,
+                        i.reason.value,
+                        i.scope_status.value,
+                        i.collection_status.value,
+                        i.evidence_id,
+                        i.priority,
+                        i.discovered_from,
+                        getattr(i, "authorization_status", "") or "",
+                        getattr(i, "created_at", "") or "",
+                        getattr(i, "claimed_at", "") or "",
+                        getattr(i, "completed_at", "") or "",
+                        getattr(i, "failure_reason", "") or "",
+                        getattr(i, "collector", "") or "",
+                    )
+                    for i in indicators
+                ],
+            )
+
+    def upsert_intel_attempts(self, run_id: str, attempts) -> None:
+        """Persist collection attempts without wiping the rest of the run."""
+        if not attempts:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_collection_attempts
+                   (run_id, attempt_id, indicator_id, value, capability, status,
+                    reason, collector, observed_at, artifact)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        a.attempt_id,
+                        a.indicator_id,
+                        a.value,
+                        a.capability,
+                        a.status,
+                        a.reason,
+                        a.collector,
+                        a.observed_at,
+                        a.artifact,
+                    )
+                    for a in attempts
+                ],
+            )
+
+    def record_network_requests(self, run_id: str, requests: list[dict]) -> None:
+        """Persist per-destination network authorization decisions.
+
+        `requests` is a list of plain dicts (see `core.collection.audit.
+        NetworkRequestRecord.to_dict()`), accumulated in `context.metadata
+        ["network_requests"]` by the crawler-confinement proxy and httpx's
+        redirect-hop resolver — the two components that make individual,
+        per-destination ALLOW/DENY decisions outside the input-file gate.
+        `INSERT OR REPLACE` so a retried/partial finalize is idempotent.
+        """
+        if not requests:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_network_requests
+                   (run_id, request_id, collector, capability, method, url,
+                    normalized_hostname, resolved_ip, port, redirect_hop, decision, reason,
+                    network_attempted, network_completed, response_status,
+                    response_location, parent_request_id, observed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        str(r.get("request_id") or ""),
+                        str(r.get("collector") or ""),
+                        str(r.get("capability") or ""),
+                        str(r.get("method") or ""),
+                        str(r.get("url") or ""),
+                        str(r.get("normalized_hostname") or ""),
+                        str(r.get("resolved_ip") or ""),
+                        r.get("port"),
+                        int(r.get("redirect_hop") or 0),
+                        str(r.get("decision") or ""),
+                        str(r.get("reason") or ""),
+                        1 if r.get("network_attempted") else 0,
+                        1 if r.get("network_completed") else 0,
+                        r.get("response_status"),
+                        str(r.get("response_location") or ""),
+                        str(r.get("parent_request_id") or ""),
+                        str(r.get("observed_at") or ""),
+                    )
+                    for r in requests
+                    if r.get("request_id")
+                ],
+            )
+
+    def get_network_requests(
+        self, run_id: str, *, decision: str | None = None
+    ) -> list[dict[str, object]]:
+        """Read back the network-request audit trail for a run (CLI/debugging)."""
+        with self._connect() as conn:
+            if decision:
+                rows = conn.execute(
+                    "SELECT * FROM intel_network_requests WHERE run_id=? AND decision=? "
+                    "ORDER BY id",
+                    (run_id, decision),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM intel_network_requests WHERE run_id=? ORDER BY id",
+                    (run_id,),
+                ).fetchall()
+        return [dict(row) for row in rows]
 
     def upsert_host(self, run_id: str, host: Host) -> None:
         """Legacy single-host upsert (used by tests)."""
@@ -730,7 +957,7 @@ class AssetStore:
 
     def export_run_json(self, run_id: str) -> dict[str, Any]:
         hosts = self.get_hosts(run_id)
-        return {
+        payload: dict[str, Any] = {
             "run_id": run_id,
             "host_count": len(hosts),
             "alive_count": sum(1 for h in hosts if h.http_services),
@@ -738,6 +965,55 @@ class AssetStore:
             "clusters": [c.to_dict() for c in self.get_clusters(run_id)],
             "graph": self.get_graph(run_id).to_dict(),
         }
+        try:
+            from core.intel.query import IntelQuery
+            from core.intel.serialize import serialize_relationships
+
+            conn = self.intel_connection()
+            try:
+                query = IntelQuery(conn, run_id)
+                rels = query.relationships_for_run(limit=500)
+                evidence_rows = []
+                if rels:
+                    ids = [r.get("evidence_id") for r in rels if r.get("evidence_id")]
+                    if ids:
+                        placeholders = ",".join("?" * len(ids))
+                        # placeholders is a fixed count of '?' chars; all values are bound params
+                        evidence_rows = [
+                            dict(row)
+                            for row in conn.execute(
+                                f"SELECT * FROM intel_evidence WHERE run_id=? AND evidence_id IN ({placeholders})",  # noqa: S608 # nosec B608
+                                [run_id, *ids],
+                            ).fetchall()
+                        ]
+                        for item in evidence_rows:
+                            meta = item.get("metadata_json")
+                            if meta:
+                                try:
+                                    item["metadata"] = json.loads(meta)
+                                except json.JSONDecodeError:
+                                    item["metadata"] = {}
+                entities = {
+                    row["entity_id"]: dict(row)
+                    for row in conn.execute(
+                        "SELECT * FROM intel_entities WHERE run_id=?",
+                        (run_id,),
+                    ).fetchall()
+                }
+                evidence_by_id = {row.get("evidence_id"): row for row in evidence_rows}
+                payload["intelligence"] = {
+                    "relationships": serialize_relationships(
+                        rels,
+                        evidence_by_id=evidence_by_id,
+                        entities_by_id=entities,
+                        run_id=run_id,
+                    )
+                }
+            finally:
+                conn.close()
+        except Exception:
+            payload["intelligence"] = {"relationships": []}
+        return payload
 
     def query_hosts_by_risk(self, run_id: str, min_score: int = 25) -> list[Host]:
         with self._connect() as conn:
@@ -1380,8 +1656,10 @@ class AssetStore:
             conn.executemany(
                 """INSERT OR REPLACE INTO intel_indicators
                    (run_id, indicator_id, kind, value, depth, parent_id, reason,
-                    scope_status, collection_status, evidence_id, priority, discovered_from)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    scope_status, collection_status, evidence_id, priority, discovered_from,
+                    authorization_status, created_at, claimed_at, completed_at,
+                    failure_reason, collector)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         run_id,
@@ -1396,8 +1674,64 @@ class AssetStore:
                         i.evidence_id,
                         i.priority,
                         i.discovered_from,
+                        getattr(i, "authorization_status", "") or "",
+                        getattr(i, "created_at", "") or "",
+                        getattr(i, "claimed_at", "") or "",
+                        getattr(i, "completed_at", "") or "",
+                        getattr(i, "failure_reason", "") or "",
+                        getattr(i, "collector", "") or "",
                     )
                     for i in intel.indicators
+                ],
+            )
+        hypotheses = getattr(intel, "hypotheses", None) or []
+        if isinstance(hypotheses, dict):
+            hypotheses = list(hypotheses.values())
+        if hypotheses:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_hypotheses
+                   (run_id, hypothesis_id, relationship_id, target_value, evidence_id,
+                    confidence_band, status, rationale, depth, kind)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        h.hypothesis_id,
+                        h.relationship_id,
+                        h.target_value,
+                        h.evidence_id or None,
+                        h.confidence_band,
+                        h.status,
+                        h.rationale,
+                        h.depth,
+                        h.kind,
+                    )
+                    for h in hypotheses
+                ],
+            )
+        attempts = (
+            getattr(intel, "collection_attempts", None) or getattr(intel, "attempts", None) or []
+        )
+        if attempts:
+            conn.executemany(
+                """INSERT OR REPLACE INTO intel_collection_attempts
+                   (run_id, attempt_id, indicator_id, value, capability, status,
+                    reason, collector, observed_at, artifact)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        a.attempt_id,
+                        a.indicator_id,
+                        a.value,
+                        a.capability,
+                        a.status,
+                        a.reason,
+                        a.collector,
+                        a.observed_at,
+                        a.artifact,
+                    )
+                    for a in attempts
                 ],
             )
 
@@ -1583,3 +1917,39 @@ class AssetStore:
             "relationships": relationships,
             "evidence": evidence,
         }
+
+
+def _apply_prior_indicator_lifecycle(intel, prior_rows: list[dict[str, Any]]) -> None:
+    """Preserve FAILED / interrupted IN_FLIGHT across finalize. Never invent COLLECTED."""
+    from core.intel.model import CollectionStatus
+
+    by_id = {str(row.get("indicator_id") or ""): row for row in prior_rows}
+    by_value = {str(row.get("value") or "").lower(): row for row in prior_rows}
+    for indicator in getattr(intel, "indicators", []) or []:
+        row = by_id.get(indicator.indicator_id) or by_value.get(str(indicator.value).lower())
+        if not row:
+            continue
+        try:
+            prior = CollectionStatus(str(row.get("collection_status") or ""))
+        except ValueError:
+            continue
+        if prior is CollectionStatus.IN_FLIGHT:
+            if indicator.collection_status is not CollectionStatus.COLLECTED:
+                indicator.collection_status = CollectionStatus.FAILED
+                indicator.failure_reason = (
+                    getattr(indicator, "failure_reason", "") or "interrupted_in_flight"
+                )
+        elif prior is CollectionStatus.FAILED:
+            if indicator.collection_status is not CollectionStatus.COLLECTED:
+                indicator.collection_status = CollectionStatus.FAILED
+                indicator.failure_reason = str(
+                    row.get("failure_reason")
+                    or getattr(indicator, "failure_reason", "")
+                    or "failed"
+                )
+        if row.get("claimed_at"):
+            indicator.claimed_at = str(row.get("claimed_at"))
+        if row.get("created_at") and not getattr(indicator, "created_at", ""):
+            indicator.created_at = str(row.get("created_at"))
+        if row.get("collector") and not getattr(indicator, "collector", ""):
+            indicator.collector = str(row.get("collector"))

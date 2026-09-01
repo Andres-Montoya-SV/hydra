@@ -59,25 +59,71 @@ def _record(*, input_host: str, final_url: str, chain: list | None = None, **ext
     return rec
 
 
+def _httpx_stub(pages: dict[str, dict], requested: list[str]):
+    """Fake `_execute_self_output` standing in for the real httpx binary.
+
+    Mimics httpx without `-follow-redirects`: it answers exactly one request
+    per invocation — the `-u` single target, or every host in the `-l` list
+    file on the very first call — and never manufactures a response for a
+    URL that isn't in `pages`. `requested` records every URL actually asked
+    for, in order, so tests can assert on attempted requests, not just on
+    where they landed.
+    """
+
+    async def fake_exec(ctx, args, output_path, **kwargs):
+        if "-u" in args:
+            targets = [args[args.index("-u") + 1]]
+        else:
+            list_path = Path(args[args.index("-l") + 1])
+            targets = read_lines(list_path)
+        records = []
+        for target in targets:
+            requested.append(target)
+            page = pages.get(target)
+            if page is not None:
+                records.append(page)
+        write_jsonl(output_path, records, base_dir=ctx.output_dir)
+        return PluginResult(success=True, output_path=output_path, lines_produced=len(records))
+
+    return fake_exec
+
+
 @pytest.mark.asyncio
 async def test_in_scope_redirect_stays_an_active_target(tmp_path: Path, settings: Settings) -> None:
-    """Authorized host → in-scope host: follow and treat the landing URL as alive."""
+    """Authorized host → in-scope host: followed hop by hop, landing URL is alive.
+
+    Same outward behavior as before the redirect-safety fix (landing URL ends
+    up in alive.txt, no observation is recorded) — httpx just no longer
+    fetches the destination on its own; Hydra authorizes then requests it.
+    """
     context = _context(tmp_path)
     plugin = HttpxPlugin(settings)
     hosts = context.output_dir / "resolved.txt"
     write_lines(hosts, [SEED], base_dir=context.output_dir)
+    seed_url = f"https://{SEED}/"
     landing = f"https://{IN_SCOPE_DEST}/dashboard"
-
-    async def fake_exec(ctx, args, output_path, **kwargs):
-        write_jsonl(
-            output_path,
-            [_record(input_host=SEED, final_url=landing, location=landing)],
-            base_dir=ctx.output_dir,
-        )
-        return PluginResult(success=True, output_path=output_path, lines_produced=1)
-
-    plugin._execute_self_output = fake_exec  # type: ignore[method-assign]
+    requested: list[str] = []
+    pages = {
+        SEED: {
+            "input": SEED,
+            "host": SEED,
+            "url": seed_url,
+            "status_code": 302,
+            "location": landing,
+        },
+        landing: {
+            "input": landing,
+            "host": IN_SCOPE_DEST,
+            "url": landing,
+            "status_code": 200,
+            "title": "ok",
+        },
+    }
+    plugin._execute_self_output = _httpx_stub(pages, requested)  # type: ignore[method-assign]
     await plugin.run(context, hosts)
+
+    # Exactly the origin, then the authorized landing hop — one httpx call per hop.
+    assert requested == [SEED, landing]
 
     alive = read_lines(context.output_dir / "alive.txt")
     assert landing in alive
@@ -87,39 +133,39 @@ async def test_in_scope_redirect_stays_an_active_target(tmp_path: Path, settings
     assert obs == []
     stored = read_jsonl(context.output_dir / "httpx.json")
     assert stored[0]["scope_status"] == ScopeStatus.IN_SCOPE.value
+    assert stored[0]["final_url"] == landing
 
 
 @pytest.mark.asyncio
 async def test_oos_redirect_is_observation_not_alive_target(
     tmp_path: Path, settings: Settings
 ) -> None:
-    """Authorized host → OOS: record observation, never put dest in alive.txt."""
+    """Authorized host → OOS: record observation, never request the destination."""
     context = _context(tmp_path)
     plugin = HttpxPlugin(settings)
     hosts = context.output_dir / "resolved.txt"
     write_lines(hosts, [SEED], base_dir=context.output_dir)
+    seed_url = f"https://{SEED}/"
     oos_url = f"https://{OOS}/sso"
-
-    async def fake_exec(ctx, args, output_path, **kwargs):
-        write_jsonl(
-            output_path,
-            [
-                _record(
-                    input_host=SEED,
-                    final_url=oos_url,
-                    location=oos_url,
-                    chain=[
-                        {"url": f"https://{SEED}/"},
-                        {"url": oos_url, "status_code": 302},
-                    ],
-                )
-            ],
-            base_dir=ctx.output_dir,
-        )
-        return PluginResult(success=True, output_path=output_path, lines_produced=1)
-
-    plugin._execute_self_output = fake_exec  # type: ignore[method-assign]
+    requested: list[str] = []
+    pages = {
+        SEED: {
+            "input": SEED,
+            "host": SEED,
+            "url": seed_url,
+            "status_code": 302,
+            "location": oos_url,
+        },
+        # Deliberately no entry for oos_url. If the plugin ever asked for it,
+        # `requested` below would catch it regardless of what a stub returned.
+    }
+    plugin._execute_self_output = _httpx_stub(pages, requested)  # type: ignore[method-assign]
     await plugin.run(context, hosts)
+
+    # The assertion that matters: the request was never attempted, not just
+    # that its result didn't end up in alive.txt.
+    assert requested == [SEED]
+    assert oos_url not in requested
 
     alive = read_lines(context.output_dir / "alive.txt")
     assert oos_url not in alive
@@ -137,7 +183,10 @@ async def test_oos_redirect_is_observation_not_alive_target(
 
     stored = read_jsonl(context.output_dir / "httpx.json")
     assert stored[0]["scope_status"] == ScopeStatus.OUT_OF_SCOPE.value
-    assert oos_url in stored[0]["url"]
+    assert stored[0]["final_url"] == oos_url
+    # `url` reflects the request httpx actually made (the origin) — the OOS
+    # destination named by `final_url` was never fetched.
+    assert oos_url not in stored[0]["url"]
 
     katana = KatanaPlugin(settings)
     assert all(OOS not in u for u in katana._alive_urls(context))
@@ -153,8 +202,104 @@ async def test_oos_redirect_is_observation_not_alive_target(
     assert allow_browser_navigation(f"https://{SEED}/", context) is True
     assert OOS not in _alive_hosts(context)
     assert SEED in _alive_hosts(context)
+    # tech/title on this record describe the origin's own (never-OOS) 302
+    # response, so they're legitimate SEED intel and are kept.
     context.httpx_results[0]["tech"] = ["nginx:1.25.0"]
-    assert _collect_techs(context) == []
+    assert _collect_techs(context) == [
+        {"host": SEED, "url": seed_url, "name": "nginx", "version": "1.25.0"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_redirect_chain_stops_at_first_oos_hop_never_requests_hop_after(
+    tmp_path: Path, settings: Settings
+) -> None:
+    """origin → in-scope hop1 → OOS hop2 → hop3: stop at hop2, hop3 never evaluated."""
+    context = _context(tmp_path)
+    plugin = HttpxPlugin(settings)
+    hosts = context.output_dir / "resolved.txt"
+    write_lines(hosts, [SEED], base_dir=context.output_dir)
+    seed_url = f"https://{SEED}/"
+    hop1 = f"https://{IN_SCOPE_DEST}/step1"
+    hop2 = f"https://{OOS}/step2"
+    hop3 = f"https://{OOS}/step3-should-never-be-fetched"
+    requested: list[str] = []
+    pages = {
+        SEED: {"input": SEED, "host": SEED, "url": seed_url, "status_code": 302, "location": hop1},
+        hop1: {
+            "input": hop1,
+            "host": IN_SCOPE_DEST,
+            "url": hop1,
+            "status_code": 302,
+            "location": hop2,
+        },
+        hop2: {"input": hop2, "host": OOS, "url": hop2, "status_code": 302, "location": hop3},
+        # hop3 intentionally absent — Hydra reaching for it would be the bug.
+    }
+    plugin._execute_self_output = _httpx_stub(pages, requested)  # type: ignore[method-assign]
+    await plugin.run(context, hosts)
+
+    assert requested == [SEED, hop1]
+    assert hop2 not in requested
+    assert hop3 not in requested
+
+    obs = read_jsonl(context.output_dir / "httpx_redirects.jsonl")
+    assert len(obs) == 1
+    assert obs[0]["final_url"] == hop2
+    assert hop3 not in obs[0]["redirect_chain"]
+
+    alive = read_lines(context.output_dir / "alive.txt")
+    assert all(OOS not in line for line in alive)
+
+
+@pytest.mark.asyncio
+async def test_browser_navigation_guard_fails_closed_on_exception(
+    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bug while evaluating navigation authorization must block, not fall open."""
+    import modules.browser_probe as browser_probe
+
+    context = _context(tmp_path)
+
+    def _boom(url: str, ctx: object) -> bool:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(browser_probe, "allow_browser_navigation", _boom)
+
+    calls: dict[str, object] = {"abort": None, "continued": False}
+
+    class FakeRequest:
+        url = f"https://{SEED}/"
+        resource_type = "document"
+
+        def is_navigation_request(self) -> bool:
+            return True
+
+    class FakeRoute:
+        request = FakeRequest()
+
+        async def abort(self, reason: str) -> None:
+            calls["abort"] = reason
+
+        async def continue_(self) -> None:
+            calls["continued"] = True
+
+    handlers: dict[str, object] = {}
+
+    class FakeContext:
+        async def route(self, pattern: str, handler: object) -> None:
+            handlers["guard"] = handler
+
+        async def route_web_socket(self, pattern: str, handler: object) -> None:
+            handlers["websocket_guard"] = handler
+
+    blocked_counts: dict[str, int] = {}
+    await browser_probe._install_scope_request_guard(FakeContext(), context, blocked_counts)
+    await handlers["guard"](FakeRoute())
+
+    assert calls["abort"] == "blockedbyclient"
+    assert calls["continued"] is False
+    assert blocked_counts.get("document") == 1
 
 
 def test_multi_hop_filter_uses_final_destination_not_first_hop() -> None:

@@ -73,6 +73,7 @@ def intel_config_for_pipeline(context: PipelineContext, settings: Settings) -> I
         scope = CollectionScope.from_seeds(
             [t.domain for t in context.targets],
             patterns=patterns,
+            cloud_collection_allowed=settings.cloud_bucket_enum_authorize_derived,
         )
         context.collection_scope = scope
     collected = {
@@ -87,6 +88,7 @@ def intel_config_for_pipeline(context: PipelineContext, settings: Settings) -> I
         bounds=DiscoveryBounds.from_settings(settings),
         collected_domains=collected,
         emissions=list(context.intel_emissions),
+        cloud_collection_allowed=settings.cloud_bucket_enum_authorize_derived,
     )
 
 
@@ -156,9 +158,9 @@ class PipelineRunner:
         scope_path = self.settings.scope_file
         if not scope_path:
             return
-        from core.scope import load_scope_patterns, out_of_scope_targets
+        from core.scope import load_scope_patterns, out_of_scope_targets, split_scope_patterns
 
-        patterns = load_scope_patterns(scope_path)
+        patterns, _path_exclusions = split_scope_patterns(load_scope_patterns(scope_path))
         names = [t.domain for t in targets if getattr(t, "domain", None)]
         rejected = out_of_scope_targets(names, patterns)
         if rejected:
@@ -178,6 +180,7 @@ class PipelineRunner:
         return CollectionScope.from_seeds(
             [t.domain for t in context.targets],
             patterns=patterns,
+            cloud_collection_allowed=self.settings.cloud_bucket_enum_authorize_derived,
         )
 
     def _authorized_names(self, context: PipelineContext, names: list[str]) -> list[str]:
@@ -190,13 +193,28 @@ class PipelineRunner:
     def _gate_active_input(
         self, context: PipelineContext, plugin: ReconPlugin, input_path: Path
     ) -> Path:
-        """Filter collector input immediately before cache lookup and invocation."""
+        """Filter collector input immediately before cache lookup and invocation.
+
+        Composes scope AND OPSEC through ``authorize_collection`` (not just
+        scope via ``allows_active_collection``). The plugin-level STRICT_OPSEC
+        skip in ``_run_single_plugin`` already keeps a non-allowed plugin from
+        reaching this point at all — this is defense in depth so the gate a
+        plugin's input actually passes through is independently correct, not
+        reliant on that separate check running first.
+        """
         if plugin.name not in ACTIVE_COLLECTION_PLUGINS:
             return input_path
         from core.intel.scope import authorize_plugin_input
 
         context.collection_scope = self._collection_scope_for(context)
-        return authorize_plugin_input(context, input_path, plugin.name)
+        return authorize_plugin_input(
+            context,
+            input_path,
+            plugin.name,
+            capability=plugin.capability,
+            strict_opsec=self.settings.strict_opsec,
+            opsec_allowed=plugin.name in STRICT_OPSEC_ALLOWED_PLUGINS,
+        )
 
     def _enabled_plugins(self, names: frozenset[str]) -> list[ReconPlugin]:
         return [
@@ -329,7 +347,8 @@ class PipelineRunner:
 
             # Stage 4: DNS resolution (+ optional port scan)
             self._emit_stage(context, PipelineStage.DNSX, "Resolving DNS")
-            await self._run_plugin_chain(context, self._dns_plugins(), subs_path)
+            dns_input = self._seed_dns_input(context, subs_path)
+            await self._run_plugin_chain(context, self._dns_plugins(), dns_input)
 
             resolved_path = output_dir / "resolved.txt"
             if self.settings.strict_opsec:
@@ -360,6 +379,10 @@ class PipelineRunner:
                     context.add_warning(
                         f"{unresolved} subdomains did not resolve — excluded from HTTP probing"
                     )
+
+            from core.intel.artifacts import snapshot_seed_dns
+
+            snapshot_seed_dns(output_dir)
 
             asn_lookup = self.tool_manager.get_plugin("asn_lookup")
             if (
@@ -412,6 +435,11 @@ class PipelineRunner:
                 await self._run_single_plugin(context, httpx, resolved_path)
             elif not context.resolved:
                 context.add_warning("Skipping httpx — no resolved hosts")
+
+            from core.intel.artifacts import snapshot_seed_http, write_authorized_alive
+
+            snapshot_seed_http(output_dir)
+            write_authorized_alive(output_dir, self._collection_scope_for(context))
 
             context.metadata.setdefault("dns_probes", len(context.subdomains))
             context.metadata.setdefault("http_probes", len(context.resolved))
@@ -488,8 +516,11 @@ class PipelineRunner:
                 names = ", ".join(p.display_name for p in optional)
                 self._emit_stage(context, PipelineStage.OPTIONAL, f"Running: {names}")
                 alive_path = output_dir / "alive.txt"
+                authorized_alive = output_dir / "authorized_alive.txt"
                 input_for_optional = resolved_path
-                if alive_path.exists() and alive_path.stat().st_size > 0:
+                if authorized_alive.exists() and authorized_alive.stat().st_size > 0:
+                    input_for_optional = authorized_alive
+                elif alive_path.exists() and alive_path.stat().st_size > 0:
                     input_for_optional = alive_path
                 await self._run_plugins_concurrent(context, optional, input_for_optional)
 
@@ -547,6 +578,43 @@ class PipelineRunner:
 
         return context
 
+    def _seed_dns_input(self, context: PipelineContext, subs_path: Path) -> Path:
+        """Seed DNS resolves enum+seed names only. CT SANs become follow-up indicators.
+
+        ``subdomains.txt`` remains the observation union (including OOS CT names).
+        """
+        from core.intel.followup import (
+            apply_wildcard_seed_dns_policy,
+            load_certificate_backed_names,
+            load_wildcard_roots,
+        )
+
+        enum_names: list[str] = [t.domain for t in context.targets]
+        for filename in ("subfinder.txt", "amass.txt", "assetfinder.txt"):
+            path = context.output_dir / filename
+            if path.exists():
+                enum_names.extend(read_lines(path))
+        if not any(
+            (context.output_dir / name).exists()
+            for name in ("subfinder.txt", "amass.txt", "assetfinder.txt")
+        ):
+            enum_names.extend(read_lines(subs_path) if subs_path.exists() else [])
+        kept, withheld = apply_wildcard_seed_dns_policy(
+            list(dict.fromkeys(enum_names)),
+            seeds=[t.domain for t in context.targets],
+            wildcard_roots=load_wildcard_roots(context.output_dir, context.metadata),
+            certificate_backed=load_certificate_backed_names(context.output_dir),
+            scope=self._collection_scope_for(context),
+        )
+        dest = context.output_dir / "authorized_dns_targets.txt"
+        write_lines(dest, kept, base_dir=context.output_dir)
+        if withheld:
+            context.add_warning(
+                f"Wildcard DNS policy: withheld {len(withheld)} DNS-only name(s) from resolution"
+            )
+            context.metadata["wildcard_dns_withheld"] = withheld[:200]
+        return dest
+
     def schedule_followup_collection(self, context: PipelineContext, engine):
         """Claim, re-authorize, and write collector inputs. One bounded pass."""
         from core.intel.followup import load_wildcard_roots, plan_followup_collection
@@ -563,8 +631,8 @@ class PipelineRunner:
             already_collected=collected,
             dns_budget=dns_left,
             http_budget=http_left,
+            engine=engine,
         )
-        # Never trust the planner output either — re-check the hard gate.
         plan.dns_targets = self._authorized_names(context, plan.dns_targets)
         plan.http_targets = self._authorized_names(context, plan.http_targets)
         authorized = set(plan.dns_targets) | set(plan.http_targets)
@@ -588,7 +656,6 @@ class PipelineRunner:
             plan.http_targets,
             base_dir=context.output_dir,
         )
-        # Defense in depth: never schedule naabu against untrusted queue names.
         write_lines(
             context.output_dir / "followup_naabu_targets.txt",
             plan.dns_targets,
@@ -601,8 +668,86 @@ class PipelineRunner:
         ]
         return plan
 
+    def _overlay_indicator_lifecycle(self, engine, context: PipelineContext) -> None:
+        from core.intel.model import CollectionStatus, IndicatorKind
+
+        store = self._store
+        if store is None or not context.run_id:
+            return
+        try:
+            rows = store.get_intel_indicators(context.run_id)
+        except Exception:
+            return
+        for row in rows:
+            try:
+                kind = IndicatorKind(str(row.get("kind") or "DOMAIN"))
+                status = CollectionStatus(str(row.get("collection_status") or ""))
+            except ValueError:
+                continue
+            engine.queue.overlay_status(
+                kind,
+                str(row.get("value") or ""),
+                status,
+                claimed_at=str(row.get("claimed_at") or ""),
+                completed_at=str(row.get("completed_at") or ""),
+                failure_reason=str(row.get("failure_reason") or ""),
+                collector=str(row.get("collector") or ""),
+            )
+
+    def _persist_indicators(self, context: PipelineContext, engine) -> None:
+        store = self._store
+        if store is None or not context.run_id:
+            return
+        try:
+            store.upsert_intel_indicators(context.run_id, engine.queue.values())
+            attempts = list(getattr(engine, "attempts", []) or [])
+            existing = context.metadata.setdefault("collection_attempts", [])
+            if not isinstance(existing, list):
+                existing = []
+                context.metadata["collection_attempts"] = existing
+            seen = {str(row.get("attempt_id") or "") for row in existing if isinstance(row, dict)}
+            for attempt in attempts:
+                payload = attempt.to_dict()
+                aid = str(payload.get("attempt_id") or "")
+                if aid and aid not in seen:
+                    existing.append(payload)
+                    seen.add(aid)
+            store.upsert_intel_attempts(context.run_id, attempts)
+        except Exception:
+            logger.exception("Failed to persist indicator lifecycle")
+
+    def _attach_collection_attempts(self, context: PipelineContext, intel) -> None:
+        if intel is None:
+            return
+        from core.intel.model import CollectionAttempt
+
+        rows = context.metadata.get("collection_attempts") or []
+        attached: list[CollectionAttempt] = []
+        seen: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            aid = str(row.get("attempt_id") or "")
+            if not aid or aid in seen:
+                continue
+            seen.add(aid)
+            attached.append(
+                CollectionAttempt(
+                    attempt_id=aid,
+                    indicator_id=str(row.get("indicator_id") or ""),
+                    value=str(row.get("value") or ""),
+                    capability=str(row.get("capability") or ""),
+                    status=str(row.get("status") or ""),
+                    reason=str(row.get("reason") or ""),
+                    collector=str(row.get("collector") or ""),
+                    observed_at=str(row.get("observed_at") or ""),
+                    artifact=str(row.get("artifact") or ""),
+                )
+            )
+        intel.collection_attempts = attached
+
     async def _maybe_collect_followups(self, context: PipelineContext, resolved_path: Path) -> None:
-        """One bounded follow-up pass for in-scope indicators discovered from evidence."""
+        """Bounded intelligence loop: ingest → authorize → collect → union → persist."""
         settings = self.settings
         if not settings.enable_followup_collection or settings.max_discovery_depth < 1:
             return
@@ -611,24 +756,23 @@ class PipelineRunner:
             context.add_warning("Follow-up collection skipped: MAX_RUNTIME reached")
             return
 
+        from core.intel.artifacts import followup_suffix, snapshot_seed_dns, snapshot_seed_http
         from core.intel.engine import IntelEngine
         from core.intel.model import IndicatorKind
 
+        snapshot_seed_dns(context.output_dir)
+        snapshot_seed_http(context.output_dir)
+
         collected = {host.lower().rstrip(".") for host in context.resolved}
-        previously_claimed = [
-            str(item).lower().rstrip(".")
-            for item in (context.metadata.get("followup_claimed_indicators") or [])
-            if item
-        ]
         config = intel_config_for_pipeline(context, settings)
         engine = IntelEngine(config)
         for domain in collected:
-            engine.queue.mark_collected(IndicatorKind.DOMAIN, domain)
+            engine.queue.mark_collected(IndicatorKind.DOMAIN, domain, collector="seed")
         if context.registry:
             engine.ingest_hosts(context.registry.to_dict())
         engine.ingest_artifacts(context.output_dir)
-        for domain in previously_claimed:
-            engine.queue.mark_collected(IndicatorKind.DOMAIN, domain)
+        engine.correlate()
+        self._overlay_indicator_lifecycle(engine, context)
         engine.queue.followups_enqueued = max(
             engine.queue.followups_enqueued,
             int(context.metadata.get("followup_enqueued") or 0),
@@ -638,17 +782,19 @@ class PipelineRunner:
             int(context.metadata.get("followup_budget_used") or 0),
         )
         plan = self.schedule_followup_collection(context, engine)
-        claimed = list(dict.fromkeys([*previously_claimed, *plan.dns_targets, *plan.http_targets]))
-        context.metadata["followup_claimed_indicators"] = claimed
+        pass_no = int(context.metadata.get("followup_pass") or 0) + 1
+        context.metadata["followup_pass"] = pass_no
         context.metadata["followup_enqueued"] = engine.queue.followups_enqueued
         context.metadata["followup_budget_used"] = engine.queue.budget_used
+        self._persist_indicators(context, engine)
         if not plan.dns_targets and not plan.http_targets:
             return
 
         context.add_warning(
-            f"Bounded follow-up: collecting {len(plan.dns_targets)} in-scope indicator(s) "
-            f"(depth<={settings.max_discovery_depth})"
+            f"Bounded follow-up pass {pass_no}: collecting {len(plan.dns_targets)} "
+            f"in-scope indicator(s) (depth<={settings.max_discovery_depth})"
         )
+        suffix = followup_suffix(pass_no)
 
         dnsx_plugins = self._dns_plugins()
         follow_path = context.output_dir / "followup_domains.txt"
@@ -658,17 +804,55 @@ class PipelineRunner:
             and self.tool_manager.is_runnable("dnsx")
             and not settings.strict_opsec
         ):
-            context.metadata["dnsx_output_suffix"] = "_followup"
+            context.metadata["dnsx_output_suffix"] = suffix
+            from core.intel.model import CollectionCapability
+
+            for host in plan.dns_targets:
+                engine.claim_attempt(
+                    host,
+                    capability=CollectionCapability.DNS_RESOLUTION,
+                    collector="dnsx",
+                    reason="followup_dns_claimed",
+                )
+            self._persist_indicators(context, engine)
             try:
                 await self._run_plugin_chain(context, dnsx_plugins, follow_path)
+            except Exception:
+                for host in plan.dns_targets:
+                    engine.queue.mark_failed(
+                        IndicatorKind.DOMAIN, host, reason="followup_dns_crash"
+                    )
+                self._persist_indicators(context, engine)
+                context.add_warning("Follow-up DNS crashed; seed DNS artifacts preserved")
+                return
             finally:
                 context.metadata.pop("dnsx_output_suffix", None)
-            self._merge_dnsx_followup(context)
+            self._merge_dnsx_followup(context, pass_no)
             context.metadata["dns_probes"] = int(context.metadata.get("dns_probes") or 0) + len(
                 plan.dns_targets
             )
+            from core.intel.artifacts import successful_followup_hosts
+
+            succeeded = successful_followup_hosts(context.output_dir, pass_no)
+            from core.intel.model import CollectionCapability
+
             for host in plan.dns_targets:
-                engine.queue.mark_collected(IndicatorKind.DOMAIN, host)
+                ok = host in succeeded
+                engine.record_attempt(
+                    host,
+                    capability=CollectionCapability.DNS_RESOLUTION,
+                    success=ok,
+                    collector="dnsx",
+                    reason="followup_dns" if ok else "followup_dns_empty",
+                    artifact=f"resolved_followup_{pass_no}.txt",
+                )
+                if ok:
+                    engine.queue.mark_collected(IndicatorKind.DOMAIN, host, collector="dnsx")
+                else:
+                    engine.queue.mark_failed(
+                        IndicatorKind.DOMAIN, host, reason="followup_dns_empty"
+                    )
+            self._persist_indicators(context, engine)
         elif settings.strict_opsec and plan.http_targets:
             merged = self._authorized_names(context, list(context.resolved) + plan.http_targets)
             write_lines(resolved_path, merged, base_dir=context.output_dir)
@@ -678,78 +862,149 @@ class PipelineRunner:
         if settings.strict_opsec:
             http_targets = list(plan.http_targets)
         if not http_targets:
+            self._persist_indicators(context, engine)
             return
         httpx = self.tool_manager.get_plugin("httpx")
         if not (httpx and self.tool_manager.is_runnable("httpx")):
             return
         probe_path = context.output_dir / "followup_http_targets.txt"
         write_lines(probe_path, http_targets, base_dir=context.output_dir)
-        context.metadata["httpx_output_suffix"] = "_followup"
+        context.metadata["httpx_output_suffix"] = suffix
+        from core.intel.model import CollectionCapability
+
+        for host in http_targets:
+            engine.claim_attempt(
+                host,
+                capability=CollectionCapability.HTTP_COLLECTION,
+                collector="httpx",
+                reason="followup_http_claimed",
+            )
+        self._persist_indicators(context, engine)
         try:
             await self._run_single_plugin(context, httpx, probe_path)
+        except Exception:
+            for host in http_targets:
+                engine.queue.mark_failed(IndicatorKind.DOMAIN, host, reason="followup_http_crash")
+            self._persist_indicators(context, engine)
+            context.add_warning("Follow-up HTTP crashed; seed HTTP artifacts preserved")
+            return
         finally:
             context.metadata.pop("httpx_output_suffix", None)
-        self._merge_httpx_followup(context)
+        self._merge_httpx_followup(context, pass_no)
         context.metadata["http_probes"] = int(context.metadata.get("http_probes") or 0) + len(
             http_targets
         )
+        from core.intel.artifacts import successful_followup_http_hosts
+
+        http_ok = successful_followup_http_hosts(context.output_dir, pass_no)
+        from core.intel.model import CollectionCapability
+
         for host in http_targets:
-            engine.queue.mark_collected(IndicatorKind.DOMAIN, host)
+            ok = host in http_ok
+            engine.record_attempt(
+                host,
+                capability=CollectionCapability.HTTP_COLLECTION,
+                success=ok,
+                collector="httpx",
+                reason="followup_http" if ok else "followup_http_empty",
+                artifact=f"alive_followup_{pass_no}.txt",
+            )
+            if ok:
+                engine.queue.mark_collected(IndicatorKind.DOMAIN, host, collector="httpx")
+            else:
+                engine.queue.mark_failed(IndicatorKind.DOMAIN, host, reason="followup_http_empty")
+        self._persist_indicators(context, engine)
 
-    def _merge_dnsx_followup(self, context: PipelineContext) -> None:
-        """Atomically union follow-up DNS into canonical artifacts without clobbering seed evidence."""
-        from utils.files import read_jsonl, write_jsonl
-
-        canonical_resolved = context.output_dir / "resolved.txt"
-        follow_resolved = context.output_dir / "resolved_followup.txt"
-        canonical_records = context.output_dir / "dnsx_records.jsonl"
-        follow_records = context.output_dir / "dnsx_records_followup.jsonl"
-
-        seed_hosts = read_lines(canonical_resolved) if canonical_resolved.exists() else []
-        extra_hosts = read_lines(follow_resolved) if follow_resolved.exists() else []
-        merged_hosts = self._authorized_names(
-            context, list(context.resolved) + seed_hosts + extra_hosts
+    def _merge_dnsx_followup(self, context: PipelineContext, pass_no: int = 1) -> None:
+        """Atomically union seed + follow-up DNS. Seed snapshots are never overwritten."""
+        from core.intel.artifacts import (
+            dns_record_union_paths,
+            dns_union_paths,
+            snapshot_seed_dns,
+            write_canonical_jsonl,
+            write_canonical_lines,
         )
-        write_lines(canonical_resolved, merged_hosts, base_dir=context.output_dir)
+
+        snapshot_seed_dns(context.output_dir)
+        merged_hosts = self._authorized_names(
+            context,
+            [
+                line
+                for path in dns_union_paths(context.output_dir, pass_no)
+                if path.exists()
+                for line in read_lines(path)
+            ],
+        )
+        write_canonical_lines(
+            context.output_dir / "resolved.txt", merged_hosts, base_dir=context.output_dir
+        )
         context.resolved = merged_hosts
-
-        if follow_records.exists():
-            merged_records: list[dict] = []
-            seen: set[str] = set()
-            for path in (canonical_records, follow_records):
-                if not path.exists():
-                    continue
-                for record in read_jsonl(path):
-                    key = _dns_record_identity(record)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    merged_records.append(record)
-            write_jsonl(canonical_records, merged_records, base_dir=context.output_dir)
-
-    def _merge_httpx_followup(self, context: PipelineContext) -> None:
-        from utils.files import read_jsonl, write_jsonl
-
-        primary = context.output_dir / "httpx.json"
-        extra = context.output_dir / "httpx_followup.json"
-        if not extra.exists():
-            return
         records = []
-        if primary.exists():
-            records.extend(read_jsonl(primary))
-        records.extend(read_jsonl(extra))
-        write_jsonl(primary, records, base_dir=context.output_dir)
-        context.httpx_results = records
-        extra_alive = context.output_dir / "alive_followup.txt"
-        if extra_alive.exists():
-            merged_alive = list(dict.fromkeys(context.alive_urls + read_lines(extra_alive)))
-            from core.intel.scope import filter_authorized_indicators
+        seen: set[str] = set()
+        for path in dns_record_union_paths(context.output_dir, pass_no):
+            if not path.exists():
+                continue
+            from utils.files import read_jsonl
 
-            scope = getattr(context, "collection_scope", None)
-            if scope is not None:
-                merged_alive = filter_authorized_indicators(merged_alive, scope)
-            write_lines(context.output_dir / "alive.txt", merged_alive, base_dir=context.output_dir)
-            context.alive_urls = merged_alive
+            for record in read_jsonl(path):
+                if not isinstance(record, dict):
+                    continue
+                key = _dns_record_identity(record)
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append(record)
+        if records:
+            write_canonical_jsonl(
+                context.output_dir / "dnsx_records.jsonl", records, base_dir=context.output_dir
+            )
+
+    def _merge_httpx_followup(self, context: PipelineContext, pass_no: int = 1) -> None:
+        """Union seed HTTP with follow-up sidecars. Never trust context.alive_urls."""
+        from core.intel.artifacts import (
+            alive_union_paths,
+            httpx_union_paths,
+            snapshot_seed_http,
+            write_authorized_alive,
+            write_canonical_jsonl,
+            write_canonical_lines,
+        )
+
+        snapshot_seed_http(context.output_dir)
+        from utils.files import read_jsonl
+
+        records = []
+        seen: set[str] = set()
+        for path in httpx_union_paths(context.output_dir, pass_no):
+            if not path.exists():
+                continue
+            for record in read_jsonl(path):
+                if not isinstance(record, dict):
+                    continue
+                key = json.dumps(record, sort_keys=True, default=str)
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append(record)
+        if records:
+            write_canonical_jsonl(
+                context.output_dir / "httpx.json", records, base_dir=context.output_dir
+            )
+            context.httpx_results = records
+        merged_alive = self._authorized_names(
+            context,
+            [
+                line
+                for path in alive_union_paths(context.output_dir, pass_no)
+                if path.exists()
+                for line in read_lines(path)
+            ],
+        )
+        write_canonical_lines(
+            context.output_dir / "alive.txt", merged_alive, base_dir=context.output_dir
+        )
+        context.alive_urls = merged_alive
+        write_authorized_alive(context.output_dir, self._collection_scope_for(context))
 
     def _finalize_to_store(self, context: PipelineContext, store: AssetStore) -> None:
         """Run intelligence engine and persist canonical hosts to SQLite."""
@@ -772,11 +1027,12 @@ class PipelineRunner:
                 if not svc.url or svc.url in context.alive_urls:
                     continue
                 scope = getattr(context, "collection_scope", None)
-                if scope is not None:
-                    from core.intel.scope import allows_active_collection
+                if scope is None:
+                    continue
+                from core.intel.scope import allows_active_collection
 
-                    if not allows_active_collection(svc.url, scope):
-                        continue
+                if not allows_active_collection(svc.url, scope):
+                    continue
                 context.alive_urls.append(svc.url)
 
         context.store_warnings.extend(registry.warnings)
@@ -787,13 +1043,19 @@ class PipelineRunner:
         context.metadata["graph_nodes"] = len(registry.graph.nodes)
         context.metadata["graph_edges"] = len(registry.graph.edges)
 
+        intel = registry.intel
+        self._attach_collection_attempts(context, intel)
         store.persist_registry(
             context.run_id,
             hosts,
             clusters=registry.clusters,
             graph=registry.graph,
-            intel=registry.intel,
+            intel=intel,
         )
+
+        network_requests = context.metadata.get("network_requests")
+        if isinstance(network_requests, list) and network_requests:
+            store.record_network_requests(context.run_id, network_requests)
 
         store.finish_run(
             context.run_id,
@@ -1096,24 +1358,23 @@ class PipelineRunner:
 
                 rebuilt: list[str] = []
                 scope = getattr(context, "collection_scope", None)
-                if scope is not None:
+                if scope is None:
+                    context.alive_urls = []
+                else:
                     for rec in context.httpx_results:
                         url = authorized_alive_url(rec, scope)
                         if url:
                             rebuilt.append(url)
                     context.alive_urls = filter_authorized_indicators(rebuilt, scope)
-                else:
-                    context.alive_urls = [
-                        str(rec.get("url") or rec.get("input") or "")
-                        for rec in context.httpx_results
-                        if rec.get("url") or rec.get("input")
-                    ]
             self._restrict_alive_to_scope(context)
 
     def _restrict_alive_to_scope(self, context: PipelineContext) -> None:
         """alive.txt consumers must never inherit out-of-scope redirect landings."""
         scope = getattr(context, "collection_scope", None)
-        if scope is None or not context.alive_urls:
+        if not context.alive_urls:
+            return
+        if scope is None:
+            context.alive_urls = []
             return
         from core.intel.scope import filter_authorized_indicators
 

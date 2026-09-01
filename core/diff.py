@@ -44,6 +44,14 @@ class ScanDiff:
     new_relationships: list[dict[str, Any]] = field(default_factory=list)
     removed_relationships: list[dict[str, Any]] = field(default_factory=list)
     changed_relationships: list[dict[str, Any]] = field(default_factory=list)
+    new_entities: list[dict[str, Any]] = field(default_factory=list)
+    removed_entities: list[dict[str, Any]] = field(default_factory=list)
+    new_observations: list[dict[str, Any]] = field(default_factory=list)
+    removed_observations: list[dict[str, Any]] = field(default_factory=list)
+    new_evidence: list[dict[str, Any]] = field(default_factory=list)
+    removed_evidence: list[dict[str, Any]] = field(default_factory=list)
+    indicator_changes: list[dict[str, Any]] = field(default_factory=list)
+    certificate_rotations: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,6 +65,14 @@ class ScanDiff:
             "new_relationships": self.new_relationships,
             "removed_relationships": self.removed_relationships,
             "changed_relationships": self.changed_relationships,
+            "new_entities": self.new_entities,
+            "removed_entities": self.removed_entities,
+            "new_observations": self.new_observations,
+            "removed_observations": self.removed_observations,
+            "new_evidence": self.new_evidence,
+            "removed_evidence": self.removed_evidence,
+            "indicator_changes": self.indicator_changes,
+            "certificate_rotations": self.certificate_rotations,
         }
 
 
@@ -85,7 +101,7 @@ def diff_runs(
         new_http=sorted(current_http - previous_http),
         removed_http=sorted(previous_http - current_http),
         field_changes=_field_changes(previous_hosts, current_hosts),
-        **_intel_relationship_diff(store, previous_run_id, current_run_id),
+        **_intel_history_diff(store, previous_run_id, current_run_id),
     )
     return diff
 
@@ -184,6 +200,53 @@ def _primary_http(host: Host) -> dict[str, Any]:
     }
 
 
+def _intel_history_diff(
+    store: AssetStore, previous_run_id: str, current_run_id: str
+) -> dict[str, list[dict[str, Any]]]:
+    """Compare intel tables by stable identity. Relationships remain evidence-backed."""
+    rel = _intel_relationship_diff(store, previous_run_id, current_run_id)
+    previous_entities = _load_intel_rows(store, "intel_entities", "entity_id", previous_run_id)
+    current_entities = _load_intel_rows(store, "intel_entities", "entity_id", current_run_id)
+    previous_obs = _load_intel_rows(store, "intel_observations", "observation_id", previous_run_id)
+    current_obs = _load_intel_rows(store, "intel_observations", "observation_id", current_run_id)
+    previous_ev = _load_intel_rows(store, "intel_evidence", "evidence_id", previous_run_id)
+    current_ev = _load_intel_rows(store, "intel_evidence", "evidence_id", current_run_id)
+    previous_ind = _load_intel_rows(store, "intel_indicators", "indicator_id", previous_run_id)
+    current_ind = _load_intel_rows(store, "intel_indicators", "indicator_id", current_run_id)
+    return {
+        **rel,
+        "new_entities": _appeared(current_entities, previous_entities, "ENTITY_APPEARED"),
+        "removed_entities": _appeared(previous_entities, current_entities, "ENTITY_DISAPPEARED"),
+        "new_observations": _appeared(current_obs, previous_obs, "OBSERVATION_APPEARED"),
+        "removed_observations": _appeared(previous_obs, current_obs, "OBSERVATION_DISAPPEARED"),
+        "new_evidence": _appeared(current_ev, previous_ev, "EVIDENCE_APPEARED"),
+        "removed_evidence": _appeared(previous_ev, current_ev, "EVIDENCE_DISAPPEARED"),
+        "indicator_changes": _indicator_changes(previous_ind, current_ind),
+        "certificate_rotations": _certificate_rotations(previous_entities, current_entities),
+    }
+
+
+_VOLATILE_EVIDENCE_DATA_KEYS = frozenset({"observed_at"})
+
+
+def _evidence_content_fingerprint(row: dict[str, Any]) -> str:
+    """Content-based stand-in for "did the evidence backing this relationship change".
+
+    `evidence_id` is not usable for this: it is derived from an
+    `observation_id` that is itself namespaced by `run_id`
+    (`core/intel/engine.py:_observe`), so it is guaranteed to differ between
+    *any* two runs even when nothing about the underlying observation
+    changed at all — comparing it directly would report every relationship
+    as "changed" on every re-scan. Comparing the relationship's own `data`
+    payload instead (minus known run-scoped/volatile keys) reports a change
+    only when something about the evidence actually did.
+    """
+    data = dict(row.get("data") or {})
+    for key in _VOLATILE_EVIDENCE_DATA_KEYS:
+        data.pop(key, None)
+    return json.dumps(data, sort_keys=True, default=str)
+
+
 def _intel_relationship_diff(
     store: AssetStore, previous_run_id: str, current_run_id: str
 ) -> dict[str, list[dict[str, Any]]]:
@@ -196,13 +259,26 @@ def _intel_relationship_diff(
     for rid in sorted(set(previous) & set(current)):
         old = previous[rid]
         new = current[rid]
-        if old.get("confidence") != new.get("confidence") or old.get("evidence_id") != new.get(
-            "evidence_id"
-        ):
+        confidence_changed = old.get("confidence") != new.get("confidence")
+        evidence_changed = _evidence_content_fingerprint(old) != _evidence_content_fingerprint(new)
+        if confidence_changed or evidence_changed:
+            change_type = "RELATIONSHIP_CHANGED"
+            if confidence_changed and not evidence_changed:
+                old_band = str(old.get("confidence") or "")
+                new_band = str(new.get("confidence") or "")
+                order = ("LOW", "MEDIUM", "HIGH", "VERY_HIGH")
+                if old_band in order and new_band in order:
+                    change_type = (
+                        "CONFIDENCE_INCREASED"
+                        if order.index(new_band) > order.index(old_band)
+                        else "CONFIDENCE_DECREASED"
+                    )
+            elif evidence_changed and not confidence_changed:
+                change_type = "EVIDENCE_CHANGED"
             changed.append(
                 {
                     "relationship_id": rid,
-                    "change_type": "RELATIONSHIP_CHANGED",
+                    "change_type": change_type,
                     "relationship_type": new.get("relationship_type"),
                     "old_confidence": old.get("confidence"),
                     "new_confidence": new.get("confidence"),
@@ -265,4 +341,136 @@ def _load_intel_relationships(store: AssetStore, run_id: str) -> dict[str, dict[
         rid = str(item.get("relationship_id") or "")
         if rid:
             out[rid] = item
+    return out
+
+
+def _appeared(
+    current: dict[str, dict[str, Any]],
+    previous: dict[str, dict[str, Any]],
+    change_type: str,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for key in sorted(set(current) - set(previous)):
+        row = current[key]
+        out.append(
+            {
+                "id": key,
+                "change_type": change_type,
+                "entity_type": row.get("entity_type"),
+                "key": row.get("key") or row.get("value"),
+                "kind": row.get("kind"),
+            }
+        )
+    return out
+
+
+def _indicator_changes(
+    previous: dict[str, dict[str, Any]], current: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    for key in sorted(set(current) - set(previous)):
+        row = current[key]
+        status = str(row.get("collection_status") or "")
+        change_type = "INDICATOR_DISCOVERED"
+        if status == "COLLECTED":
+            change_type = "INDICATOR_COLLECTED"
+        elif status == "FAILED":
+            change_type = "INDICATOR_FAILED"
+        changes.append(
+            {
+                "indicator_id": key,
+                "change_type": change_type,
+                "value": row.get("value"),
+                "collection_status": status,
+                "failure_reason": row.get("failure_reason"),
+            }
+        )
+    for key in sorted(set(previous) & set(current)):
+        old = previous[key]
+        new = current[key]
+        if old.get("collection_status") == new.get("collection_status"):
+            continue
+        new_status = str(new.get("collection_status") or "")
+        change_type = "INDICATOR_STATUS_CHANGED"
+        if new_status == "COLLECTED":
+            change_type = "INDICATOR_COLLECTED"
+        elif new_status == "FAILED":
+            change_type = "INDICATOR_FAILED"
+        changes.append(
+            {
+                "indicator_id": key,
+                "change_type": change_type,
+                "value": new.get("value"),
+                "old_collection_status": old.get("collection_status"),
+                "collection_status": new_status,
+                "failure_reason": new.get("failure_reason"),
+            }
+        )
+    return changes
+
+
+def _certificate_rotations(
+    previous: dict[str, dict[str, Any]], current: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    prev_certs = {
+        key: row
+        for key, row in previous.items()
+        if str(row.get("entity_type") or "") == "CERTIFICATE"
+    }
+    curr_certs = {
+        key: row
+        for key, row in current.items()
+        if str(row.get("entity_type") or "") == "CERTIFICATE"
+    }
+    out: list[dict[str, Any]] = []
+    for key in sorted(set(curr_certs) - set(prev_certs)):
+        out.append(
+            {
+                "entity_id": key,
+                "change_type": "CERTIFICATE_APPEARED",
+                "key": curr_certs[key].get("key"),
+            }
+        )
+    for key in sorted(set(prev_certs) - set(curr_certs)):
+        out.append(
+            {
+                "entity_id": key,
+                "change_type": "CERTIFICATE_DISAPPEARED",
+                "key": prev_certs[key].get("key"),
+            }
+        )
+    return out
+
+
+def _load_intel_rows(
+    store: AssetStore, table: str, id_column: str, run_id: str
+) -> dict[str, dict[str, Any]]:
+    allowed = {
+        "intel_entities",
+        "intel_observations",
+        "intel_evidence",
+        "intel_indicators",
+    }
+    if table not in allowed:
+        return {}
+    try:
+        conn = store.intel_connection()
+    except Exception:
+        return {}
+    try:
+        # table is checked against the allow-list above; run_id is bound, not interpolated
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE run_id=?",  # noqa: S608 # nosec B608
+            (run_id,),
+        ).fetchall()
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        item = dict(row)
+        key = str(item.get(id_column) or "")
+        if key:
+            out[key] = item
     return out

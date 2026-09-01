@@ -106,6 +106,37 @@ def _parse_headers(raw: str | None) -> dict[str, str]:
     return headers
 
 
+def _parse_attribution_header(raw: str | None) -> dict[str, str]:
+    """Parse RESEARCHER_ATTRIBUTION_HEADER ('Name: value') into a single-entry dict.
+
+    Raises:
+        ConfigurationError: On malformed format or an invalid header name/value.
+    """
+    if not raw or not raw.strip():
+        return {}
+    text = raw.strip()
+    if ":" not in text:
+        raise ConfigurationError(
+            f"Invalid RESEARCHER_ATTRIBUTION_HEADER format (expected 'Name: value'): {text!r}"
+        )
+    name, _, value = text.partition(":")
+    return {validate_header_name(name): validate_header_value(value.strip())}
+
+
+def _parse_domain_list(raw: str | None) -> tuple[str, ...]:
+    """Parse a comma-separated OWNED_DOMAINS env var into normalized domains."""
+    if not raw or not raw.strip():
+        return ()
+    from core.assets import normalize_domain
+
+    domains: list[str] = []
+    for part in raw.split(","):
+        domain = normalize_domain(part.strip())
+        if domain and domain not in domains:
+            domains.append(domain)
+    return tuple(domains)
+
+
 def _safe_path(value: str, default: str) -> Path:
     """Parse a path env var, rejecting null bytes."""
     raw = value.strip() if value else default
@@ -150,6 +181,7 @@ class Settings:
     threads: int = 50
     rate_limit: int = 150
     httpx_threads: int = 50
+    httpx_max_redirect_hops: int = 10
     user_agent: str = "hydra/1.0"
     log_level: str = "INFO"
     default_output_format: str = "json"
@@ -258,9 +290,39 @@ class Settings:
     max_ct_names_per_certificate: int = 200
     max_certificates: int = 500
     max_ips: int = 2000
+    max_url_entities: int = 4000
+    max_technology_entities: int = 500
+    max_followups_per_relationship: int = 20
+    max_relationships_per_signal: int = 64
     enable_followup_collection: bool = True
     cloud_bucket_enum_authorize_derived: bool = False
+    # nuclei's interactsh OOB polling contacts ProjectDiscovery's public
+    # collaborator servers directly — third-party infrastructure that is
+    # neither the target nor Hydra's own proxy. The crawler-confinement
+    # proxy (core/collection/crawler_proxy.py) authorizes every destination
+    # against CollectionScope, which would otherwise silently break OOB
+    # template detection. Default off (nuclei runs with -ni, no OOB
+    # templates); an operator who wants OOB detection and accepts that
+    # trade-off explicitly can opt in.
+    nuclei_enable_interactsh: bool = False
     webhook_url: str | None = None
+
+    # Domains the operator owns/controls (comma-separated OWNED_DOMAINS).
+    # A run whose target domain(s) are not all in this list is treated as an
+    # external target (third-party program, e.g. a bug-bounty engagement)
+    # unless the operator already declared it explicitly via
+    # `external_target_mode` / `--external` — see `core/external_mode.py`.
+    # Every run against a domain outside this list has accumulated far less
+    # behavioral history than the operator's own domains, so it defaults to
+    # a more conservative posture rather than relying on the operator to
+    # remember to lower rate limits by hand every time.
+    owned_domains: tuple[str, ...] = ()
+    # True once a run has been classified (or explicitly forced via
+    # `--external`) as targeting a domain outside `owned_domains`. Not meant
+    # to be set directly from `.env` for normal use — `core/external_mode.py`
+    # computes it per run and mutates a live `Settings` instance in place
+    # before the pipeline starts, the same way `--external` does.
+    external_target_mode: bool = False
 
     # Optional API credentials (never included in to_safe_dict)
     urlhaus_api_key: str | None = None
@@ -268,6 +330,11 @@ class Settings:
     # Bug bounty headers (stored separately; never logged)
     custom_http_headers: dict[str, str] = field(default_factory=dict)
     x_hackerone_researcher: str | None = None
+    # Generic program-mandated attribution header, e.g.
+    # RESEARCHER_ATTRIBUTION_HEADER="X-HackerOne-Research: my_h1_handle" — unlike
+    # x_hackerone_researcher above (a fixed header name), this supports any
+    # program's required header name/value pair. 0 or 1 entries.
+    researcher_attribution_header: dict[str, str] = field(default_factory=dict)
 
     # Program metadata (optional, for reports only)
     program_name: str = ""
@@ -324,6 +391,9 @@ class Settings:
             threads=_int(os.getenv("THREADS"), 50, "THREADS"),
             rate_limit=_int(os.getenv("RATE_LIMIT"), 150, "RATE_LIMIT"),
             httpx_threads=_int(os.getenv("HTTPX_THREADS"), 50, "HTTPX_THREADS"),
+            httpx_max_redirect_hops=_int(
+                os.getenv("HTTPX_MAX_REDIRECT_HOPS"), 10, "HTTPX_MAX_REDIRECT_HOPS", maximum=50
+            ),
             user_agent=_validate_user_agent(os.getenv("USER_AGENT", "hydra/1.0")),
             log_level=validate_log_level(os.getenv("LOG_LEVEL", "INFO")),
             default_output_format=os.getenv("DEFAULT_OUTPUT_FORMAT", "json").strip().lower(),
@@ -491,15 +561,42 @@ class Settings:
                 os.getenv("MAX_CERTIFICATES"), 500, "MAX_CERTIFICATES", maximum=20000
             ),
             max_ips=_int(os.getenv("MAX_IPS"), 2000, "MAX_IPS", maximum=50000),
+            max_url_entities=_int(
+                os.getenv("MAX_URL_ENTITIES"), 4000, "MAX_URL_ENTITIES", maximum=100000
+            ),
+            max_technology_entities=_int(
+                os.getenv("MAX_TECHNOLOGY_ENTITIES"),
+                500,
+                "MAX_TECHNOLOGY_ENTITIES",
+                maximum=20000,
+            ),
+            max_followups_per_relationship=_int(
+                os.getenv("MAX_FOLLOWUPS_PER_RELATIONSHIP"),
+                20,
+                "MAX_FOLLOWUPS_PER_RELATIONSHIP",
+                maximum=500,
+            ),
+            max_relationships_per_signal=_int(
+                os.getenv("MAX_RELATIONSHIPS_PER_SIGNAL"),
+                64,
+                "MAX_RELATIONSHIPS_PER_SIGNAL",
+                maximum=500,
+            ),
             enable_followup_collection=_bool(os.getenv("ENABLE_FOLLOWUP_COLLECTION"), True),
             cloud_bucket_enum_authorize_derived=_bool(
                 os.getenv("CLOUD_BUCKET_ENUM_AUTHORIZE_DERIVED")
             ),
+            nuclei_enable_interactsh=_bool(os.getenv("NUCLEI_ENABLE_INTERACTSH")),
             webhook_url=os.getenv("WEBHOOK_URL", "").strip() or None,
+            owned_domains=_parse_domain_list(os.getenv("OWNED_DOMAINS")),
+            external_target_mode=_bool(os.getenv("EXTERNAL_TARGET_MODE"), False),
             urlhaus_api_key=os.getenv("URLHAUS_API_KEY", "").strip() or None,
             custom_http_headers=_parse_headers(os.getenv("HTTP_CUSTOM_HEADERS")),
             x_hackerone_researcher=_optional_researcher(
                 os.getenv("X_HACKERONE_RESEARCHER", "").strip()
+            ),
+            researcher_attribution_header=_parse_attribution_header(
+                os.getenv("RESEARCHER_ATTRIBUTION_HEADER", "").strip()
             ),
             program_name=_sanitize_metadata(os.getenv("PROGRAM_NAME", "")),
             program_platform=_sanitize_metadata(os.getenv("PROGRAM_PLATFORM", "")),
@@ -572,6 +669,48 @@ class Settings:
         if errors:
             raise ConfigurationError("Configuration validation failed:\n- " + "\n- ".join(errors))
 
+    # Conservative overrides applied by `apply_external_target_mode_defaults`
+    # below, only when the operator has not already customized the field
+    # away from Hydra's own built-in default — an explicit operator value is
+    # never silently clobbered. naabu's `-rate` is packets/second; an
+    # unfamiliar third-party target (especially a financial institution)
+    # deserves noticeably less traffic than an operator's own,
+    # already-characterized domain with accumulated run history.
+    _DEFAULT_RATE_LIMIT = 150
+    _DEFAULT_PARAM_FUZZ_DELAY_MS = 200
+    _DEFAULT_CLOUD_BUCKET_ENUM_DELAY_MS = 150
+    EXTERNAL_MODE_RATE_LIMIT = 20
+    EXTERNAL_MODE_PARAM_FUZZ_DELAY_MS = 1000
+    EXTERNAL_MODE_CLOUD_BUCKET_ENUM_DELAY_MS = 1000
+
+    def apply_external_target_mode_defaults(self) -> list[str]:
+        """Lower naabu/param_fuzz/cloud_bucket_enum rate limits for a run
+        classified as targeting an external (non-owned) domain — see
+        `core/external_mode.py:classify_run`. Mutates this instance in
+        place and returns human-readable change descriptions for the
+        pre-flight scope summary (empty list if every field was already an
+        explicit operator override, so nothing changed)."""
+        self.external_target_mode = True
+        changes: list[str] = []
+        if self.rate_limit == self._DEFAULT_RATE_LIMIT:
+            self.rate_limit = self.EXTERNAL_MODE_RATE_LIMIT
+            changes.append(
+                f"RATE_LIMIT: {self._DEFAULT_RATE_LIMIT} -> {self.EXTERNAL_MODE_RATE_LIMIT}"
+            )
+        if self.param_fuzz_delay_ms == self._DEFAULT_PARAM_FUZZ_DELAY_MS:
+            self.param_fuzz_delay_ms = self.EXTERNAL_MODE_PARAM_FUZZ_DELAY_MS
+            changes.append(
+                f"PARAM_FUZZ_DELAY_MS: {self._DEFAULT_PARAM_FUZZ_DELAY_MS} -> "
+                f"{self.EXTERNAL_MODE_PARAM_FUZZ_DELAY_MS}"
+            )
+        if self.cloud_bucket_enum_delay_ms == self._DEFAULT_CLOUD_BUCKET_ENUM_DELAY_MS:
+            self.cloud_bucket_enum_delay_ms = self.EXTERNAL_MODE_CLOUD_BUCKET_ENUM_DELAY_MS
+            changes.append(
+                f"CLOUD_BUCKET_ENUM_DELAY_MS: {self._DEFAULT_CLOUD_BUCKET_ENUM_DELAY_MS} -> "
+                f"{self.EXTERNAL_MODE_CLOUD_BUCKET_ENUM_DELAY_MS}"
+            )
+        return changes
+
     def ensure_directories(self) -> None:
         """Create output, logs, and reports directories under project root."""
         for directory in (self.output_directory, self.logs_directory, self.reports_directory):
@@ -613,6 +752,7 @@ class Settings:
         if self.strict_opsec:
             return {}
         headers = dict(self.custom_http_headers)
+        headers.update(self.researcher_attribution_header)
         if self.x_hackerone_researcher and "X-HackerOne-Researcher" not in headers:
             headers["X-HackerOne-Researcher"] = self.x_hackerone_researcher
         return headers
@@ -644,7 +784,6 @@ class Settings:
             "unfurl": self.unfurl_path,
             "anew": self.anew_path,
             "jq": self.jq_path,
-            "whois": self.whois_path,
             "port_verify": self.nmap_path,
         }
 
@@ -656,6 +795,7 @@ class Settings:
             "threads": self.threads,
             "rate_limit": self.rate_limit,
             "httpx_threads": self.httpx_threads,
+            "httpx_max_redirect_hops": self.httpx_max_redirect_hops,
             "log_level": self.log_level,
             "default_output_format": self.default_output_format,
             "enable_cache": self.enable_cache,
@@ -693,6 +833,9 @@ class Settings:
             ],
             "custom_headers_count": len(self.custom_http_headers),
             "has_researcher_header": self.x_hackerone_researcher is not None,
+            "has_researcher_attribution_header": bool(self.researcher_attribution_header),
+            "owned_domains_count": len(self.owned_domains),
+            "external_target_mode": self.external_target_mode,
             "strict_opsec": self.strict_opsec,
             "has_outbound_proxy": self.outbound_proxy_url is not None,
             "has_webhook": self.webhook_url is not None,
@@ -704,6 +847,8 @@ class Settings:
             "max_ct_names_per_certificate": self.max_ct_names_per_certificate,
             "max_certificates": self.max_certificates,
             "max_ips": self.max_ips,
+            "max_url_entities": self.max_url_entities,
+            "max_technology_entities": self.max_technology_entities,
         }
 
 

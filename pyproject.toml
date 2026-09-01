@@ -44,7 +44,13 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "S105", "S108"]
+# S104: SSRF-matrix tests use "0.0.0.0"/other bind-all-looking strings as
+#   pure classify_ip() test data, never to actually bind a socket.
+# S301: pickle is used exactly to prove AuthorizedCollectionTarget can't be
+#   forged via deserialization — the point of that test, not untrusted input.
+# B017: a frozen dataclass's exact exception type on illegal mutation isn't
+#   guaranteed across Python versions; asserting "some exception" is correct.
+"tests/*" = ["S101", "S104", "S105", "S108", "S301", "B017"]
 "app.py" = ["E402"]
 "core/store.py" = ["S608"]
 "modules/naabu.py" = ["S105"]  # probe_pass is not a password

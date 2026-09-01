@@ -68,6 +68,7 @@ class IntelQuery:
 
     def investigate(self, domain: str) -> dict[str, Any]:
         from core.intel.explain import explain_relationship
+        from core.intel.serialize import serialize_relationships
 
         entity = self.entity_by_domain(domain)
         eid = domain_entity_id(domain)
@@ -100,7 +101,15 @@ class IntelQuery:
         return {
             "entity": entity,
             "observations": self.observations(eid),
-            "relationships": relationships,
+            # Canonical serializer (core/intel/serialize.py) — same shape as
+            # cmd_relationships/reporter.py, so confidence/certificate/SAN
+            # fields are never independently reformatted per CLI surface.
+            "relationships": serialize_relationships(
+                relationships,
+                evidence_by_id=evidence_by_id,
+                entities_by_id=entity_cache,
+                run_id=self.run_id,
+            ),
             "evidence": evidence_rows,
             "indicators": self.indicators(domain),
             "certificates": self.certificates(domain),
@@ -233,6 +242,147 @@ class IntelQuery:
             sql += " AND run_id=?"
             params.append(self.run_id)
         return rows_to_dicts(self.conn.execute(sql, params).fetchall())
+
+    def _indicator_by_identifier(self, identifier: str) -> dict[str, Any] | None:
+        sql = "SELECT * FROM intel_indicators WHERE indicator_id=?"
+        params: list[Any] = [identifier]
+        if self.run_id:
+            sql += " AND run_id=?"
+            params.append(self.run_id)
+        row = self.conn.execute(sql, params).fetchone()
+        if row:
+            return rows_to_dicts([row])[0]
+        sql2 = "SELECT * FROM intel_indicators WHERE value=?"
+        params2: list[Any] = [normalize_domain(identifier) or identifier]
+        if self.run_id:
+            sql2 += " AND run_id=?"
+            params2.append(self.run_id)
+        row2 = self.conn.execute(sql2, params2).fetchone()
+        return rows_to_dicts([row2])[0] if row2 else None
+
+    def _attempt_by_id(self, attempt_id: str) -> dict[str, Any] | None:
+        sql = "SELECT * FROM intel_collection_attempts WHERE attempt_id=?"
+        params: list[Any] = [attempt_id]
+        if self.run_id:
+            sql += " AND run_id=?"
+            params.append(self.run_id)
+        row = self.conn.execute(sql, params).fetchone()
+        return rows_to_dicts([row])[0] if row else None
+
+    def _attempts_for_indicator(self, indicator_id: str) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM intel_collection_attempts WHERE indicator_id=? ORDER BY id"
+        params: list[Any] = [indicator_id]
+        if self.run_id:
+            sql += " AND run_id=?"
+            params.append(self.run_id)
+        return rows_to_dicts(self.conn.execute(sql, params).fetchall())
+
+    def _hypothesis_for_value(self, value: str) -> dict[str, Any] | None:
+        sql = "SELECT * FROM intel_hypotheses WHERE target_value=?"
+        params: list[Any] = [value]
+        if self.run_id:
+            sql += " AND run_id=?"
+            params.append(self.run_id)
+        row = self.conn.execute(sql, params).fetchone()
+        return rows_to_dicts([row])[0] if row else None
+
+    def _network_requests_for_host(self, hostname: str) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM intel_network_requests WHERE normalized_hostname=? ORDER BY id"
+        params: list[Any] = [hostname]
+        if self.run_id:
+            sql += " AND run_id=?"
+            params.append(self.run_id)
+        return rows_to_dicts(self.conn.execute(sql, params).fetchall())
+
+    def explain_collection(self, identifier: str) -> dict[str, Any]:
+        """Reconstruct, from persisted SQLite rows alone, why (or why not) a
+        given indicator was collected — no rescan, no re-reading warning text.
+
+        `identifier` may be an `indicator_id`, a raw value (hostname), or a
+        `collection_attempt_id`; whichever resolves first is used. Walks the
+        same causal chain the mission text specifies: indicator (why
+        discovered, its scope/collection status) -> hypothesis (why eligible,
+        the authorization decision and rationale) -> relationship/evidence
+        (what actually supported it) -> collection attempts (which collector
+        ran, whether it succeeded, what artifact resulted) -> network
+        requests (was the destination host actually contacted).
+        """
+        indicator = self._indicator_by_identifier(identifier)
+        attempts: list[dict[str, Any]] = []
+        value = ""
+
+        if indicator:
+            value = str(indicator.get("value") or "")
+            attempts = self._attempts_for_indicator(str(indicator["indicator_id"]))
+        else:
+            attempt = self._attempt_by_id(identifier)
+            if attempt:
+                attempts = [attempt]
+                value = str(attempt.get("value") or "")
+                indicator = self._indicator_by_identifier(str(attempt.get("indicator_id") or ""))
+            else:
+                value = normalize_domain(identifier) or identifier
+
+        hypothesis = self._hypothesis_for_value(value) if value else None
+        relationship: dict[str, Any] | None = None
+        evidence: dict[str, Any] | None = None
+        if hypothesis and hypothesis.get("relationship_id"):
+            bundle = self.evidence_by_relationship(str(hypothesis["relationship_id"]))
+            relationship = bundle.get("relationship")
+            evidence = bundle["evidence"][0] if bundle.get("evidence") else None
+
+        network_requests = self._network_requests_for_host(value) if value else []
+
+        narrative: list[str] = []
+        if indicator is None and not attempts:
+            narrative.append(f"No indicator, attempt, or network request found for {identifier!r}.")
+        if indicator:
+            narrative.append(
+                f"Discovered as {indicator.get('kind')} via reason={indicator.get('reason')}"
+                f" (parent_id={indicator.get('parent_id') or 'none'})."
+            )
+            narrative.append(
+                f"Scope status: {indicator.get('scope_status')}; "
+                f"collection status: {indicator.get('collection_status')}."
+            )
+            if indicator.get("authorization_status"):
+                narrative.append(f"Authorization status: {indicator.get('authorization_status')}.")
+            if indicator.get("failure_reason"):
+                narrative.append(f"Failure reason: {indicator.get('failure_reason')}.")
+        if hypothesis:
+            narrative.append(
+                f"Hypothesis {hypothesis.get('status')}: {hypothesis.get('rationale')}"
+            )
+        if evidence:
+            narrative.append(
+                f"Supporting evidence: {evidence.get('evidence_id')} "
+                f"(source={evidence.get('source')}, collector={evidence.get('collector')})."
+            )
+        for attempt in attempts:
+            narrative.append(
+                f"Attempt via {attempt.get('collector')} "
+                f"(capability={attempt.get('capability')}): {attempt.get('status')} — "
+                f"{attempt.get('reason')}"
+                + (f"; artifact={attempt.get('artifact')}" if attempt.get("artifact") else "")
+            )
+        for req in network_requests:
+            narrative.append(
+                f"Network request [{req.get('collector')}] {req.get('decision')} "
+                f"({req.get('reason')}); attempted={bool(req.get('network_attempted'))}, "
+                f"completed={bool(req.get('network_completed'))}."
+            )
+
+        return {
+            "identifier": identifier,
+            "resolved_value": value,
+            "indicator": indicator,
+            "hypothesis": hypothesis,
+            "relationship": relationship,
+            "evidence": evidence,
+            "collection_attempts": attempts,
+            "network_requests": network_requests,
+            "narrative": narrative,
+        }
 
     def graph_neighborhood(self, domain: str) -> dict[str, Any]:
         eid = domain_entity_id(domain)

@@ -23,6 +23,68 @@ SCOPE_FILE=scope.txt python app.py run -d www.metaversejustice.com
 Without `SCOPE_FILE`, Hydra does not enforce program scope — that remains
 your responsibility.
 
+A `SCOPE_FILE` line prefixed with `!` excludes a path **and everything
+beneath it** from an otherwise-authorized domain/wildcard, e.g. a program
+that authorizes `*.example.com` but carves out the whole
+`/legal/whistleblowing` subtree as explicitly out of scope:
+
+```
+*.example.com
+!example.com/legal/whistleblowing
+```
+
+This excludes `/legal/whistleblowing`, `/legal/whistleblowing/report`, and
+any deeper subpath — not just that exact URL. A different path that merely
+starts with the same text (`/legal/whistleblowing-info`) is a distinct path
+segment and is **not** excluded.
+
+An exclusion always wins over a positive domain/wildcard match. See
+`scope.example.txt` for a full example.
+
+## Researcher attribution header (several programs require this)
+
+Several bug-bounty programs require every testing request to carry an
+identifying header, so their traffic-classification systems can tell
+authorized researcher activity from a real attacker — e.g. HackerOne's
+`X-HackerOne-Research: <your handle>`. **Set this before running anything
+active against a formal program**, not after:
+
+```bash
+RESEARCHER_ATTRIBUTION_HEADER="X-HackerOne-Research: your_h1_handle" python app.py run -d target.example
+```
+
+This is sent on every active request Hydra makes *against the target
+itself* (httpx, browser_probe, param_fuzz, cloud_bucket_enum, soft404_check,
+katana/nuclei via `-H`) — never to a fixed third party (OSV.dev, crt.sh,
+WHOIS, URLhaus), where a researcher-identifying header has no meaning.
+Suppressed entirely under `STRICT_OPSEC`, same as every other identifying
+header, since sending it would defeat the purpose of non-attributable
+probing.
+
+## External targets (third-party programs) default to a conservative posture
+
+Declare the domains you actually own in `OWNED_DOMAINS` (comma-separated).
+Any run targeting a domain outside that list — most importantly a
+third-party program on someone else's infrastructure, e.g. a financial
+institution's bug-bounty scope — automatically:
+
+- Lowers `RATE_LIMIT` (naabu), `PARAM_FUZZ_DELAY_MS`, and
+  `CLOUD_BUCKET_ENUM_DELAY_MS` to conservative values (unless you already
+  set your own, which is never silently overridden).
+- Requires an explicit `[y/N]` confirmation before running
+  `ENABLE_PARAM_FUZZ`, `ENABLE_CLOUD_BUCKET_ENUM`, or `ENABLE_BROWSER_PROBE`
+  — even if they're already `true` in `.env`. Declining disables just those
+  modules for that run; discovery/observation still proceeds. A
+  non-interactive invocation (no terminal attached) declines automatically
+  rather than hanging or silently running active modules.
+- Prints a scope summary (authorized domains/wildcards, path exclusions,
+  whether the researcher attribution header above is configured) before
+  anything active starts.
+
+No `OWNED_DOMAINS` set at all means every run is treated as external — the
+setting exists to name what's exempt, not the other way around. Force this
+posture regardless of `OWNED_DOMAINS` with `run --external`.
+
 ## Active / intrusive modules
 
 These plugins send live HTTP(S) requests to the target or to brand-derived
