@@ -133,7 +133,8 @@ All settings live in `.env`. Key variables:
 | `X_HACKERONE_RESEARCHER` | HackerOne researcher header value | — |
 | `HTTP_CUSTOM_HEADERS` | Additional headers (JSON or `Header: val` pairs) | — |
 | `RESEARCHER_ATTRIBUTION_HEADER` | Program-mandated attribution header, any name (`"Name: value"`, e.g. `X-HackerOne-Research: your_h1_handle`) — sent with every active request against the target itself, never to fixed third parties (OSV.dev, crt.sh, WHOIS, URLhaus) | — |
-| `SCOPE_FILE` | Domain/wildcard scope, plus `!domain/path-glob` path exclusions — see `scope.example.txt` | — |
+| `ATTRIBUTION_USER_AGENT` | Program-mandated User-Agent attribution (e.g. Bugcrowd: "Include the string 'bugcrowd' in your User-Agent") — appended in parentheses to the normal User-Agent for httpx/katana/nuclei/hakrawler/the internal HTTP client, and to browser_probe's mobile UA without replacing its device fingerprint. Use `RESEARCHER_ATTRIBUTION_HEADER` when a program wants a custom *header* (HackerOne's convention), this when it wants the *User-Agent* itself (Bugcrowd's convention) — set both if a program asks for both. Suppressed under `STRICT_OPSEC`, same as the header. | — |
+| `SCOPE_FILE` | Domain/wildcard scope, plus `!domain/path-glob` path exclusions and whole-domain `!domain` exclusions — see `scope.example.txt` | — |
 | `OWNED_DOMAINS` | Comma-separated domains you own — anything else triggers external-target-mode | — |
 | `EXTERNAL_TARGET_MODE` | Force conservative defaults regardless of `OWNED_DOMAINS` (also: `run --external`) | `false` |
 | `TIMEOUT` | Subprocess timeout (seconds) | `300` |

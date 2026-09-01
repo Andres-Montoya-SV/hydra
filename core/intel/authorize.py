@@ -19,7 +19,7 @@ from core.intel.scope import (
     indicator_hostname,
     scope_status_allows_collection,
 )
-from core.scope import url_path_excluded
+from core.scope import host_fully_excluded, url_path_excluded
 
 # Vendor cloud hostnames are never silently in-scope just because a seed brand
 # appears in a label. Active collection requires an explicit cloud policy.
@@ -130,14 +130,19 @@ def authorize_active_indicator(
             op,
             "hostname_not_collectable",
         )
-    # Explicit path exclusions (`!domain/path-glob` SCOPE_FILE lines) take
-    # priority over every other check below, including the cloud-endpoint
-    # opt-in and ordinary domain/wildcard matching — a program can authorize
-    # `*.bancoplata.mx` broadly while still carving out a specific path as
-    # explicitly out of scope. Only ever matches when `indicator` is a full
-    # URL (a bare hostname has no path to exclude).
-    if collection_scope.path_exclusions and url_path_excluded(
-        indicator, list(collection_scope.path_exclusions)
+    # Explicit exclusions (`!domain` or `!domain/path-glob` SCOPE_FILE
+    # lines) take priority over every other check below, including the
+    # cloud-endpoint opt-in and ordinary domain/wildcard matching — a
+    # program can authorize `*.bancoplata.mx` broadly while still carving
+    # out a specific path, or a whole sibling domain, as explicitly out of
+    # scope. `host_fully_excluded` covers a whole-domain exclusion
+    # (`!community.linktr.ee`, no path) for a bare-hostname indicator too —
+    # `url_path_excluded` alone only ever matches a full URL, which would
+    # silently let a DNS-resolution-shaped indicator for the same excluded
+    # domain straight through.
+    if collection_scope.path_exclusions and (
+        host_fully_excluded(host, list(collection_scope.path_exclusions))
+        or url_path_excluded(indicator, list(collection_scope.path_exclusions))
     ):
         return AuthorizationResult(
             AuthorizationDecision.DENY,

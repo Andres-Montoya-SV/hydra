@@ -41,6 +41,21 @@ segment and is **not** excluded.
 An exclusion always wins over a positive domain/wildcard match. See
 `scope.example.txt` for a full example.
 
+A `!domain` line with **no path at all** excludes that domain entirely
+(and any further subdomain of it) from every collection path — not just a
+URL. Real case: Linktree authorizes `*.linktr.ee` but excludes its own
+`community.linktr.ee` subdomain in full:
+
+```
+*.linktr.ee
+!community.linktr.ee
+```
+
+Unlike the path-specific exclusion above, this also blocks a bare-hostname
+indicator with no URL at all — DNS resolution, a CT-log-observed name, a
+plain line in `resolved.txt` — since there is no path to reason about for a
+whole-domain exclusion in the first place.
+
 ## Researcher attribution header (several programs require this)
 
 Several bug-bounty programs require every testing request to carry an
@@ -60,6 +75,36 @@ WHOIS, URLhaus), where a researcher-identifying header has no meaning.
 Suppressed entirely under `STRICT_OPSEC`, same as every other identifying
 header, since sending it would defeat the purpose of non-attributable
 probing.
+
+## User-Agent attribution (Bugcrowd-style programs require this)
+
+Some programs identify authorized researcher traffic through the
+**User-Agent** instead of a custom header — Bugcrowd's own published
+convention (quoting two real program briefs): *"Include the string
+'bugcrowd' in your User-Agent, or add 'bugcrowd' to one of the fields of
+any form post not requiring account information."* Use
+`ATTRIBUTION_USER_AGENT` for this — it is generic, not hardcoded to
+"bugcrowd", since a future program may require its own marker the same way:
+
+```bash
+ATTRIBUTION_USER_AGENT="bugcrowd; your_handle" python app.py run -d target.example
+```
+
+**Use the header for HackerOne-style programs, the User-Agent for
+Bugcrowd-style programs, and set both if a program's brief asks for both**
+— they are independent and do not conflict.
+
+Appended in parentheses to the normal User-Agent — `hydra/1.0 (bugcrowd;
+your_handle)` — for httpx, katana, nuclei, hakrawler (all four set it via
+their custom-header flag; none has a dedicated User-Agent flag — verified
+against each installed binary's own `-h` output, not assumed), and the
+internal HTTP client used by `param_fuzz`/`cloud_bucket_enum`/
+`soft404_check`. For `browser_probe`, it is appended to the existing mobile
+Safari/iPhone User-Agent it already sends for cloaking-detection
+fingerprinting — **appended, never substituted**, since replacing that
+fingerprint would break the cloaking comparison against httpx. `naabu` does
+not apply (raw TCP port scan, no HTTP layer). Suppressed entirely under
+`STRICT_OPSEC`, same reasoning and same behavior as the header above.
 
 ## External targets (third-party programs) default to a conservative posture
 

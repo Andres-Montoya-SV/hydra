@@ -47,6 +47,17 @@ class _CountingHandler(_QuietHandler):
         self.wfile.write(b"<html><body>ok</body></html>")
 
 
+class _HeaderCapturingHandler(_QuietHandler):
+    last_headers: object = None
+
+    def do_GET(self) -> None:  # noqa: N802
+        type(self).last_headers = self.headers
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<html><body>ok</body></html>")
+
+
 def _serve(handler_cls: type) -> tuple[socketserver.TCPServer, int, threading.Thread]:
     socketserver.TCPServer.allow_reuse_address = True
     httpd = socketserver.TCPServer(("127.0.0.1", 0), handler_cls)
@@ -60,6 +71,18 @@ def _serve(handler_cls: type) -> tuple[socketserver.TCPServer, int, threading.Th
 def target_server() -> Iterator[int]:
     _CountingHandler.hits = []
     httpd, port, thread = _serve(_CountingHandler)
+    try:
+        yield port
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.fixture
+def header_capturing_server() -> Iterator[int]:
+    _HeaderCapturingHandler.last_headers = None
+    httpd, port, thread = _serve(_HeaderCapturingHandler)
     try:
         yield port
     finally:
@@ -158,3 +181,33 @@ async def test_browser_probe_in_scope_hostname_resolving_private_ip_is_blocked(
         "an in-scope hostname that resolves to a private/loopback address "
         "must never be reached by the real WebKit browser"
     )
+
+
+@pytest.mark.asyncio
+async def test_browser_probe_appends_attribution_to_real_device_user_agent(
+    tmp_path: Path, header_capturing_server: int
+) -> None:
+    """ATTRIBUTION_USER_AGENT must reach the real WebKit request — appended
+    onto the existing iPhone/Safari fingerprint (`_IPHONE_USER_AGENT`), never
+    replacing it, since the mobile-device UA is what the cloaking-detection
+    comparison against httpx depends on. Real WebKit, real local server."""
+    await _require_webkit()
+    url = f"http://127.0.0.1:{header_capturing_server}/"
+    scope = CollectionScope.from_seeds(
+        ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+    )
+    settings = Settings(
+        project_root=tmp_path,
+        enable_browser_probe=True,
+        attribution_user_agent="bugcrowd; cosmiccashew",
+    )
+    plugin = BrowserProbePlugin(settings)
+    context = _context_for(tmp_path, scope, url)
+
+    result = await plugin.run(context, tmp_path / "unused")
+
+    assert result.success
+    assert _HeaderCapturingHandler.last_headers is not None, "WebKit never reached the server"
+    ua = _HeaderCapturingHandler.last_headers.get("User-Agent") or ""
+    assert "iPhone" in ua, f"real device fingerprint must survive, got {ua!r}"
+    assert "bugcrowd" in ua, f"expected attribution marker in real User-Agent, got {ua!r}"

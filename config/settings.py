@@ -123,6 +123,20 @@ def _parse_attribution_header(raw: str | None) -> dict[str, str]:
     return {validate_header_name(name): validate_header_value(value.strip())}
 
 
+def _optional_attribution_user_agent(value: str) -> str | None:
+    """Validate ATTRIBUTION_USER_AGENT.
+
+    Ends up embedded in a literal ``User-Agent: <value>`` header line for
+    the external-binary flags (httpx/katana/nuclei/hakrawler all take a raw
+    header string, not a name/value pair) and in Playwright's ``user_agent=``
+    context option — so it gets the same CRLF-injection guard as an ordinary
+    header value, even though it is not itself parsed as "Name: value".
+    """
+    if not value or not value.strip():
+        return None
+    return validate_header_value(value.strip())
+
+
 def _parse_domain_list(raw: str | None) -> tuple[str, ...]:
     """Parse a comma-separated OWNED_DOMAINS env var into normalized domains."""
     if not raw or not raw.strip():
@@ -335,6 +349,15 @@ class Settings:
     # x_hackerone_researcher above (a fixed header name), this supports any
     # program's required header name/value pair. 0 or 1 entries.
     researcher_attribution_header: dict[str, str] = field(default_factory=dict)
+    # Some programs (Bugcrowd, per its own published brief: "Include the
+    # string 'bugcrowd' in your User-Agent...") require attribution embedded
+    # in the User-Agent itself rather than a new header. Generic — not named
+    # after Bugcrowd specifically, since other programs may require their own
+    # convention the same way. Appended as a parenthetical comment onto the
+    # normal User-Agent (see Settings.attribution_user_agent_suffix()); can
+    # be combined with researcher_attribution_header above when a program
+    # asks for both.
+    attribution_user_agent: str | None = None
 
     # Program metadata (optional, for reports only)
     program_name: str = ""
@@ -598,6 +621,9 @@ class Settings:
             researcher_attribution_header=_parse_attribution_header(
                 os.getenv("RESEARCHER_ATTRIBUTION_HEADER", "").strip()
             ),
+            attribution_user_agent=_optional_attribution_user_agent(
+                os.getenv("ATTRIBUTION_USER_AGENT", "").strip()
+            ),
             program_name=_sanitize_metadata(os.getenv("PROGRAM_NAME", "")),
             program_platform=_sanitize_metadata(os.getenv("PROGRAM_PLATFORM", "")),
         )
@@ -757,6 +783,68 @@ class Settings:
             headers["X-HackerOne-Researcher"] = self.x_hackerone_researcher
         return headers
 
+    def attribution_user_agent_suffix(self) -> str:
+        """Parenthetical User-Agent suffix for program-mandated attribution
+        (e.g. Bugcrowd's published requirement: "Include the string
+        'bugcrowd' in your User-Agent..."). Empty string when unset or under
+        strict OPSEC — same suppression `merged_headers()` already applies to
+        `researcher_attribution_header`: strict OPSEC means non-attributable
+        probing, which is the opposite intent of program-mandated
+        self-identification, so the two must not both be active on the same
+        request.
+
+        Tool-by-tool audit of how each consumer actually applies a custom
+        User-Agent, verified against the real installed binaries in this
+        environment (`<tool> -h`), not assumed from memory or documentation
+        for a different version:
+
+        - **httpx** (ProjectDiscovery): no dedicated `-user-agent`/`-ua` flag
+          exists in the installed version. Already sends a custom UA via
+          `-H "User-Agent: <value>"` (`modules/httpx.py`), which also fully
+          overrides httpx's own `-random-agent` (default true) since an
+          explicit `-H` header wins. This suffix reaches httpx for free once
+          appended in `effective_user_agent()` below — no plugin change
+          needed.
+        - **katana**: same story — no dedicated UA flag, only `-H/-headers`.
+          Previously never set a custom UA at all (only `merged_headers()`
+          for other headers); `modules/katana.py` now also sends
+          `-H "User-Agent: <value>"`, mirroring httpx.
+        - **nuclei**: same — `-H/-header` only, no dedicated UA flag.
+          `modules/nuclei.py` now sends `-H "User-Agent: <value>"` the same
+          way (previously never set a custom UA either).
+        - **hakrawler**: no dedicated UA flag; its only header mechanism is
+          `-h "Header: value;;Header2: value2"` (note: `-h`, not `-H` — this
+          binary's flag casing is its own). `modules/hakrawler.py` now passes
+          `-h "User-Agent: <value>"` when a UA override is configured
+          (previously set no headers of any kind).
+        - **naabu**: does not apply. It is a raw TCP/SYN port scanner with no
+          HTTP layer at all (confirmed against its `-h` output: no
+          header/UA-shaped flag exists) — excluded, not silently skipped.
+        - **The internal client** (`core/http_probe.py:http_get`, used via
+          `core/collection/gateway.py:CollectionGateway` by `param_fuzz`,
+          `cloud_bucket_enum`, `soft404_check`): `http_get()` already accepts
+          a `user_agent` parameter, but `CollectionGateway` never passed one
+          through — every request from these three plugins silently used
+          `http_probe`'s own hardcoded default
+          (`"Mozilla/5.0 (compatible; HydraProbe/1.0)"`), never Hydra's
+          configured UA at all, attribution or not. `CollectionGateway` now
+          accepts `user_agent=` and each of the three call sites passes
+          `self.settings.effective_user_agent()` — the same centralized
+          point that already injects `merged_headers()`. `security_headers`
+          does no network I/O of its own (reads existing httpx JSON) and
+          `vuln_match` only ever calls OSV.dev/WPScan (fixed third parties,
+          not the target) — neither applies here.
+        - **browser_probe** (Playwright/WebKit): sets a real-device UA
+          (`_IPHONE_USER_AGENT`) for its cloaking-detection fingerprint —
+          replacing it would break that detection. The attribution suffix is
+          *appended* to the existing device UA
+          (`f"{_IPHONE_USER_AGENT}{suffix}"`), never substituted, so the
+          mobile-Safari fingerprint the cloaking check depends on survives.
+        """
+        if self.strict_opsec or not self.attribution_user_agent:
+            return ""
+        return f" ({self.attribution_user_agent})"
+
     def effective_user_agent(self) -> str:
         """Return a non-identifying User-Agent when strict OPSEC is active."""
         if self.strict_opsec:
@@ -765,7 +853,7 @@ class Settings:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/126.0.0.0 Safari/537.36"
             )
-        return self.user_agent
+        return self.user_agent + self.attribution_user_agent_suffix()
 
     def all_tool_paths(self) -> dict[str, Path]:
         """Return mapping of tool name to configured binary path."""
@@ -834,6 +922,7 @@ class Settings:
             "custom_headers_count": len(self.custom_http_headers),
             "has_researcher_header": self.x_hackerone_researcher is not None,
             "has_researcher_attribution_header": bool(self.researcher_attribution_header),
+            "has_attribution_user_agent": self.attribution_user_agent is not None,
             "owned_domains_count": len(self.owned_domains),
             "external_target_mode": self.external_target_mode,
             "strict_opsec": self.strict_opsec,

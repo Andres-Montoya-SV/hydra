@@ -53,6 +53,19 @@ class _CountingHandler(_QuietHandler):
         self.wfile.write(b"reached")
 
 
+class _HeaderCapturingHandler(_QuietHandler):
+    # email.message.Message (self.headers) is case-insensitive by design —
+    # HTTP header names are case-insensitive per RFC 7230.
+    last_headers: object = None
+
+    def do_GET(self) -> None:  # noqa: N802
+        type(self).last_headers = self.headers
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+
 def _make_redirect_handler(oos_port: int, oos_host: str):
     class _RedirectHandler(_QuietHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -189,3 +202,46 @@ async def test_httpx_in_scope_hostname_resolving_to_private_ip_is_blocked(
         "an in-scope hostname that resolves to a private/loopback address "
         "must never be reached by the real httpx subprocess"
     )
+
+
+@pytest.mark.asyncio
+async def test_httpx_sends_attribution_user_agent_through_confinement_proxy(
+    tmp_path: Path,
+) -> None:
+    """ATTRIBUTION_USER_AGENT (e.g. Bugcrowd's "include 'bugcrowd' in your
+    User-Agent" requirement) must reach the real target request. httpx has
+    no dedicated -user-agent flag (confirmed against the installed binary's
+    -h output — only -random-agent, default true, and -H/-header) —
+    `modules/httpx.py` already sends a custom UA via
+    `-H "User-Agent: ..."`, which this proves both overrides -random-agent
+    and actually reaches the wire, not just argv."""
+    httpd, port, thread = _serve(_HeaderCapturingHandler)
+    _HeaderCapturingHandler.last_headers = None
+    try:
+        output_dir = tmp_path / "run"
+        output_dir.mkdir()
+        hosts_path = output_dir / "resolved.txt"
+        seed_url = f"http://127.0.0.1:{port}/"
+        write_lines(hosts_path, [seed_url], base_dir=output_dir)
+
+        settings = Settings(
+            project_root=tmp_path,
+            attribution_user_agent="bugcrowd; cosmiccashew",
+        )
+        context = PipelineContext(
+            targets=[DomainTarget(domain="127.0.0.1")],
+            output_dir=output_dir,
+            collection_scope=CollectionScope.from_seeds(
+                ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
+            ),
+        )
+        plugin = HttpxPlugin(settings)
+        await plugin.run(context, hosts_path)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+    assert _HeaderCapturingHandler.last_headers is not None, "httpx never reached the server"
+    ua = _HeaderCapturingHandler.last_headers.get("User-Agent") or ""
+    assert "bugcrowd" in ua, f"expected attribution marker in real User-Agent, got {ua!r}"

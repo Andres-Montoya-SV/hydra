@@ -61,6 +61,12 @@ class NucleiPlugin(BaseToolPlugin):
         for key, value in headers.items():
             args.extend(["-H", f"{key}: {value}"])
 
+        # nuclei has no dedicated -user-agent flag (confirmed against the
+        # installed binary's -h output) — same as httpx/katana, set via -H.
+        user_agent = self.settings.effective_user_agent()
+        if user_agent:
+            args.extend(["-H", f"User-Agent: {user_agent}"])
+
         if not self.settings.nuclei_enable_interactsh:
             # interactsh OOB polling contacts ProjectDiscovery's public
             # collaborator servers directly — third-party infra the confinement
