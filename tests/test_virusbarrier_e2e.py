@@ -269,6 +269,78 @@ def test_virusbarrier_shared_ipv4_requires_resolution_evidence(tmp_path: Path) -
     conn.close()
 
 
+def test_virusbarrier_pipeline_e2e_passive_dns_closes_the_gap(tmp_path: Path) -> None:
+    """The gap `test_virusbarrier_pipeline_e2e_seed_only` documents
+    (`shared_ip == []` for a real seed-only scan) is closed once
+    `modules/passive_dns.py` has produced `passive_dns.jsonl` — same
+    production `finalize()` path, no `ingest_passive_resolutions()`
+    shortcut, using the real fixture file a provider-shaped
+    `passive_dns.jsonl` (Mnemonic-shaped: `host`/`ip`/`collector`/`source`/
+    `providers`) would leave on disk, not synthesized inline."""
+    passive_dns_body = (FIXTURE / "passive_dns.jsonl").read_text(encoding="utf-8")
+    registry, db_path, _context = _run_production_finalize(
+        tmp_path,
+        extra_files={"passive_dns.jsonl": passive_dns_body},
+    )
+    snapshot = registry.intel
+    assert snapshot is not None
+
+    shared_ip = [
+        r
+        for r in snapshot.relationships.values()
+        if r.relationship_type is RelationshipType.SHARES_IPV4
+    ]
+    assert shared_ip, "passive_dns.jsonl must close the documented shares_ipv4 gap"
+    assert all(r.confidence.value == "MEDIUM" for r in shared_ip)
+    assert not any(r.confidence.value == "HIGH" for r in shared_ip)
+
+    store = AssetStore(db_path)
+    conn = store.intel_connection()
+    types = {
+        row["relationship_type"]
+        for row in conn.execute(
+            "SELECT relationship_type FROM intel_relationships WHERE run_id=?",
+            (RUN_ID,),
+        )
+    }
+    assert "SHARES_IPV4" in types
+    conn.close()
+
+
+def test_virusbarrier_passive_dns_empty_provider_response_adds_no_evidence(
+    tmp_path: Path,
+) -> None:
+    """A sibling with no passive-DNS history (`query_status: empty`, `ip: []`)
+    must not break anything and must not fabricate a relationship for it."""
+    passive_dns_body = (
+        json.dumps(
+            {
+                "host": SIBLINGS[0],
+                "ip": [],
+                "collector": "passive_dns",
+                "source": "passive_dns",
+                "providers": [],
+                "query_status": "empty",
+            }
+        )
+        + "\n"
+    )
+    registry, _db_path, _context = _run_production_finalize(
+        tmp_path,
+        extra_files={"passive_dns.jsonl": passive_dns_body},
+    )
+    snapshot = registry.intel
+    assert snapshot is not None
+    shared_ip = [
+        r
+        for r in snapshot.relationships.values()
+        if r.relationship_type is RelationshipType.SHARES_IPV4
+    ]
+    assert shared_ip == []
+    domains = {e.key: e for e in snapshot.entities.values() if e.entity_type is EntityType.DOMAIN}
+    assert domains[SIBLINGS[0]].collection_status is CollectionStatus.NOT_ALLOWED
+
+
 def test_e2e_seed_only_does_not_call_injection_helpers() -> None:
     source = Path(__file__).read_text(encoding="utf-8")
     start = source.index("def test_virusbarrier_pipeline_e2e_seed_only")

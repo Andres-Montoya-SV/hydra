@@ -185,7 +185,12 @@ reported as found, not softened.
 
 ## 3. What is genuinely still open
 
-One real, verified gap survived this audit — found by tracing where
+**Status update (`feat/passive-dns-correlation` branch): closed.** The
+gap below was identified in Part 1 of this document and is now fixed by
+`modules/passive_dns.py`. The original Part 1 text is kept as-is beneath
+the update for the audit trail, followed by what changed.
+
+One real, verified gap survived the Part 1 audit — found by tracing where
 `shares_ipv4` evidence can come from in a *live* run, not just in a test
 fixture.
 
@@ -209,32 +214,73 @@ edge *does* appear the moment a `passive_dns.jsonl` artifact is present —
 confirming the engine-side logic is correct and the gap is purely "no
 collector produces that artifact yet," not a modeling defect.
 
-### Proposed next increment (design only — not implemented here)
+### Closed: `modules/passive_dns.py` (opt-in, `ENABLE_PASSIVE_DNS`)
 
-Add a `passive_dns` plugin that queries a passive-DNS source (or, as a
-lower-effort first step, folds already-collected CT-log `dns_names`/ASN
-data plus dnsx historical records the project already collects) for the
-certificate's SAN set, and writes `passive_dns.jsonl` in the schema
-`ingest_passive_dns_records` already reads
-(`{"host": ..., "ip": ..., "collector": ..., "source": ...}`, per
-`test_virusbarrier_shared_ipv4_requires_resolution_evidence`). No new
-model, no new confidence logic, no new CLI surface — `core/intel/engine.py`,
-`core/intel/correlate.py`, and `core/intel/cli.py` already handle this
-input correctly. This is a single new collector plugin, following the
-existing `StructuredEmission`/artifact-file convention, and it is the only
-piece of the original four-stage plan with a concrete remaining action
-item. **Evolve, don't rewrite** — this is additive to the existing
-pipeline, no schema or engine changes.
+A new plugin (`stage_order = 46`, after `ctlogs`) queries a fixed
+third-party passive-DNS database for hostnames already observed this run
+as out-of-scope certificate siblings — never the sibling itself. Two
+providers, same additive-optional-key shape as `WPSCAN_API_TOKEN`:
 
-Secondary, lower-priority note: `intel_hypotheses` (OPEN /
-AUTHORIZED_FOR_COLLECTION / REJECTED / RESOLVED) already exists as the
-right home for "candidate relationship, not yet evidence-confirmed" — e.g.
-a same-registrant guess from WHOIS data before a shared-certificate or
-shared-IP edge confirms it. Nothing in this audit found a caller that
-populates hypotheses from anything other than certificate/IP correlation
-today; extending hypothesis generation to WHOIS/passive-DNS signals is a
-reasonable second increment after the passive-DNS plugin above, once it
-supplies more corroborating signal to reason over.
+- **Mnemonic PassiveDNS** (`api.mnemonic.no`) — default, no API key.
+  Verified against the current published API spec
+  (`https://www.docs.mnemonic.no/api/services/pdns/01-public_api.html`):
+  `GET https://api.mnemonic.no/pdns/v3/<hostname>?rrType=a`, public data is
+  TLP-white only, rate-limited by the provider to **10 requests/minute and
+  1000/day**.
+- **SecurityTrails** (`api.securitytrails.com`) — optional, additive, only
+  queried when `SECURITYTRAILS_API_KEY` is set; a SecurityTrails failure
+  never erases a successful Mnemonic result. SecurityTrails' current
+  free-tier terms are not clearly published (the vendor is now part of
+  Recorded Future) — treat this provider as "works if you have a key,"
+  not as a second guaranteed-free source.
+
+Candidate selection (`_sibling_candidates` in `modules/passive_dns.py`)
+re-derives the same out-of-scope SAN set `core/intel/engine.py` computes
+from `ctlogs.jsonl`, filtered through `allows_active_collection` — capped
+at `passive_dns_max_candidates` (default 25). This is a second,
+independent computation of the same "which SANs are out-of-scope"
+question the engine answers, not a shared call — acceptable because
+`ctlogs.jsonl` is data the plugin already has on disk, and it means
+`modules/passive_dns.py` never needs to depend on `core/intel/`'s internal
+entity state at plugin-run time (which does not exist yet — `IntelEngine`
+only runs later, inside `HostRegistry.finalize()`).
+
+Classified `THIRD_PARTY_OBSERVATION` / **F\*** in
+`docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md` (Table row + inventory row #30),
+same class as `ctlogs`/`threat_intel`: Hydra's own socket only ever
+connects to the fixed provider endpoint; the sibling hostname is query
+content, never a connection destination.
+
+No engine change was needed — `core/intel/engine.py::ingest_artifacts`
+already read `passive_dns.jsonl` if present (line 294-296, from Part 1's
+own audit); the gap was purely "nothing produces that file," not a missing
+ingestion path. `core/intel/correlate.py`'s confidence logic
+(`ipv4_confidence` → always MEDIUM, never HIGH) is untouched and unmodified
+— the plugin only supplies data, per the brief's explicit instruction not
+to touch that logic.
+
+**Proof it closed the gap, not just that the plugin exists:**
+`tests/test_virusbarrier_e2e.py::test_virusbarrier_pipeline_e2e_passive_dns_closes_the_gap`
+drives the same real `HostRegistry.finalize()` path as
+`test_virusbarrier_pipeline_e2e_seed_only` (no `ingest_passive_resolutions()`
+shortcut), with a `passive_dns.jsonl` fixture shaped exactly like this
+plugin's own output, and asserts `shared_ip` is non-empty at MEDIUM
+confidence. `test_virusbarrier_pipeline_e2e_seed_only` itself was re-run
+unmodified and **still asserts `shared_ip == []`** — the plugin is opt-in
+(`enable_passive_dns` defaults `False`), so a run without it enabled keeps
+exactly the previously-documented behavior. See §4 for full results.
+
+Secondary, lower-priority note (unchanged from Part 1, still open):
+`intel_hypotheses` (OPEN / AUTHORIZED_FOR_COLLECTION / REJECTED / RESOLVED)
+already exists as the right home for "candidate relationship, not yet
+evidence-confirmed" — e.g. a same-registrant guess from WHOIS data before a
+shared-certificate or shared-IP edge confirms it. Nothing in this audit
+found a caller that populates hypotheses from anything other than
+certificate/IP correlation today; extending hypothesis generation to
+WHOIS/passive-DNS signals is a reasonable next increment, once passive-DNS
+data supplies more corroborating signal to reason over. Not implemented in
+this branch — out of scope per the brief ("esto es exclusivamente el
+plugin de passive DNS").
 
 ## 4. Contract fixture: written, run, and honestly reported
 

@@ -227,6 +227,12 @@ class Settings:
     whois_retry_delay_seconds: int = 5
     threat_intel_timeout: int = 15
     threat_intel_concurrency: int = 4
+    # Passive-DNS lookups for out-of-scope certificate siblings never
+    # resolve the sibling directly — same delay-between-queries convention
+    # as ctlogs_delay_seconds for the fixed third-party endpoint.
+    passive_dns_timeout: int = 15
+    passive_dns_delay_seconds: int = 6
+    passive_dns_max_candidates: int = 25
     browser_probe_timeout: int = 15
     browser_probe_max_hosts: int = 20
     # Before trusting passively enumerated subdomains, resolve 2-3 random
@@ -266,6 +272,9 @@ class Settings:
     enable_ctlogs: bool = True
     enable_port_verify: bool = True
     enable_threat_intel: bool = False
+    # New external dependency (Mnemonic PassiveDNS / optional SecurityTrails)
+    # — opt-in explicitly, like threat_intel above.
+    enable_passive_dns: bool = False
     enable_browser_probe: bool = False
     enable_wildcard_check: bool = True
     enable_soft404_check: bool = True
@@ -326,6 +335,9 @@ class Settings:
 
     # Optional API credentials (never included in to_safe_dict)
     urlhaus_api_key: str | None = None
+    # Optional, additive passive-DNS provider — Mnemonic (default) needs no
+    # key; SecurityTrails is only queried when this is set.
+    securitytrails_api_key: str | None = None
 
     # Bug bounty headers (stored separately; never logged)
     custom_http_headers: dict[str, str] = field(default_factory=dict)
@@ -450,6 +462,19 @@ class Settings:
             threat_intel_concurrency=_int(
                 os.getenv("THREAT_INTEL_CONCURRENCY"), 4, "THREAT_INTEL_CONCURRENCY"
             ),
+            passive_dns_timeout=_int(os.getenv("PASSIVE_DNS_TIMEOUT"), 15, "PASSIVE_DNS_TIMEOUT"),
+            passive_dns_delay_seconds=_int(
+                os.getenv("PASSIVE_DNS_DELAY_SECONDS"),
+                6,
+                "PASSIVE_DNS_DELAY_SECONDS",
+                maximum=300,
+            ),
+            passive_dns_max_candidates=_int(
+                os.getenv("PASSIVE_DNS_MAX_CANDIDATES"),
+                25,
+                "PASSIVE_DNS_MAX_CANDIDATES",
+                maximum=200,
+            ),
             browser_probe_timeout=_int(
                 os.getenv("BROWSER_PROBE_TIMEOUT"), 15, "BROWSER_PROBE_TIMEOUT"
             ),
@@ -507,6 +532,7 @@ class Settings:
             enable_ctlogs=_bool(os.getenv("ENABLE_CTLOGS"), True),
             enable_port_verify=_bool(os.getenv("ENABLE_PORT_VERIFY"), True),
             enable_threat_intel=_bool(os.getenv("ENABLE_THREAT_INTEL")),
+            enable_passive_dns=_bool(os.getenv("ENABLE_PASSIVE_DNS")),
             enable_browser_probe=_bool(os.getenv("ENABLE_BROWSER_PROBE")),
             enable_wildcard_check=_bool(os.getenv("ENABLE_WILDCARD_CHECK"), True),
             enable_soft404_check=_bool(os.getenv("ENABLE_SOFT404_CHECK"), True),
@@ -591,6 +617,7 @@ class Settings:
             owned_domains=_parse_domain_list(os.getenv("OWNED_DOMAINS")),
             external_target_mode=_bool(os.getenv("EXTERNAL_TARGET_MODE"), False),
             urlhaus_api_key=os.getenv("URLHAUS_API_KEY", "").strip() or None,
+            securitytrails_api_key=os.getenv("SECURITYTRAILS_API_KEY", "").strip() or None,
             custom_http_headers=_parse_headers(os.getenv("HTTP_CUSTOM_HEADERS")),
             x_hackerone_researcher=_optional_researcher(
                 os.getenv("X_HACKERONE_RESEARCHER", "").strip()
@@ -821,6 +848,7 @@ class Settings:
                         self.enable_naabu and self.enable_port_verify,
                     ),
                     ("threat_intel", self.enable_threat_intel),
+                    ("passive_dns", self.enable_passive_dns),
                     ("browser_probe", self.enable_browser_probe),
                     ("wildcard_check", self.enable_wildcard_check),
                     ("soft404_check", self.enable_soft404_check),
@@ -841,6 +869,7 @@ class Settings:
             "has_webhook": self.webhook_url is not None,
             "has_scope_file": self.scope_file is not None,
             "has_wpscan_token": self.wpscan_api_token is not None,
+            "has_securitytrails_key": self.securitytrails_api_key is not None,
             "max_discovery_depth": self.max_discovery_depth,
             "enable_followup_collection": self.enable_followup_collection,
             "cloud_bucket_enum_authorize_derived": self.cloud_bucket_enum_authorize_derived,

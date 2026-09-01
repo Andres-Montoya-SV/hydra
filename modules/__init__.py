@@ -19,6 +19,7 @@ from modules import (
     naabu,
     nuclei,
     param_fuzz,
+    passive_dns,
     port_verify,
     security_headers,
     soft404_check,
@@ -57,4 +58,5 @@ __all__ = [
     "cloud_bucket_enum",
     "vuln_match",
     "security_headers",
+    "passive_dns",
 ]
