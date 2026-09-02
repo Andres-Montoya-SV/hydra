@@ -128,7 +128,13 @@ async def test_security_headers_missing_and_complete(settings: Settings, tmp_pat
     complete = [r for r in rows if r["host"] == "complete.example"]
     assert complete and complete[0]["missing"] is False
     assert complete[0]["security_headers_score"] == 100
-    assert all(r.get("raw_artifact") == "security_headers_raw.txt" for r in rows)
+    # One raw file per host (security_headers_raw/<host>.txt), not a single
+    # shared file — each host's rows point at its own artifact.
+    missing_rows = [r for r in rows if r["host"] == "missing.example"]
+    assert all(
+        r.get("raw_artifact") == "security_headers_raw/missing.example.txt" for r in missing_rows
+    )
+    assert complete[0].get("raw_artifact") == "security_headers_raw/complete.example.txt"
 
     hosts, _ = SecurityHeadersParser().parse(output_dir)
     missing = next(h for h in hosts if h.domain == "missing.example")
