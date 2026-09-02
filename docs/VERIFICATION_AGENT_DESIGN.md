@@ -327,33 +327,118 @@ in B.2 calls an LLM; if a future hypothesis-suggestion layer is built on
 top of this, it is explicitly a *different*, clearly-labeled layer sitting
 downstream of a verification result, never inside the verification itself.
 
-## 5. What Part 2 (implementation) would build, in order
+## 5. What Part 2 (implementation) built, in order
 
-Not committed here — recorded so review can weigh in before it starts:
+**Status: implemented** (branch `feat/verification-agent-design`, commits
+`b3c52a5`..`34bd68c`). Each numbered item below is the design's own
+ordering; each now links to the test(s) that prove it against real data,
+not just synthetic input.
 
-1. `verification_flags` table + `VerificationFinding`/`ContradictionSeverity`
-   model (mirrors `core/intel/model.py`'s existing dataclass-with-`to_dict()`
-   convention).
-2. B.2 detectors for items 1, 2, 3, 6 — each has a real fixture already
-   sitting in this repo's test suite from the incidents themselves
-   (`tests/test_dnsx.py`, `tests/test_security_headers.py`,
-   `tests/test_infrastructure_plugins.py`'s WHOIS/port_verify tests) that
-   can be reused directly as the detector's own regression fixture, since
-   the "wrong" and "right" interpretations of each are already captured
-   there.
-3. B.1's two new `runs` columns + the historical cross-check, built on
-   `find_latest_finished_run`/`find_previous_run` (no new query
-   infrastructure).
-4. B.1's `WEBHOOK_URL` format validator (small, isolated, no dependency on
-   anything else here).
-5. B.3's grounding gate in front of `core/intel/query.py`'s existing
-   evidence assembly.
-6. The one deliberately-harder piece: B.1's scope-exclusion canary check
-   (needs to run before any real collection, using
-   `CollectionScope.path_exclusions` and a synthetic-name generator per
-   exclusion pattern shape).
+1. **Done.** `verification_flags` table + `VerificationFinding`/
+   `ContradictionSeverity`/`VerificationStatus` model
+   (`core/verification/model.py`, `core/store.py`) — mirrors
+   `core/intel/model.py`'s dataclass-with-`to_dict()` convention, as
+   planned. Proven by `tests/test_verification_model.py` (10 tests).
+2. **Done.** B.2 detectors for items 1, 2, 3, 6
+   (`core/verification/detectors.py`), each reusing the real fixture from
+   its own incident (`tests/test_dnsx.py`'s fishbowlapp.com NODATA records,
+   `tests/test_security_headers.py`'s creator.stripchat.com header dict,
+   `tests/test_infrastructure_plugins.py`'s virusbarrier.xyz WHOIS/
+   port_verify fixtures) as planned. Proven by
+   `tests/test_verification_detectors.py` (15 tests). **Adjustment found
+   while implementing, not assumed going in:** `detect_whois_block_specificity`
+   first required ≥2 "Domain Name:" lines to disambiguate a referral chain;
+   the real virusbarrier.xyz fixture has exactly one (the IANA block above
+   it uses a bare `domain:` field, not a second "Domain Name:" line), so
+   the check was corrected to require only one match, matching
+   `modules/whois.py::_authoritative_block`'s actual anchoring rule.
+   **Gap self-identified and closed afterward, not in the original
+   Section-5 list:** these four detectors were pure functions, unit-tested
+   in isolation, but never invoked during a real run. Added
+   `core/verification/postmodule.py::run_post_module_checks(output_dir)`,
+   wired into `PipelineRunner._finalize_to_store` right before
+   `store.persist_registry`, reading each detector's real artifacts
+   (`dnsx_records.jsonl`+`resolved.txt`, `security_headers.jsonl`+
+   `httpx.json`, `whois.jsonl`+`whois_raw.txt` with per-domain section
+   extraction, `port_verify.jsonl`). Proven by
+   `tests/test_verification_postmodule.py` (19 tests), including two
+   end-to-end tests driving the real `_finalize_to_store` path with the
+   real fishbowlapp.com NODATA fixture and confirming a zero-flag clean
+   run.
+3. **Done.** B.1's two new `runs` columns (`scope_file_hash`,
+   `attribution_fingerprint`) + the historical cross-check
+   (`core/verification/preflight.py::historical_cross_check`), wired into
+   `PipelineRunner.run()` before tool validation. Built a new
+   `AssetStore.find_latest_finished_run_for_program` rather than reusing
+   `find_latest_finished_run`/`find_previous_run` directly: pre-flight runs
+   *before* the current run has a `runs` row, and needs to match by
+   declared `program_name`, not by the target-overlap heuristic those two
+   existing methods use. Proven by `tests/test_verification_preflight.py`
+   (`TestComputeScopeFileHash`, `TestComputeAttributionFingerprint`,
+   `TestHistoricalCrossCheck`, `TestHistoricalCrossCheckWiredIntoRunner` —
+   the latter reproduces catalog item 7's exact Stripchat/Glassdoor
+   attribution-reuse shape end-to-end through the real runner).
+4. **Done.** B.1's `WEBHOOK_URL` format validator
+   (`core/verification/preflight.py::validate_webhook_url`, wired into
+   `config/settings.py::Settings.from_env`). Proven by
+   `TestValidateWebhookUrl` (7 tests), including a test documenting that
+   `urllib.parse.urlparse` alone does **not** catch the real silent-
+   corruption shape (unquoted value + trailing text after a stray space) —
+   verified empirically against this project's actual python-dotenv
+   parser before writing the check, not assumed.
+5. **Done, with one corrected assumption.** B.3's grounding gate
+   (`core/verification/grounding.py`). The design above sketched this in
+   front of `core/intel/query.py`'s evidence assembly; while implementing,
+   `core/intel/model.py::Evidence` and the `intel_evidence` table were
+   confirmed to have **no `raw_artifact`/artifact-path column at all**
+   (every caller's `metadata` dict carries pure data — fingerprints, IPs,
+   favicon hashes — never a file path). The gate was retargeted to the
+   `verification_flags` table this part introduced (which does carry
+   `raw_artifact`) instead, exposed via a new `app.py verification-flags
+   RUN_ID` CLI command (`core/intel/cli.py::cmd_verification_flags`).
+   `provenance.artifact_path` does exist but is confirmed unused in any
+   report today. Proven by `tests/test_verification_grounding.py`
+   (12 tests, including path-traversal confinement and two end-to-end CLI
+   tests).
+6. **Done.** B.1's scope-exclusion canary check
+   (`core/verification/preflight.py::scope_exclusion_canary_check`), the
+   one piece that makes a real call into `core.intel.authorize`'s own
+   authorization logic with synthetic hostnames, never a real target.
+   Proven by `TestScopeExclusionCanaryCheck` and
+   `TestScopeExclusionCanaryCheckWiredIntoRunner` — including a live
+   reproduction of the still-unfixed real bug on this branch
+   (`!mta*.stripchat.com` currently has zero effect, since
+   `fix/scope-exclusion-host-wildcard` has not merged here yet): the
+   canary check correctly flags it as INVALIDATES, proving the check would
+   have caught the original incident had it existed at the time.
+
+Item 9 (test-count discrepancy) remains `VerificationStatus.UNRESOLVED` by
+design — no detector or explanation was invented to close it; see §1.2.
+
+### Honest strength assessment
+
+- **Strongest (real pipeline data, not just synthetic unit fixtures):** the
+  four B.2 detectors, via `test_verification_postmodule.py`'s end-to-end
+  `_finalize_to_store` tests; the scope-exclusion canary, via a live
+  reproduction of a bug that is still actually present on this branch; the
+  historical cross-check, via a full `PipelineRunner.run()` reproduction of
+  catalog item 7's exact shape.
+- **Weaker (real fixture data, but only exercised as pure functions or in
+  isolation, not through a full pipeline run producing them fresh):** the
+  WHOIS block-specificity and security-headers key-mismatch detectors use
+  the exact real incident text/header dicts, but nothing here re-runs the
+  actual `modules/whois.py`/`modules/security_headers.py` plugins against
+  live targets to reproduce the artifacts from scratch — the fixtures are
+  the historical record of the bug, not a fresh reproduction of it.
+- **Weakest (synthetic only):** the `WEBHOOK_URL` validator's malformed
+  values are hand-constructed strings shaped like the real corruption
+  pattern, not a value actually read from a corrupted `.env` in this
+  project's own history.
 
 ## 6. Commit scope
 
-This document only. No detector, no schema migration, no pre-flight check
-implemented in this part.
+Part 2 implemented across incremental commits on
+`feat/verification-agent-design`, one per numbered step above plus the
+self-identified B.2-wiring gap closure. Not merged — left for review via
+the project's own process (clone, run tests independently, verify, then
+approve the merge).
