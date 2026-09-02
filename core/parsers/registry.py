@@ -183,17 +183,25 @@ class DnsxParser(ToolParser):
                 continue
 
             host = by_host.setdefault(domain, Host(domain=domain))
-            host.dns_resolved = True
-            host.add_provenance(
-                record_observation(
-                    tool="dnsx",
-                    field="dns_resolved",
-                    value="true",
-                    confidence=90,
-                    verified_by=["dnsx"],
-                    artifact_path=artifact_str,
+            # NOERROR with only an SOA record (NODATA) is not resolution —
+            # it means the zone exists but this specific name has no A/AAAA.
+            # A host is created either way so CNAME/MX/TXT/etc. survive as
+            # observations, but dns_resolved must reflect a real address.
+            # See modules/dnsx.py for the matching resolved.txt-side fix and
+            # the real fishbowlapp.com case this was confirmed against.
+            has_address = bool(rec.get("a")) or bool(rec.get("aaaa"))
+            if has_address:
+                host.dns_resolved = True
+                host.add_provenance(
+                    record_observation(
+                        tool="dnsx",
+                        field="dns_resolved",
+                        value="true",
+                        confidence=90,
+                        verified_by=["dnsx"],
+                        artifact_path=artifact_str,
+                    )
                 )
-            )
 
             # A records
             ttl = _parse_ttl(rec)
@@ -402,7 +410,18 @@ class HttpxParser(ToolParser):
             if not domain:
                 continue
             host = Host(domain=domain)
-            host.dns_resolved = True
+            # dns_resolved is deliberately NOT set here — DnsxParser is the
+            # authoritative source for that fact. An httpx.json record alone
+            # does not confirm DNS resolution: under STRICT_OPSEC httpx never
+            # even requests -ip, and (the real case this was confirmed
+            # against, fishbowlapp.com's jenkins.api.* siblings) the
+            # confinement proxy answers a dns_resolution_failed DENY with its
+            # own synthetic 403 that looks exactly like a genuine httpx
+            # response — asserting dns_resolved here would launder that
+            # straight into the canonical Host model. See
+            # HostRegistry._flag_unconfirmed_dns_http_responses, which flags
+            # exactly this mismatch (http_services present, dns_resolved
+            # false) after all parsers have merged.
             host.add_provenance(
                 record_observation(
                     tool="httpx",
