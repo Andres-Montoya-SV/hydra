@@ -1081,6 +1081,20 @@ class PipelineRunner:
 
         intel = registry.intel
         self._attach_collection_attempts(context, intel)
+
+        # Post-module contradiction detectors (docs/VERIFICATION_AGENT_DESIGN.md
+        # B.2) — pure functions over the artifacts just ingested above, run
+        # once here, before persistence, per the design's own ordering.
+        from core.verification.postmodule import run_post_module_checks
+
+        postmodule_findings = run_post_module_checks(context.output_dir)
+        if postmodule_findings:
+            store.record_verification_findings(context.run_id, postmodule_findings)
+            for finding in postmodule_findings:
+                context.add_warning(
+                    f"Verification: {finding.detector} — {finding.claim} — {finding.evidence}"
+                )
+
         store.persist_registry(
             context.run_id,
             hosts,
