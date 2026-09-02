@@ -5,7 +5,13 @@
 Advisory only: every check here returns a `VerificationFinding` (or a list
 of them) for the caller to surface to the operator. Nothing in this module
 raises, blocks a run, or rewrites `SCOPE_FILE`/`.env` — see
-docs/VERIFICATION_AGENT_DESIGN.md Part D.
+docs/VERIFICATION_AGENT_DESIGN.md Part D. The one exception is
+`validate_webhook_url`, which does raise: it runs during `Settings.from_env()`
+itself (config loading, before there is even a `Settings` object to attach
+an advisory finding to), matching every other env-value validator already
+in `config/settings.py` (`_parse_attribution_header`,
+`_optional_proxy_url`, ...) — all of them fail closed on a malformed value
+rather than accepting silent corruption.
 """
 
 from __future__ import annotations
@@ -14,7 +20,9 @@ import hashlib
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
+from core.exceptions import ConfigurationError
 from core.verification.model import ContradictionSeverity, VerificationFinding
 
 if TYPE_CHECKING:
@@ -153,3 +161,37 @@ def historical_cross_check(
         )
 
     return findings
+
+
+def validate_webhook_url(value: str) -> str | None:
+    """Catalog item 8: trailing text pasted after WEBHOOK_URL's value
+    silently corrupted it.
+
+    Verified empirically against this project's actual .env parser
+    (python-dotenv) before writing this, rather than assumed: a QUOTED
+    value with text glued directly after the closing quote
+    (`WEBHOOK_URL="https://..."junk`) makes python-dotenv fail to parse the
+    whole line — the variable ends up unset, not corrupted, a different
+    (and already-silent-by-omission) failure mode `Settings.from_env`
+    already handles correctly (`None`, webhook simply never fires). The
+    real silent-corruption shape is an UNQUOTED value with trailing text
+    after a stray space (`WEBHOOK_URL=https://hooks.slack.com/services/ABC
+    typo`): dotenv absorbs everything after `=` up to the newline into one
+    string, embedded space and all. `urllib.parse.urlparse` alone does NOT
+    catch this — confirmed directly: it happily parses the trailing text
+    as part of the URL path (`.../ABC typo` -> path `/ABC typo`) — so the
+    explicit whitespace check below is the actual fix, not a redundant
+    belt-and-suspenders addition.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    if any(ch.isspace() for ch in text):
+        raise ConfigurationError(
+            f"Invalid WEBHOOK_URL: contains embedded whitespace, likely text "
+            f"pasted after the value in .env: {text!r}"
+        )
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ConfigurationError(f"Invalid WEBHOOK_URL (expected http(s)://host/...): {text!r}")
+    return text

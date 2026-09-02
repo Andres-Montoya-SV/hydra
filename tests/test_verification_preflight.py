@@ -18,6 +18,7 @@ from core.verification.preflight import (
     compute_attribution_fingerprint,
     compute_scope_file_hash,
     historical_cross_check,
+    validate_webhook_url,
 )
 
 
@@ -328,3 +329,44 @@ class TestHistoricalCrossCheckWiredIntoRunner:
 
         assert store.get_verification_flags("run2") == []
         assert not any("Verification (pre-flight)" in w for w in context2.warnings)
+
+
+class TestValidateWebhookUrl:
+    def test_empty_value_returns_none(self) -> None:
+        assert validate_webhook_url("") is None
+        assert validate_webhook_url("   ") is None
+
+    def test_valid_https_url_is_accepted(self) -> None:
+        url = "https://hooks.slack.com/services/ABC/DEF/ghijkl"
+        assert validate_webhook_url(url) == url
+
+    def test_valid_http_url_is_accepted(self) -> None:
+        url = "http://localhost:9000/webhook"
+        assert validate_webhook_url(url) == url
+
+    def test_trailing_text_after_a_space_is_rejected(self) -> None:
+        """The exact real corruption shape, confirmed empirically against
+        this project's actual .env parser (python-dotenv): an UNQUOTED
+        WEBHOOK_URL with a stray space and trailing text gets absorbed by
+        dotenv into one string. urlparse alone silently accepts this
+        (the trailing text becomes part of the path) — this check is what
+        actually catches it."""
+        with pytest.raises(Exception, match="WEBHOOK_URL"):
+            validate_webhook_url("https://hooks.slack.com/services/ABC typo")
+
+    def test_urlparse_alone_would_not_have_caught_this(self) -> None:
+        """Documents exactly why the whitespace check is load-bearing, not
+        redundant with urlparse's own validation."""
+        from urllib.parse import urlparse
+
+        parsed = urlparse("https://hooks.slack.com/services/ABC typo")
+        assert parsed.scheme == "https"
+        assert parsed.netloc == "hooks.slack.com"  # would pass a scheme/netloc-only check
+
+    def test_missing_scheme_is_rejected(self) -> None:
+        with pytest.raises(Exception, match="WEBHOOK_URL"):
+            validate_webhook_url("hooks.slack.com/services/ABC")
+
+    def test_non_http_scheme_is_rejected(self) -> None:
+        with pytest.raises(Exception, match="WEBHOOK_URL"):
+            validate_webhook_url("ftp://hooks.slack.com/services/ABC")

@@ -636,7 +636,7 @@ class Settings:
                 os.getenv("CLOUD_BUCKET_ENUM_AUTHORIZE_DERIVED")
             ),
             nuclei_enable_interactsh=_bool(os.getenv("NUCLEI_ENABLE_INTERACTSH")),
-            webhook_url=os.getenv("WEBHOOK_URL", "").strip() or None,
+            webhook_url=_validate_webhook_url(os.getenv("WEBHOOK_URL", "")),
             owned_domains=_parse_domain_list(os.getenv("OWNED_DOMAINS")),
             external_target_mode=_bool(os.getenv("EXTERNAL_TARGET_MODE"), False),
             urlhaus_api_key=os.getenv("URLHAUS_API_KEY", "").strip() or None,
@@ -1000,6 +1000,17 @@ def _optional_proxy_url(value: str) -> str | None:
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ConfigurationError("OUTBOUND_PROXY_URL must be an http:// or https:// proxy URL")
     return value
+
+
+def _validate_webhook_url(value: str) -> str | None:
+    """See core.verification.preflight.validate_webhook_url — catalog item 8
+    (docs/VERIFICATION_AGENT_DESIGN.md): a bare `.strip()` here previously
+    accepted a WEBHOOK_URL silently corrupted by trailing text pasted after
+    the value in .env.
+    """
+    from core.verification.preflight import validate_webhook_url
+
+    return validate_webhook_url(value)
 
 
 def _optional_scope_file(value: str) -> Path | None:

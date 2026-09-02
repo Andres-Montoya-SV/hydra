@@ -104,6 +104,31 @@ class TestSettings:
         with pytest.raises(ConfigurationError):
             Settings.from_env(project_root=project_root)
 
+    def test_webhook_url_accepts_well_formed_value(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WEBHOOK_URL", "https://hooks.slack.com/services/ABC")
+        settings = Settings.from_env(project_root=project_root)
+        assert settings.webhook_url == "https://hooks.slack.com/services/ABC"
+
+    def test_webhook_url_rejects_trailing_text_after_a_space(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Catalog item 8 (docs/VERIFICATION_AGENT_DESIGN.md): an unquoted
+        WEBHOOK_URL with trailing text pasted after a stray space used to
+        be silently accepted (a bare .strip()) — now fails closed at load
+        time instead of failing silently, later, when the webhook fires."""
+        monkeypatch.setenv("WEBHOOK_URL", "https://hooks.slack.com/services/ABC typo")
+        with pytest.raises(ConfigurationError, match="WEBHOOK_URL"):
+            Settings.from_env(project_root=project_root)
+
+    def test_webhook_url_unset_is_none(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WEBHOOK_URL", raising=False)
+        settings = Settings.from_env(project_root=project_root)
+        assert settings.webhook_url is None
+
     def test_get_run_output_dir_confined(self, project_root: Path) -> None:
         settings = Settings(project_root=project_root)
         run_dir = settings.get_run_output_dir("test_run")
