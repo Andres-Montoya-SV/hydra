@@ -195,3 +195,82 @@ def validate_webhook_url(value: str) -> str | None:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ConfigurationError(f"Invalid WEBHOOK_URL (expected http(s)://host/...): {text!r}")
     return text
+
+
+# ---------------------------------------------------------------------------
+# Scope-exclusion canary check (design Part B.1 / catalog item 5) — the one
+# deliberately-harder check, saved for last per
+# docs/VERIFICATION_AGENT_DESIGN.md Section 5. Unlike every other function
+# in this module, this one makes a real call into Hydra's own authorization
+# logic (never a network request to any real target — see the module
+# docstring and design Part D) because a SCOPE_FILE exclusion's correctness
+# cannot be read off any artifact: nothing on disk today records "we tried
+# this pattern against a name and it worked."
+# ---------------------------------------------------------------------------
+
+_CANARY_TOKEN = "hydra-verification-canary"  # noqa: S105  # nosec B105 - a label, not a secret
+
+
+def _synthetic_hostname_for_pattern(domain_pattern: str) -> str:
+    """A name that should match `domain_pattern` if its wildcard engine
+    works at all — `mta*.example.com` -> `mtahydra-verification-canary.
+    example.com`; a pattern with no wildcard (`community.linktr.ee`) is
+    already a concrete name, used as-is.
+    """
+    if "*" not in domain_pattern:
+        return domain_pattern
+    return domain_pattern.replace("*", _CANARY_TOKEN)
+
+
+def _synthetic_path_for_glob(path_glob: str) -> str:
+    """`/*/whistleblowing` -> `/hydra-verification-canary/whistleblowing` —
+    a concrete path matching the glob's segment shape.
+    """
+    segments = path_glob.split("/")
+    return "/".join(_CANARY_TOKEN if segment == "*" else segment for segment in segments)
+
+
+def scope_exclusion_canary_check(scope: object) -> list[VerificationFinding]:
+    """For every configured SCOPE_FILE exclusion, actively probe Hydra's
+    own `authorize_active_indicator` with a synthetic name shaped like the
+    pattern — never a real target, never a real network request. If the
+    exclusion should deny that name and doesn't, the exclusion has no
+    effect at all (INVALIDATES — this is not "confidence is lower", the
+    protection an operator believes exists simply is not there).
+
+    Takes `scope` typed loosely (not `CollectionScope`) to avoid this
+    module importing `core.intel.scope` at module load time — the same
+    lazy-import convention `core/runner.py` already uses for
+    `core.intel.*` throughout, kept here too.
+    """
+    from core.intel.authorize import authorize_active_indicator
+
+    findings: list[VerificationFinding] = []
+    for domain_pattern, path_glob in getattr(scope, "path_exclusions", ()):
+        candidate_host = _synthetic_hostname_for_pattern(domain_pattern)
+        if path_glob == "/*":
+            indicator = candidate_host
+            pattern_display = f"!{domain_pattern}"
+        else:
+            indicator = f"https://{candidate_host}{_synthetic_path_for_glob(path_glob)}"
+            pattern_display = f"!{domain_pattern}{path_glob}"
+
+        result = authorize_active_indicator(
+            indicator, scope, "verification_canary", "scope_exclusion_canary_check"
+        )
+        if result.allowed:
+            findings.append(
+                VerificationFinding(
+                    claim=f"{pattern_display}: excludes {candidate_host}",
+                    evidence=(
+                        f"authorize_active_indicator({indicator!r}) returned ALLOW — "
+                        "this exclusion pattern has no effect on a synthetic name "
+                        "shaped exactly like what it should exclude"
+                    ),
+                    raw_artifact=None,
+                    severity=ContradictionSeverity.INVALIDATES,
+                    detector="scope_exclusion_canary_check",
+                    host=candidate_host,
+                )
+            )
+    return findings

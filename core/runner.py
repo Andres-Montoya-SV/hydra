@@ -284,6 +284,7 @@ class PipelineRunner:
                 compute_attribution_fingerprint,
                 compute_scope_file_hash,
                 historical_cross_check,
+                scope_exclusion_canary_check,
             )
 
             scope_file_hash = compute_scope_file_hash(self.settings.scope_file)
@@ -310,6 +311,12 @@ class PipelineRunner:
                 attribution_fingerprint=attribution_fingerprint,
                 current_scope_domains=[t.domain for t in context.targets],
             )
+            # Scope-exclusion canary check (design Part B.1's deliberately
+            # harder piece) — active, but only against Hydra's own
+            # authorization function with synthetic names, never a real
+            # target. Runs before any real collection.
+            if context.collection_scope is not None:
+                preflight_findings.extend(scope_exclusion_canary_check(context.collection_scope))
             if preflight_findings:
                 store.record_verification_findings(validated_run_id, preflight_findings)
                 for finding in preflight_findings:

@@ -18,6 +18,7 @@ from core.verification.preflight import (
     compute_attribution_fingerprint,
     compute_scope_file_hash,
     historical_cross_check,
+    scope_exclusion_canary_check,
     validate_webhook_url,
 )
 
@@ -370,3 +371,104 @@ class TestValidateWebhookUrl:
     def test_non_http_scheme_is_rejected(self) -> None:
         with pytest.raises(Exception, match="WEBHOOK_URL"):
             validate_webhook_url("ftp://hooks.slack.com/services/ABC")
+
+
+class TestScopeExclusionCanaryCheck:
+    """The deliberately hardest check, saved for last (design Section 5
+    step 6): actively probes Hydra's own authorize_active_indicator with a
+    synthetic name shaped like each configured exclusion — never a real
+    target.
+    """
+
+    def test_real_stripchat_wildcard_host_exclusion_is_caught_broken(self) -> None:
+        """The exact real incident (catalog item 5): `!mta*.stripchat.com`
+        that once protected nothing. Run against this branch's actual
+        current core/scope.py — the host-wildcard-exclusion fix is a
+        separate, not-yet-merged branch, so this reproduces the real bug
+        live, not a simulation of it."""
+        from core.intel.scope import CollectionScope
+
+        scope = CollectionScope.from_seeds(
+            ["stripchat.com"], patterns=["*.stripchat.com", "!mta*.stripchat.com"]
+        )
+        findings = scope_exclusion_canary_check(scope)
+        assert len(findings) == 1
+        assert findings[0].severity is ContradictionSeverity.INVALIDATES
+        assert findings[0].detector == "scope_exclusion_canary_check"
+        assert "mta*.stripchat.com" in findings[0].claim
+        assert findings[0].host is not None and findings[0].host.startswith("mta")
+
+    def test_whole_domain_exclusion_that_works_raises_nothing(self) -> None:
+        """!community.linktr.ee has no wildcard — host_fully_excluded
+        already handles it correctly on this branch, so the canary must
+        find zero problems."""
+        from core.intel.scope import CollectionScope
+
+        scope = CollectionScope.from_seeds(
+            ["linktr.ee"], patterns=["*.linktr.ee", "!community.linktr.ee"]
+        )
+        findings = scope_exclusion_canary_check(scope)
+        assert findings == []
+
+    def test_path_specific_exclusion_that_works_raises_nothing(self) -> None:
+        """!bancoplata.mx/*/whistleblowing — the original, long-established
+        path-exclusion fix — must also raise nothing."""
+        from core.intel.scope import CollectionScope
+
+        scope = CollectionScope.from_seeds(
+            ["bancoplata.mx"],
+            patterns=["*.bancoplata.mx", "!bancoplata.mx/*/whistleblowing"],
+        )
+        findings = scope_exclusion_canary_check(scope)
+        assert findings == []
+
+    def test_no_exclusions_at_all_raises_nothing(self) -> None:
+        from core.intel.scope import CollectionScope
+
+        scope = CollectionScope.from_seeds(["example.com"], patterns=["*.example.com"])
+        assert scope_exclusion_canary_check(scope) == []
+
+    def test_never_makes_a_real_network_request(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Design Part D: the only network-adjacent exception in this whole
+        package must still never touch a real socket — confirmed by
+        failing the test if anything tries to resolve DNS or open a
+        connection during the check."""
+        from core.intel.scope import CollectionScope
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError("scope_exclusion_canary_check must never touch the network")
+
+        monkeypatch.setattr("socket.socket.connect", _fail)
+        monkeypatch.setattr("socket.getaddrinfo", _fail)
+
+        scope = CollectionScope.from_seeds(
+            ["stripchat.com"], patterns=["*.stripchat.com", "!mta*.stripchat.com"]
+        )
+        scope_exclusion_canary_check(scope)  # must not raise the monkeypatched AssertionError
+
+
+class TestScopeExclusionCanaryCheckWiredIntoRunner:
+    @pytest.mark.asyncio
+    async def test_broken_wildcard_exclusion_is_flagged_during_a_real_run(
+        self, project_root: Path
+    ) -> None:
+        """End-to-end: a SCOPE_FILE with the real broken `!mta*.stripchat.com`
+        pattern produces a persisted verification_flags row and a pre-flight
+        warning during the real (missing-tools-aborted) PipelineRunner.run()."""
+        scope_path = project_root / "scope.txt"
+        scope_path.write_text("*.stripchat.com\n!mta*.stripchat.com\n", encoding="utf-8")
+        settings = Settings(project_root=project_root, scope_file=scope_path)
+        runner = PipelineRunner(settings)
+        with patch.object(runner.tool_manager, "validate_tools", new=AsyncMock(return_value=False)):
+            with patch.object(
+                runner.tool_manager,
+                "ensure_mandatory_tools",
+                new=AsyncMock(side_effect=Exception("tools missing")),
+            ):
+                context = await runner.run(domain="stripchat.com", run_id="run1")
+
+        store = AssetStore(project_root / "output" / "recon.db")
+        flags = store.get_verification_flags("run1")
+        canary_flags = [f for f in flags if f["detector"] == "scope_exclusion_canary_check"]
+        assert len(canary_flags) == 1
+        assert any("scope_exclusion_canary_check" in w or "mta" in w for w in context.warnings)
