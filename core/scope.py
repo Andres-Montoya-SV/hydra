@@ -112,11 +112,46 @@ def url_path_excluded(url: str, exclusions: list[tuple[str, str]]) -> bool:
     return False
 
 
+def hostname_matches_pattern(host: str, pattern: str) -> bool:
+    """True when `host` matches `pattern` — an exact hostname, or a
+    hostname pattern with a `fnmatch` wildcard anywhere in it (e.g.
+    `mta*.stripchat.com`, `*-beta.example.com`, `staging-*.example.com`) —
+    or is a further subdomain of some name the pattern would match.
+
+    Uses `fnmatch` directly against the whole hostname string, the same
+    matching engine `url_path_excluded` already uses per path segment and
+    the positive `*.domain` scope patterns already rely on — not a second,
+    different comparison mechanism for exclusions. `fnmatch`'s `*` has no
+    concept of a label boundary (it matches any run of characters,
+    including further dots), which is intentionally on the safe side for
+    an *exclusion*: matching a wider set of hostnames only ever excludes
+    more, never less, the same conservative principle host_fully_excluded
+    already documents for the plain-subdomain case below.
+
+    A pattern with no wildcard character behaves exactly like the
+    pre-wildcard exact-or-subdomain check this replaces: `fnmatch` with no
+    special characters is a plain string comparison, so `host == pattern`
+    is unaffected, and the subdomain walk below reproduces the previous
+    `host.endswith("." + domain)` check for that case.
+    """
+    if not host or not pattern:
+        return False
+    if fnmatch.fnmatch(host, pattern):
+        return True
+    labels = host.split(".")
+    for i in range(1, len(labels)):
+        if fnmatch.fnmatch(".".join(labels[i:]), pattern):
+            return True
+    return False
+
+
 def host_fully_excluded(host: str, exclusions: list[tuple[str, str]]) -> bool:
     """True when `host` (or any subdomain of it) falls under a **whole-domain**
     exclusion — a `!domain` SCOPE_FILE line with no path at all (or an
     explicit `!domain/*`, which means the same thing: every path excluded is
-    the whole domain excluded).
+    the whole domain excluded). `domain` may itself contain a `fnmatch`
+    wildcard (`!mta*.stripchat.com`) — matched via `hostname_matches_pattern`
+    above, not a separate mechanism.
 
     `url_path_excluded` above only ever fires for a real URL (scheme +
     path) — a bare hostname indicator (what DNS resolution, a CT-log SAN
@@ -139,14 +174,18 @@ def host_fully_excluded(host: str, exclusions: list[tuple[str, str]]) -> bool:
     Conservative by design, same principle as the subtree rule above: a
     further subdomain of the excluded domain (`sub.community.linktr.ee`) is
     excluded too, not just the exact excluded name — in scope-exclusion
-    ambiguity, excluding more is safer than excluding less.
+    ambiguity, excluding more is safer than excluding less. The same
+    principle now also covers a further subdomain of a name a *wildcard*
+    exclusion pattern matches (`sub.mta1.stripchat.com` under
+    `!mta*.stripchat.com`), since `hostname_matches_pattern` walks the
+    label suffixes for both the exact and the wildcard case alike.
     """
     if not host:
         return False
     for domain, path_glob in exclusions:
         if path_glob != "/*":
             continue
-        if host == domain or host.endswith("." + domain):
+        if hostname_matches_pattern(host, domain):
             return True
     return False
 
