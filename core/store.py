@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS runs (
     warnings_json TEXT,
     errors_json TEXT,
     intel_truncated INTEGER DEFAULT 0,
-    intel_truncation_reason TEXT
+    intel_truncation_reason TEXT,
+    scope_file_hash TEXT,
+    attribution_fingerprint TEXT
 );
 
 CREATE TABLE IF NOT EXISTS hosts (
@@ -210,6 +212,33 @@ CREATE TABLE IF NOT EXISTS provenance (
     artifact_path TEXT,
     FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
+
+-- Verification agent (docs/VERIFICATION_AGENT_DESIGN.md): a contradiction
+-- between an interpreted claim and the raw evidence that backs or
+-- contradicts it. Deliberately its own table, not folded into `findings`
+-- (a claim about the target) or `provenance` (a single tool observation) —
+-- see the design doc Part C for why each was reviewed and rejected.
+-- related_table/related_id are a loose, non-FK pointer on purpose: a flag
+-- can point at a row in findings/hosts/intel_relationships, or nothing at
+-- all (an UNRESOLVED, run-level flag with no single row to blame).
+CREATE TABLE IF NOT EXISTS verification_flags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    host TEXT,
+    detector TEXT NOT NULL,
+    claim TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    raw_artifact TEXT,
+    severity TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'CONFIRMED',
+    related_table TEXT,
+    related_id TEXT,
+    metadata_json TEXT,
+    discovered_at TEXT,
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_verification_flags_run ON verification_flags(run_id);
+CREATE INDEX IF NOT EXISTS idx_verification_flags_related ON verification_flags(related_table, related_id);
 
 CREATE TABLE IF NOT EXISTS clusters (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -546,6 +575,8 @@ class AssetStore:
             "runs": {
                 "intel_truncated": "ALTER TABLE runs ADD COLUMN intel_truncated INTEGER DEFAULT 0",
                 "intel_truncation_reason": "ALTER TABLE runs ADD COLUMN intel_truncation_reason TEXT",
+                "scope_file_hash": "ALTER TABLE runs ADD COLUMN scope_file_hash TEXT",
+                "attribution_fingerprint": "ALTER TABLE runs ADD COLUMN attribution_fingerprint TEXT",
             },
             "intel_indicators": {
                 "authorization_status": "ALTER TABLE intel_indicators ADD COLUMN authorization_status TEXT",
@@ -590,8 +621,9 @@ class AssetStore:
             conn.execute(
                 """INSERT OR REPLACE INTO runs
                    (run_id, started_at, finished_at, targets_json, program_name,
-                    host_count, alive_count, warnings_json, errors_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    host_count, alive_count, warnings_json, errors_json,
+                    scope_file_hash, attribution_fingerprint)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run.run_id,
                     run.started_at,
@@ -602,6 +634,8 @@ class AssetStore:
                     run.alive_count,
                     json.dumps(run.warnings),
                     json.dumps(run.errors),
+                    run.scope_file_hash,
+                    run.attribution_fingerprint,
                 ),
             )
 
@@ -863,6 +897,59 @@ class AssetStore:
             else:
                 rows = conn.execute(
                     "SELECT * FROM intel_network_requests WHERE run_id=? ORDER BY id",
+                    (run_id,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_verification_findings(self, run_id: str, findings: list) -> None:
+        """Persist verification-agent contradiction flags for a run.
+
+        `findings` is a list of `core.verification.model.VerificationFinding`
+        (or anything with the same `.to_dict()` shape). See
+        docs/VERIFICATION_AGENT_DESIGN.md Part C for why this is its own
+        table rather than folded into `findings` or `provenance`.
+        """
+        if not findings:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """INSERT INTO verification_flags
+                   (run_id, host, detector, claim, evidence, raw_artifact,
+                    severity, status, related_table, related_id, metadata_json,
+                    discovered_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        f.host,
+                        f.detector,
+                        f.claim,
+                        f.evidence,
+                        f.raw_artifact,
+                        f.severity.value,
+                        f.status.value,
+                        f.related_table,
+                        f.related_id,
+                        json.dumps(f.metadata),
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                    for f in findings
+                ],
+            )
+
+    def get_verification_flags(
+        self, run_id: str, *, status: str | None = None
+    ) -> list[dict[str, object]]:
+        """Read back verification flags for a run (CLI/report use)."""
+        with self._connect() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM verification_flags WHERE run_id=? AND status=? ORDER BY id",
+                    (run_id, status),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM verification_flags WHERE run_id=? ORDER BY id",
                     (run_id,),
                 ).fetchall()
         return [dict(row) for row in rows]
@@ -1748,6 +1835,8 @@ class AssetStore:
             "program_name": row["program_name"],
             "host_count": row["host_count"],
             "alive_count": row["alive_count"],
+            "scope_file_hash": row["scope_file_hash"],
+            "attribution_fingerprint": row["attribution_fingerprint"],
         }
 
     def find_previous_run(self, current_run_id: str) -> str | None:
@@ -1833,6 +1922,34 @@ class AssetStore:
                 ORDER BY started_at DESC
                 LIMIT 1
                 """
+            ).fetchone()
+        return row["run_id"] if row else None
+
+    def find_latest_finished_run_for_program(self, program_name: str) -> str | None:
+        """Latest finished run declared under the same PROGRAM_NAME.
+
+        Verification-agent pre-flight (docs/VERIFICATION_AGENT_DESIGN.md
+        B.1): unlike `find_previous_run`, this needs no existing `runs` row
+        for the current run — it runs *before* `PipelineRunner.run()`,
+        before the current run has been created at all. Unlike
+        `find_latest_finished_run(domain=...)`, matching is by declared
+        program identity, not by target overlap — two runs can share a
+        program name across different target sets (a multi-target bug
+        bounty program), and target overlap alone would miss that.
+        """
+        name = (program_name or "").strip()
+        if not name:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT run_id FROM runs
+                WHERE program_name = ?
+                  AND finished_at IS NOT NULL AND finished_at != ''
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (name,),
             ).fetchone()
         return row["run_id"] if row else None
 

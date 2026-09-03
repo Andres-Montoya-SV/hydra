@@ -109,6 +109,25 @@ def cmd_explain_collection(db_path: Path, identifier: str, run_id: str | None) -
     return 0
 
 
+def cmd_verification_flags(db_path: Path, run_id: str, status: str | None = None) -> int:
+    """Contradiction flags the verification agent raised for a run
+    (docs/VERIFICATION_AGENT_DESIGN.md) — the B.3 report-grounding gate:
+    each flag's own `raw_artifact` is checked against the run's real output
+    directory before being shown, exactly like every other claim this
+    design distrusts by default. A flag whose raw_artifact can't be
+    confirmed is marked `grounding_status: UNVERIFIABLE`, never hidden and
+    never shown with the same confidence as a grounded one.
+    """
+    from core.verification.grounding import ground_rows
+
+    store = AssetStore(db_path)
+    flags = store.get_verification_flags(run_id, status=status)
+    output_dir = db_path.parent / run_id
+    grounded = ground_rows(flags, output_dir, value_field="evidence", artifact_field="raw_artifact")
+    print_json({"run_id": run_id, "verification_flags": grounded})
+    return 0
+
+
 def cmd_diff_runs(db_path: Path, run_a: str, run_b: str | None = None) -> int:
     from core.diff import diff_runs
 

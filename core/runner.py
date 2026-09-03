@@ -279,14 +279,50 @@ class PipelineRunner:
             db_path = self.settings.project_root / self.settings.output_directory / "recon.db"
             store = AssetStore(db_path)
             self._store = store
+
+            from core.verification.preflight import (
+                compute_attribution_fingerprint,
+                compute_scope_file_hash,
+                historical_cross_check,
+                scope_exclusion_canary_check,
+            )
+
+            scope_file_hash = compute_scope_file_hash(self.settings.scope_file)
+            attribution_fingerprint = compute_attribution_fingerprint(
+                self.settings.researcher_attribution_header,
+                self.settings.attribution_user_agent,
+            )
             store.create_run(
                 ScanRun(
                     run_id=validated_run_id,
                     started_at=context.started_at.isoformat() + "Z",
                     targets=[t.domain for t in context.targets],
                     program_name=self.settings.program_name,
+                    scope_file_hash=scope_file_hash,
+                    attribution_fingerprint=attribution_fingerprint,
                 )
             )
+            # Pre-flight historical cross-check (docs/VERIFICATION_AGENT_DESIGN.md
+            # B.1) — advisory only: surfaced as warnings, never blocks the run.
+            preflight_findings = historical_cross_check(
+                store,
+                program_name=self.settings.program_name,
+                scope_file_hash=scope_file_hash,
+                attribution_fingerprint=attribution_fingerprint,
+                current_scope_domains=[t.domain for t in context.targets],
+            )
+            # Scope-exclusion canary check (design Part B.1's deliberately
+            # harder piece) — active, but only against Hydra's own
+            # authorization function with synthetic names, never a real
+            # target. Runs before any real collection.
+            if context.collection_scope is not None:
+                preflight_findings.extend(scope_exclusion_canary_check(context.collection_scope))
+            if preflight_findings:
+                store.record_verification_findings(validated_run_id, preflight_findings)
+                for finding in preflight_findings:
+                    context.add_warning(
+                        f"Verification (pre-flight): {finding.claim} — {finding.evidence}"
+                    )
 
             tools_ok = await self.tool_manager.validate_tools(context)
             if not tools_ok and not self.settings.strict_opsec:
@@ -1045,6 +1081,20 @@ class PipelineRunner:
 
         intel = registry.intel
         self._attach_collection_attempts(context, intel)
+
+        # Post-module contradiction detectors (docs/VERIFICATION_AGENT_DESIGN.md
+        # B.2) — pure functions over the artifacts just ingested above, run
+        # once here, before persistence, per the design's own ordering.
+        from core.verification.postmodule import run_post_module_checks
+
+        postmodule_findings = run_post_module_checks(context.output_dir)
+        if postmodule_findings:
+            store.record_verification_findings(context.run_id, postmodule_findings)
+            for finding in postmodule_findings:
+                context.add_warning(
+                    f"Verification: {finding.detector} — {finding.claim} — {finding.evidence}"
+                )
+
         store.persist_registry(
             context.run_id,
             hosts,

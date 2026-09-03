@@ -154,6 +154,15 @@ def build_parser() -> argparse.ArgumentParser:
     diff_p.add_argument("run_a", help="Previous run id, or domain when used alone")
     diff_p.add_argument("run_b", nargs="?", default=None, help="Current run id")
 
+    verify_p = subparsers.add_parser(
+        "verification-flags",
+        help="Contradiction flags the verification agent raised for a run (no rescan)",
+    )
+    verify_p.add_argument("run_id", help="Run to query")
+    verify_p.add_argument(
+        "--status", choices=["CONFIRMED", "DISMISSED", "UNRESOLVED"], help="Filter by status"
+    )
+
     return parser
 
 
@@ -419,6 +428,7 @@ def cmd_intel(args: argparse.Namespace, settings: Settings) -> int:
         cmd_indicators,
         cmd_investigate,
         cmd_relationships,
+        cmd_verification_flags,
         default_db,
     )
 
@@ -433,6 +443,8 @@ def cmd_intel(args: argparse.Namespace, settings: Settings) -> int:
             print("Error: provide DOMAIN or RUN_A RUN_B", file=sys.stderr)
             return 1
         return cmd_diff_runs(db_path, args.run_a, run_b)
+    if args.command == "verification-flags":
+        return cmd_verification_flags(db_path, run_id, getattr(args, "status", None))
     domain = getattr(args, "entity", None) or getattr(args, "domain", "")
     if args.command == "investigate":
         if not domain:
@@ -511,6 +523,7 @@ def main() -> int:
             "indicators",
             "explain-collection",
             "diff",
+            "verification-flags",
         }:
             return cmd_intel(args, settings)
         return 1

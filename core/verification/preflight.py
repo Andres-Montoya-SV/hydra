@@ -1,0 +1,276 @@
+"""Pre-flight verification (design Part B.1) — runs before
+`PipelineRunner.run()`, using only data already available at that point
+(the loaded `Settings`, `SCOPE_FILE`, and prior runs already in SQLite).
+
+Advisory only: every check here returns a `VerificationFinding` (or a list
+of them) for the caller to surface to the operator. Nothing in this module
+raises, blocks a run, or rewrites `SCOPE_FILE`/`.env` — see
+docs/VERIFICATION_AGENT_DESIGN.md Part D. The one exception is
+`validate_webhook_url`, which does raise: it runs during `Settings.from_env()`
+itself (config loading, before there is even a `Settings` object to attach
+an advisory finding to), matching every other env-value validator already
+in `config/settings.py` (`_parse_attribution_header`,
+`_optional_proxy_url`, ...) — all of them fail closed on a malformed value
+rather than accepting silent corruption.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import urlparse
+
+from core.exceptions import ConfigurationError
+from core.verification.model import ContradictionSeverity, VerificationFinding
+
+if TYPE_CHECKING:
+    from core.store import AssetStore
+
+
+def compute_scope_file_hash(scope_file: Path | None) -> str | None:
+    """A hash of SCOPE_FILE's contents, never the contents themselves — the
+    `runs.scope_file_hash` column only needs to answer "is this the same
+    file as last time", not reproduce the file.
+    """
+    if not scope_file:
+        return None
+    try:
+        content = scope_file.read_bytes()
+    except OSError:
+        return None
+    return "sha256:" + hashlib.sha256(content).hexdigest()
+
+
+def compute_attribution_fingerprint(
+    researcher_attribution_header: dict[str, str] | None,
+    attribution_user_agent: str | None,
+) -> str | None:
+    """A fingerprint of the RESEARCHER_ATTRIBUTION_HEADER/ATTRIBUTION_USER_AGENT
+    pair actually in effect — never the raw values, which may carry an
+    operator handle/token not meant for a queryable `runs` column.
+    """
+    header = dict(researcher_attribution_header or {})
+    user_agent = attribution_user_agent or ""
+    if not header and not user_agent:
+        return None
+    canonical = json.dumps({"header": header, "user_agent": user_agent}, sort_keys=True)
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _normalize_domain(value: str) -> str:
+    return str(value or "").strip().lower().rstrip(".")
+
+
+def historical_cross_check(
+    store: AssetStore,
+    *,
+    program_name: str,
+    scope_file_hash: str | None,
+    attribution_fingerprint: str | None,
+    current_scope_domains: list[str],
+) -> list[VerificationFinding]:
+    """Compare the current run's configuration against the most recent
+    finished run declared under the same PROGRAM_NAME (design Part B.1).
+
+    A first run for a given `program_name` naturally has nothing to compare
+    against — returns `[]`, not a "missing history" finding. Every check
+    here is DOWNGRADES_CONFIDENCE, never INVALIDATES: a changed scope file
+    or attribution header might be entirely intentional (a program's scope
+    legitimately grew, a researcher rotated handles) — this raises the
+    question for the operator, it does not claim the current run is wrong.
+    """
+    findings: list[VerificationFinding] = []
+    name = (program_name or "").strip()
+    if not name:
+        return findings
+
+    previous_run_id = store.find_latest_finished_run_for_program(name)
+    if previous_run_id is None:
+        return findings
+    previous = store.get_run(previous_run_id)
+    if previous is None:
+        return findings
+
+    if (
+        scope_file_hash
+        and previous.get("scope_file_hash")
+        and scope_file_hash != previous["scope_file_hash"]
+    ):
+        findings.append(
+            VerificationFinding(
+                claim=f"PROGRAM_NAME {name!r}: SCOPE_FILE matches this program's prior runs",
+                evidence=(
+                    f"scope_file_hash differs from the most recent finished run for "
+                    f"this program ({previous_run_id})"
+                ),
+                raw_artifact=None,
+                severity=ContradictionSeverity.DOWNGRADES_CONFIDENCE,
+                detector="historical_cross_check_scope_file",
+                related_table="runs",
+                related_id=previous_run_id,
+            )
+        )
+
+    if (
+        attribution_fingerprint
+        and previous.get("attribution_fingerprint")
+        and attribution_fingerprint != previous["attribution_fingerprint"]
+    ):
+        findings.append(
+            VerificationFinding(
+                claim=(
+                    f"PROGRAM_NAME {name!r}: attribution header/User-Agent matches "
+                    "this program's prior runs"
+                ),
+                evidence=(
+                    f"attribution_fingerprint differs from the most recent finished "
+                    f"run for this program ({previous_run_id}) — check "
+                    "RESEARCHER_ATTRIBUTION_HEADER/ATTRIBUTION_USER_AGENT against "
+                    "PROGRAM_NAME before running anything active"
+                ),
+                raw_artifact=None,
+                severity=ContradictionSeverity.DOWNGRADES_CONFIDENCE,
+                detector="historical_cross_check_attribution",
+                related_table="runs",
+                related_id=previous_run_id,
+            )
+        )
+
+    previous_targets = {_normalize_domain(t) for t in previous.get("targets", [])}
+    current_domains = {_normalize_domain(d) for d in current_scope_domains if d}
+    if previous_targets and current_domains and previous_targets.isdisjoint(current_domains):
+        findings.append(
+            VerificationFinding(
+                claim=(
+                    f"PROGRAM_NAME {name!r}: current SCOPE_FILE overlaps this "
+                    "program's prior targets"
+                ),
+                evidence=(
+                    f"no domain in the current run overlaps the most recent finished "
+                    f"run for this program ({previous_run_id}, targets="
+                    f"{sorted(previous_targets)})"
+                ),
+                raw_artifact=None,
+                severity=ContradictionSeverity.DOWNGRADES_CONFIDENCE,
+                detector="historical_cross_check_target_overlap",
+                related_table="runs",
+                related_id=previous_run_id,
+            )
+        )
+
+    return findings
+
+
+def validate_webhook_url(value: str) -> str | None:
+    """Catalog item 8: trailing text pasted after WEBHOOK_URL's value
+    silently corrupted it.
+
+    Verified empirically against this project's actual .env parser
+    (python-dotenv) before writing this, rather than assumed: a QUOTED
+    value with text glued directly after the closing quote
+    (`WEBHOOK_URL="https://..."junk`) makes python-dotenv fail to parse the
+    whole line — the variable ends up unset, not corrupted, a different
+    (and already-silent-by-omission) failure mode `Settings.from_env`
+    already handles correctly (`None`, webhook simply never fires). The
+    real silent-corruption shape is an UNQUOTED value with trailing text
+    after a stray space (`WEBHOOK_URL=https://hooks.slack.com/services/ABC
+    typo`): dotenv absorbs everything after `=` up to the newline into one
+    string, embedded space and all. `urllib.parse.urlparse` alone does NOT
+    catch this — confirmed directly: it happily parses the trailing text
+    as part of the URL path (`.../ABC typo` -> path `/ABC typo`) — so the
+    explicit whitespace check below is the actual fix, not a redundant
+    belt-and-suspenders addition.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    if any(ch.isspace() for ch in text):
+        raise ConfigurationError(
+            f"Invalid WEBHOOK_URL: contains embedded whitespace, likely text "
+            f"pasted after the value in .env: {text!r}"
+        )
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ConfigurationError(f"Invalid WEBHOOK_URL (expected http(s)://host/...): {text!r}")
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Scope-exclusion canary check (design Part B.1 / catalog item 5) — the one
+# deliberately-harder check, saved for last per
+# docs/VERIFICATION_AGENT_DESIGN.md Section 5. Unlike every other function
+# in this module, this one makes a real call into Hydra's own authorization
+# logic (never a network request to any real target — see the module
+# docstring and design Part D) because a SCOPE_FILE exclusion's correctness
+# cannot be read off any artifact: nothing on disk today records "we tried
+# this pattern against a name and it worked."
+# ---------------------------------------------------------------------------
+
+_CANARY_TOKEN = "hydra-verification-canary"  # noqa: S105  # nosec B105 - a label, not a secret
+
+
+def _synthetic_hostname_for_pattern(domain_pattern: str) -> str:
+    """A name that should match `domain_pattern` if its wildcard engine
+    works at all — `mta*.example.com` -> `mtahydra-verification-canary.
+    example.com`; a pattern with no wildcard (`community.linktr.ee`) is
+    already a concrete name, used as-is.
+    """
+    if "*" not in domain_pattern:
+        return domain_pattern
+    return domain_pattern.replace("*", _CANARY_TOKEN)
+
+
+def _synthetic_path_for_glob(path_glob: str) -> str:
+    """`/*/whistleblowing` -> `/hydra-verification-canary/whistleblowing` —
+    a concrete path matching the glob's segment shape.
+    """
+    segments = path_glob.split("/")
+    return "/".join(_CANARY_TOKEN if segment == "*" else segment for segment in segments)
+
+
+def scope_exclusion_canary_check(scope: object) -> list[VerificationFinding]:
+    """For every configured SCOPE_FILE exclusion, actively probe Hydra's
+    own `authorize_active_indicator` with a synthetic name shaped like the
+    pattern — never a real target, never a real network request. If the
+    exclusion should deny that name and doesn't, the exclusion has no
+    effect at all (INVALIDATES — this is not "confidence is lower", the
+    protection an operator believes exists simply is not there).
+
+    Takes `scope` typed loosely (not `CollectionScope`) to avoid this
+    module importing `core.intel.scope` at module load time — the same
+    lazy-import convention `core/runner.py` already uses for
+    `core.intel.*` throughout, kept here too.
+    """
+    from core.intel.authorize import authorize_active_indicator
+
+    findings: list[VerificationFinding] = []
+    for domain_pattern, path_glob in getattr(scope, "path_exclusions", ()):
+        candidate_host = _synthetic_hostname_for_pattern(domain_pattern)
+        if path_glob == "/*":
+            indicator = candidate_host
+            pattern_display = f"!{domain_pattern}"
+        else:
+            indicator = f"https://{candidate_host}{_synthetic_path_for_glob(path_glob)}"
+            pattern_display = f"!{domain_pattern}{path_glob}"
+
+        result = authorize_active_indicator(
+            indicator, scope, "verification_canary", "scope_exclusion_canary_check"
+        )
+        if result.allowed:
+            findings.append(
+                VerificationFinding(
+                    claim=f"{pattern_display}: excludes {candidate_host}",
+                    evidence=(
+                        f"authorize_active_indicator({indicator!r}) returned ALLOW — "
+                        "this exclusion pattern has no effect on a synthetic name "
+                        "shaped exactly like what it should exclude"
+                    ),
+                    raw_artifact=None,
+                    severity=ContradictionSeverity.INVALIDATES,
+                    detector="scope_exclusion_canary_check",
+                    host=candidate_host,
+                )
+            )
+    return findings

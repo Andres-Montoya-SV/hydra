@@ -584,6 +584,15 @@ class ScanRun:
     alive_count: int = 0
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Verification agent pre-flight (docs/VERIFICATION_AGENT_DESIGN.md B.1):
+    # a hash of SCOPE_FILE's contents and a fingerprint of the
+    # RESEARCHER_ATTRIBUTION_HEADER/ATTRIBUTION_USER_AGENT pair actually in
+    # effect for this run — never the raw values, which may carry an
+    # operator handle/token not meant for a queryable column. Used to warn
+    # (never block) when a later run under the same PROGRAM_NAME looks
+    # inconsistent with its own history.
+    scope_file_hash: str | None = None
+    attribution_fingerprint: str | None = None
 
 
 @dataclass
