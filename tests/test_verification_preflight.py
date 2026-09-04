@@ -380,23 +380,23 @@ class TestScopeExclusionCanaryCheck:
     target.
     """
 
-    def test_real_stripchat_wildcard_host_exclusion_is_caught_broken(self) -> None:
+    def test_real_stripchat_wildcard_host_exclusion_now_works(self) -> None:
         """The exact real incident (catalog item 5): `!mta*.stripchat.com`
-        that once protected nothing. Run against this branch's actual
-        current core/scope.py — the host-wildcard-exclusion fix is a
-        separate, not-yet-merged branch, so this reproduces the real bug
-        live, not a simulation of it."""
+        that once protected nothing at all — `scope_exclusion_canary_check`
+        used to flag this scope with an INVALIDATES finding (see git
+        history of this test) because `host_fully_excluded` never treated a
+        `*` inside an exclusion's host as a wildcard. Fixed in
+        `core/scope.py::hostname_matches_pattern`
+        (fix/scope-host-wildcard-exclusion-v2) — this is the same canary
+        check the design doc's own acceptance test for that fix uses,
+        confirming it now finds nothing wrong."""
         from core.intel.scope import CollectionScope
 
         scope = CollectionScope.from_seeds(
             ["stripchat.com"], patterns=["*.stripchat.com", "!mta*.stripchat.com"]
         )
         findings = scope_exclusion_canary_check(scope)
-        assert len(findings) == 1
-        assert findings[0].severity is ContradictionSeverity.INVALIDATES
-        assert findings[0].detector == "scope_exclusion_canary_check"
-        assert "mta*.stripchat.com" in findings[0].claim
-        assert findings[0].host is not None and findings[0].host.startswith("mta")
+        assert findings == []
 
     def test_whole_domain_exclusion_that_works_raises_nothing(self) -> None:
         """!community.linktr.ee has no wildcard — host_fully_excluded
@@ -449,12 +449,16 @@ class TestScopeExclusionCanaryCheck:
 
 class TestScopeExclusionCanaryCheckWiredIntoRunner:
     @pytest.mark.asyncio
-    async def test_broken_wildcard_exclusion_is_flagged_during_a_real_run(
+    async def test_fixed_wildcard_exclusion_raises_no_flag_during_a_real_run(
         self, project_root: Path
     ) -> None:
-        """End-to-end: a SCOPE_FILE with the real broken `!mta*.stripchat.com`
-        pattern produces a persisted verification_flags row and a pre-flight
-        warning during the real (missing-tools-aborted) PipelineRunner.run()."""
+        """End-to-end: a SCOPE_FILE with the once-broken `!mta*.stripchat.com`
+        pattern now produces zero `verification_flags` rows and zero
+        pre-flight warnings during a real (missing-tools-aborted)
+        `PipelineRunner.run()` — `core/scope.py::hostname_matches_pattern`
+        (fix/scope-host-wildcard-exclusion-v2) makes the exclusion actually
+        take effect, so the canary check run inline as part of the real run
+        has nothing left to report."""
         scope_path = project_root / "scope.txt"
         scope_path.write_text("*.stripchat.com\n!mta*.stripchat.com\n", encoding="utf-8")
         settings = Settings(project_root=project_root, scope_file=scope_path)
@@ -470,5 +474,5 @@ class TestScopeExclusionCanaryCheckWiredIntoRunner:
         store = AssetStore(project_root / "output" / "recon.db")
         flags = store.get_verification_flags("run1")
         canary_flags = [f for f in flags if f["detector"] == "scope_exclusion_canary_check"]
-        assert len(canary_flags) == 1
-        assert any("scope_exclusion_canary_check" in w or "mta" in w for w in context.warnings)
+        assert canary_flags == []
+        assert not any("scope_exclusion_canary_check" in w for w in context.warnings)
