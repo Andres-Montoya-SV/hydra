@@ -316,6 +316,15 @@ async def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
             f"Resolved: {len(context.resolved)} | "
             f"Alive: {len(context.alive_urls)}"
         )
+        if context.run_id:
+            from core.store import AssetStore
+            from core.verification.grounding import summarize_verification_flags
+            from ui.tables import verification_summary_line
+
+            db_path = settings.project_root / settings.output_directory / "recon.db"
+            if db_path.exists():
+                flags = AssetStore(db_path).get_verification_flags(context.run_id)
+                print(verification_summary_line(summarize_verification_flags(flags)))
         return 1 if context.errors else 0
 
     context = await run_with_dashboard(
