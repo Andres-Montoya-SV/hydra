@@ -442,3 +442,114 @@ Part 2 implemented across incremental commits on
 self-identified B.2-wiring gap closure. Not merged — left for review via
 the project's own process (clone, run tests independently, verify, then
 approve the merge).
+
+## 7. Part 3 — integrated into the real run, not just invocable by hand
+
+**Status: implemented** (branch `feat/verification-agent-wired-into-run`).
+Part 2 built and unit-tested every layer; an audit at the start of this
+part confirmed commit `34bd68c` had already wired B.1 (`historical_cross_check`
++ `scope_exclusion_canary_check`) and B.2 (`run_post_module_checks`) into
+every real `PipelineRunner.run()`, persisting to `verification_flags` with
+the real `run_id` — not just callable by hand. What Part 2 left undone:
+every finding, including a scope exclusion the canary check proved has
+zero protective effect, was only ever a warning; nothing gated the run,
+and nothing downstream of a run (the report, the CLI) ever looked at
+`verification_flags` again.
+
+1. **Fail-closed gate.** `core/runner.py::run()` now raises the new
+   `ScopeVerificationError` (`core/exceptions.py`) — before
+   `tool_manager.validate_tools()`, i.e. before any plugin runs — when
+   `scope_exclusion_canary_check` returns an INVALIDATES finding. Every
+   other pre-flight finding (DOWNGRADES_CONFIDENCE, or an INVALIDATES from
+   a different detector) stays advisory-only, unchanged. Proven by
+   `tests/test_verification_preflight.py::TestScopeExclusionGateBlocksTheRun`
+   (3 tests) — since the real host-wildcard exclusion bug this design's
+   own canary check was built to catch is now fixed
+   (`fix/scope-host-wildcard-exclusion-v2`, merged to `main`), the "broken
+   exclusion" case is exercised by monkeypatching the canary check's
+   return value directly, confirmed via `validate_tools.assert_not_called()`
+   — this tests the runner's own gating condition, not the detector's
+   correctness (already covered elsewhere with the real, still-fixable
+   bug while it existed).
+2. **B.2 confirmed already wired** (see audit above) — no code change
+   needed, only the audit itself and the tests that already existed from
+   Part 2's own gap-closure commit.
+3. **Report-grounding gate wired into report generation.**
+   `core/verification/grounding.py` gained `partition_verification_flags_by_host`,
+   `summarize_verification_flags`, `downgraded_confidence_score`, and
+   `downgrade_note` — pure functions over `AssetStore.get_verification_flags()`'s
+   dict rows. `core/reporter.py`'s `generate()` (summary.json),
+   `_write_markdown_overview` (overview.md), and `_write_html_summary`
+   (summary.html) all now exclude any High-Priority Infrastructure host or
+   Intelligence Relationship naming a host with an INVALIDATES flag,
+   moving it to a new "⚠ Contradicted / Unverifiable Findings"
+   section/`contradicted_findings` key with its claim, evidence, detector,
+   and raw_artifact. A DOWNGRADES_CONFIDENCE host stays with a reduced
+   confidence_score and a visible note. Found and fixed along the way,
+   not scope creep: `_intel_relationship_lines` had been displaying and
+   would have matched against a relationship's raw, type-prefixed
+   `source_entity`/`target_entity` id (e.g. `"domain:mta1.stripchat.com"`)
+   instead of the bare host — resolved through `intel_entities.key` first,
+   the same way the HTML path already did, which also fixed the markdown
+   relationships list to show readable hostnames instead of raw prefixed
+   ids. Proven by `tests/test_reporter_verification_gate.py` (10 tests),
+   including two that reuse the real virusbarrier.xyz
+   certificate-sharing fixture from `test_virusbarrier_e2e.py` (a real
+   `SHARES_CERTIFICATE` relationship, not hand-crafted rows) to prove
+   relationship exclusion end-to-end.
+4. **CLI visibility.** `ui/tables.py::verification_summary_line` /
+   `build_verification_panel` render the one-line summary ("Verification:
+   2 confirmed, 0 pending, 1 finding invalidated and excluded from
+   report") plus a listed row per excluded finding, printed in the same
+   "Reconnaissance Complete" table as Statistics/Tool Status/Errors &
+   Warnings (`ui/dashboard.py::print_final_report`) and via the same
+   shared helper in the `--no-ui` text path (`app.py::cmd_run`). Proven by
+   `tests/test_ui_verification_panel.py` (8 tests).
+5. **Standalone query command — already existed.** Part 2's `verification-flags
+   RUN_ID` (`app.py` / `core/intel/cli.py::cmd_verification_flags`)
+   already matches this item exactly: reconstructs and grounds a run's
+   `verification_flags` straight from SQLite, no rescan. No new command
+   needed; confirmed still working via `tests/test_verification_grounding.py::TestCmdVerificationFlagsCli`
+   and a fresh manual run against a synthetic run during this part.
+
+### Real end-to-end demonstration
+
+Ran the real fishbowlapp.com dnsx-NODATA fixture (catalog item 6) through
+the actual `PipelineRunner._finalize_to_store` → `ReportGenerator.generate`
+→ `build_verification_panel` chain (not a unit test in isolation):
+
+```
+                                               Verification
+ Summary             Verification: 0 confirmed, 0 pending, 1 finding invalidated and excluded from report
+                     ✗ jenkins.api.fishbowlapp.com: jenkins.api.fishbowlapp.com: resolved
+```
+
+```
+## ⚠ Contradicted / Unverifiable Findings
+
+| Host | Claim | Why It's Contradicted | Evidence |
+|------|-------|------------------------|----------|
+| `jenkins.api.fishbowlapp.com` | jenkins.api.fishbowlapp.com: resolved | dnsx record has
+status_code='NOERROR' with only an soa record, no a/aaaa — NODATA... (detect_dnsx_nodata_as_resolved) | `dnsx_records.jsonl` |
+```
+
+**On whether the pre-flight gate really stops a run**, the question this
+part cared most about getting right, not just leaving as an inline
+assertion: `tests/test_verification_preflight.py::TestScopeExclusionGateBlocksTheRun::test_broken_scope_exclusion_stops_the_run_before_any_plugin_runs`
+drives the *real* `PipelineRunner.run()` (not a mock of `run()` itself)
+with a mocked `AsyncMock` on `tool_manager.validate_tools` and asserts
+`validate_tools_mock.assert_not_called()` after the run returns — i.e. it
+does not just check that an error string is present, it proves the method
+that gates every subsequent plugin call was never reached at all. The
+finding that caused the abort is independently confirmed still persisted
+in `verification_flags` afterward, so the operator can inspect exactly
+why via `verification-flags RUN_ID` even though the run itself refused to
+start.
+
+## 8. Commit scope (Part 3)
+
+Implemented across incremental commits on
+`feat/verification-agent-wired-into-run`: the fail-closed gate, the
+report-grounding wiring (plus the entity-id resolution fix it required),
+and CLI visibility. Not merged — left for review via the project's own
+process.
