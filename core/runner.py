@@ -25,6 +25,7 @@ from core.diff import diff_runs
 from core.exceptions import (
     ConfigurationError,
     PipelineInterruptedError,
+    ScopeVerificationError,
     ToolNotFoundError,
     ValidationError,
 )
@@ -323,6 +324,28 @@ class PipelineRunner:
                     context.add_warning(
                         f"Verification (pre-flight): {finding.claim} — {finding.evidence}"
                     )
+            # Fail-closed, same principle as STRICT_OPSEC's gate: a broken
+            # scope exclusion (the canary check proved authorize_active_indicator
+            # would ALLOW a name the operator believes is excluded) means a
+            # configured scope protection does not work. Every other
+            # pre-flight finding (DOWNGRADES_CONFIDENCE, or an INVALIDATES
+            # from a different detector) is advisory only and never reaches
+            # here — only a broken scope exclusion is unsafe to collect
+            # against at all.
+            from core.verification.model import ContradictionSeverity
+
+            broken_scope_exclusions = [
+                finding
+                for finding in preflight_findings
+                if finding.detector == "scope_exclusion_canary_check"
+                and finding.severity is ContradictionSeverity.INVALIDATES
+            ]
+            if broken_scope_exclusions:
+                raise ScopeVerificationError(
+                    "Refusing to start active collection — SCOPE_FILE exclusion(s) "
+                    "verified broken (no protective effect): "
+                    + "; ".join(f"{f.claim} ({f.evidence})" for f in broken_scope_exclusions)
+                )
 
             tools_ok = await self.tool_manager.validate_tools(context)
             if not tools_ok and not self.settings.strict_opsec:
@@ -589,7 +612,12 @@ class PipelineRunner:
             context.add_warning("Pipeline was interrupted")
             self._emit_log("WARNING", "Pipeline interrupted")
             await terminate_all_processes()
-        except (ToolNotFoundError, ValidationError, ConfigurationError) as exc:
+        except (
+            ToolNotFoundError,
+            ValidationError,
+            ConfigurationError,
+            ScopeVerificationError,
+        ) as exc:
             context.add_error(str(exc))
             self._emit_log("ERROR", str(exc))
         except Exception as exc:

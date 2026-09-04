@@ -13,7 +13,7 @@ from config.settings import Settings
 from core.assets import ScanRun
 from core.runner import PipelineRunner
 from core.store import AssetStore
-from core.verification.model import ContradictionSeverity
+from core.verification.model import ContradictionSeverity, VerificationFinding
 from core.verification.preflight import (
     compute_attribution_fingerprint,
     compute_scope_file_hash,
@@ -476,3 +476,105 @@ class TestScopeExclusionCanaryCheckWiredIntoRunner:
         canary_flags = [f for f in flags if f["detector"] == "scope_exclusion_canary_check"]
         assert canary_flags == []
         assert not any("scope_exclusion_canary_check" in w for w in context.warnings)
+
+
+# ---------------------------------------------------------------------------
+# The B.1 fail-closed gate (design Part 3 / integration): a broken scope
+# exclusion must stop the run before any plugin executes — every other
+# pre-flight finding (DOWNGRADES_CONFIDENCE, or an INVALIDATES from a
+# different detector) stays advisory-only. Real live exclusions on this
+# branch all work correctly (fix/scope-host-wildcard-exclusion-v2 already
+# merged), so the "broken exclusion" case is exercised by monkeypatching
+# scope_exclusion_canary_check's return value directly — this tests the
+# runner's own gating condition, not the canary detector's correctness
+# (already covered in TestScopeExclusionCanaryCheck above).
+# ---------------------------------------------------------------------------
+
+
+class TestScopeExclusionGateBlocksTheRun:
+    @pytest.mark.asyncio
+    async def test_broken_scope_exclusion_stops_the_run_before_any_plugin_runs(
+        self, settings: Settings, project_root: Path
+    ) -> None:
+        import core.verification.preflight as preflight_module
+
+        broken_finding = VerificationFinding(
+            claim="!mta*.stripchat.com: excludes mta1.stripchat.com",
+            evidence="authorize_active_indicator('mta1.stripchat.com') returned ALLOW",
+            raw_artifact=None,
+            severity=ContradictionSeverity.INVALIDATES,
+            detector="scope_exclusion_canary_check",
+            host="mta1.stripchat.com",
+        )
+
+        runner = PipelineRunner(settings)
+        with patch.object(
+            preflight_module, "scope_exclusion_canary_check", return_value=[broken_finding]
+        ):
+            validate_tools_mock = AsyncMock(return_value=True)
+            with patch.object(runner.tool_manager, "validate_tools", new=validate_tools_mock):
+                context = await runner.run(domain="example.com", run_id="run1")
+
+        validate_tools_mock.assert_not_called()
+        assert context.errors
+        assert any("mta1.stripchat.com" in e for e in context.errors)
+        assert any("Refusing to start active collection" in e for e in context.errors)
+        # The finding itself is still persisted — the operator can inspect
+        # exactly why the run refused to start via `verification-flags`.
+        store = AssetStore(project_root / "output" / "recon.db")
+        flags = store.get_verification_flags("run1")
+        assert any(f["detector"] == "scope_exclusion_canary_check" for f in flags)
+
+    @pytest.mark.asyncio
+    async def test_downgrades_confidence_finding_does_not_stop_the_run(
+        self, settings: Settings
+    ) -> None:
+        """A DOWNGRADES_CONFIDENCE finding (the real, common shape —
+        historical_cross_check never produces INVALIDATES at all) must
+        never block collection — advisory only, per design Part B.1."""
+        import core.verification.preflight as preflight_module
+
+        downgrade_finding = VerificationFinding(
+            claim="PROGRAM_NAME 'X': attribution header matches prior runs",
+            evidence="attribution_fingerprint differs from a prior run",
+            raw_artifact=None,
+            severity=ContradictionSeverity.DOWNGRADES_CONFIDENCE,
+            detector="historical_cross_check_attribution",
+        )
+
+        runner = PipelineRunner(settings)
+        with patch.object(
+            preflight_module, "historical_cross_check", return_value=[downgrade_finding]
+        ):
+            validate_tools_mock = AsyncMock(return_value=True)
+            with patch.object(runner.tool_manager, "validate_tools", new=validate_tools_mock):
+                await runner.run(domain="example.com", run_id="run1")
+
+        validate_tools_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_invalidates_from_a_non_scope_detector_does_not_stop_the_run(
+        self, settings: Settings
+    ) -> None:
+        """Only scope_exclusion_canary_check's own INVALIDATES findings gate
+        the run — an INVALIDATES finding from a different pre-flight
+        detector is advisory only, same as a DOWNGRADES_CONFIDENCE one."""
+        import core.verification.preflight as preflight_module
+
+        unrelated_invalidates = VerificationFinding(
+            claim="some other pre-flight claim",
+            evidence="some other pre-flight evidence",
+            raw_artifact=None,
+            severity=ContradictionSeverity.INVALIDATES,
+            detector="some_other_detector",
+        )
+
+        runner = PipelineRunner(settings)
+        with patch.object(
+            preflight_module, "historical_cross_check", return_value=[unrelated_invalidates]
+        ):
+            validate_tools_mock = AsyncMock(return_value=True)
+            with patch.object(runner.tool_manager, "validate_tools", new=validate_tools_mock):
+                await runner.run(domain="example.com", run_id="run1")
+
+        validate_tools_mock.assert_called_once()

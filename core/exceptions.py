@@ -37,5 +37,13 @@ class PipelineInterruptedError(ReconError):
     """Raised when the pipeline is interrupted by the user."""
 
 
+class ScopeVerificationError(ReconError):
+    """Raised when a live pre-flight check proves a SCOPE_FILE exclusion has
+    no effect (docs/VERIFICATION_AGENT_DESIGN.md B.1's
+    scope_exclusion_canary_check). Fail-closed, same principle as
+    STRICT_OPSEC's gate: an active collection run must never start when a
+    configured scope protection is already known not to work."""
+
+
 class EmptyOutputError(ReconError):
     """Raised when a tool produces no usable output."""
