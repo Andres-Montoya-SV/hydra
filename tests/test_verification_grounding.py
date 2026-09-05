@@ -14,7 +14,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from core.verification.grounding import UNVERIFIABLE, ground_rows, is_claim_grounded
+from core.verification.grounding import (
+    UNVERIFIABLE,
+    downgrade_note,
+    downgraded_confidence_score,
+    ground_rows,
+    is_claim_grounded,
+    partition_verification_flags_by_host,
+    summarize_verification_flags,
+)
 
 
 class TestIsClaimGrounded:
@@ -165,3 +173,110 @@ class TestCmdVerificationFlagsCli:
         payload = capsys.readouterr().out
         assert '"grounded": false' in payload
         assert "UNVERIFIABLE" in payload
+
+
+# ---------------------------------------------------------------------------
+# partition_verification_flags_by_host / downgraded_confidence_score /
+# downgrade_note / summarize_verification_flags — the report-side gate
+# (design Part 3): using this run's own verification_flags to exclude
+# INVALIDATES-tainted findings from the normal report and demote
+# DOWNGRADES_CONFIDENCE ones in place.
+# ---------------------------------------------------------------------------
+
+
+def _flag(host, severity, status="CONFIRMED", claim="c", evidence="e"):
+    return {
+        "host": host,
+        "severity": severity,
+        "status": status,
+        "claim": claim,
+        "evidence": evidence,
+    }
+
+
+class TestPartitionVerificationFlagsByHost:
+    def test_invalidates_and_downgrades_go_to_separate_maps(self) -> None:
+        flags = [
+            _flag("a.example.com", "INVALIDATES"),
+            _flag("b.example.com", "DOWNGRADES_CONFIDENCE"),
+        ]
+        invalidated, downgraded = partition_verification_flags_by_host(flags)
+        assert set(invalidated) == {"a.example.com"}
+        assert set(downgraded) == {"b.example.com"}
+
+    def test_multiple_flags_for_the_same_host_are_grouped(self) -> None:
+        flags = [
+            _flag("a.example.com", "INVALIDATES", claim="c1"),
+            _flag("a.example.com", "INVALIDATES", claim="c2"),
+        ]
+        invalidated, _ = partition_verification_flags_by_host(flags)
+        assert len(invalidated["a.example.com"]) == 2
+
+    def test_flag_with_no_host_is_skipped(self) -> None:
+        flags = [_flag(None, "DOWNGRADES_CONFIDENCE")]
+        invalidated, downgraded = partition_verification_flags_by_host(flags)
+        assert invalidated == {}
+        assert downgraded == {}
+
+    def test_empty_flags_returns_empty_maps(self) -> None:
+        assert partition_verification_flags_by_host([]) == ({}, {})
+
+
+class TestDowngradedConfidenceScore:
+    def test_no_flags_leaves_score_unchanged(self) -> None:
+        assert downgraded_confidence_score(80, []) == 80
+
+    def test_one_flag_applies_the_flat_penalty(self) -> None:
+        assert downgraded_confidence_score(80, [_flag("h", "DOWNGRADES_CONFIDENCE")]) == 55
+
+    def test_multiple_flags_do_not_stack_the_penalty(self) -> None:
+        flags = [_flag("h", "DOWNGRADES_CONFIDENCE"), _flag("h", "DOWNGRADES_CONFIDENCE")]
+        assert downgraded_confidence_score(80, flags) == 55
+
+    def test_score_never_goes_below_zero(self) -> None:
+        assert downgraded_confidence_score(10, [_flag("h", "DOWNGRADES_CONFIDENCE")]) == 0
+
+
+class TestDowngradeNote:
+    def test_no_flags_is_empty_string(self) -> None:
+        assert downgrade_note([]) == ""
+
+    def test_single_flag_shows_claim_and_evidence(self) -> None:
+        note = downgrade_note([_flag("h", "DOWNGRADES_CONFIDENCE", claim="X", evidence="Y")])
+        assert "X" in note
+        assert "Y" in note
+        assert "more" not in note
+
+    def test_multiple_flags_shows_a_count_suffix(self) -> None:
+        flags = [
+            _flag("h", "DOWNGRADES_CONFIDENCE", claim="X", evidence="Y"),
+            _flag("h", "DOWNGRADES_CONFIDENCE", claim="Z", evidence="W"),
+        ]
+        assert "(+1 more)" in downgrade_note(flags)
+
+
+class TestSummarizeVerificationFlags:
+    def test_matches_the_documented_cli_example(self) -> None:
+        """The literal example from the fix request: 'Verification: 2
+        confirmed, 0 pending, 1 finding invalidated and excluded from
+        report.'"""
+        flags = [
+            _flag("a", "DOWNGRADES_CONFIDENCE"),
+            _flag("b", "DOWNGRADES_CONFIDENCE"),
+            _flag("c", "INVALIDATES"),
+        ]
+        counts = summarize_verification_flags(flags)
+        assert counts == {"confirmed": 2, "pending": 0, "invalidated": 1, "total": 3}
+
+    def test_unresolved_status_counts_as_pending_regardless_of_severity(self) -> None:
+        flags = [_flag("a", "INVALIDATES", status="UNRESOLVED")]
+        counts = summarize_verification_flags(flags)
+        assert counts == {"confirmed": 0, "pending": 1, "invalidated": 0, "total": 1}
+
+    def test_empty_flags_is_all_zero(self) -> None:
+        assert summarize_verification_flags([]) == {
+            "confirmed": 0,
+            "pending": 0,
+            "invalidated": 0,
+            "total": 0,
+        }

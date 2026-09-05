@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from rich.table import Table
 
 from core.models import PipelineContext, RunSummary, ToolStatus
+
+if TYPE_CHECKING:
+    from core.store import AssetStore
 
 STATUS_STYLES = {
     ToolStatus.PENDING: "dim",
@@ -118,5 +123,52 @@ def build_targets_table(context: PipelineContext) -> Table:
 
     for target in context.targets:
         table.add_row(target.domain, target.source)
+
+    return table
+
+
+def verification_summary_line(counts: dict[str, int]) -> str:
+    """The one-line terminal summary (design Part 3, item 4): e.g.
+    'Verification: 2 confirmed, 0 pending, 1 finding invalidated and
+    excluded from report.' Shared by the Rich panel below and the
+    plain-text --no-ui path (app.py::cmd_run) so both render identically.
+    """
+    invalidated = counts.get("invalidated", 0)
+    noun = "finding" if invalidated == 1 else "findings"
+    return (
+        f"Verification: {counts.get('confirmed', 0)} confirmed, "
+        f"{counts.get('pending', 0)} pending, "
+        f"{invalidated} {noun} invalidated and excluded from report"
+    )
+
+
+def build_verification_panel(context: PipelineContext, store: AssetStore | None) -> Table:
+    """Verification agent summary for the run-completion table (design Part
+    3, item 4) — visible in the terminal at completion, not only in
+    summary.json / the `verification-flags` CLI command.
+    """
+    table = Table(title="Verification", show_header=False, box=None)
+    table.add_column(style="dim", width=18)
+    table.add_column(style="bold white")
+
+    if not store or not context.run_id:
+        table.add_row("Status", "[dim]not available (no store for this run)[/dim]")
+        return table
+
+    from core.verification.grounding import (
+        partition_verification_flags_by_host,
+        summarize_verification_flags,
+    )
+
+    flags = store.get_verification_flags(context.run_id)
+    counts = summarize_verification_flags(flags)
+    style = "yellow" if counts["invalidated"] or counts["pending"] else "green"
+    table.add_row("Summary", f"[{style}]{verification_summary_line(counts)}[/{style}]")
+
+    if counts["invalidated"]:
+        invalidated_hosts, _ = partition_verification_flags_by_host(flags)
+        for host, host_flags in list(invalidated_hosts.items())[:10]:
+            for f in host_flags:
+                table.add_row("", f"[red]✗[/red] {host}: {f.get('claim', '')}")
 
     return table

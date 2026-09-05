@@ -211,6 +211,9 @@ def test_html_executive_and_glossary(settings: Settings, tmp_path: Path) -> None
         def query_hosts_by_risk(self, run_id: str, min_score: int = 25):
             return [host]
 
+        def get_verification_flags(self, run_id: str, *, status: str | None = None):
+            return []
+
     context = PipelineContext(output_dir=output_dir, run_id="r1")
     (output_dir / "tarpit_check.jsonl").write_text(
         json.dumps(

@@ -26,6 +26,7 @@ from ui.tables import (
     build_statistics_table,
     build_targets_table,
     build_tool_status_table,
+    build_verification_panel,
 )
 
 if TYPE_CHECKING:
@@ -395,6 +396,17 @@ class Dashboard:
 
         if context.errors or context.warnings:
             console.print(build_errors_panel(context))
+            console.print()
+
+        # Verification agent summary (design Part 3, item 4) — visible in
+        # the terminal at completion, not only in summary.json or the
+        # standalone `verification-flags` CLI command.
+        if context.run_id:
+            from core.store import AssetStore
+
+            db_path = self.settings.project_root / self.settings.output_directory / "recon.db"
+            verification_store = AssetStore(db_path) if db_path.exists() else None
+            console.print(build_verification_panel(context, verification_store))
             console.print()
 
         # Telemetry summary

@@ -33,6 +33,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from core.verification.model import ContradictionSeverity, VerificationStatus
+
 UNVERIFIABLE = "UNVERIFIABLE"
 
 
@@ -78,3 +80,106 @@ def ground_rows(
             enriched["grounding_status"] = UNVERIFIABLE
         annotated.append(enriched)
     return annotated
+
+
+# ---------------------------------------------------------------------------
+# Report-side gate (design Part 3 / integration): before summary.json,
+# overview.md, the HTML report, or the CLI's completion table show a
+# High-Priority Infrastructure host or an Intelligence Relationship, check
+# whether this run's own verification_flags already proved something about
+# it wrong. Pure functions over `AssetStore.get_verification_flags()`'s
+# already-dict-shaped rows — no I/O, no new persistence, callable from
+# core/reporter.py, ui/tables.py, and core/intel/cli.py alike.
+# ---------------------------------------------------------------------------
+
+
+def partition_verification_flags_by_host(
+    flags: list[dict[str, object]],
+) -> tuple[dict[str, list[dict[str, object]]], dict[str, list[dict[str, object]]]]:
+    """Group a run's verification_flags rows by host into
+    (invalidated, downgraded) maps.
+
+    A host with at least one INVALIDATES flag must be excluded from the
+    normal report sections and moved to a visible "Contradicted /
+    Unverifiable Findings" section instead (design Part 3, item 3) — the
+    detector already proved the claim about it is simply wrong, not merely
+    uncertain. A host with only DOWNGRADES_CONFIDENCE flags stays in its
+    normal place with a reduced confidence_score and a visible note
+    (`downgrade_note` below) instead.
+
+    A flag with no `host` at all (e.g. historical_cross_check's run-level
+    findings, which describe the whole run's configuration rather than any
+    one host) is not host-scoped and has nothing to attach to in a
+    per-host report section — skipped here, not lost: it already surfaced
+    as a pre-flight warning when the run started.
+    """
+    invalidated: dict[str, list[dict[str, object]]] = {}
+    downgraded: dict[str, list[dict[str, object]]] = {}
+    for flag in flags:
+        host = flag.get("host")
+        if not host or not isinstance(host, str):
+            continue
+        severity = flag.get("severity")
+        if severity == ContradictionSeverity.INVALIDATES.value:
+            invalidated.setdefault(host, []).append(flag)
+        elif severity == ContradictionSeverity.DOWNGRADES_CONFIDENCE.value:
+            downgraded.setdefault(host, []).append(flag)
+    return invalidated, downgraded
+
+
+# Report-display-only penalty applied to a host's shown confidence_score
+# when it has a DOWNGRADES_CONFIDENCE flag — never written back to the
+# `hosts` table itself, only to what a report/CLI renders for it.
+_DOWNGRADE_PENALTY = 25
+
+
+def downgraded_confidence_score(confidence_score: int, downgrade_flags: list[dict]) -> int:
+    """The confidence_score a report should display for a host with at
+    least one DOWNGRADES_CONFIDENCE flag — a flat penalty regardless of how
+    many such flags exist (a second and third independent doubt about the
+    same host do not make the original evidence progressively less true;
+    they are still the same underlying "a second source disagrees" fact),
+    floored at 0.
+    """
+    if not downgrade_flags:
+        return confidence_score
+    return max(0, confidence_score - _DOWNGRADE_PENALTY)
+
+
+def downgrade_note(downgrade_flags: list[dict]) -> str:
+    """One-line, human-readable reason a host's confidence was reduced —
+    the first flag's claim/evidence, plus a count when there is more than
+    one."""
+    if not downgrade_flags:
+        return ""
+    first = downgrade_flags[0]
+    note = f"{first.get('claim', '')} — {first.get('evidence', '')}"
+    if len(downgrade_flags) > 1:
+        note += f" (+{len(downgrade_flags) - 1} more)"
+    return note
+
+
+def summarize_verification_flags(flags: list[dict[str, object]]) -> dict[str, int]:
+    """Counts for the one-line CLI/report summary (design Part 3, item 4):
+    `confirmed` (stays visible in the report, possibly with a reduced
+    confidence_score), `pending` (status UNRESOLVED — no verdict yet, e.g.
+    catalog item 9's own kind of open question), and `invalidated`
+    (excluded from the report entirely, moved to the Contradicted
+    Findings section).
+    """
+    invalidated = 0
+    pending = 0
+    confirmed = 0
+    for flag in flags:
+        if flag.get("status") == VerificationStatus.UNRESOLVED.value:
+            pending += 1
+        elif flag.get("severity") == ContradictionSeverity.INVALIDATES.value:
+            invalidated += 1
+        else:
+            confirmed += 1
+    return {
+        "confirmed": confirmed,
+        "pending": pending,
+        "invalidated": invalidated,
+        "total": len(flags),
+    }

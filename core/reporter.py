@@ -8,6 +8,12 @@ from typing import TYPE_CHECKING, Any
 
 from core.intel.correlate import score_to_band
 from core.models import PipelineContext, RunSummary
+from core.verification.grounding import (
+    downgrade_note,
+    downgraded_confidence_score,
+    partition_verification_flags_by_host,
+    summarize_verification_flags,
+)
 from utils.files import safe_write_text, write_json
 from utils.security import escape_html
 
@@ -77,9 +83,46 @@ class ReportGenerator:
             export = store.export_run_json(context.run_id)
             write_json(base / "assets.json", export, base_dir=base)
             hosts = store.get_hosts(context.run_id, limit=500)
-            summary_data["high_priority"] = [
-                h.to_dict() for h in hosts if h.risk_level.value in ("critical", "high")
-            ][:25]
+
+            # B.3 report-grounding gate (design Part 3): a host this run's
+            # own verification_flags proved INVALIDATES must never appear
+            # in the normal high-priority list — moved to
+            # contradicted_findings instead. A DOWNGRADES_CONFIDENCE host
+            # stays, with a reduced confidence_score and a visible note.
+            verification_flags = store.get_verification_flags(context.run_id)
+            invalidated_hosts, downgraded_hosts = partition_verification_flags_by_host(
+                verification_flags
+            )
+            summary_data["verification"] = summarize_verification_flags(verification_flags)
+
+            high_priority_dicts = []
+            for h in hosts:
+                if h.risk_level.value not in ("critical", "high"):
+                    continue
+                if h.domain in invalidated_hosts:
+                    continue
+                d = h.to_dict()
+                if h.domain in downgraded_hosts:
+                    d["confidence_score"] = downgraded_confidence_score(
+                        h.confidence_score, downgraded_hosts[h.domain]
+                    )
+                    d["verification_note"] = downgrade_note(downgraded_hosts[h.domain])
+                high_priority_dicts.append(d)
+            summary_data["high_priority"] = high_priority_dicts[:25]
+
+            if invalidated_hosts:
+                summary_data["contradicted_findings"] = [
+                    {
+                        "host": host,
+                        "claim": f.get("claim"),
+                        "evidence": f.get("evidence"),
+                        "detector": f.get("detector"),
+                        "raw_artifact": f.get("raw_artifact"),
+                    }
+                    for host, host_flags in invalidated_hosts.items()
+                    for f in host_flags
+                ]
+
             summary_data["low_confidence_hosts"] = [
                 h.domain for h in hosts if h.confidence_score < 50
             ][:50]
@@ -192,7 +235,16 @@ class ReportGenerator:
         )
 
         if store and context.run_id:
+            # B.3 report-grounding gate (design Part 3): compute once, reuse
+            # for High-Priority Infrastructure, Intelligence Relationships,
+            # and the new Contradicted Findings section below.
+            verification_flags = store.get_verification_flags(context.run_id)
+            invalidated_hosts, downgraded_hosts = partition_verification_flags_by_host(
+                verification_flags
+            )
+
             hosts = store.query_hosts_by_risk(context.run_id, min_score=10)
+            hosts = [h for h in hosts if h.domain not in invalidated_hosts]
             if hosts:
                 lines.extend(
                     [
@@ -205,12 +257,18 @@ class ReportGenerator:
                 for h in hosts[:30]:
                     cat = h.profile.category.value if h.profile else "unknown"
                     why = "; ".join(h.risk_reasons[:2]) if h.risk_reasons else "—"
+                    confidence = h.confidence_score
+                    if h.domain in downgraded_hosts:
+                        confidence = downgraded_confidence_score(
+                            confidence, downgraded_hosts[h.domain]
+                        )
+                        why = f"{why} — ⚠ confidence reduced: {downgrade_note(downgraded_hosts[h.domain])}"
                     lines.append(
-                        f"| `{h.domain}` | {h.risk_score} | {h.confidence_score}% | {cat} | {why} |"
+                        f"| `{h.domain}` | {h.risk_score} | {confidence}% | {cat} | {why} |"
                     )
                 lines.append("")
 
-            lines.extend(self._intel_relationship_lines(store, context.run_id))
+            lines.extend(self._intel_relationship_lines(store, context.run_id, invalidated_hosts))
 
             clusters = store.get_clusters(context.run_id)
             app_clusters = [
@@ -310,6 +368,29 @@ class ReportGenerator:
                     lines.append(f"- `{h.domain}`")
                 lines.append("")
 
+            if invalidated_hosts:
+                lines.extend(
+                    [
+                        "## ⚠ Contradicted / Unverifiable Findings",
+                        "",
+                        "These hosts (and any relationship involving them above) were "
+                        "excluded from the normal sections above: this run's own "
+                        "verification agent checked the claim against its raw evidence "
+                        "and found it does not hold — not merely uncertain, disproven.",
+                        "",
+                        "| Host | Claim | Why It's Contradicted | Evidence |",
+                        "|------|-------|------------------------|----------|",
+                    ]
+                )
+                for host, host_flags in invalidated_hosts.items():
+                    for f in host_flags:
+                        artifact = f.get("raw_artifact") or "no raw artifact recorded"
+                        lines.append(
+                            f"| `{host}` | {f.get('claim', '')} | {f.get('evidence', '')} "
+                            f"({f.get('detector', '')}) | `{artifact}` |"
+                        )
+                lines.append("")
+
         elif context.httpx_results:
             lines.extend(
                 [
@@ -367,10 +448,18 @@ class ReportGenerator:
         store: AssetStore | None = None,
     ) -> None:
         graph_nodes = graph_edges = 0
+        invalidated_hosts: dict[str, list[dict]] = {}
+        downgraded_hosts: dict[str, list[dict]] = {}
         if store and context.run_id:
             graph = store.get_graph(context.run_id)
             graph_nodes = len(graph.nodes)
             graph_edges = len(graph.edges)
+            # B.3 report-grounding gate (design Part 3), computed once and
+            # reused for the Assets table, Intelligence Correlation, and
+            # the Contradicted Findings section below.
+            invalidated_hosts, downgraded_hosts = partition_verification_flags_by_host(
+                store.get_verification_flags(context.run_id)
+            )
 
         html_parts = [
             "<!DOCTYPE html>",
@@ -422,7 +511,7 @@ class ReportGenerator:
             "  </div>",
         ]
         html_parts.extend(self._executive_summary_html(context, summary, store))
-        html_parts.extend(self._intel_correlation_html(context, store))
+        html_parts.extend(self._intel_correlation_html(context, store, invalidated_hosts))
         html_parts.extend(self._host_projection_clusters_html(context, store))
         html_parts.extend(
             [
@@ -438,13 +527,18 @@ class ReportGenerator:
 
         if store and context.run_id:
             for h in store.query_hosts_by_risk(context.run_id, min_score=5)[:100]:
+                if h.domain in invalidated_hosts:
+                    continue
                 svc = h.http_services[0] if h.http_services else None
                 cat = h.profile.category.value if h.profile else "unknown"
                 tech = ", ".join(svc.tech_names()[:4]) if svc else ""
+                risk_label = f"{h.risk_level.value} {h.risk_score}"
+                if h.domain in downgraded_hosts:
+                    risk_label += " ⚠"
                 html_parts.append(
                     f"    <tr data-risk='{escape_html(h.risk_level.value)}'>"
                     f"<td>{escape_html(svc.url if svc and svc.url else h.domain)}</td>"
-                    f"<td>{escape_html(h.risk_level.value)} {h.risk_score}</td>"
+                    f"<td>{escape_html(risk_label)}</td>"
                     f"<td>{escape_html(cat)}</td>"
                     f"<td>{escape_html(svc.title if svc else '')}</td>"
                     f"<td>{escape_html(svc.webserver if svc else '')}</td>"
@@ -513,6 +607,29 @@ class ReportGenerator:
                 for h in soft404_hosts:
                     html_parts.append(f"    <li>{escape_html(h.domain)}</li>")
                 html_parts.append("  </ul>")
+
+            if invalidated_hosts:
+                html_parts.append(
+                    "  <h2>⚠ Contradicted / Unverifiable Findings</h2>"
+                    "  <p class='muted'>Excluded from the sections above: this run's own "
+                    "verification agent checked the claim against its raw evidence and "
+                    "found it does not hold — not merely uncertain, disproven.</p>"
+                    "  <table>"
+                    "    <tr><th>Host</th><th>Claim</th><th>Why It's Contradicted</th><th>Evidence</th></tr>"
+                )
+                for host, host_flags in invalidated_hosts.items():
+                    for f in host_flags:
+                        artifact = escape_html(
+                            str(f.get("raw_artifact") or "no raw artifact recorded")
+                        )
+                        html_parts.append(
+                            f"    <tr><td>{escape_html(host)}</td>"
+                            f"<td>{escape_html(str(f.get('claim', '')))}</td>"
+                            f"<td>{escape_html(str(f.get('evidence', '')))} "
+                            f"<span class='muted'>({escape_html(str(f.get('detector', '')))})</span></td>"
+                            f"<td><code>{artifact}</code></td></tr>"
+                        )
+                html_parts.append("  </table>")
 
         invalid_param_hosts = context.metadata.get("param_fuzz_baseline_invalid_hosts") or []
         if invalid_param_hosts:
@@ -745,7 +862,12 @@ class ReportGenerator:
         write_json(context.output_dir / "metadata.json", metadata, base_dir=context.output_dir)
         return metadata
 
-    def _intel_relationship_lines(self, store: AssetStore, run_id: str) -> list[str]:
+    def _intel_relationship_lines(
+        self,
+        store: AssetStore,
+        run_id: str,
+        invalidated_hosts: dict[str, list[dict]] | None = None,
+    ) -> list[str]:
         from core.intel.query import IntelQuery
         from core.intel.serialize import serialize_relationship
 
@@ -753,10 +875,17 @@ class ReportGenerator:
         try:
             query = IntelQuery(conn, run_id)
             rows = query.relationships_for_run(limit=80)
+            entities = {
+                row["entity_id"]: dict(row)
+                for row in conn.execute(
+                    "SELECT entity_id, key FROM intel_entities WHERE run_id=?", (run_id,)
+                ).fetchall()
+            }
         finally:
             conn.close()
         if not rows:
             return []
+        invalidated_hosts = invalidated_hosts or {}
         lines = [
             "## Intelligence Relationships",
             "",
@@ -765,25 +894,52 @@ class ReportGenerator:
             "Correlation is infrastructure evidence, not actor or owner attribution.",
             "",
         ]
-        for row in rows[:40]:
+        shown = 0
+        for row in rows:
+            if shown >= 40:
+                break
             payload = serialize_relationship(row, run_id=run_id)
+            # entity_id is a type-prefixed string (core/intel/model.py::entity_id,
+            # e.g. "domain:mta1.stripchat.com") — resolve it to the bare key
+            # (intel_entities.key) before comparing against invalidated_hosts,
+            # which is keyed by plain host, same as the HTML report already does.
+            src_key = str(
+                entities.get(payload.get("source_entity") or "", {}).get("key")
+                or payload.get("source_entity")
+                or ""
+            )
+            dst_key = str(
+                entities.get(payload.get("target_entity") or "", {}).get("key")
+                or payload.get("target_entity")
+                or ""
+            )
+            # B.3 report-grounding gate: a relationship naming a host this
+            # run's own verification agent proved INVALIDATES is excluded
+            # here too — it appears instead in Contradicted Findings.
+            if src_key in invalidated_hosts or dst_key in invalidated_hosts:
+                continue
             lines.append(
-                f"- `{payload.get('source_entity')}` — {payload.get('relationship_type')} → "
-                f"`{payload.get('target_entity')}` ({payload.get('confidence_band')}, "
+                f"- `{src_key}` — {payload.get('relationship_type')} → "
+                f"`{dst_key}` ({payload.get('confidence_band')}, "
                 f"{payload.get('strength')})"
             )
             if payload.get("explanation"):
                 first = str(payload["explanation"]).splitlines()[0]
                 if first:
                     lines.append(f"  {first}")
+            shown += 1
         lines.append("")
         return lines
 
     def _intel_correlation_html(
-        self, context: PipelineContext, store: AssetStore | None
+        self,
+        context: PipelineContext,
+        store: AssetStore | None,
+        invalidated_hosts: dict[str, list[dict]] | None = None,
     ) -> list[str]:
         if not (store and context.run_id):
             return []
+        invalidated_hosts = invalidated_hosts or {}
         getter = getattr(store, "intel_connection", None)
         if not callable(getter):
             return []
@@ -825,8 +981,15 @@ class ReportGenerator:
             confidence = escape_html(str(payload.get("confidence_band") or ""))
             src_ent = entities.get(payload.get("source_entity") or "") or {}
             dst_ent = entities.get(payload.get("target_entity") or "") or {}
-            src_label = escape_html(str(src_ent.get("key") or payload.get("source_entity") or ""))
-            dst_label = escape_html(str(dst_ent.get("key") or payload.get("target_entity") or ""))
+            src_key = str(src_ent.get("key") or payload.get("source_entity") or "")
+            dst_key = str(dst_ent.get("key") or payload.get("target_entity") or "")
+            # B.3 report-grounding gate: a relationship naming a host this
+            # run's own verification agent proved INVALIDATES is excluded
+            # here too — it appears instead in Contradicted Findings.
+            if src_key in invalidated_hosts or dst_key in invalidated_hosts:
+                continue
+            src_label = escape_html(src_key)
+            dst_label = escape_html(dst_key)
             src_scope = escape_html(str(src_ent.get("scope_status") or ""))
             dst_scope = escape_html(str(dst_ent.get("scope_status") or ""))
             src_coll = escape_html(str(src_ent.get("collection_status") or ""))
