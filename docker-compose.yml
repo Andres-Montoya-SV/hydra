@@ -1,0 +1,26 @@
+services:
+  hydra:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hydra:local
+    # Every ENABLE_*/PATH/timeout variable from config/.env.example can be
+    # set here — see docs/DOCKER.md for the full list and the exact
+    # `docker compose run` invocations for a real target.
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      # Persistent state: output/ (includes recon.db), logs/, reports/ —
+      # survive `docker compose down`/container recreation. Created once on
+      # the host (see docs/DOCKER.md) so ownership matches the image's
+      # non-root uid:gid (10001:10001) before the first run.
+      - ./docker-data/output:/app/output
+      - ./docker-data/logs:/app/logs
+      - ./docker-data/reports:/app/reports
+      # SCOPE_FILE — read-only; never baked into the image. Point
+      # SCOPE_FILE=/app/scope.txt at it via .env or -e.
+      - ./scope.txt:/app/scope.txt:ro
+    # No command by default — `docker compose run hydra ...` supplies one.
+    # `docker compose up` alone would just print --help and exit, which is
+    # intentional: Hydra is not a long-running daemon.

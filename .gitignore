@@ -31,6 +31,10 @@ reports/*.json
 reports/*.html
 reports/*.bak
 
+# Docker Compose bind-mount data (docs/DOCKER.md) — host-side persistent
+# state for containerized runs, never repo content.
+/docker-data/
+
 # IDE / OS
 .idea/
 .vscode/
