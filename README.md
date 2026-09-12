@@ -121,6 +121,22 @@ cp config/.env.example .env
 # Edit .env with your program settings
 ```
 
+### Alternative: Docker
+
+All of the above — Python, every Go binary, nmap, and Playwright/WebKit —
+can run inside a container instead, with nothing installed on the host:
+
+```bash
+docker build -t hydra:local .
+docker run --rm --env-file .env -v "$(pwd)/docker-data/output:/app/output" \
+  hydra:local python app.py run -d example.com
+```
+
+See [`docs/DOCKER.md`](docs/DOCKER.md) for the full guide: volume layout
+for persistent state, injecting `.env`/`SCOPE_FILE` without baking them
+into the image, `docker-compose.yml` usage, and the network-confinement
+verification run against the containerized build.
+
 ---
 
 ## Configuration
