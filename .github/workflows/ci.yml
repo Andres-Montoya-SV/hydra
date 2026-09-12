@@ -32,3 +32,50 @@ jobs:
         run: bandit -c pyproject.toml -r .
       - name: pytest
         run: pytest tests/ -q
+
+  # Builds the real Docker image and runs the suite inside it — the only
+  # place CI actually exercises the pinned Go binaries, nmap, and
+  # Playwright/WebKit (the `check` job above never installs any of them,
+  # so every tool-gated `skipif`/`importorskip` test above is silently
+  # skipped there). This adds several minutes (image build: Go compiles +
+  # apt + pip + a ~100MB WebKit download) on top of the `check` job's
+  # under-a-minute run — noticeably slower, so it's scoped to pull_request
+  # only, not every push to a branch: a feature branch still gets fast
+  # `check` feedback on every push, and the full containerized run gates
+  # the actual merge into main. See docs/DOCKER.md for what this proved
+  # when first added (807 passed inside the container, all 13
+  # tool-gated confinement tests ran for real instead of skipping, and
+  # the scope_exclusion_canary_check real-bug reproduction stayed clean).
+  docker:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t hydra:ci .
+      - name: pytest inside container
+        run: docker run --rm hydra:ci pytest tests/ -q
+      - name: ruff inside container
+        run: docker run --rm hydra:ci ruff check .
+      - name: black inside container
+        run: docker run --rm hydra:ci black --check .
+      - name: isort inside container
+        run: docker run --rm hydra:ci isort --check-only .
+      - name: bandit inside container
+        run: docker run --rm hydra:ci bandit -c pyproject.toml -r .
+      - name: Network-confinement verification inside container
+        run: |
+          docker run --rm hydra:ci pytest -v \
+            tests/test_httpx_confinement_live.py \
+            tests/test_browser_confinement_live.py \
+            tests/test_crawler_confinement_live.py
+          docker run --rm hydra:ci python -c "
+          from core.intel.scope import CollectionScope
+          from core.verification.preflight import scope_exclusion_canary_check
+          scope = CollectionScope.from_seeds(
+              ['stripchat.com'], patterns=['*.stripchat.com', '!mta*.stripchat.com']
+          )
+          findings = scope_exclusion_canary_check(scope)
+          assert findings == [], f'canary check found something broken inside the container: {findings}'
+          print('OK: scope_exclusion_canary_check clean inside the container')
+          "

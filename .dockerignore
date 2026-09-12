@@ -1,0 +1,38 @@
+# Secrets and authorized-scope — must never be baked into an image layer.
+.env
+config/.env
+.env.*
+!config/.env.example
+/scope.txt
+
+# Git
+.git/
+.github/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Hydra run artifacts — these live in a mounted volume at runtime, never in the image.
+output/
+logs/
+reports/
+*.db
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.claude/
