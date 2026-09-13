@@ -183,7 +183,20 @@ training) before choosing one. Current models, at design time:
 | Claude Fable 5.1 | `claude-fable-5-1` | $10 / $50 |
 | Claude Opus 5 | `claude-opus-5` | $5 / $25 |
 | Claude Sonnet 5 | `claude-sonnet-5` | $2 / $10 |
-| Claude Haiku 4.5 | `claude-haiku-4-5` | $1 / $5 |
+| Claude Haiku 4.5 | `claude-haiku-4-5-20251001` | $1 / $5 |
+
+*Correction made during Part 2 implementation*: the model IDs above were
+re-verified directly against `https://platform.claude.com/docs/en/about-claude/models/overview`
+(not just the cached skill table this section originally cited) before
+writing any code. Fable 5.1/Opus 5/Sonnet 5 are dateless, self-pinned IDs
+("every Claude model ID is a pinned snapshot, including the dateless IDs
+used from the 4.6 generation on" — official docs), so those three were
+already exactly right. Haiku 4.5 was not: its real Claude API ID is the
+dated snapshot `claude-haiku-4-5-20251001`; `claude-haiku-4-5` is only a
+convenience alias that resolves to it, not the literal pinned ID. Fixed
+above. This doesn't change the chosen default (Sonnet 5, not Haiku), but
+the task's own review caught it and it's corrected here rather than left
+wrong in an approved design doc.
 
 **Chosen default: `claude-sonnet-5`.** This task's shape — read a
 moderately long natural-language document once, then classify a batch of
@@ -203,16 +216,32 @@ constant — a program with unusually dense or adversarially-worded rules
 text is a legitimate reason to point this at `claude-opus-5` for that one
 run.
 
-**Request shape**: a single non-streaming `client.messages.create()` call
+**Request shape**: a single non-streaming `client.messages.parse()` call
 (batch sizes are capped low enough — Part D — that output stays well under
 streaming-timeout territory), `thinking: {type: "adaptive"}` at
 `output_config: {effort: "medium"}` (this is a single batched judgment call,
 not a multi-turn agentic loop, so the cost of a slightly higher effort
 level is bounded and paid once per run — worth it for a task where a wrong
-`ELIGIBLE` call has real consequences), and **structured outputs**
-(`output_config.format`, via `client.messages.parse()`) rather than
-freeform text — validated JSON in, no ad hoc text parsing of Claude's
-response.
+`ELIGIBLE` call has real consequences), and **structured outputs** via
+`output_format=<a Pydantic model>` (the SDK translates this to
+`output_config.format` internally) rather than freeform text — validated,
+typed output in, no ad hoc text parsing of Claude's response.
+
+*Verified during Part 2 implementation, not assumed*: fetched
+`https://platform.claude.com/docs/en/build-with-claude/structured-outputs`
+and `https://platform.claude.com/docs/en/build-with-claude/token-counting`
+directly, and introspected the real installed SDK
+(`pip install anthropic==1.5.0`, the current release) rather than trusting
+this section's original draft on faith. Every mechanic below matched what
+this design already assumed, with no beta header required for any of it:
+`output_config.format` with `{"type": "json_schema", "schema": {...}}` is
+real and current; `client.messages.parse(..., output_format=SomePydanticModel)`
+exists on the installed SDK and exposes `response.parsed_output`;
+`client.messages.count_tokens(...)` (Part D.3) is a real, free,
+no-beta-header endpoint that also accepts `output_config`/`output_format`,
+so the pre-flight cost estimate can include the schema's own token
+overhead, not just the raw text. Nothing about the request shape needed to
+change — only the Haiku model ID above did.
 
 Proposed schema (illustrative — Part 2 finalizes the exact field set):
 

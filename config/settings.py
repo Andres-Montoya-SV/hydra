@@ -352,6 +352,17 @@ class Settings:
     # Optional, additive passive-DNS provider — Mnemonic (default) needs no
     # key; SecurityTrails is only queried when this is set.
     securitytrails_api_key: str | None = None
+    # Reportability agent (docs/REPORTABILITY_AGENT_DESIGN.md) — opt-in,
+    # same pattern as urlhaus_api_key/securitytrails_api_key. Only consulted
+    # by the standalone `assess-reportability` command, never by `run`.
+    anthropic_api_key: str | None = None
+    # Overridable per program — see design doc Part B.3 for why
+    # claude-sonnet-5 is the default rather than a larger/costlier model.
+    anthropic_model: str = "claude-sonnet-5"
+    # Hard ceiling on findings assessed in one assess-reportability pass —
+    # exceeding it refuses the run outright (never silently truncates); see
+    # design doc Part D.2.
+    reportability_max_findings_per_batch: int = 50
 
     # Bug bounty headers (stored separately; never logged)
     custom_http_headers: dict[str, str] = field(default_factory=dict)
@@ -641,6 +652,14 @@ class Settings:
             external_target_mode=_bool(os.getenv("EXTERNAL_TARGET_MODE"), False),
             urlhaus_api_key=os.getenv("URLHAUS_API_KEY", "").strip() or None,
             securitytrails_api_key=os.getenv("SECURITYTRAILS_API_KEY", "").strip() or None,
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip() or None,
+            anthropic_model=os.getenv("ANTHROPIC_MODEL", "").strip() or "claude-sonnet-5",
+            reportability_max_findings_per_batch=_int(
+                os.getenv("REPORTABILITY_MAX_FINDINGS_PER_BATCH"),
+                50,
+                "REPORTABILITY_MAX_FINDINGS_PER_BATCH",
+                maximum=1000,
+            ),
             custom_http_headers=_parse_headers(os.getenv("HTTP_CUSTOM_HEADERS")),
             x_hackerone_researcher=_optional_researcher(
                 os.getenv("X_HACKERONE_RESEARCHER", "").strip()
@@ -959,6 +978,9 @@ class Settings:
             "has_scope_file": self.scope_file is not None,
             "has_wpscan_token": self.wpscan_api_token is not None,
             "has_securitytrails_key": self.securitytrails_api_key is not None,
+            "has_anthropic_key": self.anthropic_api_key is not None,
+            "anthropic_model": self.anthropic_model,
+            "reportability_max_findings_per_batch": self.reportability_max_findings_per_batch,
             "max_discovery_depth": self.max_discovery_depth,
             "enable_followup_collection": self.enable_followup_collection,
             "cloud_bucket_enum_authorize_derived": self.cloud_bucket_enum_authorize_derived,

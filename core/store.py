@@ -240,6 +240,36 @@ CREATE TABLE IF NOT EXISTS verification_flags (
 CREATE INDEX IF NOT EXISTS idx_verification_flags_run ON verification_flags(run_id);
 CREATE INDEX IF NOT EXISTS idx_verification_flags_related ON verification_flags(related_table, related_id);
 
+-- Reportability agent (docs/REPORTABILITY_AGENT_DESIGN.md): a per-finding
+-- eligibility annotation against a program's own natural-language rules
+-- text, produced by the Claude API (the one place in this project an LLM
+-- makes the primary judgment, not a convenience — see the design doc
+-- Part 1). Deliberately its own table, not folded into `findings` (a
+-- claim about the target; this is a claim about a finding, a different
+-- grain) or `verification_flags` (whose `severity` column is
+-- ContradictionSeverity, meaningless for a three-way eligibility verdict —
+-- see the design doc Part C.1 for the full comparison). Unlike
+-- verification_flags' deliberately loose related_id, finding_id here is a
+-- real foreign key: this system's input is always exactly one persisted
+-- Finding, never a host/relationship/nothing.
+CREATE TABLE IF NOT EXISTS reportability_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    finding_id INTEGER NOT NULL,
+    eligibility TEXT NOT NULL,
+    rule_citation TEXT NOT NULL DEFAULT '',
+    citation_grounded INTEGER,
+    reasoning TEXT,
+    program_rules_artifact TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'reportability_agent',
+    model_used TEXT NOT NULL,
+    assessed_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+    FOREIGN KEY(finding_id) REFERENCES findings(id)
+);
+CREATE INDEX IF NOT EXISTS idx_reportability_run ON reportability_assessments(run_id);
+CREATE INDEX IF NOT EXISTS idx_reportability_finding ON reportability_assessments(finding_id);
+
 CREATE TABLE IF NOT EXISTS clusters (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
@@ -952,6 +982,79 @@ class AssetStore:
                     "SELECT * FROM verification_flags WHERE run_id=? ORDER BY id",
                     (run_id,),
                 ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_findings(
+        self,
+        run_id: str,
+        *,
+        severity: list[str] | None = None,
+        host: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Raw `findings` rows for a run, with their real `id` — the
+        reportability agent (docs/REPORTABILITY_AGENT_DESIGN.md) needs the
+        actual row id as its `finding_id` foreign key, which the in-memory
+        `core.assets.Finding` dataclass does not carry (it is assigned only
+        on insert). `Host.findings` hydration is the wrong shape for this;
+        this reads the table directly instead.
+        """
+        query = "SELECT * FROM findings WHERE run_id=?"  # nosec B608 - identifier is a literal, values are bound params
+        params: list[object] = [run_id]
+        if host:
+            query += " AND host=?"
+            params.append(host)
+        if severity:
+            placeholders = ",".join("?" for _ in severity)
+            query += f" AND severity IN ({placeholders})"  # noqa: S608  # nosec B608  # placeholders are '?' marks, values are bound params
+            params.extend(severity)
+        query += " ORDER BY id"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_reportability_assessments(self, run_id: str, assessments: list) -> None:
+        """Persist reportability-agent eligibility annotations for a run.
+
+        `assessments` is a list of
+        `core.reportability.model.ReportabilityAssessment` (or anything
+        with the same attributes). See
+        docs/REPORTABILITY_AGENT_DESIGN.md Part C.1 for why this is its
+        own table rather than folded into `findings` or
+        `verification_flags`.
+        """
+        if not assessments:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """INSERT INTO reportability_assessments
+                   (run_id, finding_id, eligibility, rule_citation,
+                    citation_grounded, reasoning, program_rules_artifact,
+                    source, model_used, assessed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        a.finding_id,
+                        a.eligibility.value,
+                        a.rule_citation,
+                        a.citation_grounded,
+                        a.reasoning,
+                        a.program_rules_artifact,
+                        a.source,
+                        a.model_used,
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                    for a in assessments
+                ],
+            )
+
+    def get_reportability_assessments(self, run_id: str) -> list[dict[str, object]]:
+        """Read back reportability assessments for a run (CLI use)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM reportability_assessments WHERE run_id=? ORDER BY id",
+                (run_id,),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def upsert_host(self, run_id: str, host: Host) -> None:
