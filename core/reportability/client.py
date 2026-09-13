@@ -1,4 +1,5 @@
-"""Claude API client wrapper for the reportability agent (design Part B).
+"""Claude API client wrapper for the reportability agent (design Part B,
+v2 addendum for the provider abstraction and adversarial cross-validation).
 
 Lazy-imports `anthropic` so importing this module never fails when the
 optional dependency isn't installed — the `assess-reportability` command
@@ -9,8 +10,16 @@ module merely existing on `sys.path`.
 
 from __future__ import annotations
 
-from core.reportability.prompt import SYSTEM_PROMPT, build_user_message
-from core.reportability.schema import ReportabilityBatchResult
+from core.reportability.errors import ReportabilityAPIError
+from core.reportability.prompt import (
+    ADVERSARIAL_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    build_adversarial_user_message,
+    build_user_message,
+)
+from core.reportability.schema import AdversarialBatchResult, ReportabilityBatchResult
+
+__all__ = ["ReportabilityAPIError", "AnthropicClient"]
 
 # One non-streaming request per run's batch (design Part B.2/B.3) — batch
 # sizes are capped low (Settings.reportability_max_findings_per_batch) so
@@ -18,17 +27,13 @@ from core.reportability.schema import ReportabilityBatchResult
 _MAX_TOKENS = 16000
 
 
-class ReportabilityAPIError(Exception):
-    """Wraps any Anthropic SDK exception with a clear, actionable message —
-    the CLI layer (app.py) catches this one type instead of importing
-    `anthropic`'s exception hierarchy itself.
-    """
-
-
-class ReportabilityClient:
+class AnthropicClient:
     """Thin wrapper around `anthropic.Anthropic().messages.{parse,count_tokens}`.
-    Construction itself never makes a network call.
+    Construction itself never makes a network call. Implements the
+    `core.reportability.provider.ReportabilityProvider` protocol.
     """
+
+    name = "anthropic"
 
     def __init__(self, api_key: str, model: str) -> None:
         try:
@@ -40,7 +45,7 @@ class ReportabilityClient:
             ) from exc
         self._anthropic = anthropic
         self._client = anthropic.Anthropic(api_key=api_key)
-        self._model = model
+        self.model = model
 
     def count_input_tokens(self, rules_text: str, findings: list[dict[str, object]]) -> int:
         """Real input-token count for this exact batch, via the free,
@@ -50,7 +55,7 @@ class ReportabilityClient:
         """
         try:
             response = self._client.messages.count_tokens(
-                model=self._model,
+                model=self.model,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": build_user_message(rules_text, findings)}],
                 output_format=ReportabilityBatchResult,
@@ -69,7 +74,7 @@ class ReportabilityClient:
         """
         try:
             response = self._client.messages.parse(
-                model=self._model,
+                model=self.model,
                 max_tokens=_MAX_TOKENS,
                 thinking={"type": "adaptive"},
                 output_config={"effort": "medium"},
@@ -84,6 +89,37 @@ class ReportabilityClient:
                 "Claude's response did not include a structured output — this should not "
                 "happen with output_format set; treat this run's assessment as failed, not "
                 "as zero findings."
+            )
+        return response.parsed_output
+
+    def review_batch(
+        self,
+        rules_text: str,
+        findings: list[dict[str, object]],
+        primary_result: ReportabilityBatchResult,
+    ) -> AdversarialBatchResult:
+        """Adversarial cross-validation call (design v2): review another
+        provider's already-produced structured verdicts, never a fresh
+        independent classification from scratch (see
+        core.reportability.prompt.ADVERSARIAL_SYSTEM_PROMPT).
+        """
+        message = build_adversarial_user_message(rules_text, findings, primary_result.assessments)
+        try:
+            response = self._client.messages.parse(
+                model=self.model,
+                max_tokens=_MAX_TOKENS,
+                thinking={"type": "adaptive"},
+                output_config={"effort": "medium"},
+                system=ADVERSARIAL_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": message}],
+                output_format=AdversarialBatchResult,
+            )
+        except Exception as exc:  # re-raised as one domain type below
+            raise ReportabilityAPIError(_describe(self._anthropic, exc)) from exc
+        if response.parsed_output is None:
+            raise ReportabilityAPIError(
+                "Claude's adversarial review response did not include a structured output — "
+                "treat this run's review as failed, not as zero challenges."
             )
         return response.parsed_output
 

@@ -1,7 +1,12 @@
 # Active browser cloaking probe (large optional browser download)
 playwright==1.62.0
 # Reportability agent (docs/REPORTABILITY_AGENT_DESIGN.md) — opt-in, used only
-# by `python app.py assess-reportability`, never by `run`. Version verified
-# against the current SDK (messages.parse/count_tokens output_format support
-# confirmed on this exact release) before pinning.
+# by `python app.py assess-reportability`, never by `run`. Both providers are
+# optional independently — install whichever you actually use. Versions
+# verified against each installed SDK's own source before pinning (not just
+# documentation): anthropic's messages.parse/count_tokens output_format
+# support, and openai's responses.parse/text_format + output_parsed and its
+# exception hierarchy (AuthenticationError/PermissionDeniedError/NotFoundError/
+# RateLimitError/InternalServerError/APIStatusError/APIConnectionError).
 anthropic==1.5.0
+openai==3.13.0

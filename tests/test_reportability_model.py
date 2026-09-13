@@ -1,16 +1,33 @@
-"""core/reportability/model.py + the reportability_assessments table
-(core/store.py). See docs/REPORTABILITY_AGENT_DESIGN.md Part A.2/C.
+"""core/reportability/model.py + the reportability_assessments /
+reportability_adversarial_reviews tables (core/store.py). See
+docs/REPORTABILITY_AGENT_DESIGN.md Part A.2/C and the v2 addendum for
+provider-agnostic / adversarial cross-validation.
 """
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from core.assets import Finding, Host, RiskLevel, ScanRun
-from core.reportability.model import Eligibility, ReportabilityAssessment
+from core.reportability.model import (
+    AdversarialFindingReview,
+    Confidence,
+    Eligibility,
+    ReportabilityAssessment,
+    ReviewChallenge,
+    combine_eligibility,
+)
 from core.store import AssetStore
+
+_COMMON_KWARGS = dict(
+    provider="anthropic",
+    model_used="claude-sonnet-5",
+    rules_hash="a" * 64,
+    prompt_version="v2",
+)
 
 
 def test_eligibility_is_exactly_three_values() -> None:
@@ -24,20 +41,79 @@ def test_eligibility_is_exactly_three_values() -> None:
     }
 
 
+def test_confidence_is_exactly_three_values() -> None:
+    assert {member.value for member in Confidence} == {"HIGH", "MEDIUM", "LOW"}
+
+
+def test_review_challenge_is_exactly_three_values() -> None:
+    assert {member.value for member in ReviewChallenge} == {
+        "AGREE",
+        "DISAGREE",
+        "INSUFFICIENT_INFORMATION",
+    }
+
+
+class TestCombineEligibility:
+    def test_agree_preserves_the_primary_verdict(self) -> None:
+        assert (
+            combine_eligibility(Eligibility.ELIGIBLE, ReviewChallenge.AGREE) == Eligibility.ELIGIBLE
+        )
+        assert (
+            combine_eligibility(Eligibility.NOT_ELIGIBLE, ReviewChallenge.AGREE)
+            == Eligibility.NOT_ELIGIBLE
+        )
+
+    def test_disagree_fails_closed_to_uncertain_never_the_reviewers_own_counter_verdict(
+        self,
+    ) -> None:
+        """The fail-closed disagreement policy (design v2): a real
+        disagreement always becomes UNCERTAIN, never the adversarial
+        reviewer's own preferred alternative — this function doesn't even
+        take a counter_eligibility argument, by design, so there is nothing
+        for a "provider preference" or "majority vote" bug to accidentally
+        read."""
+        assert (
+            combine_eligibility(Eligibility.ELIGIBLE, ReviewChallenge.DISAGREE)
+            == Eligibility.UNCERTAIN
+        )
+        assert (
+            combine_eligibility(Eligibility.NOT_ELIGIBLE, ReviewChallenge.DISAGREE)
+            == Eligibility.UNCERTAIN
+        )
+
+    def test_insufficient_information_also_fails_closed_to_uncertain(self) -> None:
+        """A reviewer that could not confirm the primary verdict has not
+        validated it — treated the same as an active disagreement, not the
+        same as silent agreement."""
+        assert (
+            combine_eligibility(Eligibility.ELIGIBLE, ReviewChallenge.INSUFFICIENT_INFORMATION)
+            == Eligibility.UNCERTAIN
+        )
+
+
 def test_assessment_to_dict_round_trips_enum_value() -> None:
     assessment = ReportabilityAssessment(
         finding_id=1,
         eligibility=Eligibility.NOT_ELIGIBLE,
+        final_eligibility=Eligibility.NOT_ELIGIBLE,
         rule_citation="Findings on out-of-scope assets are not eligible.",
         program_rules_artifact="program_rules_snapshot.txt",
-        model_used="claude-sonnet-5",
         citation_grounded=True,
+        grounding_method="exact",
         reasoning="Host is not in the program's scope table.",
+        confidence=Confidence.HIGH,
+        **_COMMON_KWARGS,
     )
     data = assessment.to_dict()
     assert data["eligibility"] == "NOT_ELIGIBLE"
+    assert data["final_eligibility"] == "NOT_ELIGIBLE"
     assert data["source"] == "reportability_agent"
     assert data["citation_grounded"] is True
+    assert data["grounding_method"] == "exact"
+    assert data["confidence"] == "HIGH"
+    assert data["provider"] == "anthropic"
+    assert data["rules_hash"] == "a" * 64
+    assert data["prompt_version"] == "v2"
 
 
 def test_empty_citation_requires_grounded_to_be_none() -> None:
@@ -47,10 +123,11 @@ def test_empty_citation_requires_grounded_to_be_none() -> None:
         ReportabilityAssessment(
             finding_id=1,
             eligibility=Eligibility.UNCERTAIN,
+            final_eligibility=Eligibility.UNCERTAIN,
             rule_citation="",
             program_rules_artifact="rules.txt",
-            model_used="claude-sonnet-5",
             citation_grounded=True,
+            **_COMMON_KWARGS,
         )
 
 
@@ -59,9 +136,10 @@ def test_nonempty_citation_requires_grounded_to_be_set() -> None:
         ReportabilityAssessment(
             finding_id=1,
             eligibility=Eligibility.ELIGIBLE,
+            final_eligibility=Eligibility.ELIGIBLE,
             rule_citation="Critical RCE findings are always eligible.",
             program_rules_artifact="rules.txt",
-            model_used="claude-sonnet-5",
+            **_COMMON_KWARGS,
         )
 
 
@@ -69,25 +147,28 @@ def test_ungrounded_property_is_true_only_when_citation_check_failed() -> None:
     grounded = ReportabilityAssessment(
         finding_id=1,
         eligibility=Eligibility.ELIGIBLE,
+        final_eligibility=Eligibility.ELIGIBLE,
         rule_citation="x",
         program_rules_artifact="rules.txt",
-        model_used="claude-sonnet-5",
         citation_grounded=True,
+        **_COMMON_KWARGS,
     )
     ungrounded = ReportabilityAssessment(
         finding_id=2,
         eligibility=Eligibility.ELIGIBLE,
+        final_eligibility=Eligibility.ELIGIBLE,
         rule_citation="fabricated text",
         program_rules_artifact="rules.txt",
-        model_used="claude-sonnet-5",
         citation_grounded=False,
+        **_COMMON_KWARGS,
     )
     no_citation = ReportabilityAssessment(
         finding_id=3,
         eligibility=Eligibility.UNCERTAIN,
+        final_eligibility=Eligibility.UNCERTAIN,
         rule_citation="",
         program_rules_artifact="rules.txt",
-        model_used="claude-sonnet-5",
+        **_COMMON_KWARGS,
     )
     assert grounded.ungrounded is False
     assert ungrounded.ungrounded is True
@@ -142,28 +223,39 @@ class TestRecordAndReadReportabilityAssessments:
         assessment = ReportabilityAssessment(
             finding_id=finding_id,
             eligibility=Eligibility.NOT_ELIGIBLE,
+            final_eligibility=Eligibility.NOT_ELIGIBLE,
             rule_citation="Findings on out-of-scope assets are not eligible.",
             program_rules_artifact="program_rules_snapshot.txt",
-            model_used="claude-sonnet-5",
             citation_grounded=True,
+            grounding_method="exact",
             reasoning="Host is not in the program's scope table.",
+            confidence=Confidence.HIGH,
+            **_COMMON_KWARGS,
         )
-        store.record_reportability_assessments("run1", [assessment])
+        inserted_ids = store.record_reportability_assessments("run1", [assessment])
+        assert len(inserted_ids) == 1
 
         rows = store.get_reportability_assessments("run1")
         assert len(rows) == 1
         row = rows[0]
+        assert row["id"] == inserted_ids[0]
         assert row["finding_id"] == finding_id
         assert row["eligibility"] == "NOT_ELIGIBLE"
+        assert row["final_eligibility"] == "NOT_ELIGIBLE"
         assert row["citation_grounded"] == 1
+        assert row["grounding_method"] == "exact"
+        assert row["confidence"] == "HIGH"
         assert row["source"] == "reportability_agent"
+        assert row["provider"] == "anthropic"
         assert row["model_used"] == "claude-sonnet-5"
+        assert row["rules_hash"] == "a" * 64
+        assert row["prompt_version"] == "v2"
         assert row["program_rules_artifact"] == "program_rules_snapshot.txt"
         assert row["assessed_at"]
 
     def test_empty_list_is_a_no_op(self, tmp_path: Path) -> None:
         store, _ = _seed_run_and_finding(tmp_path)
-        store.record_reportability_assessments("run1", [])
+        assert store.record_reportability_assessments("run1", []) == []
         assert store.get_reportability_assessments("run1") == []
 
     def test_ungrounded_citation_persists_as_grounded_zero_not_null(self, tmp_path: Path) -> None:
@@ -176,10 +268,11 @@ class TestRecordAndReadReportabilityAssessments:
         assessment = ReportabilityAssessment(
             finding_id=finding_id,
             eligibility=Eligibility.ELIGIBLE,
+            final_eligibility=Eligibility.ELIGIBLE,
             rule_citation="This exact sentence does not appear in the rules file.",
             program_rules_artifact="program_rules_snapshot.txt",
-            model_used="claude-sonnet-5",
             citation_grounded=False,
+            **_COMMON_KWARGS,
         )
         store.record_reportability_assessments("run1", [assessment])
         row = store.get_reportability_assessments("run1")[0]
@@ -193,9 +286,10 @@ class TestRecordAndReadReportabilityAssessments:
         assessment = ReportabilityAssessment(
             finding_id=finding_id,
             eligibility=Eligibility.ELIGIBLE,
+            final_eligibility=Eligibility.ELIGIBLE,
             rule_citation="",
             program_rules_artifact="program_rules_snapshot.txt",
-            model_used="claude-sonnet-5",
+            **_COMMON_KWARGS,
         )
         store.record_reportability_assessments("run1", [assessment])
         with store._connect() as conn:  # noqa: SLF001
@@ -206,3 +300,112 @@ class TestRecordAndReadReportabilityAssessments:
                 ("run1",),
             ).fetchone()
         assert row["host"] == "admin.x.test"
+
+    def test_composite_fk_rejects_a_finding_id_from_a_different_run(self, tmp_path: Path) -> None:
+        """design v2, Section 7: it must be structurally impossible (a
+        SQLite constraint violation, not just an application bug) to
+        attach an assessment to a finding_id that is valid but belongs to
+        a DIFFERENT run than the assessment's own run_id.
+        """
+        store, finding_id_in_run1 = _seed_run_and_finding(tmp_path, run_id="run1")
+        store.create_run(
+            ScanRun(run_id="run2", started_at="2026-01-01T00:00:00Z", targets=["y.test"])
+        )
+        assessment = ReportabilityAssessment(
+            finding_id=finding_id_in_run1,  # real id, but belongs to run1
+            eligibility=Eligibility.ELIGIBLE,
+            final_eligibility=Eligibility.ELIGIBLE,
+            rule_citation="",
+            program_rules_artifact="program_rules_snapshot.txt",
+            **_COMMON_KWARGS,
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            store.record_reportability_assessments("run2", [assessment])
+        # And nothing was left half-written by the failed attempt.
+        assert store.get_reportability_assessments("run2") == []
+
+
+class TestAdversarialFindingReview:
+    def test_to_dict_round_trips_enum_values(self) -> None:
+        review = AdversarialFindingReview(
+            assessment_id=1,
+            finding_id=2,
+            reviewer_provider="openai",
+            reviewer_model="gpt-5.6-terra",
+            challenge=ReviewChallenge.DISAGREE,
+            prompt_version="v2",
+            counter_eligibility=Eligibility.NOT_ELIGIBLE,
+            reasoning="The cited rule doesn't apply to this host.",
+        )
+        data = review.to_dict()
+        assert data["challenge"] == "DISAGREE"
+        assert data["counter_eligibility"] == "NOT_ELIGIBLE"
+
+    def test_counter_eligibility_defaults_to_none(self) -> None:
+        review = AdversarialFindingReview(
+            assessment_id=1,
+            finding_id=2,
+            reviewer_provider="openai",
+            reviewer_model="gpt-5.6-terra",
+            challenge=ReviewChallenge.AGREE,
+            prompt_version="v2",
+        )
+        assert review.to_dict()["counter_eligibility"] is None
+
+
+class TestRecordAndReadAdversarialReviews:
+    def _assessment(self, finding_id: int) -> ReportabilityAssessment:
+        return ReportabilityAssessment(
+            finding_id=finding_id,
+            eligibility=Eligibility.ELIGIBLE,
+            final_eligibility=Eligibility.UNCERTAIN,
+            rule_citation="",
+            program_rules_artifact="program_rules_snapshot.txt",
+            **_COMMON_KWARGS,
+        )
+
+    def test_round_trips_through_sqlite(self, tmp_path: Path) -> None:
+        store, finding_id = _seed_run_and_finding(tmp_path)
+        assessment_id = store.record_reportability_assessments(
+            "run1", [self._assessment(finding_id)]
+        )[0]
+        review = AdversarialFindingReview(
+            assessment_id=assessment_id,
+            finding_id=finding_id,
+            reviewer_provider="openai",
+            reviewer_model="gpt-5.6-terra",
+            challenge=ReviewChallenge.DISAGREE,
+            prompt_version="v2",
+            counter_eligibility=Eligibility.NOT_ELIGIBLE,
+            reasoning="The primary's citation doesn't actually cover this case.",
+        )
+        store.record_reportability_adversarial_reviews("run1", [review])
+
+        rows = store.get_reportability_adversarial_reviews("run1")
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["assessment_id"] == assessment_id
+        assert row["finding_id"] == finding_id
+        assert row["reviewer_provider"] == "openai"
+        assert row["challenge"] == "DISAGREE"
+        assert row["counter_eligibility"] == "NOT_ELIGIBLE"
+        assert row["reviewed_at"]
+
+    def test_composite_fk_rejects_a_finding_id_from_a_different_run(self, tmp_path: Path) -> None:
+        store, finding_id_in_run1 = _seed_run_and_finding(tmp_path, run_id="run1")
+        store.create_run(
+            ScanRun(run_id="run2", started_at="2026-01-01T00:00:00Z", targets=["y.test"])
+        )
+        assessment_id = store.record_reportability_assessments(
+            "run1", [self._assessment(finding_id_in_run1)]
+        )[0]
+        review = AdversarialFindingReview(
+            assessment_id=assessment_id,
+            finding_id=finding_id_in_run1,
+            reviewer_provider="openai",
+            reviewer_model="gpt-5.6-terra",
+            challenge=ReviewChallenge.AGREE,
+            prompt_version="v2",
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            store.record_reportability_adversarial_reviews("run2", [review])
