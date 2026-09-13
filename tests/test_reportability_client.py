@@ -2,8 +2,8 @@
 core/reportability/schema.py (design Part B). The real Anthropic API call
 is mocked in every test here — none of these spend real credits. A
 separate, opt-in live test exists in
-tests/test_reportability_live.py::test_real_api_call_against_stripchat_rules
-for confirming this against the real API by hand.
+tests/test_reportability_live.py for confirming this against the real
+API by hand.
 """
 
 from __future__ import annotations
