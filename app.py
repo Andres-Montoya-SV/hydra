@@ -167,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
         "assess-reportability",
         help=(
             "Assess persisted findings' bounty eligibility against a program's rules text "
-            "via the Claude API — opt-in, spends real API credits, never run by 'run'"
+            "via Claude and/or OpenAI — opt-in, spends real API credits, never run by 'run'"
         ),
     )
     assess_p.add_argument("run_id", help="Run whose findings to assess")
@@ -183,6 +183,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         help="Override REPORTABILITY_MAX_FINDINGS_PER_BATCH for this run",
+    )
+    assess_p.add_argument(
+        "--provider",
+        choices=["anthropic", "openai"],
+        help="Primary provider (default: REPORTABILITY_PROVIDER, itself defaulting to anthropic)",
+    )
+    assess_p.add_argument(
+        "--adversarial-provider",
+        choices=["anthropic", "openai"],
+        help=(
+            "Enable adversarial cross-validation: a second, different provider reviews the "
+            "primary provider's structured verdicts. Any real disagreement is reported as "
+            "UNCERTAIN rather than resolved in either provider's favor. "
+            "(default: REPORTABILITY_ADVERSARIAL_PROVIDER, unset by default = disabled)"
+        ),
+    )
+    assess_p.add_argument(
+        "--allow-fuzzy-grounding",
+        action="store_true",
+        help=(
+            "Allow a citation to be marked grounded via approximate text-similarity matching, "
+            "not just exact/normalized substring matching. Off by default (design v2: this is "
+            "the weakest, most conservative-by-default grounding tier)."
+        ),
     )
     assess_p.add_argument(
         "--yes",
@@ -573,6 +597,9 @@ def main() -> int:
                 host=args.host,
                 limit=args.limit,
                 yes=args.yes,
+                provider=args.provider,
+                adversarial_provider=args.adversarial_provider,
+                allow_fuzzy_grounding=args.allow_fuzzy_grounding,
             )
         return 1
 
