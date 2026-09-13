@@ -291,6 +291,16 @@ class Host:
     cdn_provider: str | None = None
     waf_provider: str | None = None
     dns_resolved: bool = False
+    # True when an HTTP service was captured for this host but no A/AAAA
+    # record ever confirmed it — never merge this into dns_resolved/the
+    # "resolved" count. Confirmed real cause at least once (fishbowlapp.com's
+    # jenkins.api.* siblings, NODATA-only dnsx responses): the confinement
+    # proxy denies the request for reason "dns_resolution_failed" and writes
+    # its own synthetic "403 Forbidden" (core/collection/crawler_proxy.py)
+    # with zero real network activity — httpx logs that exactly like a
+    # genuine response. Set by HostRegistry.finalize() after all parsers
+    # have merged, not by any single parser in isolation.
+    dns_unconfirmed_http_response: bool = False
     dns_wildcard: bool = False
     # True when a pre-scan canary probe (arbitrary high ports with no
     # standard/real-world service association) came back "open", indicating
@@ -400,6 +410,8 @@ class Host:
 
         if other.dns_resolved:
             self.dns_resolved = True
+        if other.dns_unconfirmed_http_response:
+            self.dns_unconfirmed_http_response = True
         if other.dns_wildcard:
             self.dns_wildcard = True
         if other.tarpit_suspected:
@@ -505,6 +517,7 @@ class Host:
             "cdn_provider": self.cdn_provider,
             "waf_provider": self.waf_provider,
             "dns_resolved": self.dns_resolved,
+            "dns_unconfirmed_http_response": self.dns_unconfirmed_http_response,
             "dns_wildcard": self.dns_wildcard,
             "tarpit_suspected": self.tarpit_suspected,
             "tarpit_canary_ports": self.tarpit_canary_ports,

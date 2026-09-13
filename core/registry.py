@@ -47,6 +47,7 @@ class HostRegistry(AssetCollection):
         """Run intelligence pipeline on all hosts."""
         hosts = self.to_dict()
         self._refresh_source_correlation()
+        self._flag_unconfirmed_dns_http_responses(hosts)
         result = self._engine.process(hosts)
         self.clusters = result.clusters
         self.graph = result.graph
@@ -80,3 +81,39 @@ class HostRegistry(AssetCollection):
                 correlated[host.domain] = discovery_sources
         self.source_counts = source_counts
         self.correlated_hosts = correlated
+
+    def _flag_unconfirmed_dns_http_responses(self, hosts: dict[str, Host]) -> None:
+        """A host with an HTTP service but no A/AAAA record ever confirmed by
+        DnsxParser is not a normal live host — it must never be counted
+        alongside genuinely resolved hosts.
+
+        Confirmed root cause at least once (fishbowlapp.com's
+        `jenkins.api.*` siblings): dnsx returned NODATA (NOERROR with only an
+        SOA record, no A/AAAA) for these names — real, independently
+        verified with `dig`/`curl` hours later, never a transient DNS
+        change. Yet httpx.json still carried a `403` for each of them. The
+        confinement proxy's own audit trail for that exact run
+        (`metadata.json`) shows why: `decision: DENY`, `reason:
+        dns_resolution_failed`, `network_attempted: false`,
+        `network_completed: false` — the proxy never even tried to connect
+        anywhere. It denies locally and writes back its own synthetic
+        `HTTP/1.1 403 Forbidden\\r\\nContent-Length: 0\\r\\n...`
+        (`core/collection/crawler_proxy.py`), which httpx then logs
+        indistinguishably from a genuine server response (matching signature:
+        ~2-3ms "network" time, a single `content-length: 0` header, empty
+        body — no real server, including a Cloudflare error page, responds
+        that fast with that little).
+
+        This is run only after every parser has merged (`HostRegistry.
+        finalize()`), not inside any single parser — `host.dns_resolved`
+        must reflect every source's opinion before this check is meaningful.
+        """
+        for host in hosts.values():
+            if host.http_services and not host.dns_resolved:
+                host.dns_unconfirmed_http_response = True
+                self.warnings.append(
+                    f"{host.domain}: HTTP response captured with no confirmed A/AAAA "
+                    "record — likely a synthetic local proxy-denial response "
+                    "(dns_resolution_failed), not a real connection to this host; "
+                    "excluded from the confirmed-resolved count"
+                )

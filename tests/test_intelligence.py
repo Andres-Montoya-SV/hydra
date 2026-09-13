@@ -51,6 +51,48 @@ class TestParsers:
         assert hosts[0].http_services[0].technologies[0].name == "nginx"
         assert hosts[0].http_services[0].technologies[0].confidence == 95
 
+    def test_httpx_parser_does_not_assert_dns_resolved(self, tmp_path: Path) -> None:
+        """dns_resolved is DnsxParser's fact to assert, not HttpxParser's —
+        an httpx.json record alone (no `a`/`ip` field, e.g. under
+        STRICT_OPSEC, or the real fishbowlapp.com case where the confinement
+        proxy answers a DNS-resolution failure with its own synthetic 403)
+        does not confirm DNS resolution. Regression for a real bug: this
+        used to unconditionally set dns_resolved=True for every record."""
+        httpx_json = tmp_path / "httpx.json"
+        record = {
+            "url": "http://jenkins.api.fishbowlapp.com",
+            "input": "jenkins.api.fishbowlapp.com",
+            "host": "jenkins.api.fishbowlapp.com",
+            "status_code": 403,
+            "failed": False,
+        }
+        httpx_json.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        hosts, _ = HttpxParser().parse(tmp_path)
+        assert len(hosts) == 1
+        assert hosts[0].dns_resolved is False
+
+    def test_dnsx_parser_nodata_soa_only_is_not_dns_resolved(self, tmp_path: Path) -> None:
+        """The real fishbowlapp.com case: NOERROR with only an SOA record
+        (NODATA) must not set dns_resolved — the zone exists, this specific
+        name does not have an A/AAAA record."""
+        dnsx_json = tmp_path / "dnsx_records.jsonl"
+        record = {
+            "host": "jenkins.api.fishbowlapp.com",
+            "soa": [{"name": "fishbowlapp.com", "ns": "irma.ns.cloudflare.com"}],
+            "status_code": "NOERROR",
+        }
+        dnsx_json.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        hosts, _ = DnsxParser().parse(tmp_path)
+        assert len(hosts) == 1
+        assert hosts[0].dns_resolved is False
+
+    def test_dnsx_parser_real_a_record_is_dns_resolved(self, tmp_path: Path) -> None:
+        dnsx_json = tmp_path / "dnsx_records.jsonl"
+        record = {"host": "api.fishbowlapp.com", "a": ["104.18.32.42"], "status_code": "NOERROR"}
+        dnsx_json.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        hosts, _ = DnsxParser().parse(tmp_path)
+        assert hosts[0].dns_resolved is True
+
     def test_dnsx_parser_enriches_extended_records(self, tmp_path: Path) -> None:
         dnsx_json = tmp_path / "dnsx_records.jsonl"
         record = {
@@ -112,6 +154,69 @@ class TestHostRegistry:
         assert host is not None
         assert host.dns_resolved
         assert len(host.provenance) == 2
+
+    def test_finalize_flags_http_response_without_confirmed_dns(self, tmp_path: Path) -> None:
+        """End-to-end regression for the real fishbowlapp.com case: dnsx
+        returns NODATA (SOA only) for jenkins.api.fishbowlapp.com, yet
+        httpx.json still has a 403 record for it (the confinement proxy's
+        own synthetic deny response — core/collection/crawler_proxy.py).
+        After ingesting both and finalizing, this host must never be
+        dns_resolved, and must be flagged distinctly rather than silently
+        counted as an ordinary alive host."""
+        (tmp_path / "dnsx_records.jsonl").write_text(
+            json.dumps(
+                {
+                    "host": "jenkins.api.fishbowlapp.com",
+                    "soa": [{"name": "fishbowlapp.com", "ns": "irma.ns.cloudflare.com"}],
+                    "status_code": "NOERROR",
+                }
+            )
+            + "\n"
+            + json.dumps({"host": "api.fishbowlapp.com", "a": ["104.18.32.42"]})
+            + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "httpx.json").write_text(
+            json.dumps(
+                {
+                    "input": "jenkins.api.fishbowlapp.com",
+                    "host": "jenkins.api.fishbowlapp.com",
+                    "url": "http://jenkins.api.fishbowlapp.com",
+                    "status_code": 403,
+                    "failed": False,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "input": "api.fishbowlapp.com",
+                    "host": "api.fishbowlapp.com",
+                    "url": "http://api.fishbowlapp.com",
+                    "a": ["104.18.32.42"],
+                    "status_code": 200,
+                    "failed": False,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        registry = HostRegistry("test", tmp_path)
+        registry.ingest_all(["dnsx", "httpx"])
+        hosts = registry.finalize()
+
+        jenkins = hosts["jenkins.api.fishbowlapp.com"]
+        assert jenkins.dns_resolved is False
+        assert jenkins.http_services  # httpx did produce a record for it
+        assert jenkins.dns_unconfirmed_http_response is True
+        assert any(
+            "jenkins.api.fishbowlapp.com" in w and "no confirmed A/AAAA" in w
+            for w in registry.warnings
+        )
+
+        api = hosts["api.fishbowlapp.com"]
+        assert api.dns_resolved is True
+        assert api.dns_unconfirmed_http_response is False
 
     def test_cross_source_correlation_dedupes_hosts(self, tmp_path: Path) -> None:
         (tmp_path / "subfinder.txt").write_text(

@@ -75,8 +75,20 @@ class DnsxPlugin(BaseToolPlugin):
         # dnsx writes JSON to -o; don't capture stdout
         result = await self._execute_self_output(context, args, records_path, allow_empty=True)
 
-        # Build resolved.txt (simple hostname list) from JSON output
+        # Build resolved.txt (simple hostname list) from JSON output. A host
+        # only counts as resolved when it has a real A/AAAA record — dnsx
+        # returns NOERROR with only an SOA record (NODATA: the zone exists,
+        # this specific name does not have the requested record type) for a
+        # name that never actually resolves, and status_code alone cannot
+        # tell the two apart. Confirmed against a real case
+        # (fishbowlapp.com's jenkins.api.* siblings, tests/test_dnsx.py):
+        # treating that as "resolved" fed httpx a hostname with no DNS at
+        # all, which the confinement proxy then denies for
+        # "dns_resolution_failed" and answers with its own synthetic 403 —
+        # indistinguishable downstream from a real live host unless this
+        # gate exists.
         resolved_hosts: list[str] = []
+        parsed_any_json_line = False
         if records_path.exists():
             for line in records_path.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = line.strip()
@@ -84,21 +96,32 @@ class DnsxPlugin(BaseToolPlugin):
                     continue
                 try:
                     rec = json.loads(line)
+                    parsed_any_json_line = True
                     host = rec.get("host", "").strip().rstrip(".")
-                    if host:
+                    has_address = bool(rec.get("a")) or bool(rec.get("aaaa"))
+                    if host and has_address:
                         resolved_hosts.append(host)
                 except (json.JSONDecodeError, KeyError):
-                    # Fallback: treat non-JSON line as plain hostname
+                    # Fallback: treat non-JSON line as plain hostname. This
+                    # legacy/plain dnsx output format carries no record data
+                    # to check an address against — it exists only because a
+                    # host successfully resolved is exactly what dnsx's plain
+                    # (non-JSON) mode prints one per line.
                     domain = line.split()[0].rstrip(".")
                     if domain:
                         resolved_hosts.append(domain)
 
-        if not resolved_hosts and result.success:
+        if not resolved_hosts and not parsed_any_json_line and result.success:
             # dnsx ran successfully but wrote a non-JSON/legacy format we didn't
             # recognize — fall back to treating input as resolved. Only do this
-            # when the tool actually succeeded; if it crashed, timed out, or the
-            # binary was missing, resolved_hosts must stay empty so the failure
-            # is visible instead of being silently treated as "everything resolved".
+            # when nothing on the page parsed as JSON at all (a genuine format
+            # we don't understand), never merely because every real JSON record
+            # turned out to be NODATA (SOA-only, no a/aaaa) — that is a valid,
+            # already-parsed "nothing resolved" outcome, not a parse failure,
+            # and must not be silently reinterpreted as "everything resolved".
+            # If the tool crashed, timed out, or the binary was missing,
+            # resolved_hosts must stay empty so the failure is visible instead
+            # of being silently treated as "everything resolved".
             resolved_hosts = read_lines(input_path)
 
         from core.intel.scope import filter_authorized_indicators, require_collection_scope
