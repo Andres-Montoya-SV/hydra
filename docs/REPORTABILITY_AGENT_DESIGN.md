@@ -458,31 +458,122 @@ Before the real assessment call, the command:
 neither should ever silently become a hard dependency of `python app.py
 run`.
 
-## 6. What Part 2 (implementation) would build, in order
+## 6. What Part 2 (implementation) built, in order
 
-Not committed here — recorded so review can weigh in before it starts,
-same convention as the verification agent's own Part 1 → Part 2 split:
+**Status: implemented** (branch `feat/reportability-agent-design`, commits
+after this document's initial approval). Each step below links to the
+test(s) proving it, per this project's standing practice.
 
-1. `reportability_assessments` table + `Settings.anthropic_api_key`/
+1. **Done.** `reportability_assessments` table + `Settings.anthropic_api_key`/
    `anthropic_model`/`reportability_max_findings_per_batch` +
-   `.env.example` block (Part B.1, C.2, D.2).
-2. `is_citation_grounded` in `core/verification/grounding.py` (Part C.3),
-   with its threshold justified against real rules text from at least one
-   of the five programs already reviewed by hand, plus a fabricated-
-   citation test proving it fails at the chosen threshold.
-3. `core/reportability/` package: the Claude API client wrapper, prompt
-   construction, and structured-output schema (Part B).
-4. `app.py assess-reportability` command: filtering, the batch-ceiling
-   refusal, the token-count/cost estimate, and the interactive
-   confirmation gate (Part D).
-5. End-to-end verification against at least one real program's rules text
-   and real persisted findings from an actual prior run — not a synthetic
-   fixture alone — confirming a real `ELIGIBLE`/`NOT_ELIGIBLE` call comes
-   back with a citation that greps clean against the snapshotted rules
-   file, and confirming a deliberately corrupted/fabricated citation is
-   correctly caught and marked `UNGROUNDED`.
+   `config/.env.example` block (Part B.1, C.2, D.2). `core/reportability/model.py`
+   (`Eligibility`, `ReportabilityAssessment`) was built alongside this step
+   rather than deferred to step 3 as originally listed here — the SQL
+   layer needed the enum/dataclass to be testable at all, the same way the
+   verification agent's own step 1 bundled its table with its model.py.
+   Proven by `tests/test_reportability_model.py` (12 tests) — the
+   three-value enum guard, the `__post_init__` invariant that makes
+   "no citation offered" and "a citation failed to verify" impossible to
+   conflate, and the full SQLite round-trip including the real foreign
+   key to `findings.id`.
+2. **Done.** `is_citation_grounded` in `core/verification/grounding.py`
+   (Part C.3). The threshold in this document's original draft (0.92,
+   proposed as a plausible placeholder) turned out to be too loose once
+   measured against real text — real `tests/fixtures/stripchat_rules.txt`
+   sentences with a single word negated ("...is prohibited." → "...is
+   permitted.") scored as high as 0.975 by raw character similarity,
+   despite inverting the sentence's meaning. Raised to 0.98, and — more
+   importantly — restructured so whitespace/case/quote-style variation is
+   absorbed by an exact match on *normalized* text (a separate, still-
+   zero-fuzziness step) before the ratio-based fallback ever runs, so that
+   fallback only ever has to cover genuine single-character-level slips,
+   not the noise that made 0.92 unsafe in the first place. Proven by
+   `tests/test_verification_grounding.py::TestIsCitationGroundedAgainstRealStripchatRules`
+   (13 tests, all against the real fixture): exact match, two
+   normalization cases, the one legitimate fuzzy-match case, two
+   adversarial negation-flip rejections at the exact ratios that motivated
+   raising the threshold, a dropped-word rejection, and the fabricated-
+   citation-with-no-real-counterpart rejection.
+3. **Done.** `core/reportability/` package (Part B): `schema.py`
+   (`FindingAssessment`, `ReportabilityBatchResult`), `prompt.py`
+   (`SYSTEM_PROMPT`, `build_user_message`), `client.py`
+   (`ReportabilityClient`, `ReportabilityAPIError`). Built only after
+   independently re-verifying the request shape against
+   `platform.claude.com`'s current docs and the real installed
+   `anthropic==1.5.0` SDK source (`Messages.parse`/`Messages.count_tokens`)
+   — not this document's original, unverified draft. Finding: everything
+   about the request shape (`output_config.format`, `thinking: {"type":
+   "adaptive"}`, the free `count_tokens` endpoint) was already correct;
+   only the Haiku model ID in this document's own model table was wrong
+   (`claude-haiku-4-5` is an alias, not the real dated snapshot
+   `claude-haiku-4-5-20251001` — corrected in Part B.3 above). Proven by
+   `tests/test_reportability_client.py` (14 tests, the real Anthropic API
+   call mocked in every one): the prompt actually contains its literal-
+   quote/empty-citation/scope-and-report non-negotiables, `assess_batch`
+   passes the right thinking/effort/schema and returns the parsed output
+   unchanged, a `None` `parsed_output` raises rather than silently
+   succeeding, and every mapped exception type (constructed as the real
+   SDK classes) produces the right message.
+4. **Done.** `python app.py assess-reportability` command (Part D):
+   `--severity`/`--host`/`--limit` filtering, the batch-ceiling refusal,
+   the real `count_tokens`-based cost estimate, and the interactive
+   confirmation gate (fails closed on non-interactive stdin without
+   `--yes`, mirroring `app.py::_external_mode_preflight`'s existing
+   pattern exactly). Proven by `tests/test_reportability_cli.py`
+   (17 tests): every failure mode fails clean and specific (missing key,
+   missing database/run, empty rules file), the ceiling refuses on both
+   the configured default and an explicit `--limit` and never truncates
+   silently, the confirmation gate's fail-closed/`--yes`-bypass/decline
+   paths, a hallucinated `finding_id` is discarded with a warning and
+   never persisted, the rules snapshot is written verbatim only after a
+   successful call, and — the test this whole system is built around — a
+   fabricated citation is persisted as ungrounded *and* printed as a
+   visible warning with its full text, never silently accepted.
+5. **Done, with an honest limitation.** No `ANTHROPIC_API_KEY` was
+   available in the implementation environment (checked directly — shell
+   env, `.env`, `config/.env`, all unset — not assumed). Rather than
+   fabricate a "verified live" claim, the same opt-in skip pattern this
+   project already uses for real-binary confinement tests
+   (`shutil.which(...)`/`pytest.importorskip(...)` in
+   `tests/test_*_confinement_live.py`) was applied to a real credential
+   instead: `tests/test_reportability_live.py` skips cleanly without a
+   key and, when a real key is present, drives a real persisted finding
+   through the real `cmd_assess_reportability` against the real, full
+   Stripchat rules text end to end. What this document's author *did*
+   confirm directly, honestly labeled as such: an end-to-end run through
+   the real `cmd_assess_reportability` code path — real persisted
+   `Host`/`Finding` rows, the real, full rules fixture, the real
+   `is_citation_grounded` check, the real batch-ceiling/cost-estimate/
+   confirmation/snapshot logic — with *only* the Anthropic network call
+   itself mocked, proving one grounded real citation and one deliberately
+   fabricated citation both resolve correctly (`citation_grounded: 1`
+   and a clean grep of the snapshot for the first; `citation_grounded: 0`
+   and a visible operator warning, absent from the snapshot on grep, for
+   the second). This is not the same claim as a verified live API
+   response and was not presented as one.
+
+### Honest strength assessment
+
+- **Strongest**: `is_citation_grounded`'s threshold and every adversarial
+  case it rejects — measured against real program rules text, not
+  invented numbers (step 2). The fail-closed batch ceiling and
+  confirmation gate — directly exercised, no API involved at all (step 4).
+- **Solid but network-mocked**: the Claude API request/response shape
+  itself — verified against current, real documentation and the real SDK
+  source, and exercised end-to-end with the network boundary mocked, but
+  never against a real response from the model (steps 3 and 5).
+- **Weakest, by necessity, not by choice**: whether Claude *itself*
+  reliably follows the verbatim-quote instruction in practice, across a
+  variety of real program rules texts and finding shapes — that can only
+  be learned by actually running this against the real API on real runs,
+  which requires `ANTHROPIC_API_KEY` and did not happen in this
+  environment. `tests/test_reportability_live.py` is what to run, and
+  what its own first real result should be sanity-checked against, once a
+  key is available.
 
 ## 7. Commit scope
 
-This document only. No table migration, no `Settings` field, no CLI
-command, no Claude API call implemented in this part.
+Part 2 implemented across incremental commits on
+`feat/reportability-agent-design`, one per numbered step above. Not
+merged — left for review via the project's own process (clone, run tests
+independently, verify, then approve the merge).
