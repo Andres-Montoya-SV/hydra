@@ -23,6 +23,10 @@ from utils.security import (
 )
 
 _VALID_OUTPUT_FORMATS = frozenset({"json", "csv", "txt"})
+# Mirrors core.reportability.provider.SUPPORTED_PROVIDERS — duplicated as a
+# plain constant rather than imported so config/ never depends on core/
+# (the reverse of every other dependency direction in this project).
+_VALID_REPORTABILITY_PROVIDERS = frozenset({"anthropic", "openai"})
 _BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE = frozenset({"0", "false", "no", "off", ""})
 
@@ -352,6 +356,28 @@ class Settings:
     # Optional, additive passive-DNS provider — Mnemonic (default) needs no
     # key; SecurityTrails is only queried when this is set.
     securitytrails_api_key: str | None = None
+    # Reportability agent (docs/REPORTABILITY_AGENT_DESIGN.md) — opt-in,
+    # same pattern as urlhaus_api_key/securitytrails_api_key. Only consulted
+    # by the standalone `assess-reportability` command, never by `run`.
+    anthropic_api_key: str | None = None
+    # Overridable per program — see design doc Part B.3 for why
+    # claude-sonnet-5 is the default rather than a larger/costlier model.
+    anthropic_model: str = "claude-sonnet-5"
+    # v2: OpenAI as the second supported provider, same opt-in pattern.
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-5.6-terra"
+    # Which provider assess-reportability uses by default; --provider
+    # overrides this per invocation. Anthropic remains the default since
+    # it's the provider this whole feature was originally built and
+    # verified against (design Part B).
+    reportability_provider: str = "anthropic"
+    # Unset by default: adversarial cross-validation is opt-in, not
+    # automatic, since it doubles API spend for every assessment run.
+    reportability_adversarial_provider: str | None = None
+    # Hard ceiling on findings assessed in one assess-reportability pass —
+    # exceeding it refuses the run outright (never silently truncates); see
+    # design doc Part D.2.
+    reportability_max_findings_per_batch: int = 50
 
     # Bug bounty headers (stored separately; never logged)
     custom_http_headers: dict[str, str] = field(default_factory=dict)
@@ -641,6 +667,20 @@ class Settings:
             external_target_mode=_bool(os.getenv("EXTERNAL_TARGET_MODE"), False),
             urlhaus_api_key=os.getenv("URLHAUS_API_KEY", "").strip() or None,
             securitytrails_api_key=os.getenv("SECURITYTRAILS_API_KEY", "").strip() or None,
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip() or None,
+            anthropic_model=os.getenv("ANTHROPIC_MODEL", "").strip() or "claude-sonnet-5",
+            openai_api_key=os.getenv("OPENAI_API_KEY", "").strip() or None,
+            openai_model=os.getenv("OPENAI_MODEL", "").strip() or "gpt-5.6-terra",
+            reportability_provider=os.getenv("REPORTABILITY_PROVIDER", "").strip() or "anthropic",
+            reportability_adversarial_provider=(
+                os.getenv("REPORTABILITY_ADVERSARIAL_PROVIDER", "").strip() or None
+            ),
+            reportability_max_findings_per_batch=_int(
+                os.getenv("REPORTABILITY_MAX_FINDINGS_PER_BATCH"),
+                50,
+                "REPORTABILITY_MAX_FINDINGS_PER_BATCH",
+                maximum=1000,
+            ),
             custom_http_headers=_parse_headers(os.getenv("HTTP_CUSTOM_HEADERS")),
             x_hackerone_researcher=_optional_researcher(
                 os.getenv("X_HACKERONE_RESEARCHER", "").strip()
@@ -675,6 +715,19 @@ class Settings:
 
         if self.default_output_format not in _VALID_OUTPUT_FORMATS:
             errors.append(f"DEFAULT_OUTPUT_FORMAT must be one of {sorted(_VALID_OUTPUT_FORMATS)}")
+
+        if self.reportability_provider not in _VALID_REPORTABILITY_PROVIDERS:
+            errors.append(
+                f"REPORTABILITY_PROVIDER must be one of {sorted(_VALID_REPORTABILITY_PROVIDERS)}"
+            )
+        if (
+            self.reportability_adversarial_provider is not None
+            and self.reportability_adversarial_provider not in _VALID_REPORTABILITY_PROVIDERS
+        ):
+            errors.append(
+                "REPORTABILITY_ADVERSARIAL_PROVIDER must be one of "
+                f"{sorted(_VALID_REPORTABILITY_PROVIDERS)}"
+            )
 
         if self.strict_opsec and not self.outbound_proxy_url:
             errors.append(
@@ -959,6 +1012,13 @@ class Settings:
             "has_scope_file": self.scope_file is not None,
             "has_wpscan_token": self.wpscan_api_token is not None,
             "has_securitytrails_key": self.securitytrails_api_key is not None,
+            "has_anthropic_key": self.anthropic_api_key is not None,
+            "anthropic_model": self.anthropic_model,
+            "has_openai_key": self.openai_api_key is not None,
+            "openai_model": self.openai_model,
+            "reportability_provider": self.reportability_provider,
+            "reportability_adversarial_provider": self.reportability_adversarial_provider,
+            "reportability_max_findings_per_batch": self.reportability_max_findings_per_batch,
             "max_discovery_depth": self.max_discovery_depth,
             "enable_followup_collection": self.enable_followup_collection,
             "cloud_bucket_enum_authorize_derived": self.cloud_bucket_enum_authorize_derived,

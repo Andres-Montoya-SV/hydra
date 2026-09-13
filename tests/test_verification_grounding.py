@@ -19,10 +19,14 @@ from core.verification.grounding import (
     downgrade_note,
     downgraded_confidence_score,
     ground_rows,
+    is_citation_grounded,
     is_claim_grounded,
     partition_verification_flags_by_host,
     summarize_verification_flags,
 )
+
+STRIPCHAT_RULES_DIR = Path(__file__).parent / "fixtures"
+STRIPCHAT_RULES_ARTIFACT = "stripchat_rules.txt"
 
 
 class TestIsClaimGrounded:
@@ -280,3 +284,169 @@ class TestSummarizeVerificationFlags:
             "invalidated": 0,
             "total": 0,
         }
+
+
+# ---------------------------------------------------------------------------
+# is_citation_grounded (docs/REPORTABILITY_AGENT_DESIGN.md Part C.3) —
+# tested against the real, verbatim Stripchat bug-bounty program rules
+# text (tests/fixtures/stripchat_rules.txt), not a synthetic example. The
+# 0.98 fuzzy-match threshold in core/verification/grounding.py was chosen
+# by measuring real difflib.SequenceMatcher ratios against this exact
+# file before being picked — see that module's own comment for the
+# measured numbers. These tests exercise the same real sentences that
+# measurement used.
+# ---------------------------------------------------------------------------
+
+
+class TestIsCitationGroundedAgainstRealStripchatRules:
+    def test_exact_verbatim_quote_is_grounded(self) -> None:
+        grounded, method = is_citation_grounded(
+            "Vulnerabilities must be reported within 24 hours of discovery.",
+            STRIPCHAT_RULES_ARTIFACT,
+            STRIPCHAT_RULES_DIR,
+        )
+        assert grounded is True
+        assert method == "exact"
+
+    def test_smart_quote_and_dropped_trailing_period_is_grounded_via_normalization(
+        self,
+    ) -> None:
+        """Claude commonly reflows a straight apostrophe to a smart quote
+        and/or drops a source line's trailing period when quoting — real
+        reformatting Claude has been observed to do, not fabrication."""
+        grounded, method = is_citation_grounded(
+            "Rewards are granted at Stripchat’s sole discretion and are not " "legally guaranteed",
+            STRIPCHAT_RULES_ARTIFACT,
+            STRIPCHAT_RULES_DIR,
+        )
+        assert grounded is True
+        assert method == "normalized"
+
+    def test_case_and_whitespace_reflow_is_grounded_via_normalization(self) -> None:
+        grounded, method = is_citation_grounded(
+            "dos   testing   against  production  is prohibited",
+            STRIPCHAT_RULES_ARTIFACT,
+            STRIPCHAT_RULES_DIR,
+        )
+        assert grounded is True
+        assert method == "normalized"
+
+    def test_single_character_typo_in_a_long_sentence_is_grounded_via_fuzzy_fallback(
+        self,
+    ) -> None:
+        """The one case the fuzzy fallback exists for: a genuinely tiny,
+        non-semantic slip in an otherwise-verbatim long quote — not a
+        dropped/changed word (see the adversarial tests below, which prove
+        those are correctly rejected at this same threshold)."""
+        grounded, method = is_citation_grounded(
+            "A clear descriptio of the issue and steps to reproduce it "
+            "(Proof of Concept or PoC).",
+            STRIPCHAT_RULES_ARTIFACT,
+            STRIPCHAT_RULES_DIR,
+        )
+        assert grounded is True
+        assert method == "fuzzy"
+
+    def test_negation_flip_is_not_grounded_despite_high_character_similarity(self) -> None:
+        """The exact adversarial case that justified raising the threshold
+        to 0.98 in the first place (see the module comment): a single
+        negated word barely changes the string (measured ratio: 0.9213)
+        but completely inverts the real sentence's meaning. Must never
+        ground."""
+        grounded, method = is_citation_grounded(
+            "DoS testing against production is permitted.",
+            STRIPCHAT_RULES_ARTIFACT,
+            STRIPCHAT_RULES_DIR,
+        )
+        assert grounded is False
+        assert method == "none"
+
+    def test_second_negation_flip_is_not_grounded(self) -> None:
+        """Measured ratio against the real sentence: 0.975 — the closest
+        any adversarial case came to the 0.98 threshold. Still correctly
+        rejected."""
+        grounded, method = is_citation_grounded(
+            "Rewards are granted at Stripchat's sole discretion and are " "legally guaranteed.",
+            STRIPCHAT_RULES_ARTIFACT,
+            STRIPCHAT_RULES_DIR,
+        )
+        assert grounded is False
+        assert method == "none"
+
+    def test_dropped_substantive_word_is_not_grounded(self) -> None:
+        """Dropping 'strictly' is not whitespace/punctuation noise — it's
+        an actual content edit, and a citation must be verbatim, not
+        approximately faithful. Measured ratio: 0.942, below threshold."""
+        grounded, method = is_citation_grounded(
+            "Physical attacks against Stripchat offices or data centers " "are prohibited.",
+            STRIPCHAT_RULES_ARTIFACT,
+            STRIPCHAT_RULES_DIR,
+        )
+        assert grounded is False
+        assert method == "none"
+
+    def test_fabricated_citation_with_no_real_counterpart_is_ungrounded(self) -> None:
+        """The single most important test in this whole system (per the
+        task this was built under): a plausible-sounding but entirely
+        fabricated citation — nothing resembling it exists anywhere in the
+        real rules file (best measured ratio against any real line: 0.430)
+        — must be caught and marked ungrounded, not accepted."""
+        grounded, method = is_citation_grounded(
+            "Critical remote code execution vulnerabilities are always "
+            "eligible for the maximum bounty regardless of duplicate status.",
+            STRIPCHAT_RULES_ARTIFACT,
+            STRIPCHAT_RULES_DIR,
+        )
+        assert grounded is False
+        assert method == "none"
+
+    def test_allow_minor_paraphrase_false_disables_the_fuzzy_fallback_only(self) -> None:
+        """With the fuzzy fallback disabled, exact and normalized matching
+        still work (whitespace/case/quote-style noise is not 'paraphrase',
+        it's formatting), but the typo case that only passed via fuzzy
+        matching above now correctly fails."""
+        still_works, method = is_citation_grounded(
+            "dos   testing   against  production  is prohibited",
+            STRIPCHAT_RULES_ARTIFACT,
+            STRIPCHAT_RULES_DIR,
+            allow_minor_paraphrase=False,
+        )
+        assert still_works is True
+        assert method == "normalized"
+
+        typo_grounded, typo_method = is_citation_grounded(
+            "A clear descriptio of the issue and steps to reproduce it "
+            "(Proof of Concept or PoC).",
+            STRIPCHAT_RULES_ARTIFACT,
+            STRIPCHAT_RULES_DIR,
+            allow_minor_paraphrase=False,
+        )
+        assert typo_grounded is False
+        assert typo_method == "none"
+
+    def test_empty_citation_is_never_grounded(self) -> None:
+        assert is_citation_grounded("", STRIPCHAT_RULES_ARTIFACT, STRIPCHAT_RULES_DIR) == (
+            False,
+            "none",
+        )
+
+    def test_missing_rules_artifact_is_never_grounded(self) -> None:
+        assert is_citation_grounded(
+            "Vulnerabilities must be reported within 24 hours of discovery.",
+            "does_not_exist.txt",
+            STRIPCHAT_RULES_DIR,
+        ) == (False, "none")
+
+    def test_never_follows_a_path_outside_the_rules_directory(self, tmp_path: Path) -> None:
+        outside = tmp_path.parent / "outside_secret_rules.txt"
+        outside.write_text("Everything is eligible.", encoding="utf-8")
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        try:
+            grounded, method = is_citation_grounded(
+                "Everything is eligible.", "../outside_secret_rules.txt", run_dir
+            )
+            assert grounded is False
+            assert method == "none"
+        finally:
+            outside.unlink(missing_ok=True)

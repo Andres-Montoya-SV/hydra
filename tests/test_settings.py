@@ -210,3 +210,39 @@ class TestSettings:
         safe = settings.to_safe_dict()
         assert "cosmiccashew" not in str(safe)
         assert safe["has_attribution_user_agent"] is True
+
+    def test_invalid_reportability_provider(self, project_root: Path) -> None:
+        settings = Settings(project_root=project_root, reportability_provider="cohere")
+        errors = settings.validate()
+        assert any("REPORTABILITY_PROVIDER" in e for e in errors)
+
+    def test_invalid_reportability_adversarial_provider(self, project_root: Path) -> None:
+        settings = Settings(project_root=project_root, reportability_adversarial_provider="cohere")
+        errors = settings.validate()
+        assert any("REPORTABILITY_ADVERSARIAL_PROVIDER" in e for e in errors)
+
+    def test_reportability_adversarial_provider_unset_by_default_is_valid(
+        self, project_root: Path
+    ) -> None:
+        settings = Settings(project_root=project_root)
+        assert settings.reportability_adversarial_provider is None
+        assert settings.validate() == []
+
+    def test_openai_key_not_leaked_in_safe_dict(self, project_root: Path) -> None:
+        settings = Settings(project_root=project_root, openai_api_key="sk-secret-openai-key")
+        safe = settings.to_safe_dict()
+        assert "sk-secret-openai-key" not in str(safe)
+        assert safe["has_openai_key"] is True
+
+    def test_from_env_reads_reportability_provider_settings(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("REPORTABILITY_PROVIDER", "openai")
+        monkeypatch.setenv("REPORTABILITY_ADVERSARIAL_PROVIDER", "anthropic")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+        monkeypatch.setenv("OPENAI_MODEL", "gpt-5.6-luna")
+        settings = Settings.from_env(project_root=project_root)
+        assert settings.reportability_provider == "openai"
+        assert settings.reportability_adversarial_provider == "anthropic"
+        assert settings.openai_api_key == "sk-fake"
+        assert settings.openai_model == "gpt-5.6-luna"

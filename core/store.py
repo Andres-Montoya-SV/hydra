@@ -196,6 +196,14 @@ CREATE TABLE IF NOT EXISTS findings (
     confidence_score INTEGER DEFAULT 80,
     discovered_at TEXT,
     UNIQUE(run_id, host, template_id, url),
+    -- (id, run_id) is redundant with id alone being unique, but SQLite
+    -- requires an explicit UNIQUE index over the exact column tuple a
+    -- composite FK references (reportability_assessments,
+    -- reportability_adversarial_reviews below) — this is what makes it
+    -- structurally impossible, at the database level, to attach a
+    -- reportability assessment for finding_id=N to any run_id other than
+    -- the run that finding actually belongs to.
+    UNIQUE(id, run_id),
     FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 
@@ -239,6 +247,82 @@ CREATE TABLE IF NOT EXISTS verification_flags (
 );
 CREATE INDEX IF NOT EXISTS idx_verification_flags_run ON verification_flags(run_id);
 CREATE INDEX IF NOT EXISTS idx_verification_flags_related ON verification_flags(related_table, related_id);
+
+-- Reportability agent (docs/REPORTABILITY_AGENT_DESIGN.md): a per-finding
+-- eligibility annotation against a program's own natural-language rules
+-- text, produced by the Claude API (the one place in this project an LLM
+-- makes the primary judgment, not a convenience — see the design doc
+-- Part 1). Deliberately its own table, not folded into `findings` (a
+-- claim about the target; this is a claim about a finding, a different
+-- grain) or `verification_flags` (whose `severity` column is
+-- ContradictionSeverity, meaningless for a three-way eligibility verdict —
+-- see the design doc Part C.1 for the full comparison). Unlike
+-- verification_flags' deliberately loose related_id, finding_id here is a
+-- real foreign key: this system's input is always exactly one persisted
+-- Finding, never a host/relationship/nothing.
+-- v2 (Claude + OpenAI, adversarial cross-validation): finding_id's FK is
+-- now composite (finding_id, run_id) -> findings(id, run_id), not just
+-- finding_id -> findings(id) alone. The old FK made it possible in
+-- principle to insert a row whose finding_id was a real, valid findings.id
+-- but belonged to a *different* run than this row's own run_id (SQLite
+-- never checked that run_id matched) — a single stray cross-run write
+-- (application bug, not malice) would have silently attributed an
+-- eligibility verdict to the wrong run's finding. The composite FK makes
+-- that structurally impossible rather than relying on application code to
+-- always get it right.
+CREATE TABLE IF NOT EXISTS reportability_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    finding_id INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    model_used TEXT NOT NULL,
+    eligibility TEXT NOT NULL,
+    final_eligibility TEXT NOT NULL,
+    confidence TEXT,
+    rule_citation TEXT NOT NULL DEFAULT '',
+    citation_grounded INTEGER,
+    grounding_method TEXT NOT NULL DEFAULT 'none',
+    reasoning TEXT,
+    program_rules_artifact TEXT NOT NULL,
+    rules_hash TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'reportability_agent',
+    assessed_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+    FOREIGN KEY(finding_id, run_id) REFERENCES findings(id, run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reportability_run ON reportability_assessments(run_id);
+CREATE INDEX IF NOT EXISTS idx_reportability_finding ON reportability_assessments(finding_id);
+
+-- Adversarial cross-validation (v2): one row per (assessment, reviewer)
+-- pair. Deliberately its own table, not extra columns on
+-- reportability_assessments — a review is a structurally different fact
+-- (a second provider's challenge to the first provider's output) from the
+-- assessment being challenged, not a cosmetic split of the same fact (see
+-- docs/REPORTABILITY_AGENT_DESIGN.md v2 Part on adversarial validation).
+-- assessment_id ties a review to the exact primary-assessment row it
+-- reviewed; the (finding_id, run_id) composite FK gives the same
+-- cross-run structural protection as reportability_assessments above.
+CREATE TABLE IF NOT EXISTS reportability_adversarial_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    assessment_id INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
+    finding_id INTEGER NOT NULL,
+    reviewer_provider TEXT NOT NULL,
+    reviewer_model TEXT NOT NULL,
+    challenge TEXT NOT NULL,
+    counter_eligibility TEXT,
+    reasoning TEXT,
+    prompt_version TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    FOREIGN KEY(assessment_id) REFERENCES reportability_assessments(id),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+    FOREIGN KEY(finding_id, run_id) REFERENCES findings(id, run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reportability_review_assessment
+    ON reportability_adversarial_reviews(assessment_id);
+CREATE INDEX IF NOT EXISTS idx_reportability_review_run
+    ON reportability_adversarial_reviews(run_id);
 
 CREATE TABLE IF NOT EXISTS clusters (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -952,6 +1036,143 @@ class AssetStore:
                     "SELECT * FROM verification_flags WHERE run_id=? ORDER BY id",
                     (run_id,),
                 ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_findings(
+        self,
+        run_id: str,
+        *,
+        severity: list[str] | None = None,
+        host: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Raw `findings` rows for a run, with their real `id` — the
+        reportability agent (docs/REPORTABILITY_AGENT_DESIGN.md) needs the
+        actual row id as its `finding_id` foreign key, which the in-memory
+        `core.assets.Finding` dataclass does not carry (it is assigned only
+        on insert). `Host.findings` hydration is the wrong shape for this;
+        this reads the table directly instead.
+        """
+        query = "SELECT * FROM findings WHERE run_id=?"  # nosec B608 - identifier is a literal, values are bound params
+        params: list[object] = [run_id]
+        if host:
+            query += " AND host=?"
+            params.append(host)
+        if severity:
+            placeholders = ",".join("?" for _ in severity)
+            query += f" AND severity IN ({placeholders})"  # noqa: S608  # nosec B608  # placeholders are '?' marks, values are bound params
+            params.extend(severity)
+        query += " ORDER BY id"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_reportability_assessments(self, run_id: str, assessments: list) -> list[int]:
+        """Persist reportability-agent eligibility annotations for a run.
+
+        `assessments` is a list of
+        `core.reportability.model.ReportabilityAssessment` (or anything
+        with the same attributes). See
+        docs/REPORTABILITY_AGENT_DESIGN.md Part C.1 for why this is its
+        own table rather than folded into `findings` or
+        `verification_flags`.
+
+        Returns the real `id` assigned to each inserted row, in the same
+        order as `assessments` — the adversarial cross-validation path
+        needs these to attach `reportability_adversarial_reviews` rows to
+        the exact assessment they reviewed, so this can't be a fire-and-
+        forget `executemany` the way `record_verification_findings` is.
+        All inserts still happen inside the one transaction `_connect()`
+        already provides (commit on success, rollback on any exception) —
+        a partial write here is exactly the "unexpected DB state" the exact-
+        batch-validation gate in core/reportability/batch.py exists to
+        prevent from ever being reached in the first place.
+        """
+        if not assessments:
+            return []
+        inserted_ids: list[int] = []
+        with self._connect() as conn:
+            for a in assessments:
+                cursor = conn.execute(
+                    """INSERT INTO reportability_assessments
+                       (run_id, finding_id, provider, model_used, eligibility,
+                        final_eligibility, confidence, rule_citation,
+                        citation_grounded, grounding_method, reasoning,
+                        program_rules_artifact, rules_hash, prompt_version,
+                        source, assessed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        run_id,
+                        a.finding_id,
+                        a.provider,
+                        a.model_used,
+                        a.eligibility.value,
+                        a.final_eligibility.value,
+                        a.confidence.value if a.confidence is not None else None,
+                        a.rule_citation,
+                        a.citation_grounded,
+                        a.grounding_method,
+                        a.reasoning,
+                        a.program_rules_artifact,
+                        a.rules_hash,
+                        a.prompt_version,
+                        a.source,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                inserted_ids.append(int(cursor.lastrowid))
+        return inserted_ids
+
+    def get_reportability_assessments(self, run_id: str) -> list[dict[str, object]]:
+        """Read back reportability assessments for a run (CLI use)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM reportability_assessments WHERE run_id=? ORDER BY id",
+                (run_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_reportability_adversarial_reviews(self, run_id: str, reviews: list) -> None:
+        """Persist adversarial cross-validation reviews for a run.
+
+        `reviews` is a list of
+        `core.reportability.model.AdversarialFindingReview` (or anything
+        with the same attributes), each already carrying the real
+        `assessment_id` of the primary assessment it reviewed (from
+        `record_reportability_assessments`'s return value).
+        """
+        if not reviews:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """INSERT INTO reportability_adversarial_reviews
+                   (assessment_id, run_id, finding_id, reviewer_provider,
+                    reviewer_model, challenge, counter_eligibility, reasoning,
+                    prompt_version, reviewed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        r.assessment_id,
+                        run_id,
+                        r.finding_id,
+                        r.reviewer_provider,
+                        r.reviewer_model,
+                        r.challenge.value,
+                        r.counter_eligibility.value if r.counter_eligibility is not None else None,
+                        r.reasoning,
+                        r.prompt_version,
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                    for r in reviews
+                ],
+            )
+
+    def get_reportability_adversarial_reviews(self, run_id: str) -> list[dict[str, object]]:
+        """Read back adversarial cross-validation reviews for a run (CLI use)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM reportability_adversarial_reviews WHERE run_id=? ORDER BY id",
+                (run_id,),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def upsert_host(self, run_id: str, host: Host) -> None:

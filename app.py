@@ -163,6 +163,57 @@ def build_parser() -> argparse.ArgumentParser:
         "--status", choices=["CONFIRMED", "DISMISSED", "UNRESOLVED"], help="Filter by status"
     )
 
+    assess_p = subparsers.add_parser(
+        "assess-reportability",
+        help=(
+            "Assess persisted findings' bounty eligibility against a program's rules text "
+            "via Claude and/or OpenAI — opt-in, spends real API credits, never run by 'run'"
+        ),
+    )
+    assess_p.add_argument("run_id", help="Run whose findings to assess")
+    assess_p.add_argument(
+        "--program-rules",
+        required=True,
+        type=Path,
+        help="Path to the program's rules text (plain text or Markdown)",
+    )
+    assess_p.add_argument("--severity", help="Comma-separated severities to include (default: all)")
+    assess_p.add_argument("--host", help="Only assess findings for this host")
+    assess_p.add_argument(
+        "--limit",
+        type=int,
+        help="Override REPORTABILITY_MAX_FINDINGS_PER_BATCH for this run",
+    )
+    assess_p.add_argument(
+        "--provider",
+        choices=["anthropic", "openai"],
+        help="Primary provider (default: REPORTABILITY_PROVIDER, itself defaulting to anthropic)",
+    )
+    assess_p.add_argument(
+        "--adversarial-provider",
+        choices=["anthropic", "openai"],
+        help=(
+            "Enable adversarial cross-validation: a second, different provider reviews the "
+            "primary provider's structured verdicts. Any real disagreement is reported as "
+            "UNCERTAIN rather than resolved in either provider's favor. "
+            "(default: REPORTABILITY_ADVERSARIAL_PROVIDER, unset by default = disabled)"
+        ),
+    )
+    assess_p.add_argument(
+        "--allow-fuzzy-grounding",
+        action="store_true",
+        help=(
+            "Allow a citation to be marked grounded via approximate text-similarity matching, "
+            "not just exact/normalized substring matching. Off by default (design v2: this is "
+            "the weakest, most conservative-by-default grounding tier)."
+        ),
+    )
+    assess_p.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation (required for non-interactive/automated use)",
+    )
+
     return parser
 
 
@@ -535,6 +586,21 @@ def main() -> int:
             "verification-flags",
         }:
             return cmd_intel(args, settings)
+        if args.command == "assess-reportability":
+            from core.reportability.cli import cmd_assess_reportability
+
+            return cmd_assess_reportability(
+                settings,
+                args.run_id,
+                args.program_rules,
+                severity=args.severity,
+                host=args.host,
+                limit=args.limit,
+                yes=args.yes,
+                provider=args.provider,
+                adversarial_provider=args.adversarial_provider,
+                allow_fuzzy_grounding=args.allow_fuzzy_grounding,
+            )
         return 1
 
     except (ConfigurationError, ValidationError, ReconError) as exc:
