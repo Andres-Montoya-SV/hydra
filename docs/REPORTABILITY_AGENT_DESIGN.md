@@ -571,9 +571,360 @@ test(s) proving it, per this project's standing practice.
   what its own first real result should be sanity-checked against, once a
   key is available.
 
-## 7. Commit scope
+## 7. Commit scope (Part 2)
 
 Part 2 implemented across incremental commits on
 `feat/reportability-agent-design`, one per numbered step above. Not
 merged — left for review via the project's own process (clone, run tests
 independently, verify, then approve the merge).
+
+## 8. Part E — v2: Claude + OpenAI, adversarial cross-validation
+
+Status: **implemented**, same branch. Written in response to two things
+arriving together: a real CI regression (this package's optional-dependency
+imports were eager, breaking test collection for the whole suite on a
+runner without `requirements-optional.txt`) and a request to make the
+reportability agent provider-agnostic and add adversarial cross-validation
+between two different LLM providers.
+
+**The non-negotiable this section keeps restating, because it is the one
+thing everything else here exists to protect**: an LLM is never authoritative
+over scope, authorization, evidence, whether a vulnerability exists, or
+whether anything gets submitted anywhere. Hydra's deterministic code
+(grounding, batch validation, database constraints) is what actually decides
+whether a verdict can be trusted enough to show a human; the LLM only ever
+proposes. Agreement between two LLMs — even under adversarial review — does
+not constitute proof that a vulnerability exists or is in scope. It is
+another triage signal, not a substitute for reading the program's rules.
+
+### E.1 Provider abstraction
+
+`core/reportability/provider.py` defines `ReportabilityProvider`, a
+`Protocol` (not a base class — nothing to share except a method shape) with
+`count_input_tokens`/`assess_batch`/`review_batch`, all returning either a
+plain `int` or one of the shared Pydantic schema types
+(`core/reportability/schema.py`) both providers fill in identically.
+`create_provider(name, api_key=..., model=...)` is the one place either
+provider is actually chosen — both `AnthropicClient`
+(`core/reportability/client.py`, renamed from `ReportabilityClient` now that
+there's a second provider) and `OpenAIClient`
+(`core/reportability/openai_client.py`, new) are lazy-imported inside it, so
+`core/reportability/cli.py` never branches on which provider it is holding,
+and importing `provider.py`/`cli.py` never requires either SDK.
+
+**OpenAI verification, matching the rigor already applied to
+`anthropic==1.5.0`**: no `openai` package was installed in the base
+environment, so a disposable virtualenv was created specifically to install
+`openai==3.13.0` and read its real installed source before writing
+`openai_client.py` against it — not just the public docs. Confirmed
+directly from SDK source: `client.responses.parse(model=..., instructions=...,
+input=..., text_format=<PydanticModel>)` is a real method with exactly those
+parameter names (`inspect.signature`), the parsed result is a genuine
+`output_parsed` property on `ParsedResponse` (present in `dir()`, not a
+declared pydantic field, which is why a `model_fields` check alone would
+have missed it — worth noting as a real way this kind of verification can
+go subtly wrong if done carelessly), and the exception hierarchy
+(`AuthenticationError`, `PermissionDeniedError`, `NotFoundError`,
+`RateLimitError`, `InternalServerError`, `APIStatusError`,
+`APIConnectionError`) all exist on the `openai` module exactly as used in
+`_describe()`. That virtualenv was deleted after verification; it never
+became part of this repository.
+
+**Honest gap, unlike Anthropic's**: OpenAI has no free, no-spend endpoint
+equivalent to `messages.count_tokens`. `OpenAIClient.count_input_tokens` is
+therefore a labeled *approximation* (~4 characters/token), not an exact
+count — the CLI always prints an explicit caveat when the primary or
+adversarial provider is OpenAI, never presenting the estimate with the same
+confidence as Anthropic's real count. Adding `tiktoken` purely to make this
+one estimate exact was considered and rejected as a second optional
+dependency for a number the CLI already labels honestly as approximate.
+
+### E.2 Exact-batch-validation, and why it's stricter than Part 2's version
+
+Part 2's CLI discarded an assessment for an unrequested `finding_id` with a
+warning and kept going. This was replaced entirely:
+`core/reportability/batch.py::validate_exact_batch` rejects the **whole**
+batch — nothing persisted, no `program_rules_snapshot.txt` even written —
+if the returned `finding_id` set has anything missing, anything unexpected,
+or any duplicate. Rationale for the stricter behavior: a provider that got
+the ID bookkeeping wrong for *part* of a batch has given no structural
+reason to trust the rest of that same batch either; silently keeping the
+"good-looking" entries assumes a fault model (only ID-matching broke, every
+other field is fine) that has no actual justification. The same function is
+reused, unmodified, to validate the adversarial reviewer's batch of
+challenges against the same `finding_id` set.
+
+### E.3 SQLite-level run/finding integrity
+
+Before this: `reportability_assessments.finding_id` was `FOREIGN KEY
+REFERENCES findings(id)` alone — a real constraint, but one that only
+proves `finding_id` is *some* valid row in `findings`, not that it belongs
+to *this row's own* `run_id`. Confirmed directly (reading
+`core/store.py::configure_sqlite`/`connect_sqlite`/`AssetStore._connect`)
+that this project already runs every connection with `PRAGMA
+foreign_keys=ON`, so a real constraint here is genuinely enforced, not a
+no-op — worth fixing properly rather than only in application code.
+
+Fix: `findings` gained `UNIQUE(id, run_id)` (redundant with `id` alone being
+unique, but SQLite requires an explicit unique index over the exact tuple a
+composite foreign key references), and both
+`reportability_assessments.(finding_id, run_id)` and the new
+`reportability_adversarial_reviews.(finding_id, run_id)` now use `FOREIGN
+KEY(finding_id, run_id) REFERENCES findings(id, run_id)`. Proven directly in
+`tests/test_reportability_model.py::test_composite_fk_rejects_a_finding_id_from_a_different_run`
+(both tables): constructing a real finding in `run1` and attempting to
+attach an assessment/review for it under `run2` — a real `finding_id`, just
+belonging to the wrong run — raises `sqlite3.IntegrityError` before anything
+is written.
+
+**Known limitation, stated rather than hidden**: this project has no schema
+migration mechanism beyond additive `ALTER TABLE ... ADD COLUMN` (see
+`AssetStore._migrate_schema`), which cannot retroactively add a `UNIQUE`
+constraint or change a `FOREIGN KEY` on an existing on-disk database. Since
+`reportability_assessments`/`reportability_adversarial_reviews` are new
+tables introduced on this same unmerged branch (no production data exists
+yet), this was judged acceptable rather than worth building a table-rebuild
+migration for. A database created fresh (every test, and any real run
+against a newly-initialized `recon.db`) gets the composite FK from the
+start; an existing pre-v2 database would need to be recreated, not
+migrated, to gain this protection.
+
+### E.4 Assessment versioning
+
+`reportability_assessments` gained `provider`, `confidence`,
+`grounding_method`, `rules_hash` (SHA-256 of the exact rules text the
+assessment was made against), and `prompt_version`
+(`core/reportability/prompt.py::PROMPT_VERSION`, bumped whenever
+`SYSTEM_PROMPT`/`ADVERSARIAL_SYSTEM_PROMPT` change in any way that could
+change model behavior). Together these answer "what was this verdict even
+asked, by which provider/model, against which exact rules text" for a
+verdict made long ago — not full response determinism (neither provider
+offers that), just enough context to explain a past decision rather than
+having to guess.
+
+### E.5 Adversarial cross-validation — and the specific fail-closed policy chosen
+
+`--adversarial-provider` (must differ from `--provider`; refused otherwise,
+since cross-validating a provider against itself shares the same failure
+modes and defeats the point) sends the primary provider's *already-produced*
+structured verdicts to a second provider for review
+(`ADVERSARIAL_SYSTEM_PROMPT`, `build_adversarial_user_message`) — never a
+second, independent classification made from scratch, and never the
+reviewer's hidden reasoning process, only the primary's final structured
+output. The reviewer returns `AGREE`/`DISAGREE`/`INSUFFICIENT_INFORMATION`
+per finding, plus an optional `counter_eligibility` when `DISAGREE` — kept
+strictly informational for a human reader.
+
+`core/reportability/model.py::combine_eligibility` is the one place the
+combination policy lives:
+
+- `AGREE` → `final_eligibility` = the primary's verdict.
+- `DISAGREE` → `final_eligibility` = `UNCERTAIN`. Never the reviewer's own
+  `counter_eligibility` — `combine_eligibility` doesn't even accept that
+  value as an argument, so there's nothing for a "trust the reviewer
+  instead" bug to accidentally read.
+- `INSUFFICIENT_INFORMATION` → also `UNCERTAIN`, not treated as silent
+  agreement. This is a deliberate interpretation, not directly dictated:
+  a reviewer that could not confirm the primary's verdict has not validated
+  it, and letting that case fall through to "trust the primary" would let a
+  non-informative review count as validation it never actually performed.
+
+This resolves an internal tension in how adversarial validation could be
+read: as two independent classifications compared for agreement, or as one
+provider auditing another's specific output. The schema
+(`AdversarialFindingChallenge`) is deliberately review-shaped (`challenge`
+is the real signal), while still carrying an optional `counter_eligibility`
+so a concrete alternative can be shown to a human — without ever using that
+value to pick a winner.
+
+Persistence: a new table, `reportability_adversarial_reviews` — one row per
+`(assessment_id, reviewer)` — not extra columns bolted onto
+`reportability_assessments`, since a review is a structurally different
+fact (a second provider's challenge to output that already exists) from the
+assessment being challenged, not a cosmetic split of the same fact.
+`reportability_assessments` itself keeps both `eligibility` (always the
+primary's raw verdict) and `final_eligibility` (what every consumer should
+actually act on) on the same row, since those two both describe the exact
+same assessment rather than a second, separate fact.
+
+### E.6 Prompt-injection defense
+
+Finding fields (`host`, `url`, `name`, `description`, `template_id`) are
+observed on the *target's* own infrastructure — an attacker who controls the
+target controls these strings, including making them look like instructions
+to the assessing LLM. Both `SYSTEM_PROMPT` and `ADVERSARIAL_SYSTEM_PROMPT`
+now explicitly name every such field as UNTRUSTED DATA and give a concrete
+example of the attack shape, instructing the model never to follow anything
+embedded in them; the adversarial prompt additionally warns that the
+primary's own `reasoning` text is LLM-generated from the same untrusted
+input and must be treated the same way.
+
+**What is and isn't actually tested here, stated plainly**:
+`tests/test_reportability_prompt_injection.py` proves (a) Hydra's own code
+never specially interprets a finding field — every injection payload tried
+lands in the outgoing message as one inert, literal line of data, never
+templated or executed; and (b) even a maximally adversarial *fake* provider
+response — simulating an LLM a prompt-injection attack fully succeeded
+against, fabricating a citation the injected text asked for — still gets
+caught by `is_citation_grounded`, because grounding checks the citation's
+literal text against the real rules file and has no dependency on what the
+model claims its eligibility or reasoning was. What this suite cannot prove,
+and does not claim to: whether a real Claude or GPT model actually resists
+a given injection payload in practice. That requires a live API call this
+suite deliberately never makes. There is also nothing in this codebase that
+auto-submits a report anywhere (confirmed by grep — no such code path
+exists at all), so "the LLM must never be authoritative over report
+submission" is satisfied by there being no submission capability for it to
+be authoritative over, not by an access-control check on one.
+
+### E.7 Grounding conservatism
+
+`is_citation_grounded`'s own default (`allow_minor_paraphrase=True`) was
+left unchanged — it's already deliberately tested and justified (Part 2,
+Section 6.2's 0.98 threshold). What changed is the CLI layer:
+`assess-reportability` now calls it with `allow_minor_paraphrase=False` by
+default, opting into the fuzzy tier only with the new
+`--allow-fuzzy-grounding` flag — narrowing the conservatism to where the v2
+request actually asked for it, without changing the well-tested default
+behavior of a shared utility other future callers might rely on.
+`grounding_method` (`"exact"`/`"normalized"`/`"fuzzy"`/`"none"`) is now
+persisted on every assessment row, not just returned and discarded.
+
+### E.8 CLI and configuration
+
+`--provider`/`--adversarial-provider` (`anthropic`|`openai`) and
+`--allow-fuzzy-grounding` added to `assess-reportability`, all routed
+through `create_provider` — no per-provider branch anywhere in `cli.py`.
+Cost estimation covers both calls before any spend: the adversarial call's
+estimate is itself approximate (the real primary output size isn't known
+until after the primary call completes), and is always labeled as such.
+New settings: `OPENAI_API_KEY`, `OPENAI_MODEL` (default `gpt-5.6-terra` —
+verified as a real, current model ID against live OpenAI documentation,
+chosen as the balanced default the way `claude-sonnet-5` is for Anthropic,
+not the priciest flagship), `REPORTABILITY_PROVIDER` (default `anthropic`),
+`REPORTABILITY_ADVERSARIAL_PROVIDER` (default unset — adversarial review is
+opt-in, since it doubles spend).
+
+### E.9 Astra-style adversarial security self-review
+
+Performed as a development-time activity on the finished v2 diff — Astra
+itself is never a runtime dependency, this is a review checklist applied by
+hand before considering the work done:
+
+- **Secrets**: `anthropic_api_key`/`openai_api_key` follow the exact
+  existing `to_safe_dict()` exclusion pattern (`has_*_key` booleans only,
+  never the value) — checked directly, not assumed.
+- **Injection via finding fields**: covered in E.6 above.
+- **Path handling**: `program_rules_snapshot.txt` writes and
+  `is_citation_grounded` reads both go through the existing
+  `_read_confined_artifact` path-confinement helper — untouched by v2, still
+  in the request/response path, still tested (Part 2).
+- **Fail-open risk in the new code**: audited every new failure path
+  (missing key, unsupported provider, same-provider-as-adversarial,
+  provider construction error, cost-estimate error, batch-mismatch on
+  either the primary or adversarial call, mid-call API error) — every one
+  returns `1` and persists nothing; there is no path where a malformed or
+  partial batch results in a database write. `TestExactBatchValidation` and
+  `TestAdversarialCrossValidation` in `tests/test_reportability_cli.py`
+  exercise this directly, including confirming
+  `program_rules_snapshot.txt` is never written when either batch is
+  rejected.
+- **Adversarial disagreement cannot be gamed toward false confidence**:
+  confirmed `combine_eligibility` has no path back to the primary's verdict
+  except a real `AGREE` — re-read after writing to make sure no later edit
+  had reintroduced a confidence- or majority-based tie-break.
+  `test_disagree_forces_final_eligibility_to_uncertain_never_the_counter_verdict`
+  exists specifically to catch a future regression here (e.g. an "obvious"
+  looking fix that resolves DISAGREE by trusting whichever provider claimed
+  higher confidence).
+- **Overengineering check against the v2 request's own explicit boundary
+  list**: no LangChain/agent framework, no vector DB, no tool-calling or
+  browsing or command execution granted to either LLM, no rewrite of any
+  unrelated Hydra subsystem. `ReportabilityProvider` is a `Protocol`, not a
+  class hierarchy; there is no `providers/` package, just two sibling
+  modules (`client.py`, `openai_client.py`) plus `provider.py` — this
+  package's existing flat layout was kept rather than introducing directory
+  ceremony for two implementations.
+
+No issues were found that weren't already fixed as part of writing this
+section — this is a record of what was checked, not a list of
+after-the-fact patches.
+
+### E.10 What v2 built, in order (with test references)
+
+1. **Done.** Fixed the CI-breaking regression: `core/reportability/cli.py`
+   no longer imports `ReportabilityClient`/`schema.py` at module level —
+   the import is function-local, wrapped in `try/except ImportError`.
+   `pytest.importorskip("anthropic")`/`("pydantic")` added to every test
+   file that needs a real SDK. Verified by running `pytest tests/ -q` with
+   `anthropic` genuinely absent from the environment: collection no longer
+   errors, the three affected files skip/collect cleanly.
+2. **Done.** Provider abstraction: `core/reportability/provider.py`
+   (`ReportabilityProvider` Protocol, `create_provider`),
+   `core/reportability/errors.py` (shared `ReportabilityAPIError`,
+   `BatchValidationError`), `core/reportability/openai_client.py`
+   (`OpenAIClient`), `client.py` renamed `ReportabilityClient` →
+   `AnthropicClient`. Proven by `tests/test_reportability_provider.py` (4
+   tests), `tests/test_reportability_client.py` (24 tests, real
+   `anthropic==1.5.0` source), `tests/test_reportability_openai_client.py`
+   (11 tests, real `openai==3.13.0` source, both verified in a disposable
+   venv as described in E.1).
+3. **Done.** Exact-batch-validation: `core/reportability/batch.py`. Proven
+   by `tests/test_reportability_batch.py` (7 tests: exact match regardless
+   of order, missing/unexpected/duplicate each rejected individually and
+   together, empty batches match).
+4. **Done.** SQLite composite FK integrity: `core/store.py` schema changes
+   (E.3). Proven by `tests/test_reportability_model.py`'s two
+   `test_composite_fk_rejects_a_finding_id_from_a_different_run` tests.
+5. **Done.** Assessment versioning fields + `AdversarialFindingReview`
+   model + `combine_eligibility`: `core/reportability/model.py`. Proven by
+   `tests/test_reportability_model.py` (22 tests total, including
+   `TestCombineEligibility`'s three cases and
+   `TestRecordAndReadAdversarialReviews`).
+6. **Done.** Adversarial cross-validation end to end: prompts
+   (`ADVERSARIAL_SYSTEM_PROMPT`, `build_adversarial_user_message`),
+   `review_batch` on both provider clients, `cli.py` wiring
+   (`--adversarial-provider`, same-provider refusal, combined cost
+   estimate, disagreement reporting). Proven by
+   `tests/test_reportability_cli.py::TestAdversarialCrossValidation` (5
+   tests: AGREE preserves the verdict, DISAGREE and
+   INSUFFICIENT_INFORMATION both force UNCERTAIN, a malformed adversarial
+   batch fails the whole run, a mid-call adversarial API error persists
+   nothing).
+7. **Done.** Prompt-injection defense: prompt text (E.6) +
+   `tests/test_reportability_prompt_injection.py` (12 tests).
+8. **Done.** Grounding conservatism: `--allow-fuzzy-grounding` flag,
+   `grounding_method` persisted. Proven by
+   `tests/test_reportability_cli.py`'s grounding-method assertions.
+9. **Done, with an honest limitation carried over from Part 2.** No
+   `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` was available in the
+   implementation environment (checked directly, not assumed) — v2's
+   provider/adversarial logic is proven with deterministic fake providers
+   (`tests/test_reportability_cli.py`'s `_FakeProvider`), never a live
+   model response. `tests/test_reportability_live.py` (Part 2, unchanged
+   in behavior) remains the one opt-in live test; there is no OpenAI
+   equivalent of it, for the same reason.
+
+### Honest strength assessment (v2)
+
+- **Strongest**: exact-batch-validation and the composite FK — both are
+  pure/structural checks proven completely offline, no provider involved.
+  The fail-closed disagreement policy (`combine_eligibility`) — three lines
+  of code, directly tested against all three challenge outcomes.
+- **Solid but SDK-source-verified rather than live-verified**: both
+  provider clients' request/response shapes — read from real installed SDK
+  source (`anthropic==1.5.0`, `openai==3.13.0`) in a disposable venv, not
+  merely from documentation, but never exercised against a real model
+  response in this environment.
+- **Weakest, by necessity, not by choice**: whether prompt-injection
+  defense actually holds against a real model, and whether adversarial
+  cross-validation catches real disagreements a human would also catch —
+  both require live API access to both providers, on real program rules
+  and real findings, which this environment does not have. This is stated
+  here rather than glossed over.
+
+## 9. Commit scope (v2)
+
+Implemented across incremental commits on `feat/reportability-agent-design`,
+continuing the same branch as Part 2. Not merged — left for review via the
+project's own process.
