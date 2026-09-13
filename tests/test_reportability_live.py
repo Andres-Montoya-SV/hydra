@@ -19,10 +19,13 @@ from pathlib import Path
 
 import pytest
 
-from config.settings import Settings
-from core.assets import Finding, Host, RiskLevel, ScanRun
-from core.reportability.cli import cmd_assess_reportability
-from core.store import AssetStore
+pytest.importorskip("anthropic")
+pytest.importorskip("pydantic")
+
+from config.settings import Settings  # noqa: E402
+from core.assets import Finding, Host, RiskLevel, ScanRun  # noqa: E402
+from core.reportability.cli import cmd_assess_reportability  # noqa: E402
+from core.store import AssetStore  # noqa: E402
 
 _NO_LIVE_KEY = pytest.mark.skipif(
     not os.getenv("ANTHROPIC_API_KEY"),

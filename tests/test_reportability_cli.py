@@ -9,12 +9,15 @@ from pathlib import Path
 
 import pytest
 
-from config.settings import Settings
-from core.assets import Finding, Host, RiskLevel, ScanRun
-from core.reportability.cli import cmd_assess_reportability
-from core.reportability.client import ReportabilityAPIError
-from core.reportability.schema import FindingAssessment, ReportabilityBatchResult
-from core.store import AssetStore
+pytest.importorskip("anthropic")
+pytest.importorskip("pydantic")
+
+from config.settings import Settings  # noqa: E402
+from core.assets import Finding, Host, RiskLevel, ScanRun  # noqa: E402
+from core.reportability.cli import cmd_assess_reportability  # noqa: E402
+from core.reportability.client import ReportabilityAPIError  # noqa: E402
+from core.reportability.schema import FindingAssessment, ReportabilityBatchResult  # noqa: E402
+from core.store import AssetStore  # noqa: E402
 
 RUN_ID = "run1"
 

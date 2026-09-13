@@ -8,13 +8,14 @@ API by hand.
 
 from __future__ import annotations
 
-import anthropic
-import httpx2
 import pytest
 
-from core.reportability.client import ReportabilityAPIError, ReportabilityClient
-from core.reportability.prompt import SYSTEM_PROMPT, build_user_message
-from core.reportability.schema import FindingAssessment, ReportabilityBatchResult
+anthropic = pytest.importorskip("anthropic")
+httpx2 = pytest.importorskip("httpx2")
+
+from core.reportability.client import ReportabilityAPIError, ReportabilityClient  # noqa: E402
+from core.reportability.prompt import SYSTEM_PROMPT, build_user_message  # noqa: E402
+from core.reportability.schema import FindingAssessment, ReportabilityBatchResult  # noqa: E402
 
 _FINDINGS = [
     {

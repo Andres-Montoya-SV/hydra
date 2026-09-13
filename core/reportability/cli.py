@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from core.intel.cli import default_db
-from core.reportability.client import ReportabilityAPIError, ReportabilityClient
 from core.reportability.model import Eligibility, ReportabilityAssessment
 from core.store import AssetStore
 from core.verification.grounding import is_citation_grounded
@@ -63,6 +62,22 @@ def cmd_assess_reportability(
             "Error: ANTHROPIC_API_KEY is not configured. This command is opt-in and does "
             "nothing without it — see docs/REPORTABILITY_AGENT_DESIGN.md and "
             "config/.env.example.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Deferred, not module-level: core.reportability.client -> schema.py
+    # requires pydantic, and client.py itself requires anthropic. Neither is
+    # a hard dependency of Hydra as a whole (requirements-optional.txt only)
+    # — importing core.reportability.cli itself must never require them, so
+    # this whole package stays importable (and its tests collectable) on a
+    # machine that only installed requirements-dev.txt.
+    try:
+        from core.reportability.client import ReportabilityAPIError, ReportabilityClient
+    except ImportError as exc:
+        print(
+            f"Error: {exc}. This command requires the optional reportability dependencies "
+            "— install them with `pip install -r requirements-optional.txt`.",
             file=sys.stderr,
         )
         return 1
