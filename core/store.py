@@ -460,6 +460,23 @@ CREATE TABLE IF NOT EXISTS intel_indicators (
     collector TEXT,
     UNIQUE(run_id, indicator_id),
     FOREIGN KEY(run_id) REFERENCES runs(run_id)
+    -- Hardening round 1, Task 5: a composite FK on evidence_id was tried
+    -- here and reverted — real, tested pipeline behavior
+    -- (core/intel/engine.py:_ingest_a_or_aaaa) legitimately stores an
+    -- intel_observations.observation_id in this field for
+    -- DNS-resolution-derived indicators, not a genuine intel_evidence.
+    -- evidence_id (confirmed by re-running the full suite: adding the
+    -- FK broke test_virusbarrier_e2e.py/test_followup_loop.py/
+    -- test_infra_correlation.py with real FOREIGN KEY constraint
+    -- failures, not a test-fixture artifact). The field name is
+    -- overloaded — sometimes a real evidence_id, sometimes an
+    -- observation_id used loosely as "the observation that justified
+    -- discovering this indicator" — a genuine pre-existing semantic
+    -- inconsistency this audit is documenting, not silently
+    -- constraining around. See docs/FINAL_PROJECT_AUDIT.md-style
+    -- hardening report for this round: fixing it for real means either
+    -- renaming/splitting the field or normalizing every write site
+    -- first, which is schema/model redesign out of this round's scope.
 );
 
 CREATE TABLE IF NOT EXISTS intel_hypotheses (
@@ -475,7 +492,14 @@ CREATE TABLE IF NOT EXISTS intel_hypotheses (
     depth INTEGER DEFAULT 1,
     kind TEXT,
     UNIQUE(run_id, hypothesis_id),
-    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+    -- Hardening round 1, Task 5: same cross-run-contamination protection
+    -- as intel_indicators above — a hypothesis is always constructed from
+    -- a real, already-persisted Relationship (core/intel/engine.py), so
+    -- relationship_id is never empty in practice; evidence_id already
+    -- goes through "or None" at every insert site.
+    FOREIGN KEY(run_id, relationship_id) REFERENCES intel_relationships(run_id, relationship_id),
+    FOREIGN KEY(run_id, evidence_id) REFERENCES intel_evidence(run_id, evidence_id)
 );
 
 CREATE TABLE IF NOT EXISTS intel_collection_attempts (
@@ -746,8 +770,20 @@ class AssetStore:
                 ),
             )
 
-    def clear_run_data(self, run_id: str) -> None:
-        """Remove all child data for a run (idempotent re-finalize)."""
+    def clear_run_data(self, run_id: str, *, conn: sqlite3.Connection | None = None) -> None:
+        """Remove all child data for a run (idempotent re-finalize).
+
+        Hardening round 1, Task 6: accepts an existing connection so a
+        caller doing clear-then-rebuild (persist_registry) can run the
+        delete and the subsequent inserts in one transaction. Previously
+        this always opened and committed its own connection, so a crash
+        between this method returning and persist_registry's own insert
+        transaction committing left the run with all prior data deleted
+        and no replacement written — total data loss for that run, not a
+        merely-partial write. When called with no `conn` (any other/future
+        caller, or direct use), behavior is unchanged: its own transaction,
+        committed immediately.
+        """
         tables = (
             "provenance",
             "findings",
@@ -769,22 +805,36 @@ class AssetStore:
             "intel_observations",
             "intel_entities",
         )
-        with self._connect() as conn:
+
+        def _delete_all(c: sqlite3.Connection) -> None:
             for table in tables:
-                conn.execute(
+                c.execute(
                     f"DELETE FROM {table} WHERE run_id=?",  # noqa: S608  # nosec B608  # table names are a hardcoded tuple, values are bound params
                     (run_id,),
                 )
 
+        if conn is not None:
+            _delete_all(conn)
+            return
+        with self._connect() as conn:
+            _delete_all(conn)
+
     def persist_registry(
         self, run_id: str, hosts: dict[str, Host], *, clusters=None, graph=None, intel=None
     ) -> None:
-        """Persist full intelligence snapshot (replace child data for run)."""
+        """Persist full intelligence snapshot (replace child data for run).
+
+        Hardening round 1, Task 6: clear-then-rebuild is one transaction,
+        not two — `clear_run_data` runs on the same connection this method
+        already holds open, so a crash partway through can only ever leave
+        the *previous* run snapshot intact (rolled back to before the
+        DELETEs) or the *new* one fully written, never neither.
+        """
         prior_indicators = self.get_intel_indicators(run_id) if intel is not None else []
         if intel is not None and prior_indicators:
             _apply_prior_indicator_lifecycle(intel, prior_indicators)
-        self.clear_run_data(run_id)
         with self._connect() as conn:
+            self.clear_run_data(run_id, conn=conn)
             for host in hosts.values():
                 self._insert_host(conn, run_id, host)
             if clusters:
@@ -880,7 +930,7 @@ class AssetStore:
                         i.reason.value,
                         i.scope_status.value,
                         i.collection_status.value,
-                        i.evidence_id,
+                        i.evidence_id or None,
                         i.priority,
                         i.discovered_from,
                         getattr(i, "authorization_status", "") or "",
@@ -1979,7 +2029,7 @@ class AssetStore:
                         i.reason.value,
                         i.scope_status.value,
                         i.collection_status.value,
-                        i.evidence_id,
+                        i.evidence_id or None,
                         i.priority,
                         i.discovered_from,
                         getattr(i, "authorization_status", "") or "",
