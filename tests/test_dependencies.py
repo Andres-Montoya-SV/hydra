@@ -63,6 +63,36 @@ class TestHealthValidator:
         # version may be None — that is OK
         assert result.version is None or isinstance(result.version, str)
 
+    @pytest.mark.asyncio
+    async def test_probe_and_smoke_test_do_not_leak_secrets_to_the_child(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Hardening round 2, Task 5: `_run_probe`/`_smoke_test` spawn a
+        real subprocess for every tool version/health check — they must
+        route through `utils.subprocess.child_process_env()` the same as
+        `run_command`, not the full parent environment (which carries
+        Settings.from_env()'s real secrets). A script masquerading as the
+        probed "tool" writes any leaked secret to a file `validate()` never
+        reads, so a leak fails the test even though `validate()`'s own
+        return value can't see the child's environment directly.
+        """
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-leak-canary")
+        leak_file = tmp_path / "leaked.txt"
+        fake_tool = tmp_path / "fake-tool"
+        fake_tool.write_text(
+            "#!/bin/sh\n"
+            f'echo "$ANTHROPIC_API_KEY" > "{leak_file}"\n'
+            "echo fake-tool-version-1.0.0\n"
+        )
+        fake_tool.chmod(0o755)
+
+        validator = HealthValidator()
+        defn = get_tool_definition("anew")  # any Go-style, version-optional defn works
+        await validator.validate(fake_tool, defn)
+
+        assert leak_file.exists()
+        assert leak_file.read_text().strip() == ""
+
 
 class TestDependencyService:
     @pytest.mark.asyncio

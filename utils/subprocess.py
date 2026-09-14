@@ -14,7 +14,6 @@ from core.logger import get_logger
 from utils.security import (
     atomic_write_text,
     sanitize_log_message,
-    validate_binary_path,
     validate_output_path,
 )
 
@@ -24,6 +23,38 @@ MAX_STDOUT_BYTES = 50 * 1024 * 1024  # 50 MB cap per subprocess
 
 # Track running processes for cleanup on cancellation
 _running_processes: weakref.WeakSet[asyncio.subprocess.Process] = weakref.WeakSet()
+
+# Environment variables passed through to external tool subprocesses.
+# `asyncio.create_subprocess_exec` inherits the *entire* parent environment
+# when `env` is omitted — and Hydra's own environment carries every secret
+# `Settings.from_env()` reads (ANTHROPIC_API_KEY, OPENAI_API_KEY,
+# WPSCAN_API_TOKEN, SECURITYTRAILS_API_KEY, URLHAUS_API_KEY, and any
+# credential embedded in OUTBOUND_PROXY_URL), whether or not the tool being
+# run has anything to do with those providers. None of Hydra's external
+# tools (subfinder, httpx, naabu, katana, hakrawler, dnsx, nuclei, nmap,
+# amass, assetfinder, gau, waybackurls, unfurl, anew, jq) read API keys or
+# proxy settings from environment variables — proxying is always done via
+# an explicit `-proxy` CLI flag (see modules/httpx.py, katana.py,
+# hakrawler.py, nuclei.py) — so this allowlist carries only what real-world
+# CLI tools need to run and find their own config/cache directories.
+_CHILD_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+    "GOPATH",
+    "GOCACHE",
+)
+
+
+def child_process_env() -> dict[str, str]:
+    """Minimal environment for an external tool subprocess — never the
+    full parent environment (see `_CHILD_ENV_ALLOWLIST` for why)."""
+    return {name: os.environ[name] for name in _CHILD_ENV_ALLOWLIST if name in os.environ}
 
 
 async def terminate_all_processes() -> None:
@@ -35,62 +66,6 @@ async def terminate_all_processes() -> None:
                 await proc.wait()
             except (ProcessLookupError, OSError):
                 pass
-
-
-async def check_tool_available(binary: Path) -> bool:
-    """Check if a tool binary exists and can execute (version not required)."""
-    from core.discovery.tool_discovery import probe_binary_executable
-
-    try:
-        if binary.name == str(binary) and "/" not in str(binary) and os.sep not in str(binary):
-            import shutil
-
-            found = shutil.which(str(binary))
-            if not found:
-                return False
-            binary = Path(found)
-        if not binary.exists() or not os.access(binary, os.X_OK):
-            return False
-        return await probe_binary_executable(binary)
-    except OSError:
-        return False
-    except Exception:
-        return False
-
-
-async def get_tool_version(binary: Path) -> str | None:
-    """Attempt to retrieve tool version string.
-
-    Args:
-        binary: Tool binary path.
-
-    Returns:
-        Version string or None.
-    """
-    try:
-        resolved = validate_binary_path(binary)
-    except Exception:
-        resolved = binary
-
-    for flag in ("-version", "--version", "-v"):
-        proc: asyncio.subprocess.Process | None = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                str(resolved),
-                flag,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _running_processes.add(proc)
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-            output = (stdout or stderr).decode("utf-8", errors="replace").strip()
-            if output:
-                return output.split("\n")[0][:80]
-        except (FileNotFoundError, asyncio.TimeoutError, OSError):
-            if proc and proc.returncode is None:
-                proc.kill()
-            continue
-    return None
 
 
 def _validate_args(args: Sequence[str]) -> list[str]:
@@ -136,6 +111,7 @@ async def run_command(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd) if cwd else None,
+            env=child_process_env(),
         )
         _running_processes.add(proc)
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
