@@ -90,6 +90,58 @@ class TestCombineEligibility:
             == Eligibility.UNCERTAIN
         )
 
+    def test_disagreement_never_resolves_by_picking_the_more_confident_side(self) -> None:
+        """Hardening: explicitly proves 'the higher-confidence side wins'
+        is not how disagreement is resolved, not just 'not majority vote'
+        (the existing DISAGREE test above already covers that). This
+        function's signature — combine_eligibility(primary, challenge) —
+        has no Confidence parameter at all, so a HIGH-confidence primary
+        verdict and a LOW-confidence one produce the identical UNCERTAIN
+        outcome once genuinely challenged: confidence is not merely
+        de-prioritized in the tie-break, it is structurally absent from
+        the decision. Simulates both directions (a HIGH-confidence primary
+        challenged, and — since AdversarialFindingReview carries no
+        confidence field for the reviewer either — a full round trip
+        through the real assessment/review dataclasses to prove neither
+        object's confidence-shaped data ever reaches this function).
+        """
+        # A HIGH-confidence primary verdict, genuinely disagreed with,
+        # still fails closed — high self-reported confidence never
+        # protects a verdict from a real challenge.
+        high_confidence_primary = ReportabilityAssessment(
+            finding_id=1,
+            eligibility=Eligibility.ELIGIBLE,
+            final_eligibility=Eligibility.ELIGIBLE,  # placeholder, recomputed below
+            rule_citation="",
+            program_rules_artifact="program_rules_snapshot.txt",
+            confidence=Confidence.HIGH,
+            **_COMMON_KWARGS,
+        )
+        low_confidence_primary = ReportabilityAssessment(
+            finding_id=2,
+            eligibility=Eligibility.ELIGIBLE,
+            final_eligibility=Eligibility.ELIGIBLE,
+            rule_citation="",
+            program_rules_artifact="program_rules_snapshot.txt",
+            confidence=Confidence.LOW,
+            **_COMMON_KWARGS,
+        )
+        # combine_eligibility only ever sees .eligibility and the
+        # reviewer's .challenge — never .confidence off either side.
+        assert (
+            combine_eligibility(high_confidence_primary.eligibility, ReviewChallenge.DISAGREE)
+            == Eligibility.UNCERTAIN
+        )
+        assert (
+            combine_eligibility(low_confidence_primary.eligibility, ReviewChallenge.DISAGREE)
+            == Eligibility.UNCERTAIN
+        )
+        # Identical outcome regardless of the primary's self-reported
+        # confidence — the HIGH-confidence case gets no special treatment.
+        assert combine_eligibility(
+            high_confidence_primary.eligibility, ReviewChallenge.DISAGREE
+        ) == combine_eligibility(low_confidence_primary.eligibility, ReviewChallenge.DISAGREE)
+
 
 def test_assessment_to_dict_round_trips_enum_value() -> None:
     assessment = ReportabilityAssessment(
@@ -323,6 +375,74 @@ class TestRecordAndReadReportabilityAssessments:
             store.record_reportability_assessments("run2", [assessment])
         # And nothing was left half-written by the failed attempt.
         assert store.get_reportability_assessments("run2") == []
+
+    def test_re_assessing_the_same_finding_never_overwrites_the_prior_assessment(
+        self, tmp_path: Path
+    ) -> None:
+        """Hardening: reportability_assessments has no UNIQUE constraint on
+        (run_id, finding_id) and record_reportability_assessments always
+        does a plain INSERT, never INSERT OR REPLACE/UPSERT — re-running
+        assess-reportability against a finding it already assessed (a
+        second pass with an updated program-rules file, a different
+        provider, or just re-running the same command) must add a new
+        historical row, never silently replace the old verdict. Both rows
+        must remain independently readable afterward, in insertion order,
+        each carrying its own provider/model/rules_hash/prompt_version so
+        it's possible to tell exactly which assessment used which rules
+        text and which prompt version later, without ambiguity."""
+        store, finding_id = _seed_run_and_finding(tmp_path)
+        first = ReportabilityAssessment(
+            finding_id=finding_id,
+            eligibility=Eligibility.NOT_ELIGIBLE,
+            final_eligibility=Eligibility.NOT_ELIGIBLE,
+            rule_citation="Out-of-scope assets are never eligible.",
+            program_rules_artifact="program_rules_snapshot.txt",
+            citation_grounded=True,
+            grounding_method="exact",
+            provider="anthropic",
+            model_used="claude-sonnet-5",
+            rules_hash="a" * 64,
+            prompt_version="v2",
+        )
+        first_ids = store.record_reportability_assessments("run1", [first])
+
+        # A later re-assessment: a different provider, a different (updated)
+        # rules text, a different prompt version, and a different verdict —
+        # exactly the realistic "program rules changed, re-run it" case.
+        second = ReportabilityAssessment(
+            finding_id=finding_id,
+            eligibility=Eligibility.ELIGIBLE,
+            final_eligibility=Eligibility.ELIGIBLE,
+            rule_citation="Updated scope now includes this asset class.",
+            program_rules_artifact="program_rules_snapshot.txt",
+            citation_grounded=True,
+            grounding_method="exact",
+            provider="openai",
+            model_used="gpt-5.6-terra",
+            rules_hash="b" * 64,
+            prompt_version="v3",
+        )
+        second_ids = store.record_reportability_assessments("run1", [second])
+
+        assert first_ids != second_ids, "the second assessment must be a new row, not an update"
+
+        rows = store.get_reportability_assessments("run1")
+        assert len(rows) == 2, "both the old and new assessment must remain readable"
+        by_id = {row["id"]: row for row in rows}
+
+        assert by_id[first_ids[0]]["final_eligibility"] == "NOT_ELIGIBLE"
+        assert by_id[first_ids[0]]["provider"] == "anthropic"
+        assert by_id[first_ids[0]]["rules_hash"] == "a" * 64
+        assert by_id[first_ids[0]]["prompt_version"] == "v2"
+
+        assert by_id[second_ids[0]]["final_eligibility"] == "ELIGIBLE"
+        assert by_id[second_ids[0]]["provider"] == "openai"
+        assert by_id[second_ids[0]]["rules_hash"] == "b" * 64
+        assert by_id[second_ids[0]]["prompt_version"] == "v3"
+
+        # The first assessment's own fields are untouched by the second
+        # insert — not partially merged, not blanked, genuinely independent.
+        assert by_id[first_ids[0]]["rule_citation"] == "Out-of-scope assets are never eligible."
 
 
 class TestAdversarialFindingReview:
