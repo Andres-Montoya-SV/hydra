@@ -79,14 +79,21 @@ _register(
         health_commands=(("--help",), ("-h",)),
         capabilities=frozenset({"subdomain_enumeration", "passive_dns", "active_enumeration"}),
         install_homebrew="amass",
-        # Homebrew's "amass" formula tracks upstream latest (v5.x as of
-        # this writing) — this Go module path is intentionally still
-        # pinned to v4, the version this plugin's CLI usage
-        # (`modules/amass.py`) was actually written against. See
-        # docs/FINAL_PROJECT_AUDIT.md / docs/HARDENING_ROUND2_P1.md: v5
-        # removed the `-o` flag the plugin depends on, breaking every
-        # invocation. Do not bump this to a bare "@latest" without first
-        # updating modules/amass.py for v5's directory-based output.
+        # No versioned "amass@4" Homebrew formula exists (confirmed via
+        # `brew search amass`) — Homebrew's one "amass" formula tracks
+        # upstream latest (v5.x as of this writing), so `install_homebrew`
+        # above is only ever a starting point; `go install` pinned to this
+        # exact tag is the only reliable way to get v4. v4 is a deliberate,
+        # investigated choice, not a stopgap waiting on a v5 rewrite: v5
+        # replaced the single-process `enum -o <file>` model this plugin
+        # depends on with a client/server architecture (`amass engine` +
+        # `amass enum` as a client + a separate `amass subs` query step
+        # against a graph database) — confirmed by direct testing,
+        # including a real run that returned zero results even with a
+        # 2-minute timeout. See docs/FINAL_PROJECT_AUDIT.md /
+        # docs/HARDENING_ROUND2_P1.md (the detection gate) and
+        # modules/amass.py's own docstring (the v4 pin + real output-format
+        # parser fix) for the full history.
         install_go="github.com/owasp-amass/amass/v4/...@v4.2.0",
     )
 )
@@ -252,12 +259,15 @@ def _major_version(version: str) -> int | None:
 KNOWN_INCOMPATIBLE_VERSIONS: dict[str, tuple[int, str]] = {
     "amass": (
         5,
-        "amass v5 removed the -o output flag modules/amass.py depends on "
-        '(every invocation fails: "flag provided but not defined: -o"). '
-        "Install v4 instead (go install "
-        "github.com/owasp-amass/amass/v4/...@v4.2.0), or leave "
-        "ENABLE_AMASS=false until the plugin is updated for v5's "
-        "directory-based output. See docs/FINAL_PROJECT_AUDIT.md.",
+        "amass v5 replaced the single-process enum model modules/amass.py "
+        "depends on with a client/server architecture (every invocation "
+        'fails: "flag provided but not defined: -o"), and this is not a '
+        "planned future rewrite — investigated and rejected as a "
+        "disproportionate integration for this plugin (see "
+        "modules/amass.py's docstring). Install v4 instead (go install "
+        "github.com/owasp-amass/amass/v4/...@v4.2.0; there is no "
+        "versioned amass@4 Homebrew formula), or leave ENABLE_AMASS=false. "
+        "See docs/FINAL_PROJECT_AUDIT.md.",
     ),
 }
 
