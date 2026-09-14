@@ -1169,7 +1169,14 @@ class AssetStore:
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
-                inserted_ids.append(int(cursor.lastrowid))
+                # lastrowid is None only when no row was ever inserted on
+                # this cursor — impossible here, this line runs immediately
+                # after a successful INSERT on it.
+                if cursor.lastrowid is None:
+                    raise RuntimeError(
+                        "INSERT into reportability_assessments produced no lastrowid"
+                    )
+                inserted_ids.append(cursor.lastrowid)
         return inserted_ids
 
     def get_reportability_assessments(self, run_id: str) -> list[dict[str, object]]:
@@ -1358,7 +1365,15 @@ class AssetStore:
                         (run_id,),
                     ).fetchall()
                 }
-                evidence_by_id = {row.get("evidence_id"): row for row in evidence_rows}
+                # evidence_id is TEXT NOT NULL in the schema — the `is not
+                # None` filter is defensive typing precision (satisfies
+                # serialize_relationships' dict[str, ...] parameter), not
+                # a real runtime possibility this query could return.
+                evidence_by_id: dict[str, dict[str, Any]] = {
+                    str(row["evidence_id"]): row
+                    for row in evidence_rows
+                    if row.get("evidence_id") is not None
+                }
                 payload["intelligence"] = {
                     "relationships": serialize_relationships(
                         rels,

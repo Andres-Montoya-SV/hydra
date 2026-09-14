@@ -127,9 +127,19 @@ def _normalize_for_comparison(text: str) -> str:
     terminator noise is normalized away here.
     """
     folded = unicodedata.normalize("NFKC", text)
-    folded = folded.translate(
-        str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-"})
-    )
+    # str.maketrans's single-arg overload is typed over dict[str | int, ...]
+    # (a real accepted call shape at runtime), but a bare dict[str, str]
+    # literal is invariant and mypy won't widen it implicitly — spell the
+    # annotation out explicitly rather than casting past the check.
+    quote_and_dash_map: dict[str | int, str | int | None] = {
+        "‘": "'",
+        "’": "'",
+        "“": '"',
+        "”": '"',
+        "–": "-",
+        "—": "-",
+    }
+    folded = folded.translate(str.maketrans(quote_and_dash_map))
     folded = _WHITESPACE_RE.sub(" ", folded).strip().lower()
     return _TRAILING_PUNCTUATION_RE.sub("", folded).strip()
 

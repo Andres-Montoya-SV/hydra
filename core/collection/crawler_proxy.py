@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import socket
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -142,7 +143,7 @@ class ScopeEnforcingProxy:
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_client, self.host, 0)
-        sockets = self._server.sockets or []
+        sockets: tuple[socket.socket, ...] = self._server.sockets or ()
         if not sockets:
             raise RuntimeError("ScopeEnforcingProxy failed to bind a listening socket")
         self.port = sockets[0].getsockname()[1]
@@ -258,7 +259,16 @@ class ScopeEnforcingProxy:
         response) — callers must treat that exactly like a direct-connect
         failure (502 to the client), never as success.
         """
-        upstream = urlparse(self.upstream_proxy_url)
+        upstream_url = self.upstream_proxy_url
+        if upstream_url is None:
+            # Defensive, not merely a type-narrowing trick: the one caller
+            # (below) only reaches this method inside `if
+            # self.upstream_proxy_url:`, but that narrowing is on the
+            # caller's own read of the attribute and doesn't carry across
+            # a method call — this makes the same invariant explicit and
+            # checked here too, rather than trusting the caller silently.
+            raise RuntimeError("_open_upstream_tunnel called without upstream_proxy_url set")
+        upstream = urlparse(upstream_url)
         upstream_host = upstream.hostname or ""
         upstream_port = upstream.port or (443 if upstream.scheme == "https" else 80)
         reader, writer = await asyncio.open_connection(upstream_host, upstream_port)
