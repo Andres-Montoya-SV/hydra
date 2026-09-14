@@ -1318,6 +1318,39 @@ class PipelineRunner:
             return await self._run_single_plugin(context, plugin, input_path)
 
     def _cache_key(self, plugin: ReconPlugin, input_path: Path) -> tuple[str, str]:
+        # Security audit (hardening round 1, cache/authorization task):
+        # `result_cache` has no run_id column at all — it is a deliberately
+        # global, cross-run table (see core/store.py's SCHEMA). The cache
+        # key is therefore the *entire* security boundary: anything that
+        # can change whether a cached artifact should be trusted/attributed
+        # the same way must be part of this digest, not assumed equal.
+        #
+        # For ACTIVE_COLLECTION_PLUGINS, `input_path` here is already the
+        # scope-authorization-filtered file `_gate_active_input` produced
+        # (never the raw pre-filter input) — a host excluded by the
+        # *current* scope can never appear in these bytes, so it can never
+        # be part of a cache key a later, more restrictive run could hit.
+        # That closes the "target no longer authorized" case (invariant 8)
+        # structurally, not by convention.
+        #
+        # What filtered-content-only hashing does NOT close: two different
+        # SCOPE_FILEs (different programs, different engagements) that
+        # happen to authorize the byte-identical set of hosts for a given
+        # plugin would otherwise collide on the same cache key — silently
+        # serving one program's collected data (and whatever researcher
+        # attribution header/UA it was fetched under) to a different
+        # program's run. That is a real invariant-10 violation (historical
+        # data reused across incompatible scopes), not merely a staleness
+        # concern the TTL already bounds. Closed by folding in the same two
+        # fingerprints `historical_cross_check` already uses to detect this
+        # exact class of cross-scope reuse (core/verification/preflight.py)
+        # — reusing that existing, already-tested logic rather than
+        # inventing a second notion of "has the context changed."
+        from core.verification.preflight import (
+            compute_attribution_fingerprint,
+            compute_scope_file_hash,
+        )
+
         digest = hashlib.sha256()
         digest.update(plugin.name.encode("utf-8"))
         if input_path.exists():
@@ -1329,6 +1362,18 @@ class PipelineRunner:
         # against the same input, or vice versa.
         digest.update(b"strict" if self.settings.strict_opsec else b"standard")
         digest.update((self.settings.outbound_proxy_url or "").encode("utf-8"))
+        digest.update(
+            (compute_scope_file_hash(self.settings.scope_file) or "no-scope-file").encode("utf-8")
+        )
+        digest.update(
+            (
+                compute_attribution_fingerprint(
+                    self.settings.researcher_attribution_header,
+                    self.settings.attribution_user_agent,
+                )
+                or "no-attribution"
+            ).encode("utf-8")
+        )
         # Bust stale httpx caches that stored only alive.txt (no httpx.json /
         # response headers). Downstream vuln_match and security_headers need
         # the structured JSONL, not just the URL list.
