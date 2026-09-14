@@ -31,6 +31,16 @@ mid-engagement.
 
 ### Known limitations (consolidated, one place)
 
+**Update (`cleanup/amass-plugin-coverage-nuclei-live` branch, after this
+document's original certification): three of the six items originally
+listed here are now closed** — `amass` v4 was made to actually work (not
+just cleanly detected as broken), all six previously-untested plugins now
+have real regression coverage, and `nuclei` now has a live-binary
+confinement test at the same rigor as `katana`/`hakrawler`. See each
+closed item's replacement note below for the exact test that proves it;
+the closure work itself is not re-narrated here — see that branch's own
+commits.
+
 1. **`naabu`/`port_verify`'s raw TCP/SYN scanning is not connection-pinned.**
    HTTP-speaking collectors resolve a hostname, validate the resolved IP
    against the SSRF blocklist, and connect to *that exact validated IP*
@@ -45,47 +55,79 @@ mid-engagement.
    since `docs/FINAL_PROJECT_AUDIT.md`; re-confirmed unchanged this
    session (`tests/test_untrusted_network_bypass.py`, fresh, still
    passing, still proving the same limitation rather than hiding it).
-2. **`amass` v5 does not work with `modules/amass.py`** (the installed
-   binary's `-o` flag was removed upstream). As of Round 2 this is
-   *detected*, not silent: `check-tools` and the pipeline's own
-   pre-flight validation report it as not-runnable with the exact fix
-   before the plugin ever attempts to run — confirmed live in this
-   certification's own production run (Part 2, below). The underlying
-   incompatibility itself is unfixed (a real fix means pinning `amass` v4
-   or rewriting the plugin against v5's directory-based output — out of
-   scope for both hardening rounds and this certification).
-3. **Six plugins have zero regression-test coverage of their own parsing/
-   execution logic**: `amass`, `anew`, `assetfinder`, `gau`, `unfurl`,
-   `waybackurls`. Re-confirmed unchanged this session (direct grep: 0
-   references to any of their plugin classes in `tests/`). All six are
-   real, installed, invocable tools that ran cleanly in this
-   certification's live production run; none have ever had a
-   `.parse()`-level unit test.
-4. **`nuclei`'s membership in `PROXY_VERIFIED_TOOLS` rests on a mocked
-   flag-enforcement test, not a live-binary confinement test** — found and
-   documented in this certification (Part 1.1, below). `katana` and
-   `hakrawler` both have dedicated live tests that actually spin up the
-   real binary against a local arbiter server and confirm out-of-scope
-   requests are blocked (`tests/test_crawler_confinement_live.py`);
-   `nuclei`'s equivalent proof is `tests/test_crawler_proxy_flag_enforcement.py`,
-   which proves the `-proxy` flag is always passed and mocks the rest.
-   This is a real, previously-uninspected gap in verification *rigor*,
-   not a known confinement failure — nothing found here suggests nuclei
-   actually leaks.
+   **Still open** — nothing in this document's scope touches raw-socket
+   confinement.
+2. ~~`amass` v5 does not work with `modules/amass.py`~~ — **closed.**
+   `amass` v4 (the pinned, supported version — there is no versioned
+   `amass@4` Homebrew formula, so `go install
+   github.com/owasp-amass/amass/v4/...@v4.2.0` is the only reliable
+   install path on any platform) now actually works:
+   `modules/amass.py::_extract_amass_fqdns` correctly parses v4's real
+   `-o` output — a relationship-graph transcript
+   (`"host (FQDN) --> record_type --> target (Type)"`), not the plain
+   subdomain-per-line list the plugin previously assumed — verified
+   against real captured v4.2.0 output and end-to-end against the real
+   binary (`tests/test_amass.py`, 9 tests). `amass` v5 itself remains
+   permanently unsupported: investigated and rejected, not deferred — v5
+   replaced the single-process model this plugin depends on with a
+   client/server architecture (`amass engine` + `amass enum` + a separate
+   `amass subs` query step against a graph database), confirmed by direct
+   testing including a real run that returned zero results even with a
+   2-minute timeout. `check-tools`' known-incompatible-version gate
+   (Round 2) still correctly refuses a v5 install before the plugin ever
+   attempts to run.
+3. ~~Six plugins have zero regression-test coverage of their own parsing/
+   execution logic~~ — **closed.** `amass`, `anew`, `assetfinder`, `gau`,
+   `unfurl`, and `waybackurls` each now have a dedicated test file
+   (`tests/test_amass.py`, `tests/test_anew.py`,
+   `tests/test_assetfinder.py`, `tests/test_gau.py`,
+   `tests/test_unfurl.py`, `tests/test_waybackurls.py` — 33 tests total),
+   each covering real captured output where a non-empty real capture was
+   obtainable (`amass`, `anew`, `assetfinder`, `unfurl` — all captured
+   live against real installed binaries) and empty/malformed-output
+   handling for all six. `gau` and `waybackurls`' non-empty parsing tests
+   use realistic — not captured-live — output: this dev environment could
+   not reach either tool's upstream archive APIs (wayback/otx/commoncrawl)
+   to produce a non-empty real capture (every attempt against multiple
+   real domains returned zero results or never completed even with a
+   bounded 10s timeout); their real, directly-confirmed empty-output
+   behavior *is* used as those two files' empty-output test case.
+4. ~~`nuclei`'s membership in `PROXY_VERIFIED_TOOLS` rests on a mocked
+   flag-enforcement test~~ — **closed.**
+   `tests/test_nuclei_confinement_live.py` (2 tests) proves the real
+   confinement property at the same rigor as `katana`/`hakrawler`: a real
+   nuclei template using the real `@Host` raw-request override mechanism
+   (the same one the actual shipped `azure-domain-tenant.yaml` template
+   uses to unconditionally contact `login.microsoftonline.com`, per the
+   real evidence in
+   `docs/archive/FINAL_NETWORK_CONFINEMENT_AUDIT_2026-08-31.md`) is routed
+   through the real `ScopeEnforcingProxy` and confirmed to never reach the
+   out-of-scope destination, with a negative-control test proving the same
+   template *does* reach that destination with no confinement proxy in
+   the way (ruling out "the template silently didn't fire" as an
+   alternative explanation for zero hits). This does not go through
+   `NucleiPlugin.run()` literally — that method's fixed argv has no
+   `-duc`/`-disable-update-check`, and a hermetic, single-template `$HOME`
+   (needed to keep the test fast rather than running nuclei's full
+   ~2,700-template default corpus) makes nuclei's own update check block
+   for most of a minute on unrelated network I/O — so the test drives the
+   same two real, unmodified production classes (`ScopeEnforcingProxy`,
+   the real `nuclei` binary) directly instead.
 5. **The OpenAI half of the reportability agent's real-API path is proven
    to reach the real API and handle a real error correctly, but not
    proven to complete a full successful assessment against this
    session's available key** — see Part 2, item 4. The Anthropic half
-   completed successfully end-to-end with a real API call.
+   completed successfully end-to-end with a real API call. **Still open**
+   — out of this document's scope.
 6. **Test suite: a very minor, non-reproducing skip-count variance**
    observed this session (Part 3, item 1) — never a failure, only whether
-   one specific test's skip condition fires. Noted for a future session
-   to pin down; does not block this verdict.
+   one specific test's skip condition fires. **Still open** — out of this
+   document's scope.
 
-None of these are new discoveries this document is trying to spin
-favorably — every one of them is either already in `README.md`/
-`docs/FINAL_PROJECT_AUDIT.md`, or is a direct, disclosed product of this
-certification's own testing (items 4–6).
+None of these were new discoveries invented to spin the verdict —
+items 1, 5, and 6 remain exactly as originally found; items 2–4 are
+updated in place, struck through, with the real test that closed each one
+named directly rather than asserted.
 
 ---
 
