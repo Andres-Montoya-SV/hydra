@@ -43,6 +43,31 @@ A two-stage build (`Dockerfile`):
    github.com/tomnomnom/anew@26ebc8ce1f0bdbaaee2930ea7ab191ed0c0da261`),
    which resolves correctly and is exactly as reproducible as a tag.
 
+### Native installation: the same versions, plus a compatibility strategy per tool
+
+Hardening round 2 (Task 1) audited every one of the 14 tools this document
+and the README name, specifically to answer: does the *native* (non-Docker)
+install path leave any of them floating on "whatever `brew`/`go install`
+gives you today," with no guardrail if that breaks? Each tool below was
+put into exactly one of three strategies, not pinned uniformly for its own
+sake:
+
+| Tool | Strategy | Why |
+|---|---|---|
+| subfinder, dnsx, httpx, naabu, katana, nuclei, hakrawler | **Exact pin** | Same versions as the Docker table above — `go install <module>@<version>` natively for the identical reproducibility Docker gets for free. |
+| **amass** | **Runtime detection + hard compatibility gate** | The real, reproduced case (`docs/FINAL_PROJECT_AUDIT.md`): Homebrew's `amass` formula tracks upstream v5.x, whose CLI dropped the `-o` flag `modules/amass.py` depends on — every invocation failed, silently, with no warning before this round. `python app.py check-tools` now detects the real installed version (`core/dependencies/validation.py`, itself fixed this round — see Finding 1) and, for amass specifically, checks it against a known-incompatible-versions table (`core/dependencies/registry.py::KNOWN_INCOMPATIBLE_VERSIONS`) — a v5.x install is reported not-runnable with the exact fix (`go install github.com/owasp-amass/amass/v4/...@v4.2.0`) *before* the plugin ever attempts to run, not as a cryptic subprocess error mid-scan. |
+| nmap, whois | **Minimum-version-agnostic** | Hydra's parsers (`core/parsers/registry.py::PortVerifyParser`, `modules/whois.py`) handle a range of real-world output formats already and have shown no version-specific breakage; no pin needed, version is still detected and displayed by `check-tools` for visibility. |
+| gau, waybackurls, assetfinder, unfurl, anew | **Documented compatibility strategy, no runtime gate** | These have no known version-specific incompatibility today (unlike amass) and no regression-test coverage of their own logic either (`docs/FINAL_PROJECT_AUDIT.md` §1.4) — a hard compatibility gate would be false confidence about a tool this project can't yet verify behavior for. Pin the exact version this document's Docker table would use if you add one back (see above); otherwise track whatever `go install`'s default resolves to and re-run `check-tools` after any tool upgrade. |
+
+`python app.py check-tools` is the one command that answers "is my
+installed toolchain actually compatible" for a native install — it now
+reports a real detected version for every tool above (Finding 1 fixed a
+version-detection bug that silently returned ASCII banner art instead of
+a version number for `httpx`/`naabu`/`katana`/`dnsx`/`amass`), and for
+`amass` specifically will refuse to mark it runnable at all if a known-bad
+major version is installed. See `docs/HARDENING_ROUND2_P1.md` for the full
+audit and the exact bug reproductions.
+
 2. **`final`** (`python:3.11-slim-bookworm`) — the runtime:
    - The 7 Go binaries above, copied from the builder stage.
    - `nmap`, `whois`, `jq` (apt) — the non-Go tools Hydra's plugins call.

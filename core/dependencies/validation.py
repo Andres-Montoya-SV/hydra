@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from core.dependencies.models import ToolDefinition, ValidationResult
+from utils.subprocess import child_process_env
 
 # Exit codes commonly used for help/version output
 _ACCEPTABLE_EXIT_CODES = frozenset({0, 1, 2})
@@ -15,6 +16,18 @@ _VERSION_LINE = re.compile(
     r"(?:version|v)[\s:]*([0-9][\w.\-+()]*)",
     re.IGNORECASE,
 )
+# A bare "1.2.3"/"v1.2.3" line with nothing else on it — the fallback used
+# only when no line matched _VERSION_LINE above. Deliberately anchored
+# start-to-end (not "contains a digit somewhere"): several real tools
+# (amass, httpx, naabu, katana, dnsx) print a multi-line ASCII banner
+# before their real version line, and the previous "any digit, under 80
+# chars" fallback matched banner art lines that happen to contain a
+# stray digit from the box-drawing pattern — confirmed live against real
+# installed binaries (hardening round 2, Task 1): amass's own `version`
+# subcommand banner produced the "version" string
+# '+W@@@@@@8        &+W@#...' this way, silently, with no error.
+_BARE_VERSION_LINE = re.compile(r"^(?:[a-zA-Z]+-)?v?[0-9]+(?:\.[0-9]+){1,3}(?:[-+][\w.]+)?$")
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class HealthValidator:
@@ -100,12 +113,25 @@ class HealthValidator:
         return validation
 
     async def _try_version(self, path: Path, defn: ToolDefinition) -> str | None:
-        """Attempt version detection — failures are non-fatal."""
+        """Attempt version detection — failures are non-fatal.
+
+        Tries every configured version_commands entry in order until one
+        actually yields a parseable version, not just until one "succeeds"
+        (exit code 0 with output) — confirmed live that amass's own
+        ``version`` subcommand exits 0 with real output (a multi-line
+        ASCII banner) that contains no parseable version at all, while its
+        ``-version`` flag gives a single clean line. Previously the first
+        "successful" command won regardless, and the loop fell back to
+        that command's own first output line (banner art) as if it were
+        the version — never correct, only silently wrong.
+        """
         for args in defn.version_commands:
             outcome = await self._run_probe(path, args)
-            if outcome.success and outcome.output:
-                parsed = _extract_version(outcome.output)
-                return parsed or outcome.output.split("\n")[0][:120]
+            if not (outcome.success and outcome.output):
+                continue
+            parsed = _extract_version(outcome.output)
+            if parsed:
+                return parsed
         return None
 
     async def _run_probe(self, path: Path, args: tuple[str, ...]) -> _ProbeOutcome:
@@ -117,6 +143,7 @@ class HealthValidator:
                 *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=child_process_env(),
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
@@ -146,6 +173,7 @@ class HealthValidator:
                 str(path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=child_process_env(),
             )
             try:
                 await asyncio.wait_for(proc.communicate(), timeout=self.smoke_timeout)
@@ -160,12 +188,24 @@ class HealthValidator:
 
 
 def _extract_version(output: str) -> str | None:
-    for line in output.splitlines()[:5]:
+    """Find a real version string in a tool's version/help output.
+
+    Scans up to 40 lines (not 5) — confirmed live against real installed
+    binaries that several of Hydra's primary tools (httpx, naabu, katana,
+    dnsx) print a multi-line ASCII banner before their actual
+    "Current Version: vX.Y.Z" line, which sits well past line 5. The
+    stricter bare-version fallback below only accepts a line that is
+    *entirely* a version token (optionally ANSI-colored) — not "contains
+    a digit anywhere," which previously matched banner art by accident.
+    """
+    lines = [_ANSI_ESCAPE.sub("", line).strip() for line in output.splitlines()[:40]]
+    for line in lines:
         match = _VERSION_LINE.search(line)
         if match:
             return match.group(1)
-        if line and any(c.isdigit() for c in line) and len(line) < 80:
-            return line.strip()
+    for line in lines:
+        if line and _BARE_VERSION_LINE.match(line):
+            return line
     return None
 
 

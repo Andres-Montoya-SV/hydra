@@ -15,7 +15,11 @@ from core.dependencies.models import (
     ToolReport,
     ValidationResult,
 )
-from core.dependencies.registry import get_tool_definition, install_hint_for
+from core.dependencies.registry import (
+    get_tool_definition,
+    install_hint_for,
+    known_incompatible_version,
+)
 from core.dependencies.validation import HealthValidator
 from core.platform import PlatformInfo, detect_platform
 
@@ -122,6 +126,22 @@ class DependencyService:
 
         if discovery.is_cellar_path and discovery.in_path:
             reason += " (via Homebrew Cellar — consider using brew link)"
+
+        # Hardening round 2, Task 1: a binary that executes fine and even
+        # reports a real version can still be a confirmed-incompatible
+        # major version for the plugin code driving it (amass v5's -o
+        # flag removal is the reproduced case this closes). Catching this
+        # here — at dependency-analysis time, before any plugin runs —
+        # turns a cryptic mid-run subprocess failure into a clear,
+        # actionable warning surfaced by `check-tools` and the pipeline's
+        # own pre-flight tool validation (core/tool_manager.py).
+        incompatibility = known_incompatible_version(defn.name, validation.version)
+        if incompatibility:
+            health = ToolHealth.MISSING
+            reason = (
+                f"version {validation.version} is a known-incompatible release: {incompatibility}"
+            )
+            recommendation = incompatibility
 
         return ToolReport(
             name=defn.name,

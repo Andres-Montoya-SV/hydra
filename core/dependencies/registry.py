@@ -70,11 +70,24 @@ _register(
     ToolDefinition(
         name="amass",
         display_name="amass",
-        version_commands=(("version",), ("-version",)),
+        # `-version` first: confirmed live it prints a single clean
+        # "v5.1.1" line, while the `version` subcommand prints a
+        # multi-line ASCII banner with no parseable version in it at all
+        # (hardening round 2, Task 1) — trying the noisy command first
+        # used to make version detection silently report banner art.
+        version_commands=(("-version",), ("version",)),
         health_commands=(("--help",), ("-h",)),
         capabilities=frozenset({"subdomain_enumeration", "passive_dns", "active_enumeration"}),
         install_homebrew="amass",
-        install_go="github.com/owasp-amass/amass/v4/...@master",
+        # Homebrew's "amass" formula tracks upstream latest (v5.x as of
+        # this writing) — this Go module path is intentionally still
+        # pinned to v4, the version this plugin's CLI usage
+        # (`modules/amass.py`) was actually written against. See
+        # docs/FINAL_PROJECT_AUDIT.md / docs/HARDENING_ROUND2_P1.md: v5
+        # removed the `-o` flag the plugin depends on, breaking every
+        # invocation. Do not bump this to a bare "@latest" without first
+        # updating modules/amass.py for v5's directory-based output.
+        install_go="github.com/owasp-amass/amass/v4/...@v4.2.0",
     )
 )
 
@@ -212,6 +225,58 @@ def get_tool_definition(name: str) -> ToolDefinition:
     if name in TOOL_REGISTRY:
         return TOOL_REGISTRY[name]
     return ToolDefinition(name=name, display_name=name)
+
+
+def _major_version(version: str) -> int | None:
+    """Parse a leading major version number out of a detected version
+    string ("5.1.1" / "v5.1.1" -> 5). Returns None if unparseable — never
+    guessed, since a known-incompatible check must fail open (treat as
+    unknown/compatible) rather than closed on a string it can't read, or
+    every tool with a version format this doesn't recognize would be
+    wrongly flagged."""
+    stripped = version.lstrip("vV")
+    head = stripped.split(".", 1)[0]
+    return int(head) if head.isdigit() else None
+
+
+# Hardening round 2, Task 1: known, *confirmed* hard incompatibilities
+# between a specific tool's major version and the plugin code that drives
+# it — not a general "minimum version" table (most tools here have no
+# such constraint; newer is normally fine). Each entry is
+# {tool_name: (min_incompatible_major, message)}. Checked once real
+# version detection succeeds (core/dependencies/service.py); deliberately
+# small and explicit rather than a generic semver-range system, since
+# amass is the only entry with real, reproduced evidence behind it today
+# (docs/FINAL_PROJECT_AUDIT.md, docs/HARDENING_ROUND1_P0.md) — add another
+# row only with the same kind of direct reproduction, not a guess.
+KNOWN_INCOMPATIBLE_VERSIONS: dict[str, tuple[int, str]] = {
+    "amass": (
+        5,
+        "amass v5 removed the -o output flag modules/amass.py depends on "
+        '(every invocation fails: "flag provided but not defined: -o"). '
+        "Install v4 instead (go install "
+        "github.com/owasp-amass/amass/v4/...@v4.2.0), or leave "
+        "ENABLE_AMASS=false until the plugin is updated for v5's "
+        "directory-based output. See docs/FINAL_PROJECT_AUDIT.md.",
+    ),
+}
+
+
+def known_incompatible_version(name: str, version: str | None) -> str | None:
+    """Return a clear, actionable message if `version` is a confirmed-bad
+    major version for tool `name`, else None. Fails open on anything it
+    can't confidently classify (no entry, no version string, unparseable
+    version) — this is a targeted allowlist of confirmed breakage, not a
+    general gate that could wrongly block a tool this table has no
+    evidence about."""
+    entry = KNOWN_INCOMPATIBLE_VERSIONS.get(name)
+    if not entry or not version:
+        return None
+    min_bad_major, message = entry
+    major = _major_version(version)
+    if major is not None and major >= min_bad_major:
+        return message
+    return None
 
 
 def install_hint_for(defn: ToolDefinition, *, is_macos: bool, is_linux: bool) -> str:
