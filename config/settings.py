@@ -191,7 +191,6 @@ class Settings:
     amass_path: Path = field(default_factory=lambda: Path("amass"))
     anew_path: Path = field(default_factory=lambda: Path("anew"))
     jq_path: Path = field(default_factory=lambda: Path("jq"))
-    whois_path: Path = field(default_factory=lambda: Path("whois"))
     nmap_path: Path = field(default_factory=lambda: Path("nmap"))
 
     # Execution
@@ -446,7 +445,6 @@ class Settings:
             amass_path=_safe_path(os.getenv("AMASS_PATH", ""), "amass"),
             anew_path=_safe_path(os.getenv("ANEW_PATH", ""), "anew"),
             jq_path=_safe_path(os.getenv("JQ_PATH", ""), "jq"),
-            whois_path=_safe_path(os.getenv("WHOIS_PATH", ""), "whois"),
             nmap_path=_safe_path(os.getenv("NMAP_PATH", ""), "nmap"),
             timeout=_int(os.getenv("TIMEOUT"), 300, "TIMEOUT"),
             threads=_int(os.getenv("THREADS"), 50, "THREADS"),
