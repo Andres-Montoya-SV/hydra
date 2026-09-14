@@ -631,10 +631,48 @@ DNS-rebinding/TOCTOU closure, re-verified live in Section G/I below.
 | WHOIS (native client) | Root domain | Yes — every hop of its own referral chain (IANA → registry → registrar) is Hydra's own connection, SSRF-validated | `core/collection/whois_client.py` | None beyond the SSRF policy's own known blocklist scope |
 
 **naabu/port_verify confirmation** (per this round's explicit instruction to
-re-confirm, not re-litigate): `README.md` § Security Considerations and this
+re-confirm, not re-litigate): `README.md` § Security model and this
 document's own `naabu`/`port_verify` table rows (added last round) both still
 state the same thing verified here again — re-read both files this round,
 text unchanged and accurate, no drift found.
+
+**2026-09-14 STRICT_OPSEC re-audit (hardening round 1, Task 3)**: re-verified
+every `strict_opsec_allowed = True` plugin's class attribute directly against
+`modules/*.py` (not from memory of a prior table): `browser_probe`, `ctlogs`,
+`passive_dns`, `anew`, `httpx`, `cloud_bucket_enum`, `param_fuzz`,
+`threat_intel`, `soft404_check`, `unfurl`, `vuln_match`, `security_headers` —
+exactly matches `STRICT_OPSEC_ALLOWED_PLUGINS` (derived from these class
+attributes, not a hand-maintained list). Classification, confirmed by
+re-reading each module's source this round:
+
+- **Proxy-confined for real** (already covered above): `httpx`, `browser_probe`,
+  `soft404_check`, `param_fuzz`, `cloud_bucket_enum`.
+- **No network at all** (STRICT_OPSEC-safe by having nothing to leak — grepped
+  for `socket`/`urllib`/`requests`/`proxy` in each file, zero hits):
+  `anew`, `unfurl`, `security_headers`.
+- **Fixed-third-party, and — the one gap this document's classification
+  discussion above never stated explicitly — confirmed to actually route
+  through the operator's own `OUTBOUND_PROXY_URL`** (a different property
+  than target-confinement: these never touch the target either way, but
+  under `STRICT_OPSEC` the *operator's own* connection to crt.sh/URLhaus/
+  OSV.dev/WPScan/Mnemonic/SecurityTrails must itself be proxied, or
+  `STRICT_OPSEC` would be silently protecting the target's view of Hydra
+  while leaving the *operator's* real IP exposed to those fixed third
+  parties): `ctlogs.py`, `threat_intel.py`, `vuln_match.py`,
+  `passive_dns.py` — all four pass `self.settings.outbound_proxy_url`
+  through to the shared `utils/network.py:open_url()` helper, which builds
+  a real `urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})`
+  when a proxy URL is given. Since `enforce_opsec_gate`
+  (`core/opsec_check.py`) already refuses to start a strict-OPSEC run at all
+  without `OUTBOUND_PROXY_URL` set, this proxying is unconditional in
+  practice whenever `STRICT_OPSEC=true` — not an opt-in a plugin could
+  silently skip.
+
+No invariant-9 violation found (`STRICT_OPSEC` never silently implies a
+capability Hydra can't actually apply) — every plugin allowed under strict
+mode either has nothing to leak, is proxy-confined at the target-connection
+level, or (this round's addition) is confirmed proxy-routed at the
+operator-identity level even though its destination was never the target.
 
 ### A real bypass-pattern gap found this round (Section 23), fixed immediately
 
