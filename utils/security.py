@@ -32,6 +32,15 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"(?i)x-hackerone-researcher\s*[:=]\s*.+"),
     re.compile(r"(?i)(session[_-]?id|sid)\s*[:=]\s*.+"),
     re.compile(r"(?i)(https?://)[^/\s:@]+:[^@\s/]+@"),
+    # Anthropic/OpenAI API key *shape*, independent of any surrounding
+    # keyword — the patterns above all require a "key=" / "token:" /
+    # "Bearer " prefix, which catches Hydra's own log lines but not a raw
+    # key value echoed verbatim inside a third-party SDK's exception
+    # message (e.g. anthropic.AuthenticationError's own str()). Matches
+    # real key prefixes (sk-ant-..., sk-proj-..., sk-...) followed by a
+    # long token body, so it doesn't false-positive on short unrelated
+    # "sk-" substrings.
+    re.compile(r"\bsk-(?:ant|proj)?-?[A-Za-z0-9_-]{20,}"),
 ]
 
 _MAX_READ_BYTES = 50 * 1024 * 1024  # 50 MB

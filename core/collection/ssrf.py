@@ -25,23 +25,29 @@ from dataclasses import dataclass
 # Fixed blocklist per the mission spec. Deliberately not sourced from
 # CollectionScope — these are defaults that apply regardless of scope
 # unless a run explicitly opts in via `allow_private_network_targets`.
+#  ipaddress.ip_network() is a generic factory typed to return
+# IPv4Network | IPv6Network regardless of which one a given string
+# actually parses to — mypy can't narrow that from a literal string, so
+# these use the concrete IPv4Network/IPv6Network constructors directly
+# (identical parsing/behavior for a valid CIDR string) to get the precise
+# per-tuple type these constants are meant to have.
 _BLOCKED_V4: tuple[ipaddress.IPv4Network, ...] = (
-    ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("100.64.0.0/10"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),  # covers the 169.254.169.254 metadata address
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("198.18.0.0/15"),
-    ipaddress.ip_network("224.0.0.0/4"),
-    ipaddress.ip_network("240.0.0.0/4"),
+    ipaddress.IPv4Network("0.0.0.0/8"),
+    ipaddress.IPv4Network("10.0.0.0/8"),
+    ipaddress.IPv4Network("100.64.0.0/10"),
+    ipaddress.IPv4Network("127.0.0.0/8"),
+    ipaddress.IPv4Network("169.254.0.0/16"),  # covers the 169.254.169.254 metadata address
+    ipaddress.IPv4Network("172.16.0.0/12"),
+    ipaddress.IPv4Network("192.168.0.0/16"),
+    ipaddress.IPv4Network("198.18.0.0/15"),
+    ipaddress.IPv4Network("224.0.0.0/4"),
+    ipaddress.IPv4Network("240.0.0.0/4"),
 )
 _BLOCKED_V6: tuple[ipaddress.IPv6Network, ...] = (
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),  # ULA
-    ipaddress.ip_network("fe80::/10"),  # link-local
-    ipaddress.ip_network("ff00::/8"),  # multicast
+    ipaddress.IPv6Network("::1/128"),
+    ipaddress.IPv6Network("fc00::/7"),  # ULA
+    ipaddress.IPv6Network("fe80::/10"),  # link-local
+    ipaddress.IPv6Network("ff00::/8"),  # multicast
 )
 
 
@@ -97,7 +103,12 @@ def resolve_hostname(hostname: str) -> list[str]:
     infos = socket.getaddrinfo(hostname, None)
     seen: list[str] = []
     for _family, _type, _proto, _canon, sockaddr in infos:
-        ip = sockaddr[0]
+        # typeshed types sockaddr as a union of the IPv4 (host, port) and
+        # IPv6 (host, port, flowinfo, scope_id) tuple shapes, so element 0
+        # is inferred as "str | int" even though it is always the address
+        # string at runtime for both families — real getaddrinfo() never
+        # puts an int there.
+        ip = str(sockaddr[0])
         if ip not in seen:
             seen.append(ip)
     return seen

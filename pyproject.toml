@@ -67,6 +67,36 @@ exclude = ["(?x)(tests/|\\.venv/|output/|logs/)"]
 module = ["app", "config.*", "core.*", "modules.*", "ui.*", "utils.*"]
 ignore_errors = true
 
+# Hardening round 2 (Task 3): incremental, security-priority-ordered
+# opt-in to real type checking, carved out of the blanket ignore above.
+# mypy applies the last matching override for a given module, so each
+# entry below re-enables checking for exactly that module without
+# touching the broad exemption everything else still has. Each module
+# here was fixed to pass real checking (no bare `# type: ignore`) before
+# being added — see docs/HARDENING_ROUND2_P1.md for every fix and why.
+# Expand this list incrementally in future rounds; do not widen the
+# blanket ignore instead of adding entries here.
+[[tool.mypy.overrides]]
+module = [
+    "core.intel.authorize",
+    "core.scope",
+    "core.intel.scope",
+    "core.collection.audit",
+    "core.collection.crawler_proxy",
+    "core.collection.gateway",
+    "core.collection.ssrf",
+    "core.collection.target",
+    "core.collection.whois_client",
+    "core.store",
+    "core.verification.detectors",
+    "core.verification.grounding",
+    "core.verification.model",
+    "core.verification.postmodule",
+    "core.verification.preflight",
+    "config.settings",
+]
+ignore_errors = false
+
 [tool.bandit]
 exclude_dirs = ["tests", ".venv"]
 

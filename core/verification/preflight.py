@@ -26,6 +26,7 @@ from core.exceptions import ConfigurationError
 from core.verification.model import ContradictionSeverity, VerificationFinding
 
 if TYPE_CHECKING:
+    from core.intel.scope import CollectionScope
     from core.store import AssetStore
 
 
@@ -230,7 +231,7 @@ def _synthetic_path_for_glob(path_glob: str) -> str:
     return "/".join(_CANARY_TOKEN if segment == "*" else segment for segment in segments)
 
 
-def scope_exclusion_canary_check(scope: object) -> list[VerificationFinding]:
+def scope_exclusion_canary_check(scope: CollectionScope) -> list[VerificationFinding]:
     """For every configured SCOPE_FILE exclusion, actively probe Hydra's
     own `authorize_active_indicator` with a synthetic name shaped like the
     pattern — never a real target, never a real network request. If the
@@ -238,9 +239,11 @@ def scope_exclusion_canary_check(scope: object) -> list[VerificationFinding]:
     effect at all (INVALIDATES — this is not "confidence is lower", the
     protection an operator believes exists simply is not there).
 
-    Takes `scope` typed loosely (not `CollectionScope`) to avoid this
-    module importing `core.intel.scope` at module load time — the same
-    lazy-import convention `core/runner.py` already uses for
+    Typed as `CollectionScope` under `TYPE_CHECKING` only (see the import
+    above) — `from __future__ import annotations` means this annotation is
+    never evaluated at runtime, so this module still never actually
+    imports `core.intel.scope` at load time, the same lazy-import
+    convention `core/runner.py` already uses for
     `core.intel.*` throughout, kept here too.
     """
     from core.intel.authorize import authorize_active_indicator

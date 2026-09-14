@@ -168,15 +168,30 @@ class CollectionGateway:
                 "CollectionGateway.http_get() requires an AuthorizedCollectionTarget "
                 f"(from gateway.authorize()), got {type(target).__name__!r}"
             )
-        # core/http_probe.py:http_get is a blocking urllib call.
-        kwargs: dict[str, object] = {
-            "timeout": timeout,
-            "proxy_url": self._proxy.proxy_url,
-            "extra_headers": self.extra_headers or None,
-        }
-        if self.user_agent:
-            kwargs["user_agent"] = self.user_agent
-        response = await asyncio.to_thread(_http_get, target.raw, **kwargs)
+
+        # core/http_probe.py:http_get is a blocking urllib call. Dispatched
+        # through a small typed closure rather than **dict[str, object]
+        # unpacking — the dict form loses each keyword's real type, and
+        # user_agent is conditionally omitted (not passed as None, which
+        # http_get's `user_agent: str = ...` signature doesn't accept
+        # anyway) so http_get's own default applies when unset.
+        def _call() -> ResponseSnapshot:
+            if self.user_agent:
+                return _http_get(
+                    target.raw,
+                    timeout=timeout,
+                    proxy_url=self._proxy.proxy_url,
+                    user_agent=self.user_agent,
+                    extra_headers=self.extra_headers or None,
+                )
+            return _http_get(
+                target.raw,
+                timeout=timeout,
+                proxy_url=self._proxy.proxy_url,
+                extra_headers=self.extra_headers or None,
+            )
+
+        response = await asyncio.to_thread(_call)
         self.audit.append(
             GatewayAuditEntry(
                 hostname=target.hostname,
