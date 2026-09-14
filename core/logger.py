@@ -40,6 +40,28 @@ class SecretRedactingFilter(logging.Filter):
         return True
 
 
+class RedactingFormatter(logging.Formatter):
+    """Formatter that redacts secrets from the fully rendered log line.
+
+    A `logging.Filter` (see `SecretRedactingFilter` above) runs *before*
+    `Formatter.format()` renders `record.exc_info`/`record.stack_info` into
+    text, so sanitizing only `record.msg`/`record.args` leaves a secret
+    embedded in an exception's own message — e.g. `logger.exception(...)`
+    on a network call that raised with a proxy URL carrying embedded
+    credentials, or any error string built from `OUTBOUND_PROXY_URL` — to
+    reach the log completely unredacted (confirmed empirically: a plain
+    `logging.Formatter` prints such a traceback verbatim even with
+    `SecretRedactingFilter` attached, since the exception text does not
+    exist as `record.exc_text` until formatting runs). Re-sanitizing the
+    whole rendered line here — message, traceback, and any stack info —
+    as the last step before it is written closes that gap. See
+    docs/HARDENING_ROUND2_P1.md, Task 6.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return sanitize_log_message(super().format(record))
+
+
 def setup_logging(log_level: str, log_dir: Path) -> Logger:
     """Configure root logger with console and file handlers.
 
@@ -63,7 +85,7 @@ def setup_logging(log_level: str, log_dir: Path) -> Logger:
     root.setLevel(level)
     root.handlers.clear()
 
-    formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
+    formatter = RedactingFormatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
     redact_filter = SecretRedactingFilter()
 
     console = logging.StreamHandler(sys.stderr)

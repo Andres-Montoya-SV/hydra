@@ -46,6 +46,27 @@ class TestLogSanitization:
         assert "password" not in result
         assert str(Path.home()) not in result
 
+    def test_redacts_bare_anthropic_key_shape_without_keyword_prefix(self) -> None:
+        # Hardening round 2, Task 6: a third-party SDK's own exception
+        # message (e.g. anthropic.AuthenticationError) can echo a raw key
+        # value with no "key=" / "token:" prefix for the keyword-based
+        # patterns above to anchor on — the key's own shape must be enough.
+        key = "sk-ant-api03-" + "A" * 95 + "-" + "B" * 10
+        msg = f"anthropic.AuthenticationError: invalid x-api-key {key} rejected"
+        result = sanitize_log_message(msg)
+        assert key not in result
+        assert "[REDACTED]" in result
+
+    def test_redacts_bare_openai_key_shape_without_keyword_prefix(self) -> None:
+        key = "sk-proj-" + "C" * 80
+        msg = f"openai.AuthenticationError: Incorrect API key provided: {key}"
+        result = sanitize_log_message(msg)
+        assert key not in result
+
+    def test_short_sk_prefixed_substring_is_not_a_false_positive(self) -> None:
+        msg = "process risk sk-ip mapping enabled for host"
+        assert sanitize_log_message(msg) == msg
+
 
 class TestHtmlEscape:
     def test_escapes_script_tags(self) -> None:
