@@ -1,127 +1,186 @@
-# Hydra current-state architecture
+# Hydra — Architecture
 
-**Date:** 2026-08-29
-**Method:** runtime code, not README / prior reports. Entry: `python app.py run -d <target>` → `PipelineRunner.run()`.
-**Rule:** observation is not authorization. Tests and comments were treated as untrusted; every claim below was verified this session (real subprocess runs, real WebKit tests, real SQLite persistence) — see `docs/FINAL_SECURITY_AUDIT.md` for full detail and exact citations.
+**Status: living reference**, verified against the real `core/runner.py`
+on 2026-09-13 (not re-read from any prior doc and assumed current). This
+supersedes five prior architecture documents, archived under
+`docs/archive/` with pointers here: `ARCHITECTURE_2026-08-29.md`,
+`ARCHITECTURE_CURRENT_2026-08-22.md`, `ARCHITECTURE_AUDIT_2026-08-24.md`,
+`ARCHITECTURE_AUDIT_2_2026-08-30.md`, `ARCHITECTURE_REVIEW.md` (already
+self-superseded since 2026-08-04). For the security/confinement-specific
+call paths, see `docs/NETWORK_CONFINEMENT.md`; for the project's current
+overall health with real numbers, see `docs/FINAL_PROJECT_AUDIT.md`.
 
-This file is superseded in detail by `docs/FINAL_SECURITY_AUDIT.md` (the current authoritative
-audit) and `docs/NETWORK_BOUNDARY_AUDIT.md` (the changelog of how the architecture got here). It
-stays as a short, current-state map — not the previous revision's stale snapshot.
+## Runtime flow
 
----
+```mermaid
+flowchart TD
+    CLI["python app.py run -d &lt;target&gt;"] --> Preflight["_external_mode_preflight\n(owned vs. external, conservative defaults)"]
+    Preflight --> Runner["PipelineRunner.run()"]
+    Runner --> Scope["CollectionScope.from_seeds\n(always attached; SCOPE_FILE or seed-eTLD+1 fallback)"]
+    Scope --> Canary["Pre-flight checks\n(scope_exclusion_canary_check, historical_cross_check)\nfail closed on a broken SCOPE_FILE exclusion"]
+    Canary --> Whois["whois (native SSRF-validated client)"]
+    Whois --> Enum["subfinder / assetfinder / amass"]
+    Enum --> Dedupe["dedupe + anew"]
+    Dedupe --> Wildcard["wildcard_check\n(DNS canary before trusting enumeration)"]
+    Wildcard --> Dnsx["dnsx: resolve subdomains -> resolved.txt"]
+    Dnsx --> AsnNaabu["asn_lookup, naabu -> port_verify"]
+    AsnNaabu --> Httpx["httpx: probe resolved hosts\n(each redirect hop re-authorized, AuthorizedCollectionTarget)"]
+    Httpx --> Optional["Optional/enrichment stage, concurrent:\nctlogs, katana, hakrawler, gau, waybackurls, unfurl,\nnuclei, soft404_check, param_fuzz, cloud_bucket_enum,\nthreat_intel, vuln_match, security_headers"]
+    Optional --> Gateway{{"CollectionGateway / ScopeEnforcingProxy\n(every tool-issued connection re-authorized\nat the socket, not just the input file)"}}
+    Gateway --> Followup["Bounded follow-up collection\n(re-authorizes every discovered indicator,\nMAX_DISCOVERY_DEPTH)"]
+    Followup --> Browser["browser_probe (Playwright/WebKit,\nproxy-confined, per-request route guard)"]
+    Browser --> Finalize["_finalize_to_store:\nparser registry ingest -> HostRegistry\n-> core/intel (correlation) + core/intelligence (clusters/graph/risk)\n-> core/verification (post-module checks)"]
+    Finalize --> SQLite[("SQLite: AssetStore\nWAL, foreign_keys=ON")]
+    SQLite --> Report["core/reporter.py:\nMarkdown + HTML + JSON"]
 
-## Runtime map
-
+    Assess["python app.py assess-reportability\n(standalone, opt-in, never run by `run`)"] -.-> SQLite
+    Assess -.-> LLM{{"Anthropic and/or OpenAI\n(adversarial cross-validation optional)"}}
 ```
-app.py:main
-  load_settings → cmd_run
-    ToolManager + PipelineRunner.run
-      CollectionScope.from_seeds (always attached if runner runs)
-      plugins (whois → enum → CT → seed dnsx → httpx → optional → follow-up)
-      IntelEngine ingest/correlate (follow-up + finalize)
-      AssetStore SQLite
-      ReportGenerator + CLI query
-```
 
-Network sinks (actual I/O) and what gates each one today:
+Traced 2026-09-13 directly from `core/runner.py:PipelineRunner.run()`
+(not assumed from a stage-name list — read end to end, including the
+follow-up/browser_probe ordering, which differs subtly from an earlier
+document's description: `browser_probe` runs **after** the concurrent
+optional stage and **after** follow-up collection, not inside the
+concurrent batch).
 
-| Sink | Module | Hostname source | Gate today |
-|---|---|---|---|
-| subprocess argv | `utils/subprocess.py` (no `shell=True`) | plugin argv | plugin-specific |
-| dnsx | `modules/dnsx.py` | authorized input file | `_gate_active_input` (scope+OPSEC composed) + output re-filtered |
-| httpx | `modules/httpx.py` | authorized input, then per-hop `-u` | `_gate_active_input` for the batch; **`AuthorizedCollectionTarget.authorize()` per redirect hop** — no `-follow-redirects`, never fetches an unauthorized `Location` |
-| naabu / nmap | naabu, port_verify | authorized resolved / naabu list | `_gate_active_input`; port_verify independently re-authorizes rather than trusting naabu |
-| katana / hakrawler / nuclei | respective modules | `authorized_alive.txt` / `_alive_urls()` | input gated **+ `ScopeEnforcingProxy` (`core/collection/crawler_proxy.py`) for every connection the tool makes on its own** — verified against the real installed binaries |
-| Playwright | `modules/browser_probe.py` | httpx URLs | fail-closed on missing scope; `browser_context.route()`/`route_web_socket()` authorize every document/subresource/iframe/WebSocket request, including popups |
-| urllib HTTPS | ctlogs, threat_intel, vuln_match, cloud_bucket_enum, param_fuzz, soft404_check | seeds / hosts / derived | per-request `allows_active_collection`/`authorize_active_indicator`; threat_intel/vuln_match connect to fixed third-party hosts, target data never becomes the connection host |
-| sockets | `modules/asn_lookup.py` | resolved IPs / hostnames | Team Cymru query itself is data-gated (IPs from dnsx's prior gate); the `getaddrinfo` fallback — the one place this plugin does its own active DNS — is hostname-gated via `allows_active_collection` |
-| whois binary | `modules/whois.py` | target roots | `authorize_active_indicator` per root |
-| gau / waybackurls | archive APIs | seeds | per-seed `authorize_active_indicator` |
-| cloud_bucket_enum | derived FQDNs | brand permute | plugin-entry policy flag **+ per-URL `authorize_active_indicator(..., "cloud_bucket_enum")`** |
+## Network sinks and what gates each one
 
-No `os.system`, no `shell=True` execution, no `requests`/`aiohttp` in-tree.
+Full, per-plugin detail (authorization mechanism, SSRF/DNS-rebinding
+handling, live-tested evidence) lives in `docs/NETWORK_CONFINEMENT.md` —
+not duplicated here. Short version: every plugin that can reach the
+target goes through one of three enforcement shapes:
 
----
+1. **`CollectionGateway`** (`soft404_check`, `param_fuzz`,
+   `cloud_bucket_enum`) — the plugin cannot construct a request from a
+   raw string at all; it must hold an `AuthorizedCollectionTarget`, a
+   sealed object only `gateway.authorize()` can produce.
+2. **`ScopeEnforcingProxy`** (`httpx`, `katana`, `hakrawler`, `nuclei`,
+   `browser_probe`) — a local forward proxy that authorizes the
+   destination IP (not just the hostname) before connecting; the proxy
+   pins the connection to the IP it validated, closing DNS-rebinding.
+3. **Input-gated only, architecturally unproxyable** (`naabu`,
+   `port_verify` — raw TCP/SYN cannot be routed through an HTTP proxy;
+   `whois` uses a native client with its own per-hop SSRF check instead,
+   since WHOIS isn't HTTP either).
 
-## Invariant vs implementation
+A fourth, larger group (`ctlogs`, `threat_intel`, `vuln_match`,
+`asn_lookup`'s primary Cymru query, `gau`, `waybackurls`, `passive_dns`)
+never connects to the target at all — the target's hostname is *query
+data* sent to a fixed, Hydra-chosen third party (crt.sh, URLhaus, OSV.dev,
+Team Cymru, archive.org). Routing these through the confinement proxy
+would apply target-authorization semantics to a connection that was never
+made to the target — a documented, deliberate non-fix, not an oversight.
 
-| Invariant | Current | Correction needed |
-|---|---|---|
-| A. Observation ≠ authorization | CT SANs, redirects, crawler discoveries all observed; OOS never enters canonical alive/resolved | none known |
-| B. Fail closed without CollectionScope | `require_collection_scope` enforced for all 19 `active_collection=True` plugins, verified in one parametrized test that patches every network primitive | none known |
-| C. One authorization API | `authorize_collection()` (scope+capability+OPSEC) is what `_gate_active_input` — the single choke point every active-collection plugin passes through — actually calls | not yet the *only* call path: several plugins (`asn_lookup`, `whois`, `gau`, `waybackurls`) still call the scope-only primitive directly for their per-target checks (safe today because OPSEC for them is enforced upstream at the whole-plugin skip, but not composed into that same call) |
-| D. Redirects never expand authorization | httpx: per-hop authorization via `AuthorizedCollectionTarget`, no bypass on two independent reviews. katana/hakrawler: proxy-confined. | none known for these three; other plugins don't follow redirects at all |
-| E. alive/resolved derived, not mutated ad hoc | seed snapshots + follow-up sidecars + atomic authorized union, verified pre-existing and correct | none known |
-| F. COLLECTED only on success | queue has real DISCOVERED→ELIGIBLE→IN_FLIGHT→{COLLECTED,FAILED,REJECTED,NOT_ALLOWED,PARTIAL} transitions; `overlay_status` turns a restored IN_FLIGHT into FAILED, never COLLECTED | still hostname-level, not capability-level (DNS success + HTTP fail is one indicator, not two independent capability outcomes) |
-| G. Collection attempts first-class | `intel_collection_attempts` table exists; `claim_attempt()` persists IN_FLIGHT before the follow-up subprocess runs | seed collection has no `CollectionAttempt` rows at all — not unified with the follow-up model |
-| Hypothesis type | `Hypothesis`/`HypothesisStatus` exist, `authorize_hypothesis`/`reject_hypothesis`; a hypothesis never itself triggers collection | none known |
-| Intel is correlation truth | `intel_relationships` is authoritative; Host graph/clusters remain a separate projection | none known (Host does not contradict Intel; not deeply re-audited this pass) |
-| Certificate identity | `identity_kind`: sha256 → serial_issuer → unidentified; SHARES_CERTIFICATE requires an identified kind; never a manufactured fingerprint | none known; has dedicated tests including the live-shaped crt.sh record format |
-| Wildcard | seed DNS policy + follow-up evidence gate (`evidence_supports_certificate_followup` requires a real relationship, not a plugin-claimed reason) | none known |
-| Cloud endpoints | `CollectionScope.cloud_collection_allowed` + per-URL check, both must agree | none known — was broken (opt-in flag was a no-op), fixed this session |
-| STRICT_OPSEC vs scope | composed via `authorize_collection(strict_opsec=..., opsec_allowed=...)` at the choke point; independent whole-plugin skip remains as a fast path beneath it | none known |
-| RelationshipView | `serialize_relationship()` used by CLI (`cmd_relationships` and now `cmd_investigate`), Markdown, HTML, JSON | none known — `cmd_investigate` was on a separate unserialized path, fixed this session |
-| CI format | `black`/`isort`/`ruff`/`mypy`/`bandit` all clean | none known |
+**One narrower, real residual** (confirmed 2026-09-13,
+`docs/FINAL_PROJECT_AUDIT.md` Part 3.1's cross-check): `modules/asn_lookup.py`'s
+own DNS-resolution fallback branch (used only when neither `context.resolved`
+nor `dnsx_records.jsonl` has an IP for a host) calls the narrower,
+scope-only `allows_active_collection` directly, not the fuller
+`authorize_active_indicator` that `whois`/`gau`/`waybackurls` were
+migrated onto. Low severity (this path only ever resolves hosts dnsx's
+own gate already saw), but not yet unified with the rest.
 
----
+No `os.system`, no `shell=True`, no `requests`/`aiohttp` anywhere in-tree
+— all subprocess calls use `asyncio.create_subprocess_exec` with argument
+lists.
 
-## Follow-up / intelligence loop (as coded)
+## Persistence
 
-Pass 0: seed collect (enum files → gated dnsx input) → httpx → snapshot seed DNS/HTTP.
+SQLite (`core/store.py:AssetStore`), WAL mode, `PRAGMA foreign_keys=ON` on
+every connection — real, enforced foreign keys, not just application-level
+discipline (see `docs/FINAL_PROJECT_AUDIT.md` Part 2 for a composite-FK
+test proving cross-run contamination is structurally impossible for the
+reportability tables). Core tables: `runs`, `hosts`, `http_services`,
+`ports`, `dns_records`, `tls_certificates`, `urls`, `findings`,
+`provenance`, `verification_flags`, `reportability_assessments` +
+`reportability_adversarial_reviews`, plus the `intel_*` family
+(`intel_entities`, `intel_observations`, `intel_evidence`,
+`intel_relationships`, `intel_indicators`, `intel_hypotheses`,
+`intel_collection_attempts`, `intel_network_requests`).
 
-Pass 1+: `IntelEngine.ingest_artifacts` → `correlate` → `plan_followup_collection` (authorize + evidence + wildcard + budget) → `claim_attempt()` + persist (durable before the subprocess runs) → sidecar collect → authorized union → `record_attempt()` + persist.
+## The three intelligence layers
 
-Stop: `MAX_DISCOVERY_DEPTH`, probe budgets, `MAX_RUNTIME`. Second `_maybe_collect_followups` pass exists after optional plugins.
+Hydra runs three independent, purpose-built layers on top of raw plugin
+output — independent in the sense that each has its own module, its own
+tests, and its own job, not that they duplicate each other's correlation
+truth (see `docs/NETWORK_CONFINEMENT.md`'s "Host graph vs. Intel
+confidence" section for how the two correlation-adjacent layers below stay
+consistent with each other):
 
-**Residual:** `COLLECTED` is still hostname-level, not per-capability. Seed collection has no `CollectionAttempt` audit trail (follow-up does).
+- **`core/intel/`** — the OSINT entity/relationship/hypothesis engine:
+  builds `intel_entities`/`intel_relationships` from evidence
+  (shared certificates, shared IPs, passive DNS), gates follow-up
+  collection through `authorize_active_indicator`, and is the
+  authoritative source design doc: `docs/CORRELATION_ENGINE_DESIGN.md`.
+- **`core/intelligence/`** — Host-view clustering, the infrastructure
+  graph, and risk scoring; deliberately a thin *projection* of `core/intel`'s
+  relationships (`cluster_signal_confidence` is imported directly from
+  `core/intel/correlate.py`, not recomputed), not a second, independently
+  fallible correlation engine.
+- **`core/verification/`** — a deterministic (no LLM) agent that doubts
+  Hydra's own results: pre-flight checks (a broken `SCOPE_FILE` exclusion
+  fails the run closed before any collection starts) and post-module
+  contradiction detectors (e.g. a DNS NODATA record counted as "resolved").
+  Design doc: `docs/VERIFICATION_AGENT_DESIGN.md`.
+- **`core/reportability/`** — the one place an LLM (Claude and/or OpenAI,
+  interchangeable behind one provider abstraction, with optional
+  adversarial cross-validation between the two) makes a judgment call:
+  whether a finding is likely eligible for a bounty under a program's own
+  rules text. Never authoritative over scope, evidence, or whether a
+  vulnerability exists — a triage aid, standalone (`python app.py
+  assess-reportability`), never run by `run`. Design doc:
+  `docs/REPORTABILITY_AGENT_DESIGN.md`.
 
----
+**Naming collision warning, noted so it doesn't cost you a debugging
+session**: `core/intel/` and `core/intelligence/` are genuinely different
+packages, not a typo. Same for `core/scope.py` (legacy glob-pattern
+exclusion matching) vs. `core/intel/scope.py` (the authorization-aware
+`CollectionScope`) — both are real, both are used, check the import path.
 
-## Network boundary (new since the previous revision of this document)
+## Deployment and CI
 
-`core/collection/` holds the two new primitives:
-
-- `target.py: AuthorizedCollectionTarget` — a frozen dataclass constructible only via `.authorize(...)` returning non-None on ALLOW. Wired into `modules/httpx.py`'s redirect-hop resolution as a concrete demonstration; not yet retrofitted across every plugin (that is the full `CollectionGateway`, still open).
-- `crawler_proxy.py: ScopeEnforcingProxy` — a local HTTP/HTTPS forward proxy that authorizes every destination host before connecting, used unconditionally by katana/hakrawler/nuclei. Real TCP-level containment for exactly what it covers; not TLS interception, not a claim about a tool that bypasses its own configured proxy. Full detail: `docs/FINAL_SECURITY_AUDIT.md` §6-7.
-
----
-
-## SQLite
-
-WAL + `foreign_keys=ON` on connect. Intel tables: entities, observations, evidence, relationships,
-indicators (+ lifecycle columns), `intel_hypotheses`, `intel_collection_attempts`. Truncation
-flags on `runs`.
-
----
-
-## Reporting
-
-CLI (`cmd_relationships`, `cmd_investigate`)/HTML/MD/JSON all use `serialize_relationship`. Host
-clusters/graph remain a reporting projection, not a second correlation source of truth.
-
----
+- **Docker** (`Dockerfile`, `docs/DOCKER.md`): two-stage build, runs as a
+  non-root user (uid 10001), `naabu` holds exactly `cap_net_raw=ep` and no
+  other binary has any elevated capability — verified directly
+  (`getcap` across every installed binary), not assumed from the
+  Dockerfile's intent.
+- **CI** (`.github/workflows/ci.yml`): a `check` job across Python
+  3.10/3.11/3.12 (ruff, black, isort, mypy, bandit, pytest), plus a
+  `docker` job on every pull request that builds the real image and reruns
+  the network-confinement live tests and the exact `!mta*.stripchat.com`
+  scope-exclusion canary case inside the container.
 
 ## What is already true (do not regress)
 
-- No `shell=True` / `os.system`
-- Structured subprocess argv, path confinement, output caps
-- SQLite not Neo4j
-- Fingerprint-first certificates; SAN equality does not merge
-- Follow-up sidecars; seed snapshots survive empty/crash
-- Planner rejects spoofed `CERTIFICATE_SAN` without evidence
-- `UNKNOWN` authorization fails closed in `authorize_active_indicator`
-- Presence of a CollectionScope object is not authorization of a hostname
-- No active-collection plugin makes a network call without a scope (all 19, one test)
-- Crawlers cannot reach an out-of-scope host their own internal client decides to request
+Carried forward from the prior architecture documents, re-confirmed
+2026-09-13:
 
----
+- No `shell=True` / `os.system`; structured subprocess argv; path
+  confinement; output size caps.
+- SQLite, real foreign keys — not a graph database, by design.
+- Fingerprint-first certificate identity; SAN equality alone never merges
+  two hosts.
+- `UNKNOWN` authorization fails closed in `authorize_active_indicator`.
+- Presence of a `CollectionScope` object is not itself authorization of
+  any specific hostname.
+- No active-collection plugin makes a network call without a scope (all
+  active-collection plugins, one parametrized test patching every network
+  primitive: `tests/test_missing_scope_all_active_plugins.py`).
+- Crawlers cannot reach an out-of-scope host their own internal client
+  decides to request on its own (proxy-pinned to the validated IP).
 
-## Implementation order for what's still open
+## Known, open architectural gaps
 
-1. Full `CollectionGateway`: retrofit `AuthorizedCollectionTarget` (or an equivalent) as the
-   required parameter for every plugin's actual network-issuing call, not just httpx's redirect
-   hops.
-2. Unify seed and follow-up `CollectionAttempt` accounting into one model.
-3. Per-capability (not per-hostname) `COLLECTED` status.
-4. A real third-party-provider allowlist for the confinement proxy, so nuclei's OOB detection
-   doesn't have to be all-or-nothing.
+Not hidden, not silently fixed while writing this document — see
+`docs/FINAL_PROJECT_AUDIT.md` for the full, evidence-based list. The two
+most relevant to anyone extending this codebase:
+
+1. `amass` is currently broken against its installed v5.1.1 (the CLI
+   dropped the `-o` flag `modules/amass.py` depends on) — a confirmed,
+   100%-reproducible CLI incompatibility, not a flaky network issue. See
+   `docs/FINAL_PROJECT_AUDIT.md` §3.2 for the exact reproduction and
+   `README.md`'s "Known limitations" section for the operator-facing
+   guidance.
+2. Six optional plugins (`amass`, `anew`, `assetfinder`, `gau`, `unfurl`,
+   `waybackurls`) have zero regression-test coverage of their own logic.

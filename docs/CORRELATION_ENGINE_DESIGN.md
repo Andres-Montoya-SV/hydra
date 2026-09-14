@@ -2,7 +2,7 @@
 
 Status: **audit + design only, no implementation.** Written against
 `fix/redirect-scope-safety` after the network-confinement work
-(`docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md`) closed as READY.
+(now `docs/NETWORK_CONFINEMENT.md`) closed as READY.
 
 ## 0. Why this document exists
 
@@ -246,7 +246,7 @@ entity state at plugin-run time (which does not exist yet — `IntelEngine`
 only runs later, inside `HostRegistry.finalize()`).
 
 Classified `THIRD_PARTY_OBSERVATION` / **F\*** in
-`docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md` (Table row + inventory row #30),
+`docs/NETWORK_CONFINEMENT.md` (Table row + inventory row #30),
 same class as `ctlogs`/`threat_intel`: Hydra's own socket only ever
 connects to the fixed provider endpoint; the sibling hostname is query
 content, never a connection destination.

@@ -1,5 +1,7 @@
 # Hydra Final Security Audit
 
+> **Archived 2026-09-13.** Its runtime graph and security narrative are superseded by [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md) (general runtime) and [`docs/NETWORK_CONFINEMENT.md`](../NETWORK_CONFINEMENT.md) (security-relevant call paths); the overall project-health verdict role it played is now [`docs/FINAL_PROJECT_AUDIT.md`](../FINAL_PROJECT_AUDIT.md). Kept for historical record.
+
 Current state of the `fix/redirect-scope-safety` branch after `docs/NETWORK_BOUNDARY_AUDIT.md`'s
 Phase 0 audit and its two change sets (§8, §9 of that document). This document is the
 current-state reference; the other document is the historical changelog of how we got here.

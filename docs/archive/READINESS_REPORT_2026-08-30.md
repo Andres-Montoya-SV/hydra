@@ -1,5 +1,7 @@
 # Hydra readiness report
 
+> **Archived 2026-09-13.** Its "is Hydra healthy/ready" role is now [`docs/FINAL_PROJECT_AUDIT.md`](../FINAL_PROJECT_AUDIT.md), which re-verifies project health with current evidence. Kept for historical record of the security-hardening arc's own verdict at the time (516 tests, "READY FOR CONTROLLED BETA").
+
 **Date:** 2026-08-30
 **Repository:** `Andres-Montoya-SV/hydra`, branch `fix/redirect-scope-safety`
 **Method:** forensic runtime audit (`docs/FINAL_SECURITY_AUDIT.md`, `docs/NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_BOUNDARY_AUDIT.md`, `docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md`), targeted fixes verified by real subprocess execution, real WebKit browser tests, real SQLite persistence, real DNS resolution against the actual authorized target, a real raw-socket bypass demonstration, and a live run against the project's actual authorized target (`virusbarrier.xyz`, per `scope.txt`) — not stubs alone.

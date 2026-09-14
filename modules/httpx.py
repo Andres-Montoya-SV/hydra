@@ -110,7 +110,7 @@ class HttpxPlugin(BaseToolPlugin):
         (`core/collection/ssrf.py`) checks one resolution while httpx
         performs a second, independent one when it actually connects, which
         is exactly the DNS-rebinding/TOCTOU gap the proxy closes for
-        katana/hakrawler/nuclei already. See docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
+        katana/hakrawler/nuclei already. See docs/NETWORK_CONFINEMENT.md.
         """
         args = [str(self.resolved_binary(context))]
         if target_url is not None:
@@ -182,7 +182,7 @@ class HttpxPlugin(BaseToolPlugin):
         # Without this, `AuthorizedCollectionTarget`'s destination-IP check
         # validates one DNS answer while httpx independently resolves and
         # connects a second time — a DNS-rebinding/TOCTOU window. See
-        # docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
+        # docs/NETWORK_CONFINEMENT.md.
         async with self._crawler_confinement(context) as proxy:
             args = self._build_args(
                 context, input_path, json_output, confinement_proxy_url=proxy.proxy_url

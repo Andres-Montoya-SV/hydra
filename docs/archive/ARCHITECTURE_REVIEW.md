@@ -1,5 +1,7 @@
 # Architecture Review — Reconnaissance Framework
 
+> **Archived 2026-09-13** (already self-declared superseded since 2026-08-04, see the status update below). Current architecture: [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md). Kept for historical record.
+
 **Review date:** 2026-06-29  
 **Scope:** 35 Python source files (`app.py`, `config/`, `core/`, `modules/`, `ui/`, `utils/`, `tests/`)  
 **Reviewers (roles):** Security Engineer, DevSecOps, Bug Bounty Hunter, Infrastructure Engineer, Python Architect

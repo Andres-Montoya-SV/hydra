@@ -1,5 +1,7 @@
 # Hydra Final Network Confinement Audit
 
+> **Archived 2026-09-13.** This document's content is the direct basis for [`docs/NETWORK_CONFINEMENT.md`](../NETWORK_CONFINEMENT.md), which carries it forward as a living reference (re-verified live on 2026-09-13, see `docs/FINAL_PROJECT_AUDIT.md` — all 22 confinement tests still pass, no drift found). Kept here in its original, dated, "this turn"-framed form as the historical record of the network-confinement hardening arc.
+
 **Date:** 2026-08-30
 **Method:** forensic grep across `core/` and `modules/` for every network-capable
 primitive (`socket.`, `asyncio.open_connection`, `asyncio.start_server`, `.getaddrinfo`,

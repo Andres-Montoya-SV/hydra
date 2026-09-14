@@ -98,7 +98,7 @@ class BrowserProbePlugin(BaseToolPlugin):
         # means DNS resolution and connection-pinning happen at the proxy for
         # every browser-issued connection, closing the same DNS-rebinding/
         # TOCTOU gap this turn already closed for httpx. See
-        # docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md.
+        # docs/NETWORK_CONFINEMENT.md.
         async with (
             self._crawler_confinement(context) as confinement_proxy,
             async_playwright() as playwright,

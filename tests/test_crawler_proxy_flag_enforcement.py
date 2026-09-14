@@ -1,7 +1,7 @@
 """Static confirmation (Part 2.1): katana, hakrawler, and nuclei must never
 invoke their subprocess without `-proxy <ScopeEnforcingProxy>` in argv.
 
-`docs/ARCHITECTURE_AUDIT_2.md` traced all three and found every one already
+`docs/NETWORK_CONFINEMENT.md` traced all three and found every one already
 wraps its single `_execute`/`_execute_self_output` call inside
 `async with self._crawler_confinement(context) as proxy:` with no alternate
 code path. This file is the missing static/runtime proof of that claim: it

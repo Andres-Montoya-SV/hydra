@@ -1,5 +1,7 @@
 # Hydra runtime audit
 
+> **Archived 2026-09-13.** Superseded by [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md). Kept for historical record.
+
 **Date:** 2026-08-22  
 **Entry point traced:** `python app.py run -d <target>`  
 **Method of work:** line-by-line reading of `app.py` → `PipelineRunner.run()` → each plugin `run()`, plus artifact create/overwrite/consume. README, `docs/ARCHITECTURE.md`, comments, and green tests were treated as non-authoritative.

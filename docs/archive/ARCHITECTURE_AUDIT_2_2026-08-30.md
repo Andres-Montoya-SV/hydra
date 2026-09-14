@@ -1,5 +1,7 @@
 # Architecture Audit 2 — Network Capability Inventory
 
+> **Archived 2026-09-13.** Its per-plugin network-capability classification table was folded into [`docs/NETWORK_CONFINEMENT.md`](../NETWORK_CONFINEMENT.md) (which supersedes it — notably, this document's WHOIS row is now stale: WHOIS moved to a native, SSRF-validated client, `core/collection/whois_client.py`, closing the gap this document correctly identified). Kept for historical record.
+
 Written as its own checkpoint, before any code in Parts 2–7 of the
 "Sprint Final de Arquitectura de Colección" is touched. Every prior
 architecture document (`ARCHITECTURE.md`, `ARCHITECTURE_AUDIT.md`,

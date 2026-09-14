@@ -1,5 +1,7 @@
 # Hydra — current architecture (as implemented)
 
+> **Archived 2026-09-13.** Superseded by [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md). Kept for historical record.
+
 This document describes the **runtime as of 2026-08-22**. Source, tests, the
 SQLite schema, and CLI behavior are authoritative. The README is kept in
 sync with this file; if they diverge, trust the tests.
