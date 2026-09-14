@@ -14,7 +14,7 @@ the hostname resolve to, historically. The hostname is query *content*
 sent to a fixed endpoint — Hydra's own connection always goes to the
 passive-DNS provider, never to the sibling — the same FIXED_THIRD_PARTY /
 THIRD_PARTY_OBSERVATION classification as `modules/ctlogs.py` and
-`modules/threat_intel.py` (see `docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md`).
+`modules/threat_intel.py` (see `docs/NETWORK_CONFINEMENT.md`).
 
 Two providers:
 

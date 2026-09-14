@@ -1,5 +1,7 @@
 # Hydra Final Network Boundary Audit
 
+> **Archived 2026-09-13.** Superseded by [`docs/NETWORK_CONFINEMENT.md`](../NETWORK_CONFINEMENT.md), which absorbs its flat authorization-call-site table and re-verifies it against the current codebase. Kept for historical record of the network-boundary hardening arc.
+
 **Date:** 2026-08-29
 **Method:** re-verified by grepping the current tree for every call site of
 `authorize_collection`, `authorize_active_indicator`, `allows_active_collection`,

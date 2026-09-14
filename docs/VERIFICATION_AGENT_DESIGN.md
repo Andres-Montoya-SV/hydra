@@ -3,7 +3,8 @@
 Status: **design only, no implementation.** Written against `main` after
 the correlation-engine (`docs/CORRELATION_ENGINE_DESIGN.md`), attribution
 (`AUTHORIZED_USE.md`), scope-exclusion, and `security_headers`/`dnsx`
-false-positive fixes closed. Same pattern as `docs/ARCHITECTURE_AUDIT_2.md`
+false-positive fixes closed. Same pattern as
+`docs/archive/ARCHITECTURE_AUDIT_2_2026-08-30.md`
 and `docs/CORRELATION_ENGINE_DESIGN.md`: a document to review before any
 detector gets built.
 

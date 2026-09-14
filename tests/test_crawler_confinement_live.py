@@ -1,7 +1,7 @@
 """Real katana binary + real ScopeEnforcingProxy + real CollectionScope.
 
 katana follows HTTP redirects internally by default (confirmed in
-docs/NETWORK_BOUNDARY_AUDIT.md against the real installed binary's -h
+docs/NETWORK_CONFINEMENT.md against the real installed binary's -h
 output) — a gated -list only constrains its starting seed, not what it
 decides to fetch next. This test makes the authorized seed 302 to a second
 local server and proves katana's own redirect-follow attempt to that

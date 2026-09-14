@@ -31,7 +31,7 @@ MODULES_DIR = Path(__file__).resolve().parent.parent / "modules"
 # module filename -> why a raw network primitive there is safe. Every entry
 # here connects to a FIXED, hardcoded third-party endpoint (never a
 # target-derived hostname) — verified by reading each one; see
-# docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md's THIRD_PARTY_OBSERVATION rows.
+# docs/NETWORK_CONFINEMENT.md's THIRD_PARTY_OBSERVATION rows.
 # Adding a module here without that property (a fixed destination) defeats
 # the entire point of this test.
 ALLOWED_DIRECT_NETWORK_IMPORTS: dict[str, str] = {

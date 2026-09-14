@@ -27,7 +27,7 @@ remember.
     network (validated destination, audited)
 
 This does not retrofit every plugin — that remains a real, open scope
-decision (see `docs/FINAL_NETWORK_CONFINEMENT_AUDIT.md` for which plugins
+decision (see `docs/NETWORK_CONFINEMENT.md` for which plugins
 route through this gateway today vs. still call `core/http_probe.py` or
 `allows_active_collection` directly). It demonstrates the pattern at a real
 call site (`modules/soft404_check.py`) with a passing, live-verified test

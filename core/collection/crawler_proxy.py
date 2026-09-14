@@ -19,7 +19,7 @@ This is real containment for exactly what it covers — TCP connections these
 three tools would otherwise open directly. It is not a claim of universal
 process-level network confinement: a tool that ignores its configured proxy
 entirely (a bug, or a raw-socket path bypassing its own HTTP client) is
-outside what an application-level proxy can see. See docs/FINAL_SECURITY_AUDIT.md
+outside what an application-level proxy can see. See docs/NETWORK_CONFINEMENT.md
 for the boundary this does and does not draw.
 """
 

@@ -1,7 +1,6 @@
 # Phase 2 Refactor Status
 
-> Runtime after the intelligence-engine work is documented in
-> `docs/ARCHITECTURE.md` and `docs/ARCHITECTURE_CURRENT.md`. This file is
+> Current runtime is documented in `docs/ARCHITECTURE.md`. This file is
 > the Phase 2/3 implementation log, not a claim that Hydra is
 > production-ready.
 
@@ -212,7 +211,7 @@ unchanged — they still skip TLS verify to match httpx's alive-host posture.
 
 ## Remaining
 
-See `docs/ARCHITECTURE_REVIEW.md` for the original problem register — most
+See `docs/archive/ARCHITECTURE_REVIEW.md` for the original problem register — most
 Critical/High items are now resolved. Open items: resume-from-checkpoint,
 config profiles, massdns integration, standalone `diff`/`export` CLI
 subcommands.

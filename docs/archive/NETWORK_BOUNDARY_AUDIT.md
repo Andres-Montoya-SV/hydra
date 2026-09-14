@@ -1,5 +1,7 @@
 # Hydra Network Boundary Audit
 
+> **Archived 2026-09-13.** Superseded by [`docs/NETWORK_CONFINEMENT.md`](../NETWORK_CONFINEMENT.md). Kept for historical record — this is the original Phase 0 forensic trace that started the network-boundary hardening arc; the fixes it describes (§8-11) are long since merged and verified current.
+
 **Scope of this document:** Phase 0 of the network-boundary hardening mandate. This is
 a forensic trace of the *implementation as it exists on `fix/redirect-scope-safety`*,
 not a description of intent. No code was changed to produce this document. Every claim

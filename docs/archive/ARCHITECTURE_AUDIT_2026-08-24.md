@@ -1,5 +1,7 @@
 # Hydra architecture audit (forensic baseline)
 
+> **Archived 2026-09-13.** A pre-refactor forensic baseline, explicitly framed by its own text as "before the Attack Surface Intelligence control-loop refactor" — no longer describes the current runtime. Superseded by [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md). Kept for historical record.
+
 **Date:** 2026-08-24  
 **Entry point traced:** `python app.py run -d <target>`  
 **Method:** line-by-line reading of `app.py` → `PipelineRunner.run()` → plugin `run()`, artifact create/overwrite/consume, `IntelEngine`, SQLite, reporters, CLI. README, prior docs, and green tests were treated as non-authoritative.
