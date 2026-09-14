@@ -295,21 +295,29 @@ the Example section above instead of a fabricated table here.
 
 Full evidence for every item below: [`docs/FINAL_PROJECT_AUDIT.md`](docs/FINAL_PROJECT_AUDIT.md).
 
-- **`amass` is currently broken.** The installed `amass` v5.1.1 removed
-  the `-o` output flag `modules/amass.py` depends on — every invocation
-  fails immediately (`flag provided but not defined: -o`), 100%
-  reproducible, confirmed by direct live testing, unrelated to network
-  conditions or the target. **Recommendation:** either pin/install
-  `amass` v4 specifically (the version the plugin's install hints were
-  actually written against) instead of the current Homebrew/latest v5,
-  or leave `ENABLE_AMASS=false` until the plugin is updated for v5's
-  directory-based output format.
+- **`amass` v5 does not work with `modules/amass.py`.** v5 removed the
+  `-o` output flag the plugin depends on — every invocation would fail
+  immediately (`flag provided but not defined: -o`) if attempted. This is
+  now **detected, not silent**: `python app.py check-tools` (and the
+  pipeline's own pre-flight validation) recognizes an installed v5.x via
+  a known-incompatible-version check and reports it as not-runnable with
+  the exact fix, before the plugin ever attempts to run — confirmed live
+  in a real `python app.py run` against a v5.1.1 install
+  (`docs/HARDENING_ROUND2_P1.md`, Task 1;
+  `docs/PRODUCTION_READINESS.md`, Part 2). **Recommendation unchanged:**
+  either pin/install `amass` v4 specifically (the version the plugin's
+  install hints were actually written against) instead of the current
+  Homebrew/latest v5, or leave `ENABLE_AMASS=false` until the plugin is
+  updated for v5's directory-based output format.
 - **Six optional plugins have no regression-test coverage of their own
   logic**: `amass`, `anew`, `assetfinder`, `gau`, `unfurl`, `waybackurls`.
   They are real, installable, invocable tools, and network-confinement
   behavior for the ones that connect to anything is still covered — but
   nothing exercises their own parsing/execution logic directly. `amass`
-  above is the concrete cost of that gap: it broke silently.
+  above is exactly this gap's original cost: its v5 incompatibility went
+  undetected for a real stretch of time before a dedicated check closed
+  it (see above) — the absence of test coverage, not a one-off mistake,
+  is why it took this long to notice.
 - **`katana`, `hakrawler`, `gau`, and `waybackurls` have no dedicated unit
   test of their own output parser** (`KatanaParser`/`HakrawlerParser`/
   `GauParser`/`WaybackurlsParser` — all thin subclasses of one shared

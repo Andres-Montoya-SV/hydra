@@ -51,13 +51,17 @@ LABEL org.opencontainers.image.title="hydra" \
       org.opencontainers.image.description="Evidence-backed, scope-aware Attack Surface Intelligence control plane" \
       org.opencontainers.image.source="https://github.com/Andres-Montoya-SV/hydra"
 
-# nmap: port_verify's second-opinion scan. whois: modules/whois.py. jq: an
-# optional plugin. libpcap0.8: naabu's runtime shared library (matches the
-# libpcap-dev headers it was linked against in the builder stage).
-# libcap2-bin: provides setcap, used once below, not needed at runtime.
+# nmap: port_verify's second-opinion scan. jq: an optional plugin.
+# libpcap0.8: naabu's runtime shared library (matches the libpcap-dev
+# headers it was linked against in the builder stage). libcap2-bin:
+# provides setcap, used once below, not needed at runtime. No `whois`
+# package: modules/whois.py uses Hydra's own native Python WHOIS client
+# (core/collection/whois_client.py), never the system binary — see
+# docs/HARDENING_ROUND2_P1.md, Task 2 (the WHOIS_PATH setting this same
+# stale belief produced was removed there; this image install was the
+# one place the belief survived).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       nmap \
-      whois \
       jq \
       libpcap0.8 \
       libcap2-bin \
