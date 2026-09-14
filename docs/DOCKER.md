@@ -56,7 +56,7 @@ sake:
 |---|---|---|
 | subfinder, dnsx, httpx, naabu, katana, nuclei, hakrawler | **Exact pin** | Same versions as the Docker table above — `go install <module>@<version>` natively for the identical reproducibility Docker gets for free. |
 | **amass** | **Runtime detection + hard compatibility gate** | The real, reproduced case (`docs/FINAL_PROJECT_AUDIT.md`): Homebrew's `amass` formula tracks upstream v5.x, whose CLI dropped the `-o` flag `modules/amass.py` depends on — every invocation failed, silently, with no warning before this round. `python app.py check-tools` now detects the real installed version (`core/dependencies/validation.py`, itself fixed this round — see Finding 1) and, for amass specifically, checks it against a known-incompatible-versions table (`core/dependencies/registry.py::KNOWN_INCOMPATIBLE_VERSIONS`) — a v5.x install is reported not-runnable with the exact fix (`go install github.com/owasp-amass/amass/v4/...@v4.2.0`) *before* the plugin ever attempts to run, not as a cryptic subprocess error mid-scan. |
-| nmap, whois | **Minimum-version-agnostic** | Hydra's parsers (`core/parsers/registry.py::PortVerifyParser`, `modules/whois.py`) handle a range of real-world output formats already and have shown no version-specific breakage; no pin needed, version is still detected and displayed by `check-tools` for visibility. |
+| nmap | **Minimum-version-agnostic** | Hydra's parser (`core/parsers/registry.py::PortVerifyParser`) handles a range of real-world output formats already and has shown no version-specific breakage; no pin needed, version is still detected and displayed by `check-tools` for visibility. (`whois` is not in this table: `modules/whois.py` uses Hydra's own native Python WHOIS client, `core/collection/whois_client.py`, never a system `whois` binary — see `docs/HARDENING_ROUND2_P1.md`, Task 2.) |
 | gau, waybackurls, assetfinder, unfurl, anew | **Documented compatibility strategy, no runtime gate** | These have no known version-specific incompatibility today (unlike amass) and no regression-test coverage of their own logic either (`docs/FINAL_PROJECT_AUDIT.md` §1.4) — a hard compatibility gate would be false confidence about a tool this project can't yet verify behavior for. Pin the exact version this document's Docker table would use if you add one back (see above); otherwise track whatever `go install`'s default resolves to and re-run `check-tools` after any tool upgrade. |
 
 `python app.py check-tools` is the one command that answers "is my
@@ -70,7 +70,9 @@ audit and the exact bug reproductions.
 
 2. **`final`** (`python:3.11-slim-bookworm`) — the runtime:
    - The 7 Go binaries above, copied from the builder stage.
-   - `nmap`, `whois`, `jq` (apt) — the non-Go tools Hydra's plugins call.
+   - `nmap`, `jq` (apt) — the non-Go tools Hydra's plugins call. (No
+     `whois` package: `modules/whois.py` uses Hydra's own native Python
+     WHOIS client, never a system binary.)
    - Playwright, pinned to `1.62.0` (matching `requirements-optional.txt`
      exactly), with **only WebKit** installed —
      `modules/browser_probe.py`'s one supported engine. Chromium and
