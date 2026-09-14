@@ -80,6 +80,35 @@ class TestComputeAttributionFingerprint:
         )
         assert stripchat != glassdoor
 
+    def test_x_hackerone_researcher_alone_produces_a_fingerprint(self) -> None:
+        """Task 3 (program-profiles-prep round): X_HACKERONE_RESEARCHER is
+        a second, older path to the same identity Settings.merged_headers()
+        sends as "X-HackerOne-Research" — it must participate in this
+        fingerprint the same as researcher_attribution_header does, not be
+        silently invisible to it."""
+        assert compute_attribution_fingerprint(None, None, None) is None
+        assert compute_attribution_fingerprint(None, None, "") is None
+        fp = compute_attribution_fingerprint(None, None, "my_h1_handle")
+        assert fp is not None
+        assert "my_h1_handle" not in fp
+
+    def test_different_x_hackerone_researcher_different_fingerprint(self) -> None:
+        alice = compute_attribution_fingerprint(None, None, "alice_h1")
+        bob = compute_attribution_fingerprint(None, None, "bob_h1")
+        assert alice != bob
+
+    def test_x_hackerone_researcher_distinguished_from_no_attribution_at_all(self) -> None:
+        """Regression for the exact bug found: previously,
+        compute_attribution_fingerprint(None, None) == None regardless of
+        x_hackerone_researcher, since the function never saw it at all —
+        both a run with no attribution configured and a run with only
+        X_HACKERONE_RESEARCHER set produced the identical None fingerprint."""
+        no_attribution = compute_attribution_fingerprint(None, None)
+        with_h1_only = compute_attribution_fingerprint(None, None, "alice_h1")
+        assert no_attribution is None
+        assert with_h1_only is not None
+        assert no_attribution != with_h1_only
+
 
 def _run(store: AssetStore, run_id: str, **kwargs) -> None:
     store.create_run(

@@ -292,6 +292,7 @@ class PipelineRunner:
             attribution_fingerprint = compute_attribution_fingerprint(
                 self.settings.researcher_attribution_header,
                 self.settings.attribution_user_agent,
+                self.settings.x_hackerone_researcher,
             )
             store.create_run(
                 ScanRun(
@@ -1370,6 +1371,7 @@ class PipelineRunner:
                 compute_attribution_fingerprint(
                     self.settings.researcher_attribution_header,
                     self.settings.attribution_user_agent,
+                    self.settings.x_hackerone_researcher,
                 )
                 or "no-attribution"
             ).encode("utf-8")

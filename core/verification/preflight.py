@@ -47,16 +47,36 @@ def compute_scope_file_hash(scope_file: Path | None) -> str | None:
 def compute_attribution_fingerprint(
     researcher_attribution_header: dict[str, str] | None,
     attribution_user_agent: str | None,
+    x_hackerone_researcher: str | None = None,
 ) -> str | None:
-    """A fingerprint of the RESEARCHER_ATTRIBUTION_HEADER/ATTRIBUTION_USER_AGENT
-    pair actually in effect — never the raw values, which may carry an
+    """A fingerprint of every setting that actually changes a run's
+    researcher-identity headers — never the raw values, which may carry an
     operator handle/token not meant for a queryable `runs` column.
+
+    `x_hackerone_researcher` (Task 3, program-profiles-prep round) was
+    missing here even though `Settings.merged_headers()` folds it into the
+    real "X-HackerOne-Research" header sent on the wire — two runs
+    differing only in `X_HACKERONE_RESEARCHER` previously produced the
+    identical fingerprint (both callers below only ever passed
+    `researcher_attribution_header`/`attribution_user_agent`), so this
+    same function's own cross-scope-reuse check
+    (`historical_cross_check`) and `PipelineRunner`'s cache-key
+    computation (hardening round 1, Finding 1) could not tell those two
+    attribution identities apart. Folded in as its own dict entry rather
+    than merged into `header` directly, since the real wire header name
+    ("X-HackerOne-Research") is a `merged_headers()`-level concern this
+    function has never needed to know about — only that the value
+    changes what a request looks like.
     """
     header = dict(researcher_attribution_header or {})
     user_agent = attribution_user_agent or ""
-    if not header and not user_agent:
+    h1_researcher = x_hackerone_researcher or ""
+    if not header and not user_agent and not h1_researcher:
         return None
-    canonical = json.dumps({"header": header, "user_agent": user_agent}, sort_keys=True)
+    canonical = json.dumps(
+        {"header": header, "user_agent": user_agent, "x_hackerone_researcher": h1_researcher},
+        sort_keys=True,
+    )
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

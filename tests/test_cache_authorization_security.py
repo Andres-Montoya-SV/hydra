@@ -130,6 +130,29 @@ class TestCacheKeyIncludesScopeAndAttributionIdentity:
         key_b, _ = PipelineRunner(settings_b)._cache_key(whois, targets_file)  # noqa: SLF001
         assert key_a != key_b
 
+    def test_different_x_hackerone_researcher_changes_the_key(
+        self, project_root: Path, targets_file: Path
+    ) -> None:
+        """Task 3 (program-profiles-prep round) finding: X_HACKERONE_RESEARCHER
+        is a second, older path to the same identity information
+        researcher_attribution_header carries (both end up on the wire as
+        the same "X-HackerOne-Research" header via Settings.merged_headers())
+        — but _cache_key's own compute_attribution_fingerprint call never
+        included it, only researcher_attribution_header/attribution_user_agent.
+        Two runs differing only in X_HACKERONE_RESEARCHER previously
+        collided on the identical cache key, exactly the invariant-10
+        violation the two tests above already guard against for the other
+        two attribution fields."""
+        settings_alice = _settings(project_root, x_hackerone_researcher="alice_h1")
+        settings_bob = _settings(project_root, x_hackerone_researcher="bob_h1")
+        whois = WhoisPlugin(settings_alice)
+
+        key_alice, _ = PipelineRunner(settings_alice)._cache_key(
+            whois, targets_file
+        )  # noqa: SLF001
+        key_bob, _ = PipelineRunner(settings_bob)._cache_key(whois, targets_file)  # noqa: SLF001
+        assert key_alice != key_bob
+
     def test_strict_opsec_and_proxy_mode_change_the_key(
         self, project_root: Path, targets_file: Path
     ) -> None:
