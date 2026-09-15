@@ -408,3 +408,355 @@ class TestAdversarialReasoningReview:
         assert rows[0]["reasoning_review_challenge"] == "OVERREACHES"
         out = capsys.readouterr().out
         assert "⚠" in out
+
+    def test_not_requested_review_leaves_status_not_requested(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No --adversarial-provider at all is a distinct case from an
+        invalid review batch — the absence of review must never itself
+        read as INVALID."""
+        store, rel = _seed_run_with_relationships(tmp_path)
+        settings = _settings(tmp_path)
+        batch = HypothesisBatchResult(
+            hypotheses=[
+                HypothesisProposal(
+                    statement="Likely commonly-provisioned infrastructure.",
+                    cited_relationships=[
+                        CitedRelationshipClaim(
+                            relationship_id=rel["relationship_id"],
+                            claimed_relationship_type=rel["relationship_type"],
+                            treated_as_strength=ConfidenceBand(rel["confidence"]),
+                        )
+                    ],
+                    cited_entity_ids=[],
+                    confidence="HIGH",
+                    suggested_next_step="",
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "core.hypotheses.cli.create_provider", lambda *a, **kw: _FakeProvider(batch)
+        )
+        rc = cmd_suggest_hypotheses(settings, RUN_ID, yes=True)
+        assert rc == 0
+        rows = store.get_llm_hypotheses(RUN_ID)
+        assert rows[0]["reasoning_review_status"] == "NOT_REQUESTED"
+        assert rows[0]["reasoning_review_challenge"] is None
+        assert rows[0]["grounding_status"] == "GROUNDED"
+        assert rows[0]["calibration_status"] == "CALIBRATED"
+
+
+class TestAdversarialReviewFailsClosedOnIncompleteOrDuplicateIndices:
+    """Hardening round: 'la revisión adversarial debe fallar cerrado ante
+    índices incompletos/duplicados'. Every scenario here submits TWO
+    hypotheses for review so a missing/duplicate/out-of-range index is
+    actually expressible, and checks both the persisted
+    reasoning_review_status and the final `trustworthy`-equivalent
+    (grounded+calibrated alone must never be enough once the review batch
+    is invalid).
+    """
+
+    def _two_hypothesis_batch(self, rel: dict[str, object]) -> HypothesisBatchResult:
+        claim = CitedRelationshipClaim(
+            relationship_id=rel["relationship_id"],
+            claimed_relationship_type=rel["relationship_type"],
+            treated_as_strength=ConfidenceBand(rel["confidence"]),
+        )
+        return HypothesisBatchResult(
+            hypotheses=[
+                HypothesisProposal(
+                    statement="First hypothesis.",
+                    cited_relationships=[claim],
+                    cited_entity_ids=[],
+                    confidence="HIGH",
+                    suggested_next_step="",
+                ),
+                HypothesisProposal(
+                    statement="Second hypothesis.",
+                    cited_relationships=[claim],
+                    cited_entity_ids=[],
+                    confidence="HIGH",
+                    suggested_next_step="",
+                ),
+            ]
+        )
+
+    def _run_with_review(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        reviews: list[ReasoningSoundnessReview],
+    ) -> tuple[int, object, str]:
+        store, rel = _seed_run_with_relationships(tmp_path)
+        settings = _settings(tmp_path)
+        batch = self._two_hypothesis_batch(rel)
+
+        class _AdversarialProvider(_FakeProvider):
+            name = "openai"
+            model = "gpt-5.6-terra"
+
+            def review_hypotheses(self, user_message: str) -> ReasoningSoundnessBatchResult:
+                return ReasoningSoundnessBatchResult(reviews=reviews)
+
+        primary = _FakeProvider(batch)
+        adversarial = _AdversarialProvider(HypothesisBatchResult(hypotheses=[]))
+
+        def _fake_create_provider(provider_name: str, *, api_key: str, model: str):
+            return primary if provider_name == "anthropic" else adversarial
+
+        monkeypatch.setattr("core.hypotheses.cli.create_provider", _fake_create_provider)
+        rc = cmd_suggest_hypotheses(
+            settings, RUN_ID, provider="anthropic", adversarial_provider="openai", yes=True
+        )
+        return rc, store, capsys.readouterr().err
+
+    def test_complete_review_persists_as_complete_and_trustworthy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        reviews = [
+            ReasoningSoundnessReview(hypothesis_index=0, challenge="SOUND", reasoning="ok"),
+            ReasoningSoundnessReview(hypothesis_index=1, challenge="SOUND", reasoning="ok"),
+        ]
+        rc, store, _ = self._run_with_review(tmp_path, monkeypatch, capsys, reviews)
+        assert rc == 0
+        rows = store.get_llm_hypotheses(RUN_ID)
+        assert len(rows) == 2
+        assert all(r["reasoning_review_status"] == "COMPLETE" for r in rows)
+        assert all(r["reasoning_review_challenge"] == "SOUND" for r in rows)
+
+    def test_missing_index_persists_both_hypotheses_as_invalid_and_untrustworthy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        reviews = [ReasoningSoundnessReview(hypothesis_index=0, challenge="SOUND", reasoning="ok")]
+        rc, store, stderr = self._run_with_review(tmp_path, monkeypatch, capsys, reviews)
+        assert rc == 0  # persisted, not aborted
+        rows = store.get_llm_hypotheses(RUN_ID)
+        assert len(rows) == 2
+        for row in rows:
+            assert row["reasoning_review_status"] == "INVALID"
+            assert row["grounding_status"] == "GROUNDED"
+            assert row["calibration_status"] == "CALIBRATED"
+            # Never reads as trustworthy just because grounding/calibration passed.
+            trustworthy = (
+                row["grounding_status"] == "GROUNDED"
+                and row["calibration_status"] == "CALIBRATED"
+                and row["reasoning_review_status"] != "INVALID"
+            )
+            assert trustworthy is False
+        assert "missing hypothesis_index" in stderr
+
+    def test_duplicate_index_persists_both_as_invalid(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        reviews = [
+            ReasoningSoundnessReview(hypothesis_index=0, challenge="SOUND", reasoning="ok"),
+            ReasoningSoundnessReview(hypothesis_index=0, challenge="SOUND", reasoning="ok"),
+        ]
+        rc, store, stderr = self._run_with_review(tmp_path, monkeypatch, capsys, reviews)
+        assert rc == 0
+        rows = store.get_llm_hypotheses(RUN_ID)
+        assert all(r["reasoning_review_status"] == "INVALID" for r in rows)
+        assert "duplicate hypothesis_index" in stderr
+
+    def test_out_of_range_index_persists_both_as_invalid(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        reviews = [
+            ReasoningSoundnessReview(hypothesis_index=0, challenge="SOUND", reasoning="ok"),
+            ReasoningSoundnessReview(hypothesis_index=7, challenge="SOUND", reasoning="ok"),
+        ]
+        rc, store, stderr = self._run_with_review(tmp_path, monkeypatch, capsys, reviews)
+        assert rc == 0
+        rows = store.get_llm_hypotheses(RUN_ID)
+        assert all(r["reasoning_review_status"] == "INVALID" for r in rows)
+        assert "out-of-range hypothesis_index" in stderr
+
+    def test_negative_index_persists_both_as_invalid(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        reviews = [
+            ReasoningSoundnessReview(hypothesis_index=-1, challenge="SOUND", reasoning="ok"),
+            ReasoningSoundnessReview(hypothesis_index=1, challenge="SOUND", reasoning="ok"),
+        ]
+        rc, store, stderr = self._run_with_review(tmp_path, monkeypatch, capsys, reviews)
+        assert rc == 0
+        rows = store.get_llm_hypotheses(RUN_ID)
+        assert all(r["reasoning_review_status"] == "INVALID" for r in rows)
+        assert "out-of-range hypothesis_index" in stderr
+
+    def test_extra_review_beyond_requested_count_persists_both_as_invalid(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        reviews = [
+            ReasoningSoundnessReview(hypothesis_index=0, challenge="SOUND", reasoning="ok"),
+            ReasoningSoundnessReview(hypothesis_index=1, challenge="SOUND", reasoning="ok"),
+            ReasoningSoundnessReview(hypothesis_index=2, challenge="SOUND", reasoning="ok"),
+        ]
+        rc, store, stderr = self._run_with_review(tmp_path, monkeypatch, capsys, reviews)
+        assert rc == 0
+        rows = store.get_llm_hypotheses(RUN_ID)
+        assert all(r["reasoning_review_status"] == "INVALID" for r in rows)
+        assert "out-of-range hypothesis_index" in stderr
+
+    def test_no_reviews_at_all_persists_both_as_invalid(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc, store, stderr = self._run_with_review(tmp_path, monkeypatch, capsys, [])
+        assert rc == 0
+        rows = store.get_llm_hypotheses(RUN_ID)
+        assert all(r["reasoning_review_status"] == "INVALID" for r in rows)
+        assert "missing hypothesis_index" in stderr
+
+
+class TestHardOutputLimitsFailClosed:
+    """Hardening round: 'límites duros en el output del LLM' — a batch
+    that exceeds a hard structural limit is refused in full: no
+    persistence at all, unlike the reasoning-review completeness case
+    above."""
+
+    def test_batch_exceeding_hypothesis_count_limit_persists_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from core.hypotheses.limits import MAX_HYPOTHESES_PER_BATCH
+
+        store, rel = _seed_run_with_relationships(tmp_path)
+        settings = _settings(tmp_path)
+        claim = CitedRelationshipClaim(
+            relationship_id=rel["relationship_id"],
+            claimed_relationship_type=rel["relationship_type"],
+            treated_as_strength=ConfidenceBand(rel["confidence"]),
+        )
+        batch = HypothesisBatchResult(
+            hypotheses=[
+                HypothesisProposal(
+                    statement=f"Hypothesis {i}.",
+                    cited_relationships=[claim],
+                    cited_entity_ids=[],
+                    confidence="HIGH",
+                    suggested_next_step="",
+                )
+                for i in range(MAX_HYPOTHESES_PER_BATCH + 1)
+            ]
+        )
+        monkeypatch.setattr(
+            "core.hypotheses.cli.create_provider", lambda *a, **kw: _FakeProvider(batch)
+        )
+        rc = cmd_suggest_hypotheses(settings, RUN_ID, yes=True)
+        assert rc == 1
+        assert store.get_llm_hypotheses(RUN_ID) == []
+        err = capsys.readouterr().err
+        assert "exceeding the hard limit" in err
+
+    def test_statement_exceeding_length_limit_persists_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from core.hypotheses.limits import MAX_STATEMENT_LENGTH
+
+        store, rel = _seed_run_with_relationships(tmp_path)
+        settings = _settings(tmp_path)
+        claim = CitedRelationshipClaim(
+            relationship_id=rel["relationship_id"],
+            claimed_relationship_type=rel["relationship_type"],
+            treated_as_strength=ConfidenceBand(rel["confidence"]),
+        )
+        batch = HypothesisBatchResult(
+            hypotheses=[
+                HypothesisProposal(
+                    statement="x" * (MAX_STATEMENT_LENGTH + 1),
+                    cited_relationships=[claim],
+                    cited_entity_ids=[],
+                    confidence="HIGH",
+                    suggested_next_step="",
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "core.hypotheses.cli.create_provider", lambda *a, **kw: _FakeProvider(batch)
+        )
+        rc = cmd_suggest_hypotheses(settings, RUN_ID, yes=True)
+        assert rc == 1
+        assert store.get_llm_hypotheses(RUN_ID) == []
+        err = capsys.readouterr().err
+        assert "statement is" in err
+
+    def test_citations_exceeding_count_limit_persists_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from core.hypotheses.limits import MAX_CITED_RELATIONSHIPS_PER_HYPOTHESIS
+
+        store, rel = _seed_run_with_relationships(tmp_path)
+        settings = _settings(tmp_path)
+        claim = CitedRelationshipClaim(
+            relationship_id=rel["relationship_id"],
+            claimed_relationship_type=rel["relationship_type"],
+            treated_as_strength=ConfidenceBand(rel["confidence"]),
+        )
+        batch = HypothesisBatchResult(
+            hypotheses=[
+                HypothesisProposal(
+                    statement="Cites far too many relationships.",
+                    cited_relationships=[claim] * (MAX_CITED_RELATIONSHIPS_PER_HYPOTHESIS + 1),
+                    cited_entity_ids=[],
+                    confidence="HIGH",
+                    suggested_next_step="",
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "core.hypotheses.cli.create_provider", lambda *a, **kw: _FakeProvider(batch)
+        )
+        rc = cmd_suggest_hypotheses(settings, RUN_ID, yes=True)
+        assert rc == 1
+        assert store.get_llm_hypotheses(RUN_ID) == []
+        err = capsys.readouterr().err
+        assert "relationships" in err
+
+    def test_valid_batch_at_the_limit_is_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store, rel = _seed_run_with_relationships(tmp_path)
+        settings = _settings(tmp_path)
+        claim = CitedRelationshipClaim(
+            relationship_id=rel["relationship_id"],
+            claimed_relationship_type=rel["relationship_type"],
+            treated_as_strength=ConfidenceBand(rel["confidence"]),
+        )
+        batch = HypothesisBatchResult(
+            hypotheses=[
+                HypothesisProposal(
+                    statement="A perfectly reasonable hypothesis.",
+                    cited_relationships=[claim],
+                    cited_entity_ids=[],
+                    confidence="HIGH",
+                    suggested_next_step="",
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "core.hypotheses.cli.create_provider", lambda *a, **kw: _FakeProvider(batch)
+        )
+        rc = cmd_suggest_hypotheses(settings, RUN_ID, yes=True)
+        assert rc == 0
+        assert len(store.get_llm_hypotheses(RUN_ID)) == 1

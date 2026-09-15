@@ -74,6 +74,23 @@ def gather_run_evidence(
     excluded if its own `host` has a `CONFIRMED`/`INVALIDATES` flag
     against it, which is the real granularity this codebase's
     verification agent operates at.
+
+    Entities are bounded to the subgraph the selected relationships
+    actually touch (hardening round: "acotar el contexto de entidades al
+    subgraph relevante") — only `intel_entities` rows that appear as a
+    `source_entity` or `target_entity` on one of the relationships just
+    fetched, never every entity `intel_entities` holds for the run. A run
+    with thousands of correlated entities but a 200-relationship batch
+    ceiling should never hand the LLM thousands of irrelevant entities
+    just because they happen to share a `run_id` — that inflates cost and
+    dilutes the reasoning task with context the cited relationships don't
+    even touch. No graph clustering, just the direct endpoints of the
+    relationships already selected. A relationship referencing an
+    entity_id with no matching `intel_entities` row (should not happen —
+    both columns carry a real FK to `intel_entities` — but defended
+    against regardless, e.g. FK enforcement being off) fails safe: that
+    id is simply absent from `entities`, never a crash and never a
+    phantom entity fabricated to fill the gap.
     """
     conn = store.intel_connection()
     try:
@@ -85,13 +102,22 @@ def gather_run_evidence(
                 (run_id, max_relationships),
             ).fetchall()
         ]
-        entities = [
-            dict(row)
-            for row in conn.execute(
-                "SELECT * FROM intel_entities WHERE run_id=?",
-                (run_id,),
-            ).fetchall()
-        ]
+        referenced_entity_ids = {
+            r["source_entity"] for r in relationships if r.get("source_entity")
+        } | {r["target_entity"] for r in relationships if r.get("target_entity")}
+        if referenced_entity_ids:
+            placeholders = ",".join("?" * len(referenced_entity_ids))
+            entities = [
+                dict(row)
+                for row in conn.execute(
+                    # placeholders are bound '?' marks only, values are bound params
+                    f"SELECT * FROM intel_entities WHERE run_id=? AND entity_id IN "  # noqa: S608
+                    f"({placeholders})",  # nosec B608
+                    (run_id, *referenced_entity_ids),
+                ).fetchall()
+            ]
+        else:
+            entities = []
         invalidated_hosts = {
             row["host"]
             for row in conn.execute(

@@ -14,7 +14,8 @@ from __future__ import annotations
 import sys
 from typing import TYPE_CHECKING
 
-from core.hypotheses.errors import HypothesisAPIError
+from core.hypotheses.batch import find_reasoning_review_batch_defects
+from core.hypotheses.errors import HypothesisAPIError, HypothesisBatchLimitError
 from core.hypotheses.evidence import gather_run_evidence
 from core.hypotheses.grounding import (
     check_entity_citations,
@@ -22,7 +23,8 @@ from core.hypotheses.grounding import (
     compute_calibration_status,
     compute_grounding_status,
 )
-from core.hypotheses.model import LlmHypothesis, ReasoningChallenge
+from core.hypotheses.limits import validate_hypothesis_batch_limits
+from core.hypotheses.model import LlmHypothesis, ReasoningChallenge, ReasoningReviewStatus
 from core.hypotheses.prompt import (
     PROMPT_VERSION,
     build_adversarial_user_message,
@@ -225,6 +227,12 @@ def cmd_suggest_hypotheses(
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
+    try:
+        validate_hypothesis_batch_limits(primary_result)
+    except HypothesisBatchLimitError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     if not primary_result.hypotheses:
         print(
             "\nThe model returned no hypotheses — the evidence didn't support any it judged "
@@ -234,6 +242,7 @@ def cmd_suggest_hypotheses(
 
     review_by_index: dict[int, ReasoningChallenge] = {}
     review_reasoning_by_index: dict[int, str] = {}
+    review_status = ReasoningReviewStatus.NOT_REQUESTED
     if adversarial is not None:
         review_message = build_adversarial_user_message(
             [p.model_dump(mode="json") for p in primary_result.hypotheses],
@@ -245,9 +254,28 @@ def cmd_suggest_hypotheses(
         except HypothesisAPIError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        for r in review_result.reviews:
-            review_by_index[r.hypothesis_index] = ReasoningChallenge(r.challenge)
-            review_reasoning_by_index[r.hypothesis_index] = r.reasoning
+
+        defects = find_reasoning_review_batch_defects(
+            len(primary_result.hypotheses), review_result.reviews
+        )
+        if defects:
+            review_status = ReasoningReviewStatus.INVALID
+            print(
+                "\n⚠ Reasoning-soundness review returned an invalid batch: "
+                + "; ".join(defects)
+                + ". Every hypothesis in this generation will still be persisted (they are "
+                "independently grounded/calibrated and already real API spend), but none "
+                "of them can be trusted based on this review — a provider that cannot "
+                "reliably echo back which hypothesis it reviewed has given no reason to "
+                "trust that any single verdict corresponds to the hypothesis it's attached "
+                "to.",
+                file=sys.stderr,
+            )
+        else:
+            review_status = ReasoningReviewStatus.COMPLETE
+            for r in review_result.reviews:
+                review_by_index[r.hypothesis_index] = ReasoningChallenge(r.challenge)
+                review_reasoning_by_index[r.hypothesis_index] = r.reasoning
 
     hypotheses: list[LlmHypothesis] = []
     for index, proposal in enumerate(primary_result.hypotheses):
@@ -258,7 +286,9 @@ def cmd_suggest_hypotheses(
         all_citations = relationship_citations + entity_citations
         grounding_status = compute_grounding_status(all_citations)
         calibration_status = compute_calibration_status(all_citations)
-        challenge = review_by_index.get(index)
+        challenge = (
+            review_by_index.get(index) if review_status is ReasoningReviewStatus.COMPLETE else None
+        )
         hypotheses.append(
             LlmHypothesis(
                 statement=proposal.statement,
@@ -271,8 +301,17 @@ def cmd_suggest_hypotheses(
                 confidence=proposal.confidence,
                 suggested_next_step=proposal.suggested_next_step,
                 reasoning_review_challenge=challenge,
-                reasoning_review_provider=adversarial_name if challenge is not None else None,
-                reasoning_review_model=adversarial_model if challenge is not None else None,
+                reasoning_review_status=review_status,
+                reasoning_review_provider=(
+                    adversarial_name
+                    if review_status is not ReasoningReviewStatus.NOT_REQUESTED
+                    else None
+                ),
+                reasoning_review_model=(
+                    adversarial_model
+                    if review_status is not ReasoningReviewStatus.NOT_REQUESTED
+                    else None
+                ),
             )
         )
 
@@ -296,6 +335,11 @@ def cmd_suggest_hypotheses(
                 if hypothesis.reasoning_review_challenge is not None
                 else ""
             )
+            + (
+                " reasoning_review=INVALID_BATCH"
+                if hypothesis.reasoning_review_status is ReasoningReviewStatus.INVALID
+                else ""
+            )
         )
         if hypothesis.suggested_next_step:
             print(f"    next step: {hypothesis.suggested_next_step}")
@@ -306,9 +350,10 @@ def cmd_suggest_hypotheses(
     if untrustworthy_count:
         print(
             f"⚠ {untrustworthy_count} of {len(hypotheses)} hypothesis(es) did NOT pass every "
-            "check (ungrounded citation, overstated evidence strength, or a reasoning review "
-            "that found the conclusion overreaches) — treat these with the same skepticism as "
-            "an unverified claim, never as equivalent to a fully-checked one."
+            "check (ungrounded citation, overstated evidence strength, an invalid/incomplete "
+            "reasoning-review batch, or a reasoning review that found the conclusion "
+            "overreaches) — treat these with the same skepticism as an unverified claim, "
+            "never as equivalent to a fully-checked one."
         )
     print(
         "\nReminder: a hypothesis is an investigation lead for a human analyst, never a "

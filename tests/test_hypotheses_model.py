@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from core.assets import ScanRun
 from core.hypotheses.model import (
     CalibrationStatus,
@@ -17,6 +19,7 @@ from core.hypotheses.model import (
     GroundingStatus,
     LlmHypothesis,
     ReasoningChallenge,
+    ReasoningReviewStatus,
 )
 from core.store import AssetStore
 
@@ -119,6 +122,42 @@ class TestLlmHypothesisTrustworthy:
         h = self._base(reasoning_review_challenge=ReasoningChallenge.INSUFFICIENT_EVIDENCE)
         assert h.trustworthy is False
 
+    def test_not_requested_review_status_has_no_effect_on_trustworthy(self) -> None:
+        """Absence of a requested review must never, on its own, count
+        against a hypothesis — this is a distinct case from an INVALID
+        review batch (hardening round)."""
+        h = self._base(reasoning_review_status=ReasoningReviewStatus.NOT_REQUESTED)
+        assert h.trustworthy is True
+
+    def test_invalid_review_status_makes_it_untrustworthy_even_when_grounded_and_calibrated(
+        self,
+    ) -> None:
+        """The hardening round's central invariant: it must never be
+        possible for grounded=True + calibrated=True + an incomplete/
+        invalid reasoning-review batch to read as trustworthy."""
+        h = self._base(reasoning_review_status=ReasoningReviewStatus.INVALID)
+        assert h.grounding_status is GroundingStatus.GROUNDED
+        assert h.calibration_status is CalibrationStatus.CALIBRATED
+        assert h.trustworthy is False
+
+    def test_invalid_review_status_overrides_even_a_sound_challenge(self) -> None:
+        """Defense in depth: even if a per-hypothesis challenge value
+        somehow got set alongside an INVALID batch status, INVALID must
+        still win — the challenge value cannot be trusted to correspond
+        to this hypothesis at all once the batch is known incomplete."""
+        h = self._base(
+            reasoning_review_status=ReasoningReviewStatus.INVALID,
+            reasoning_review_challenge=ReasoningChallenge.SOUND,
+        )
+        assert h.trustworthy is False
+
+    def test_complete_review_status_with_sound_challenge_is_trustworthy(self) -> None:
+        h = self._base(
+            reasoning_review_status=ReasoningReviewStatus.COMPLETE,
+            reasoning_review_challenge=ReasoningChallenge.SOUND,
+        )
+        assert h.trustworthy is True
+
     def test_to_dict_round_trips_enum_values(self) -> None:
         h = self._base(
             confidence=Confidence.HIGH,
@@ -141,7 +180,12 @@ class TestLlmHypothesisTrustworthy:
         assert data["calibration_status"] == "CALIBRATED"
         assert data["confidence"] == "HIGH"
         assert data["reasoning_review_challenge"] == "SOUND"
+        assert data["reasoning_review_status"] == "NOT_REQUESTED"
         assert len(data["evidence"]) == 1
+
+    def test_to_dict_includes_reasoning_review_status(self) -> None:
+        h = self._base(reasoning_review_status=ReasoningReviewStatus.INVALID)
+        assert h.to_dict()["reasoning_review_status"] == "INVALID"
 
 
 def _seed_run(tmp_path: Path, run_id: str = "run1") -> AssetStore:
@@ -193,6 +237,8 @@ class TestRecordAndReadLlmHypotheses:
         assert row["model_used"] == "claude-sonnet-5"
         assert row["prompt_version"] == "v1"
         assert row["generated_at"]
+        assert row["generation_id"]
+        assert row["reasoning_review_status"] == "NOT_REQUESTED"
         assert len(row["evidence"]) == 2
         rel_evidence = next(e for e in row["evidence"] if e["evidence_kind"] == "relationship")
         assert rel_evidence["cited_id"] == "rel-1"
@@ -260,3 +306,132 @@ class TestRecordAndReadLlmHypotheses:
         by_statement = {r["statement"]: r for r in rows}
         assert by_statement["First."]["evidence"][0]["cited_id"] == "rel-1"
         assert by_statement["Second."]["evidence"][0]["cited_id"] == "rel-nonexistent"
+
+
+def _plain_hypothesis(statement: str, **overrides: object) -> LlmHypothesis:
+    kwargs: dict[str, object] = dict(
+        statement=statement,
+        provider="anthropic",
+        model_used="claude-sonnet-5",
+        prompt_version="v1",
+        grounding_status=GroundingStatus.GROUNDED,
+        calibration_status=CalibrationStatus.CALIBRATED,
+    )
+    kwargs.update(overrides)
+    return LlmHypothesis(**kwargs)
+
+
+class TestGenerationIdentity:
+    """Hardening round: 'identidad de generación para corridas múltiples
+    sobre el mismo run_id' — confirms which hypotheses were generated
+    together, distinguishes separate generations against the same
+    run_id, and never lets one generation overwrite another. Judgment
+    call: augments the EXISTING `intel_llm_hypotheses` table with one
+    `generation_id` column (assigned once per `record_llm_hypotheses`
+    call) rather than adding a whole new table — every row in a
+    generation already lives in this table and needs exactly one more
+    shared scalar to be unambiguously groupable; a separate
+    generations table would only ever hold that same one column plus a
+    foreign key back here."""
+
+    def test_hypotheses_from_the_same_call_share_one_generation_id(self, tmp_path: Path) -> None:
+        store = _seed_run(tmp_path)
+        store.record_llm_hypotheses(
+            "run1", [_plain_hypothesis("First."), _plain_hypothesis("Second.")]
+        )
+        rows = store.get_llm_hypotheses("run1")
+        assert len(rows) == 2
+        generation_ids = {r["generation_id"] for r in rows}
+        assert len(generation_ids) == 1
+
+    def test_two_separate_calls_get_different_generation_ids(self, tmp_path: Path) -> None:
+        store = _seed_run(tmp_path)
+        store.record_llm_hypotheses("run1", [_plain_hypothesis("Gen 1.")])
+        store.record_llm_hypotheses("run1", [_plain_hypothesis("Gen 2.")])
+        rows = store.get_llm_hypotheses("run1")
+        assert len(rows) == 2
+        by_statement = {r["statement"]: r for r in rows}
+        assert by_statement["Gen 1."]["generation_id"] != by_statement["Gen 2."]["generation_id"]
+
+    def test_a_second_generation_never_overwrites_the_first(self, tmp_path: Path) -> None:
+        store = _seed_run(tmp_path)
+        first_ids = store.record_llm_hypotheses("run1", [_plain_hypothesis("Gen 1.")])
+        second_ids = store.record_llm_hypotheses("run1", [_plain_hypothesis("Gen 2.")])
+        assert first_ids != second_ids
+        rows = store.get_llm_hypotheses("run1")
+        assert len(rows) == 2
+        statements = {r["statement"] for r in rows}
+        assert statements == {"Gen 1.", "Gen 2."}
+
+    def test_provider_model_and_timestamp_identify_each_generation(self, tmp_path: Path) -> None:
+        store = _seed_run(tmp_path)
+        store.record_llm_hypotheses(
+            "run1",
+            [_plain_hypothesis("Gen 1.", provider="anthropic", model_used="claude-sonnet-5")],
+        )
+        store.record_llm_hypotheses(
+            "run1", [_plain_hypothesis("Gen 2.", provider="openai", model_used="gpt-5.6-terra")]
+        )
+        rows = store.get_llm_hypotheses("run1")
+        by_statement = {r["statement"]: r for r in rows}
+        assert by_statement["Gen 1."]["provider"] == "anthropic"
+        assert by_statement["Gen 2."]["provider"] == "openai"
+        assert by_statement["Gen 1."]["generated_at"]
+        assert by_statement["Gen 2."]["generated_at"]
+
+    def test_hypothesis_evidence_integrity_stays_scoped_to_its_own_generation(
+        self, tmp_path: Path
+    ) -> None:
+        """Each hypothesis's evidence rows must remain attached to their
+        own hypothesis_id/generation, never bleeding into a later
+        generation's rows just because both target the same run_id."""
+        store = _seed_run(tmp_path)
+        gen1 = _plain_hypothesis(
+            "Gen 1.",
+            evidence=[
+                CitedEvidence(
+                    evidence_kind=EvidenceKind.RELATIONSHIP, cited_id="rel-gen1", exists_in_run=True
+                )
+            ],
+        )
+        gen2 = _plain_hypothesis(
+            "Gen 2.",
+            evidence=[
+                CitedEvidence(
+                    evidence_kind=EvidenceKind.RELATIONSHIP, cited_id="rel-gen2", exists_in_run=True
+                )
+            ],
+        )
+        store.record_llm_hypotheses("run1", [gen1])
+        store.record_llm_hypotheses("run1", [gen2])
+        rows = store.get_llm_hypotheses("run1")
+        by_statement = {r["statement"]: r for r in rows}
+        assert [e["cited_id"] for e in by_statement["Gen 1."]["evidence"]] == ["rel-gen1"]
+        assert [e["cited_id"] for e in by_statement["Gen 2."]["evidence"]] == ["rel-gen2"]
+
+
+class TestRecordLlmHypothesesRollsBackOnPartialFailure:
+    def test_a_failure_partway_through_one_call_rolls_back_the_whole_batch(
+        self, tmp_path: Path
+    ) -> None:
+        """One call to record_llm_hypotheses is one transaction: if the
+        SECOND hypothesis in a batch fails to persist (here, a NOT NULL
+        constraint violation on its evidence row), the FIRST hypothesis
+        —already inserted earlier in the same call— must be rolled back
+        too. A generation is persisted whole or not at all, never half."""
+        store = _seed_run(tmp_path)
+        good = _plain_hypothesis("Should not survive.")
+        bad = _plain_hypothesis(
+            "Also should not survive.",
+            evidence=[
+                CitedEvidence(
+                    evidence_kind=EvidenceKind.RELATIONSHIP,
+                    cited_id=None,  # type: ignore[arg-type]  # violates NOT NULL by design
+                    exists_in_run=True,
+                )
+            ],
+        )
+        with pytest.raises(Exception):  # noqa: B017 - sqlite3.IntegrityError, deliberately broad
+            store.record_llm_hypotheses("run1", [good, bad])
+
+        assert store.get_llm_hypotheses("run1") == []

@@ -27,6 +27,7 @@ __all__ = [
     "GroundingStatus",
     "CalibrationStatus",
     "ReasoningChallenge",
+    "ReasoningReviewStatus",
     "EvidenceKind",
     "CitedEvidence",
     "LlmHypothesis",
@@ -85,6 +86,40 @@ class ReasoningChallenge(str, Enum):
     SOUND = "SOUND"
     OVERREACHES = "OVERREACHES"
     INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+
+
+class ReasoningReviewStatus(str, Enum):
+    """Coverage/integrity of the reasoning-soundness review batch itself
+    (hardening round: "la revisión adversarial debe fallar cerrado ante
+    índices incompletos/duplicados") — orthogonal to `ReasoningChallenge`,
+    which is the per-hypothesis VERDICT a valid review gave. This tracks
+    whether the review batch as a whole was even trustworthy enough to
+    read a verdict from.
+
+    NOT_REQUESTED: no `--adversarial-provider` was configured for this
+    generation — absence of review must never, on its own, invalidate a
+    hypothesis (a hypothesis with GROUNDED+CALIBRATED and no review
+    requested is exactly as trustworthy as one whole design already
+    intended for the pre-hardening-round behavior).
+
+    COMPLETE: an adversarial provider was asked to review N hypotheses and
+    returned exactly one valid review per hypothesis_index in range(N) —
+    no duplicates, no missing, no out-of-range indices. Only in this case
+    is the per-hypothesis `reasoning_review_challenge` trusted.
+
+    INVALID: an adversarial provider was asked to review N hypotheses but
+    the response was missing an index, duplicated one, or included one
+    out of range — the hypotheses are still persisted (they were already
+    real API spend, independently grounded/calibrated), but every one of
+    them in this batch is forced untrustworthy: a provider that cannot
+    reliably echo back which hypothesis it reviewed has given no reason to
+    trust that any single verdict actually corresponds to the hypothesis
+    it's attached to.
+    """
+
+    NOT_REQUESTED = "NOT_REQUESTED"
+    COMPLETE = "COMPLETE"
+    INVALID = "INVALID"
 
 
 class EvidenceKind(str, Enum):
@@ -154,8 +189,16 @@ class LlmHypothesis:
     confidence: Confidence | None = None
     suggested_next_step: str = ""
     reasoning_review_challenge: ReasoningChallenge | None = None
+    reasoning_review_status: ReasoningReviewStatus = ReasoningReviewStatus.NOT_REQUESTED
     reasoning_review_provider: str | None = None
     reasoning_review_model: str | None = None
+    # Identifies which `suggest-hypotheses` invocation produced this row —
+    # every hypothesis from the same call shares the same value (assigned
+    # once by `core.store.AssetStore.record_llm_hypotheses`), so re-running
+    # the command against the same run_id never conflates two separate
+    # generations (hardening round, "identidad de generación"). None only
+    # for an `LlmHypothesis` that hasn't been persisted yet.
+    generation_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -173,21 +216,31 @@ class LlmHypothesis:
                 if self.reasoning_review_challenge is not None
                 else None
             ),
+            "reasoning_review_status": self.reasoning_review_status.value,
             "reasoning_review_provider": self.reasoning_review_provider,
             "reasoning_review_model": self.reasoning_review_model,
+            "generation_id": self.generation_id,
         }
 
     @property
     def trustworthy(self) -> bool:
         """The single "should a human treat this at face value" gate
         (design: overstated evidence "must be flagged the same as a
-        fabricated citation"): both mechanical checks must pass, and if a
-        reasoning review ran, it must have returned SOUND. Never used to
-        delete/hide an untrustworthy hypothesis — only to make sure it is
-        never presented as equivalent to one that passed every check."""
+        fabricated citation"): both mechanical checks must pass, a
+        requested-but-invalid reasoning review (missing/duplicate/
+        out-of-range index — see `ReasoningReviewStatus`) must never be
+        possible to read as trustworthy just because grounding/calibration
+        happened to pass, and if a *valid* review ran, it must have
+        returned SOUND. An absent review (never requested) does not, on
+        its own, affect this — that is a distinct case from an invalid
+        one. Never used to delete/hide an untrustworthy hypothesis — only
+        to make sure it is never presented as equivalent to one that
+        passed every check."""
         if self.grounding_status is not GroundingStatus.GROUNDED:
             return False
         if self.calibration_status is not CalibrationStatus.CALIBRATED:
+            return False
+        if self.reasoning_review_status is ReasoningReviewStatus.INVALID:
             return False
         if (
             self.reasoning_review_challenge is not None

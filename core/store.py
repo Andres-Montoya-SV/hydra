@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -537,12 +538,31 @@ CREATE TABLE IF NOT EXISTS intel_llm_hypotheses (
     -- disagreement (design Section 4.3 is explicit that the latter is not
     -- what this system does).
     reasoning_review_challenge TEXT,
+    -- Hardening round: NOT_REQUESTED / COMPLETE / INVALID — whether the
+    -- reasoning-review BATCH itself (not this one hypothesis's verdict)
+    -- covered every requested hypothesis_index exactly once. An INVALID
+    -- batch still gets persisted (the hypotheses are independently
+    -- grounded/calibrated, already real API spend) but forces this row
+    -- untrustworthy regardless of reasoning_review_challenge — see
+    -- core.hypotheses.model.LlmHypothesis.trustworthy.
+    reasoning_review_status TEXT NOT NULL DEFAULT 'NOT_REQUESTED',
     reasoning_review_provider TEXT,
     reasoning_review_model TEXT,
+    -- Hardening round ("identidad de generación para corridas múltiples"):
+    -- one value per `suggest-hypotheses` invocation, shared by every
+    -- hypothesis it produced — assigned once per call to
+    -- record_llm_hypotheses, never per row, so hypotheses generated
+    -- together are unambiguously groupable even if a later run against
+    -- the same run_id lands in the same second. Re-running the command
+    -- never overwrites a prior generation's rows; this is purely an
+    -- additional grouping key on top of that already-additive INSERT.
+    generation_id TEXT NOT NULL,
     generated_at TEXT NOT NULL,
     FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 CREATE INDEX IF NOT EXISTS idx_llm_hypotheses_run ON intel_llm_hypotheses(run_id);
+CREATE INDEX IF NOT EXISTS idx_llm_hypotheses_generation
+    ON intel_llm_hypotheses(generation_id);
 
 -- One row per entity/relationship a specific intel_llm_hypotheses row
 -- cited as supporting evidence (design Section 8's "many-to-many join
@@ -1317,10 +1337,31 @@ class AssetStore:
         support, and so a future reasoning-review pass can update the
         right row by id. All inserts happen inside one transaction
         (commit on success, rollback on any exception) — same discipline
-        as `record_reportability_assessments`.
+        as `record_reportability_assessments`: if any row in this batch
+        fails to insert (e.g. a constraint violation), every row already
+        inserted earlier in the SAME call is rolled back too — a call to
+        this method either persists the whole generation or none of it,
+        never a partial one.
+
+        `generated_at`/`generation_id` are each computed exactly ONCE per
+        call, not per row (hardening round, "identidad de generación para
+        corridas múltiples sobre el mismo run_id"): every hypothesis
+        passed in one call shares both values, so a caller can always
+        answer "which hypotheses were generated together, with which
+        provider/model, and when" — including the earlier design's own
+        prior behavior of a fresh `datetime.now()` per row, which could
+        (in principle) let two rows in the SAME batch carry different
+        timestamps, undermining exactly the grouping this is meant to
+        provide. Re-running `suggest-hypotheses` against the same run_id
+        is always a second, independent call to this method — a plain
+        INSERT, never INSERT OR REPLACE/UPSERT — so it can never overwrite
+        or destroy a prior generation's rows; both remain readable,
+        distinguished by their own `generation_id`.
         """
         if not hypotheses:
             return []
+        generated_at = datetime.now(timezone.utc).isoformat()
+        generation_id = uuid.uuid4().hex
         inserted_ids: list[int] = []
         with self._connect() as conn:
             for h in hypotheses:
@@ -1329,9 +1370,10 @@ class AssetStore:
                        (run_id, statement, confidence, suggested_next_step,
                         provider, model_used, prompt_version,
                         grounding_status, calibration_status,
-                        reasoning_review_challenge, reasoning_review_provider,
-                        reasoning_review_model, generated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        reasoning_review_challenge, reasoning_review_status,
+                        reasoning_review_provider, reasoning_review_model,
+                        generation_id, generated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         run_id,
                         h.statement,
@@ -1347,9 +1389,11 @@ class AssetStore:
                             if h.reasoning_review_challenge is not None
                             else None
                         ),
+                        h.reasoning_review_status.value,
                         h.reasoning_review_provider,
                         h.reasoning_review_model,
-                        datetime.now(timezone.utc).isoformat(),
+                        generation_id,
+                        generated_at,
                     ),
                 )
                 if cursor.lastrowid is None:
