@@ -11,10 +11,22 @@ discipline, adapted from text-matching to structured-data lookup.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from core.hypotheses.evidence import RunEvidence
 from core.hypotheses.model import CalibrationStatus, CitedEvidence, EvidenceKind, GroundingStatus
-from core.hypotheses.schema import CitedRelationshipClaim
 from core.intel.model import ConfidenceBand
+
+if TYPE_CHECKING:
+    # Deferred: this module's own logic only ever duck-types `claim`
+    # (attribute access), never constructs or isinstance-checks a
+    # CitedRelationshipClaim — importing schema.py at module level would
+    # make `core.hypotheses.grounding`, and therefore `core.hypotheses.cli`
+    # (which imports this module), require pydantic just to import, which
+    # is exactly the hard dependency cli.py's own docstring says must not
+    # exist (schema.py/pydantic stay behind the provider construction
+    # that's already deferred inside cmd_suggest_hypotheses's try/except).
+    from core.hypotheses.schema import CitedRelationshipClaim
 
 # Weakest to strongest — the ordinal scale both grounding checks compare
 # on. A hypothesis is never penalized for UNDERSTATING a relationship's

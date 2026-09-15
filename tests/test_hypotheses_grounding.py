@@ -17,16 +17,20 @@ Three canonical scenarios, each proven independently:
 
 from __future__ import annotations
 
-from core.hypotheses.evidence import RunEvidence
-from core.hypotheses.grounding import (
+import pytest
+
+pytest.importorskip("pydantic")
+
+from core.hypotheses.evidence import RunEvidence  # noqa: E402
+from core.hypotheses.grounding import (  # noqa: E402
     check_entity_citations,
     check_relationship_citations,
     compute_calibration_status,
     compute_grounding_status,
 )
-from core.hypotheses.model import CalibrationStatus, GroundingStatus
-from core.hypotheses.schema import CitedRelationshipClaim
-from core.intel.model import ConfidenceBand
+from core.hypotheses.model import CalibrationStatus, GroundingStatus  # noqa: E402
+from core.hypotheses.schema import CitedRelationshipClaim  # noqa: E402
+from core.intel.model import ConfidenceBand  # noqa: E402
 
 _CERT_RELATIONSHIP = {
     "relationship_id": "rel-cert-1",
