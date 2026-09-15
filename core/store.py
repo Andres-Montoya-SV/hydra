@@ -502,6 +502,78 @@ CREATE TABLE IF NOT EXISTS intel_hypotheses (
     FOREIGN KEY(run_id, evidence_id) REFERENCES intel_evidence(run_id, evidence_id)
 );
 
+-- LLM-proposed hypotheses (docs/HYPOTHESIS_ENGINE_DESIGN.md Section 8) —
+-- an ADDITIVE layer alongside intel_hypotheses above, never a replacement.
+-- intel_hypotheses is structurally one-relationship-to-one-target, shaped
+-- for its sole producer (_emit_hypotheses' one SAN_CONTAINS rule); an
+-- LLM-proposed hypothesis naturally cites several relationships/entities
+-- at once, which that shape cannot express — same reasoning
+-- reportability_assessments being its own table (not a findings/
+-- verification_flags reuse) already established for this codebase.
+CREATE TABLE IF NOT EXISTS intel_llm_hypotheses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    statement TEXT NOT NULL,
+    confidence TEXT,
+    suggested_next_step TEXT,
+    provider TEXT NOT NULL,
+    model_used TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    -- Existence grounding (design Section 6): GROUNDED / PARTIALLY_GROUNDED
+    -- / UNGROUNDED, computed mechanically against intel_relationships/
+    -- intel_entities for this run_id — never taken on the model's word.
+    grounding_status TEXT NOT NULL,
+    -- Confidence-calibration check (design Section 7.2 / this round's
+    -- Task 3): CALIBRATED / OVERSTATED — a hypothesis can cite entirely
+    -- real evidence (GROUNDED) while still treating a MEDIUM-confidence
+    -- relationship as if it carried HIGH-confidence weight. Computed
+    -- mechanically (core/hypotheses/grounding.py), never by a second LLM
+    -- judging its own citation.
+    calibration_status TEXT NOT NULL,
+    -- Reasoning-soundness review (design Part C, Section 4.2) — NULL
+    -- unless adversarial review was requested for this batch. A REVIEW of
+    -- this specific, already-produced hypothesis by a second provider,
+    -- never a second independently-generated hypothesis compared for
+    -- disagreement (design Section 4.3 is explicit that the latter is not
+    -- what this system does).
+    reasoning_review_challenge TEXT,
+    reasoning_review_provider TEXT,
+    reasoning_review_model TEXT,
+    generated_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_hypotheses_run ON intel_llm_hypotheses(run_id);
+
+-- One row per entity/relationship a specific intel_llm_hypotheses row
+-- cited as supporting evidence (design Section 8's "many-to-many join
+-- intel_hypotheses' singular relationship_id/target_value columns cannot
+-- express"). No FK on cited_id to intel_relationships/intel_entities:
+-- SQLite cannot express a conditional/polymorphic FK across the two
+-- possible target tables (evidence_kind decides which one), and the
+-- whole point of exists_in_run/real_confidence_band below is that
+-- existence is checked and recorded by application code (a parameterized
+-- SELECT, per design Section 6), not assumed via a schema constraint.
+CREATE TABLE IF NOT EXISTS intel_llm_hypothesis_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    hypothesis_id INTEGER NOT NULL,
+    evidence_kind TEXT NOT NULL,
+    cited_id TEXT NOT NULL,
+    -- Only meaningful for evidence_kind='relationship': what strength the
+    -- hypothesis's own language is treating this citation as (design
+    -- Section 7.2, example 2) — required from the LLM's structured
+    -- output for every relationship it cites, so calibration is checkable
+    -- per-citation rather than guessed from prose.
+    treated_as_strength TEXT,
+    exists_in_run INTEGER NOT NULL,
+    real_confidence_band TEXT,
+    overstated INTEGER,
+    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+    FOREIGN KEY(hypothesis_id) REFERENCES intel_llm_hypotheses(id)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_hypothesis_evidence_hypothesis
+    ON intel_llm_hypothesis_evidence(hypothesis_id);
+
 CREATE TABLE IF NOT EXISTS intel_collection_attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
@@ -1231,6 +1303,94 @@ class AssetStore:
                 (run_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_llm_hypotheses(self, run_id: str, hypotheses: list) -> list[int]:
+        """Persist LLM-proposed hypotheses for a run (docs/HYPOTHESIS_ENGINE_DESIGN.md
+        Section 8). `hypotheses` is a list of
+        `core.hypotheses.model.LlmHypothesis` (or anything with the same
+        attributes, including `.evidence`, a list of
+        `core.hypotheses.model.CitedEvidence`).
+
+        Returns the real `id` assigned to each inserted hypothesis row, in
+        the same order as `hypotheses` — needed so a caller can attach
+        `intel_llm_hypothesis_evidence` rows to the exact hypothesis they
+        support, and so a future reasoning-review pass can update the
+        right row by id. All inserts happen inside one transaction
+        (commit on success, rollback on any exception) — same discipline
+        as `record_reportability_assessments`.
+        """
+        if not hypotheses:
+            return []
+        inserted_ids: list[int] = []
+        with self._connect() as conn:
+            for h in hypotheses:
+                cursor = conn.execute(
+                    """INSERT INTO intel_llm_hypotheses
+                       (run_id, statement, confidence, suggested_next_step,
+                        provider, model_used, prompt_version,
+                        grounding_status, calibration_status,
+                        reasoning_review_challenge, reasoning_review_provider,
+                        reasoning_review_model, generated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        run_id,
+                        h.statement,
+                        h.confidence.value if h.confidence is not None else None,
+                        h.suggested_next_step or "",
+                        h.provider,
+                        h.model_used,
+                        h.prompt_version,
+                        h.grounding_status.value,
+                        h.calibration_status.value,
+                        h.reasoning_review_challenge.value
+                        if h.reasoning_review_challenge is not None
+                        else None,
+                        h.reasoning_review_provider,
+                        h.reasoning_review_model,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                if cursor.lastrowid is None:
+                    raise RuntimeError("INSERT into intel_llm_hypotheses produced no lastrowid")
+                hypothesis_id = cursor.lastrowid
+                inserted_ids.append(hypothesis_id)
+                for e in h.evidence:
+                    conn.execute(
+                        """INSERT INTO intel_llm_hypothesis_evidence
+                           (run_id, hypothesis_id, evidence_kind, cited_id,
+                            treated_as_strength, exists_in_run,
+                            real_confidence_band, overstated)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            run_id,
+                            hypothesis_id,
+                            e.evidence_kind,
+                            e.cited_id,
+                            e.treated_as_strength.value if e.treated_as_strength else None,
+                            1 if e.exists_in_run else 0,
+                            e.real_confidence_band,
+                            (None if e.overstated is None else (1 if e.overstated else 0)),
+                        ),
+                    )
+        return inserted_ids
+
+    def get_llm_hypotheses(self, run_id: str) -> list[dict[str, object]]:
+        """Read back LLM-proposed hypotheses for a run, each with its own
+        cited evidence attached under an `"evidence"` key (CLI use)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM intel_llm_hypotheses WHERE run_id=? ORDER BY id",
+                (run_id,),
+            ).fetchall()
+            hypotheses = [dict(row) for row in rows]
+            for h in hypotheses:
+                evidence_rows = conn.execute(
+                    "SELECT * FROM intel_llm_hypothesis_evidence "
+                    "WHERE hypothesis_id=? ORDER BY id",
+                    (h["id"],),
+                ).fetchall()
+                h["evidence"] = [dict(r) for r in evidence_rows]
+        return hypotheses
 
     def upsert_host(self, run_id: str, host: Host) -> None:
         """Legacy single-host upsert (used by tests)."""
