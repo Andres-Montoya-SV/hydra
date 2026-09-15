@@ -980,12 +980,17 @@ def test_httpx_parser_redacts_session_cookies_and_auth_headers(tmp_path: Path) -
 def test_merged_headers_injects_researcher_header_when_configured(
     tmp_path: Path,
 ) -> None:
+    """ "X-HackerOne-Research" (no trailing "er") is HackerOne's own
+    documented header name (docs.hackerone.com's Traffic Identification
+    article) — this codebase previously sent "X-HackerOne-Researcher",
+    which HackerOne's own tooling would not have recognized. Fixed in
+    config/settings.py::merged_headers()."""
     settings = Settings(
         project_root=tmp_path,
         x_hackerone_researcher="my-h1-handle",
     )
     headers = settings.merged_headers()
-    assert headers["X-HackerOne-Researcher"] == "my-h1-handle"
+    assert headers["X-HackerOne-Research"] == "my-h1-handle"
 
     settings.strict_opsec = True
     settings.outbound_proxy_url = "http://proxy.example:8080"

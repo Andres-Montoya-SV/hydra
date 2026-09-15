@@ -160,7 +160,7 @@ class TestIdentityHeaders:
         settings = Settings(project_root=project_root, x_hackerone_researcher="handle")
         result = check_identity_headers(settings)
         assert result.level == "info"
-        assert "X-HackerOne-Researcher" in result.message
+        assert "X-HackerOne-Research" in result.message
 
 
 class TestRunDiagnostics:

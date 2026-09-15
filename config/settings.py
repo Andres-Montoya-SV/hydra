@@ -857,8 +857,14 @@ class Settings:
             return {}
         headers = dict(self.custom_http_headers)
         headers.update(self.researcher_attribution_header)
-        if self.x_hackerone_researcher and "X-HackerOne-Researcher" not in headers:
-            headers["X-HackerOne-Researcher"] = self.x_hackerone_researcher
+        # HackerOne's own documented convention is "X-HackerOne-Research"
+        # (no trailing "er") — verified against docs.hackerone.com's
+        # Traffic Identification article, not assumed from the variable's
+        # own name. Previously sent as "X-HackerOne-Researcher", which
+        # HackerOne's own tooling would not have recognized as the
+        # documented attribution header.
+        if self.x_hackerone_researcher and "X-HackerOne-Research" not in headers:
+            headers["X-HackerOne-Research"] = self.x_hackerone_researcher
         return headers
 
     def attribution_user_agent_suffix(self) -> str:

@@ -29,7 +29,11 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"(?i)(token|secret|password|passwd|credential)\s*[:=]\s*.+"),
     re.compile(r"(?i)bearer\s+.+"),
     re.compile(r"(?i)(authorization|cookie|set-cookie)\s*[:=]\s*.+"),
-    re.compile(r"(?i)x-hackerone-researcher\s*[:=]\s*.+"),
+    # Matches both HackerOne's real documented header ("X-HackerOne-
+    # Research", verified against docs.hackerone.com) and the previous
+    # incorrect "X-HackerOne-Researcher" this codebase sent until fixed —
+    # kept for any historical log line still carrying the old name.
+    re.compile(r"(?i)x-hackerone-research(er)?\s*[:=]\s*.+"),
     re.compile(r"(?i)(session[_-]?id|sid)\s*[:=]\s*.+"),
     re.compile(r"(?i)(https?://)[^/\s:@]+:[^@\s/]+@"),
     # Anthropic/OpenAI API key *shape*, independent of any surrounding

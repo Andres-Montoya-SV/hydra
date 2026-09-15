@@ -39,6 +39,19 @@ class TestLogSanitization:
         result = sanitize_log_message(msg)
         assert "secretuser" not in result
 
+    def test_redacts_hackerone_research_header_outside_a_subprocess_arg(self) -> None:
+        """Dedicated regression for the X-HackerOne-Research(er) pattern
+        itself, in a context the generic `-H` subprocess-argument pattern
+        above doesn't cover (no `-H` prefix) — must redact both
+        HackerOne's real documented header name ("X-HackerOne-Research",
+        verified against docs.hackerone.com) and the previous incorrect
+        "X-HackerOne-Researcher" this codebase sent until
+        config/settings.py::merged_headers() was fixed."""
+        correct = "attribution header X-HackerOne-Research: secrethandle attached"
+        legacy_wrong = "attribution header X-HackerOne-Researcher: secrethandle attached"
+        assert "secrethandle" not in sanitize_log_message(correct)
+        assert "secrethandle" not in sanitize_log_message(legacy_wrong)
+
     def test_redacts_proxy_credentials_and_home_path(self) -> None:
         msg = f"proxy http://analyst:password@proxy.example {Path.home()}/targets.txt"
         result = sanitize_log_message(msg)
