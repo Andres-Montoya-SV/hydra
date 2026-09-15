@@ -1342,9 +1342,11 @@ class AssetStore:
                         h.prompt_version,
                         h.grounding_status.value,
                         h.calibration_status.value,
-                        h.reasoning_review_challenge.value
-                        if h.reasoning_review_challenge is not None
-                        else None,
+                        (
+                            h.reasoning_review_challenge.value
+                            if h.reasoning_review_challenge is not None
+                            else None
+                        ),
                         h.reasoning_review_provider,
                         h.reasoning_review_model,
                         datetime.now(timezone.utc).isoformat(),

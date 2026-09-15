@@ -515,3 +515,104 @@ None of these affect Parts A-E's actual boundaries or grounding
 discipline — they are presentation/ergonomics decisions appropriate to
 defer to implementation review, not scope questions this design document
 needs to resolve before that checkpoint.
+
+---
+
+## 10. Implementation status (Part 2)
+
+This document's design (Parts A-E, Sections 0-9 above) is unchanged from
+its original approval — this section only records what the
+implementation checkpoint settled and where each piece landed, per the
+same "document first, implement after review" discipline this document's
+own opening states.
+
+**Section 9's open questions, settled:**
+
+- **Command naming**: `python app.py suggest-hypotheses <run_id>` —
+  `generate-hypotheses`'s working name was replaced to read naturally
+  alongside `assess-reportability`'s own verb-noun shape.
+- **Batch shape**: settled as one call per run (every relationship/entity/
+  finding up to `HYPOTHESIS_MAX_RELATIONSHIPS_PER_BATCH`), not a
+  graph-partitioned per-cluster call — the same flat, configurable-ceiling
+  shape `assess-reportability` already uses for findings. Per-cluster
+  partitioning remains a possible future refinement, not needed for the
+  virusbarrier.xyz-scale case this design targets.
+- **Where a human sees the output**: no separate `python app.py
+  hypotheses <run_id>` read command was built — `suggest-hypotheses`
+  itself prints every generated hypothesis (statement, grounding/
+  calibration status, evidence) at generation time, and
+  `AssetStore.get_llm_hypotheses` is available for any future read-only
+  command. Left as a deferred ergonomics item, unchanged from Section 9.
+
+**Implementation order, each step and its test:**
+
+1. **Data model** — `intel_llm_hypotheses` /
+   `intel_llm_hypothesis_evidence` (`core/store.py`), additive alongside
+   the untouched `intel_hypotheses`/`_emit_hypotheses`, exactly as
+   Section 8 specified. Each hypothesis's cited relationships/entities are
+   individually recorded for the grounding check to verify one by one.
+   Implemented in `core/hypotheses/model.py` (`LlmHypothesis`,
+   `CitedEvidence`) + `core/store.py::record_llm_hypotheses`/
+   `get_llm_hypotheses`. Tested in `tests/test_hypotheses_model.py`
+   (`TestRecordAndReadLlmHypotheses`).
+
+2. **API integration** — re-confirmed the real, current Anthropic
+   (`anthropic==1.5.0`)/OpenAI (`openai==3.13.0`) call shapes via
+   `inspect.signature` before writing any client code (unchanged since
+   the reportability agent was built). The generic "call a structured-
+   output API, map every SDK exception" plumbing was extracted out of
+   `core/reportability/client.py`/`openai_client.py` into the new,
+   shared `core/llm/client.py` (Part B.1's "what is shared"), and both
+   reportability's clients and the hypothesis engine's new
+   `core/hypotheses/anthropic_client.py`/`openai_client.py` now build on
+   it as thin, task-specific wrappers — the hypothesis engine's own
+   prompt/schema/table/error type (`HypothesisAPIError`) stay fully
+   separate, per Part B.2/B.3. Tested in `tests/test_hypotheses_client.py`,
+   `tests/test_hypotheses_openai_client.py`,
+   `tests/test_hypotheses_provider.py`; reportability's own full existing
+   suite (104 tests, including one real live API call) still passes
+   unchanged after the extraction.
+
+3. **The two grounding checks, not one** (Section 6/7.2) —
+   `core/hypotheses/grounding.py`: `check_relationship_citations`/
+   `check_entity_citations` (existence, a strict parameterized lookup
+   against `core/hypotheses/evidence.py::gather_run_evidence`'s real
+   SQLite data — no fuzzy tier) and `compute_calibration_status`
+   (compares each citation's claimed `treated_as_strength` against the
+   real `ConfidenceBand` on the cited row; a relationship-type mismatch,
+   Section 6's other check, folds into the same `OVERSTATED` outcome —
+   "exists but is misinterpreted" covers both). Tested exhaustively in
+   `tests/test_hypotheses_grounding.py` (all three canonical scenarios:
+   correctly-calibrated, real-but-overstated, fabricated citation) and
+   against the real virusbarrier.xyz fixture in
+   `tests/test_hypotheses_virusbarrier.py`.
+
+4. **Review pattern, not cross-generation** (Part C) —
+   `HypothesisProvider.review_hypotheses` takes the already-produced
+   hypotheses and the real evidence they cited, and returns exactly one
+   `SOUND`/`OVERREACHES`/`INSUFFICIENT_EVIDENCE` verdict per
+   `hypothesis_index` — never a fresh, independently-generated hypothesis
+   list. Tested in `tests/test_hypotheses_cli.py::TestAdversarialReasoningReview`.
+
+5. **Command** — `python app.py suggest-hypotheses <run_id>`
+   (`core/hypotheses/cli.py::cmd_suggest_hypotheses`), wired in `app.py`,
+   never invoked by `run`. Same cost-estimate/fail-closed-confirmation/
+   batch-limit-refusal shape as `assess-reportability`
+   (`HYPOTHESIS_MAX_RELATIONSHIPS_PER_BATCH`, `HYPOTHESIS_PROVIDER`,
+   `HYPOTHESIS_ADVERSARIAL_PROVIDER` in `config/settings.py`). Tested in
+   `tests/test_hypotheses_cli.py`.
+
+6. **Foundational test case** — the real `tests/fixtures/virusbarrier/`
+   fixture, run through the actual correlation engine (not mocked SQLite
+   rows), confirms a hypothesis treating the shared certificate as strong
+   (HIGH) and the shared IP as weak, non-conclusive corroboration comes
+   back `GROUNDED`/`CALIBRATED`, and the explicit adversarial case (the
+   same real shared-IP relationship claimed as HIGH when its real band is
+   MEDIUM) is caught as `OVERSTATED`. Tested in
+   `tests/test_hypotheses_virusbarrier.py`
+   (`TestVirusbarrierFoundationalCase`,
+   `TestVirusbarrierAdversarialOverInterpretationCase`).
+
+Prompt-injection defenses (Section 7.4) are tested in
+`tests/test_hypotheses_prompt_injection.py`, mirroring
+`tests/test_reportability_prompt_injection.py`'s own honest scope.
