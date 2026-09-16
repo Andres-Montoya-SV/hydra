@@ -346,11 +346,26 @@ def cmd_assess_reportability(
             )
         store.record_reportability_adversarial_reviews(run_id, reviews_to_store)
 
+    # Honesty check (this round's own fix): by the time we reach this line,
+    # `adversarial is not None` means a second provider was configured AND
+    # its review_batch call + exact-batch validation already succeeded
+    # (any failure in either would have returned 1 above, before any
+    # assessment was persisted) — so this flag alone is sufficient to
+    # decide which verdict label is true. Never label a single-provider
+    # run as cross-validated just because --adversarial-provider exists as
+    # a code path; the operator must be told exactly how much verification
+    # actually happened for THIS run, not what the tool is capable of.
+    cross_validated = adversarial is not None
+    verdict_label = (
+        "(final, post-adversarial-review verdict)"
+        if cross_validated
+        else "(single-provider verdict — no adversarial cross-validation)"
+    )
     print()
     print(
         f"Assessed {len(assessments)} finding(s): {counts['ELIGIBLE']} ELIGIBLE, "
         f"{counts['NOT_ELIGIBLE']} NOT_ELIGIBLE, {counts['UNCERTAIN']} UNCERTAIN "
-        "(final, post-adversarial-review verdict)."
+        f"{verdict_label}."
     )
     if disagreements:
         print(
@@ -372,9 +387,16 @@ def cmd_assess_reportability(
             print(f"  - finding_id={finding_id}: {citation!r}")
     if not disagreements and not ungrounded:
         print("Every non-empty citation verified against the rules text.")
-    print(
-        "\nReminder: agreement between two LLMs does not constitute proof that a "
-        "vulnerability exists or is in scope. Every verdict here is a triage aid for a human "
-        "reviewer, not a substitute for reading the program's own rules."
-    )
+    if cross_validated:
+        print(
+            "\nReminder: agreement between two LLMs does not constitute proof that a "
+            "vulnerability exists or is in scope. Every verdict here is a triage aid for a "
+            "human reviewer, not a substitute for reading the program's own rules."
+        )
+    else:
+        print(
+            "\nReminder: this is a single LLM's assessment, not cross-validated — treat it "
+            "as one opinion, not confirmed consensus. Every verdict here is a triage aid for "
+            "a human reviewer, not a substitute for reading the program's own rules."
+        )
     return 0

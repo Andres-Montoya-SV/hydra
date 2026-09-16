@@ -693,3 +693,145 @@ class TestApiErrorHandling:
         _patch_provider(monkeypatch, primary=_FailingProvider())
         rc = cmd_assess_reportability(settings, RUN_ID, _rules_file(tmp_path, RULES_TEXT), yes=True)
         assert rc == 1
+
+
+class TestSingleProviderVsCrossValidatedLabeling:
+    """Bug fix: the final summary line and reminder must never claim
+    adversarial cross-validation happened unless a second provider was
+    both configured AND its review actually completed successfully for
+    this run. Confirmed with real evidence before this fix: running
+    `assess-reportability --provider anthropic` alone (no
+    `--adversarial-provider`, no `REPORTABILITY_ADVERSARIAL_PROVIDER`)
+    still printed "(final, post-adversarial-review verdict)" and
+    "agreement between two LLMs" — a false impression of more
+    verification than actually ran.
+    """
+
+    def test_single_provider_run_labels_the_verdict_as_single_provider(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        store = _seed_run(tmp_path)
+        finding_id = store.get_findings(RUN_ID)[0]["id"]
+        settings = _settings(tmp_path)
+        _patch_provider(
+            monkeypatch,
+            primary=_FakeProvider(assessments=[_finding_assessment(finding_id=finding_id)]),
+        )
+        rc = cmd_assess_reportability(
+            settings, RUN_ID, _rules_file(tmp_path, RULES_TEXT), yes=True, provider="anthropic"
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "(single-provider verdict — no adversarial cross-validation)" in out
+        assert "post-adversarial-review" not in out
+        assert "agreement between two LLMs" not in out
+        assert "Reminder: this is a single LLM's assessment, not cross-validated" in out
+
+    def test_cross_validated_run_keeps_the_original_post_adversarial_wording(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        store = _seed_run(tmp_path)
+        finding_id = store.get_findings(RUN_ID)[0]["id"]
+        settings = _settings(tmp_path)
+        _patch_provider(
+            monkeypatch,
+            primary=_FakeProvider(assessments=[_finding_assessment(finding_id=finding_id)]),
+            adversarial=_FakeProvider(
+                reviews=[
+                    AdversarialFindingChallenge(
+                        finding_id=finding_id, challenge="AGREE", reasoning="Checks out."
+                    )
+                ]
+            ),
+        )
+        rc = cmd_assess_reportability(
+            settings,
+            RUN_ID,
+            _rules_file(tmp_path, RULES_TEXT),
+            yes=True,
+            adversarial_provider="openai",
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "(final, post-adversarial-review verdict)" in out
+        assert "Reminder: agreement between two LLMs does not constitute proof" in out
+        assert "single-provider verdict" not in out
+
+    def test_adversarial_call_failing_partway_never_produces_a_cross_validated_label(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The real production scenario this bug was found alongside: an
+        adversarial provider IS configured but its call fails partway
+        (e.g. an OpenAI rate limit). The whole run already fails closed
+        (rc=1, nothing persisted) before reaching the summary — this test
+        pins down that no misleading cross-validated wording escapes
+        either, since a future refactor could otherwise reorder things.
+        """
+        store = _seed_run(tmp_path)
+        finding_id = store.get_findings(RUN_ID)[0]["id"]
+        settings = _settings(tmp_path)
+        _patch_provider(
+            monkeypatch,
+            primary=_FakeProvider(assessments=[_finding_assessment(finding_id=finding_id)]),
+            adversarial=_FakeProvider(
+                review_error=ReportabilityAPIError("Rate limited by the OpenAI API")
+            ),
+        )
+        rc = cmd_assess_reportability(
+            settings,
+            RUN_ID,
+            _rules_file(tmp_path, RULES_TEXT),
+            yes=True,
+            adversarial_provider="openai",
+        )
+        assert rc == 1
+        assert store.get_reportability_assessments(RUN_ID) == []
+        out = capsys.readouterr().out
+        assert "post-adversarial-review" not in out
+        assert "agreement between two LLMs" not in out
+        assert "final, post-adversarial-review verdict" not in out
+
+    def test_real_world_regression_fixture_22_findings_single_provider(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Explicit fixture for the exact case this bug report was filed
+        from: 22 findings, `--provider anthropic` only, no adversarial
+        provider configured anywhere (not via flag, not via
+        REPORTABILITY_ADVERSARIAL_PROVIDER) — 20 NOT_ELIGIBLE, 2 UNCERTAIN,
+        0 ELIGIBLE, exactly as observed in production."""
+        hosts = _hosts_with_n_findings(22)
+        store = _seed_run(tmp_path, hosts=hosts)
+        settings = _settings(tmp_path, reportability_adversarial_provider=None)
+        findings = store.get_findings(RUN_ID)
+        assert len(findings) == 22
+
+        def _assessments() -> list[FindingAssessment]:
+            items = []
+            for i, finding in enumerate(findings):
+                if i < 2:
+                    eligibility = "UNCERTAIN"
+                else:
+                    eligibility = "NOT_ELIGIBLE"
+                items.append(
+                    _finding_assessment(
+                        finding_id=finding["id"],
+                        eligibility=eligibility,
+                        rule_citation="",
+                        reasoning="Not covered by an in-scope rule.",
+                    )
+                )
+            return items
+
+        _patch_provider(monkeypatch, primary=_FakeProvider(assessments=_assessments))
+        rc = cmd_assess_reportability(
+            settings, RUN_ID, _rules_file(tmp_path, RULES_TEXT), yes=True, provider="anthropic"
+        )
+        assert rc == 0
+
+        out = capsys.readouterr().out
+        assert (
+            "Assessed 22 finding(s): 0 ELIGIBLE, 20 NOT_ELIGIBLE, 2 UNCERTAIN "
+            "(single-provider verdict — no adversarial cross-validation)." in out
+        )
+        assert "post-adversarial-review" not in out
+        assert "agreement between two LLMs" not in out
