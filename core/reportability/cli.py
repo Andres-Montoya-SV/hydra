@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from core.intel.cli import default_db
+from core.llm.client import cost_line as _cost_line
 from core.reportability.batch import validate_exact_batch
 from core.reportability.errors import BatchValidationError, ReportabilityAPIError
 from core.reportability.model import (
@@ -34,30 +35,6 @@ if TYPE_CHECKING:
     from config.settings import Settings
     from core.reportability.provider import ReportabilityProvider
 
-# Published per-million-input-token pricing, current as of this
-# implementation — a point-in-time snapshot for the cost estimate below,
-# not fetched live. Confirm current pricing before trusting this for a
-# large batch. Anthropic prices verified at platform.claude.com/docs/en/
-# about-claude/pricing; OpenAI prices verified at
-# platform.openai.com/docs/guides/models (Terra, Luna only — Astra/Sol
-# pricing was not verified and is deliberately left out rather than
-# guessed; see the "no published price on file" fallback below).
-_INPUT_PRICE_PER_MTOK: dict[str, float] = {
-    "claude-fable-5-1": 10.00,
-    "claude-mythos-5-1": 10.00,
-    "claude-fable-5": 10.00,
-    "claude-opus-5": 5.00,
-    "claude-opus-4-8": 5.00,
-    "claude-opus-4-7": 5.00,
-    "claude-opus-4-6": 5.00,
-    "claude-sonnet-5": 2.00,
-    "claude-sonnet-4-6": 3.00,
-    "claude-haiku-4-5": 1.00,
-    "claude-haiku-4-5-20251001": 1.00,
-    "gpt-5.6-terra": 2.00,
-    "gpt-5.6-luna": 0.20,
-}
-
 _PROGRAM_RULES_ARTIFACT_NAME = "program_rules_snapshot.txt"
 
 # Adversarial review's input includes the full rules text + findings again
@@ -77,18 +54,6 @@ def _provider_credentials(settings: Settings, provider_name: str) -> tuple[str |
     if provider_name == "anthropic":
         return settings.anthropic_api_key, settings.anthropic_model
     return settings.openai_api_key, settings.openai_model
-
-
-def _cost_line(provider_name: str, model: str, tokens: int, *, approximate: bool) -> str:
-    label = "~" if approximate else ""
-    price_per_mtok = _INPUT_PRICE_PER_MTOK.get(model)
-    if price_per_mtok is None:
-        return (
-            f"{label}{tokens:,} tokens for {provider_name}/{model}. No published price is on "
-            f"file for this model — check the provider's current pricing page."
-        )
-    cost = tokens / 1_000_000 * price_per_mtok
-    return f"{label}{tokens:,} tokens for {provider_name}/{model} (~${cost:.4f})"
 
 
 def cmd_assess_reportability(

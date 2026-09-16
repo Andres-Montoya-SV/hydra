@@ -378,6 +378,23 @@ class Settings:
     # design doc Part D.2.
     reportability_max_findings_per_batch: int = 50
 
+    # Hypothesis engine (docs/HYPOTHESIS_ENGINE_DESIGN.md) — opt-in, same
+    # pattern as reportability above, reusing the same anthropic_api_key/
+    # anthropic_model/openai_api_key/openai_model settings (design Part
+    # B.1: same credentials, same provider abstraction, different task).
+    # Only consulted by the standalone `suggest-hypotheses` command, never
+    # by `run`.
+    hypothesis_provider: str = "anthropic"
+    # Unset by default: reasoning-soundness review is opt-in, not
+    # automatic, since it doubles API spend for every hypothesis batch
+    # (design Part D).
+    hypothesis_adversarial_provider: str | None = None
+    # Hard ceiling on relationships considered in one suggest-hypotheses
+    # pass — exceeding it refuses the run outright (never silently
+    # truncates); named to match REPORTABILITY_MAX_FINDINGS_PER_BATCH's
+    # convention exactly (design Part D).
+    hypothesis_max_relationships_per_batch: int = 200
+
     # Bug bounty headers (stored separately; never logged)
     custom_http_headers: dict[str, str] = field(default_factory=dict)
     x_hackerone_researcher: str | None = None
@@ -679,6 +696,16 @@ class Settings:
                 "REPORTABILITY_MAX_FINDINGS_PER_BATCH",
                 maximum=1000,
             ),
+            hypothesis_provider=os.getenv("HYPOTHESIS_PROVIDER", "").strip() or "anthropic",
+            hypothesis_adversarial_provider=(
+                os.getenv("HYPOTHESIS_ADVERSARIAL_PROVIDER", "").strip() or None
+            ),
+            hypothesis_max_relationships_per_batch=_int(
+                os.getenv("HYPOTHESIS_MAX_RELATIONSHIPS_PER_BATCH"),
+                200,
+                "HYPOTHESIS_MAX_RELATIONSHIPS_PER_BATCH",
+                maximum=1000,
+            ),
             custom_http_headers=_parse_headers(os.getenv("HTTP_CUSTOM_HEADERS")),
             x_hackerone_researcher=_optional_researcher(
                 os.getenv("X_HACKERONE_RESEARCHER", "").strip()
@@ -724,6 +751,19 @@ class Settings:
         ):
             errors.append(
                 "REPORTABILITY_ADVERSARIAL_PROVIDER must be one of "
+                f"{sorted(_VALID_REPORTABILITY_PROVIDERS)}"
+            )
+
+        if self.hypothesis_provider not in _VALID_REPORTABILITY_PROVIDERS:
+            errors.append(
+                f"HYPOTHESIS_PROVIDER must be one of {sorted(_VALID_REPORTABILITY_PROVIDERS)}"
+            )
+        if (
+            self.hypothesis_adversarial_provider is not None
+            and self.hypothesis_adversarial_provider not in _VALID_REPORTABILITY_PROVIDERS
+        ):
+            errors.append(
+                "HYPOTHESIS_ADVERSARIAL_PROVIDER must be one of "
                 f"{sorted(_VALID_REPORTABILITY_PROVIDERS)}"
             )
 
@@ -1023,6 +1063,9 @@ class Settings:
             "reportability_provider": self.reportability_provider,
             "reportability_adversarial_provider": self.reportability_adversarial_provider,
             "reportability_max_findings_per_batch": self.reportability_max_findings_per_batch,
+            "hypothesis_provider": self.hypothesis_provider,
+            "hypothesis_adversarial_provider": self.hypothesis_adversarial_provider,
+            "hypothesis_max_relationships_per_batch": self.hypothesis_max_relationships_per_batch,
             "max_discovery_depth": self.max_discovery_depth,
             "enable_followup_collection": self.enable_followup_collection,
             "cloud_bucket_enum_authorize_derived": self.cloud_bucket_enum_authorize_derived,

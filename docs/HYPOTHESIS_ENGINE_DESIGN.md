@@ -515,3 +515,224 @@ None of these affect Parts A-E's actual boundaries or grounding
 discipline — they are presentation/ergonomics decisions appropriate to
 defer to implementation review, not scope questions this design document
 needs to resolve before that checkpoint.
+
+---
+
+## 10. Implementation status (Part 2)
+
+This document's design (Parts A-E, Sections 0-9 above) is unchanged from
+its original approval — this section only records what the
+implementation checkpoint settled and where each piece landed, per the
+same "document first, implement after review" discipline this document's
+own opening states.
+
+**Section 9's open questions, settled:**
+
+- **Command naming**: `python app.py suggest-hypotheses <run_id>` —
+  `generate-hypotheses`'s working name was replaced to read naturally
+  alongside `assess-reportability`'s own verb-noun shape.
+- **Batch shape**: settled as one call per run (every relationship/entity/
+  finding up to `HYPOTHESIS_MAX_RELATIONSHIPS_PER_BATCH`), not a
+  graph-partitioned per-cluster call — the same flat, configurable-ceiling
+  shape `assess-reportability` already uses for findings. Per-cluster
+  partitioning remains a possible future refinement, not needed for the
+  virusbarrier.xyz-scale case this design targets.
+- **Where a human sees the output**: no separate `python app.py
+  hypotheses <run_id>` read command was built — `suggest-hypotheses`
+  itself prints every generated hypothesis (statement, grounding/
+  calibration status, evidence) at generation time, and
+  `AssetStore.get_llm_hypotheses` is available for any future read-only
+  command. Left as a deferred ergonomics item, unchanged from Section 9.
+
+**Implementation order, each step and its test:**
+
+1. **Data model** — `intel_llm_hypotheses` /
+   `intel_llm_hypothesis_evidence` (`core/store.py`), additive alongside
+   the untouched `intel_hypotheses`/`_emit_hypotheses`, exactly as
+   Section 8 specified. Each hypothesis's cited relationships/entities are
+   individually recorded for the grounding check to verify one by one.
+   Implemented in `core/hypotheses/model.py` (`LlmHypothesis`,
+   `CitedEvidence`) + `core/store.py::record_llm_hypotheses`/
+   `get_llm_hypotheses`. Tested in `tests/test_hypotheses_model.py`
+   (`TestRecordAndReadLlmHypotheses`).
+
+2. **API integration** — re-confirmed the real, current Anthropic
+   (`anthropic==1.5.0`)/OpenAI (`openai==3.13.0`) call shapes via
+   `inspect.signature` before writing any client code (unchanged since
+   the reportability agent was built). The generic "call a structured-
+   output API, map every SDK exception" plumbing was extracted out of
+   `core/reportability/client.py`/`openai_client.py` into the new,
+   shared `core/llm/client.py` (Part B.1's "what is shared"), and both
+   reportability's clients and the hypothesis engine's new
+   `core/hypotheses/anthropic_client.py`/`openai_client.py` now build on
+   it as thin, task-specific wrappers — the hypothesis engine's own
+   prompt/schema/table/error type (`HypothesisAPIError`) stay fully
+   separate, per Part B.2/B.3. Tested in `tests/test_hypotheses_client.py`,
+   `tests/test_hypotheses_openai_client.py`,
+   `tests/test_hypotheses_provider.py`; reportability's own full existing
+   suite (104 tests, including one real live API call) still passes
+   unchanged after the extraction.
+
+3. **The two grounding checks, not one** (Section 6/7.2) —
+   `core/hypotheses/grounding.py`: `check_relationship_citations`/
+   `check_entity_citations` (existence, a strict parameterized lookup
+   against `core/hypotheses/evidence.py::gather_run_evidence`'s real
+   SQLite data — no fuzzy tier) and `compute_calibration_status`
+   (compares each citation's claimed `treated_as_strength` against the
+   real `ConfidenceBand` on the cited row; a relationship-type mismatch,
+   Section 6's other check, folds into the same `OVERSTATED` outcome —
+   "exists but is misinterpreted" covers both). Tested exhaustively in
+   `tests/test_hypotheses_grounding.py` (all three canonical scenarios:
+   correctly-calibrated, real-but-overstated, fabricated citation) and
+   against the real virusbarrier.xyz fixture in
+   `tests/test_hypotheses_virusbarrier.py`.
+
+4. **Review pattern, not cross-generation** (Part C) —
+   `HypothesisProvider.review_hypotheses` takes the already-produced
+   hypotheses and the real evidence they cited, and returns exactly one
+   `SOUND`/`OVERREACHES`/`INSUFFICIENT_EVIDENCE` verdict per
+   `hypothesis_index` — never a fresh, independently-generated hypothesis
+   list. Tested in `tests/test_hypotheses_cli.py::TestAdversarialReasoningReview`.
+
+5. **Command** — `python app.py suggest-hypotheses <run_id>`
+   (`core/hypotheses/cli.py::cmd_suggest_hypotheses`), wired in `app.py`,
+   never invoked by `run`. Same cost-estimate/fail-closed-confirmation/
+   batch-limit-refusal shape as `assess-reportability`
+   (`HYPOTHESIS_MAX_RELATIONSHIPS_PER_BATCH`, `HYPOTHESIS_PROVIDER`,
+   `HYPOTHESIS_ADVERSARIAL_PROVIDER` in `config/settings.py`). Tested in
+   `tests/test_hypotheses_cli.py`.
+
+6. **Foundational test case** — the real `tests/fixtures/virusbarrier/`
+   fixture, run through the actual correlation engine (not mocked SQLite
+   rows), confirms a hypothesis treating the shared certificate as strong
+   (HIGH) and the shared IP as weak, non-conclusive corroboration comes
+   back `GROUNDED`/`CALIBRATED`, and the explicit adversarial case (the
+   same real shared-IP relationship claimed as HIGH when its real band is
+   MEDIUM) is caught as `OVERSTATED`. Tested in
+   `tests/test_hypotheses_virusbarrier.py`
+   (`TestVirusbarrierFoundationalCase`,
+   `TestVirusbarrierAdversarialOverInterpretationCase`).
+
+Prompt-injection defenses (Section 7.4) are tested in
+`tests/test_hypotheses_prompt_injection.py`, mirroring
+`tests/test_reportability_prompt_injection.py`'s own honest scope.
+
+---
+
+## 11. Hardening round 2 (targeted, 4 of a larger list)
+
+A second review found four real gaps left open by the Part 2
+implementation above; the rest of that larger review was judged
+redundant with what Section 10 already covers and was not re-litigated.
+Each of the four was independently confirmed against evidence before any
+code changed — none were assumed broken from the prompt's wording alone.
+
+1. **Reasoning-review batch completeness was never checked — a real gap,
+   fixed.** `core/hypotheses/cli.py` took whatever `hypothesis_index`
+   values a review batch returned and simply did `dict[index] = ...`; a
+   missing, duplicated, or out-of-range index silently fell back to "no
+   review for this hypothesis," which `LlmHypothesis.trustworthy` treated
+   as harmless absence — exactly the
+   `grounded=True + calibrated=True + broken review = trustworthy`
+   outcome this round set out to make impossible. Fixed with
+   `core/hypotheses/batch.py::find_reasoning_review_batch_defects` (pure,
+   mirrors `core.reportability.batch.validate_exact_batch`'s exact-match
+   discipline) and a new `ReasoningReviewStatus` enum
+   (`core/hypotheses/model.py`): `NOT_REQUESTED` / `COMPLETE` / `INVALID`,
+   persisted as its own `intel_llm_hypotheses.reasoning_review_status`
+   column. An `INVALID` batch still persists every hypothesis in it
+   (already real API spend, independently grounded/calibrated) but forces
+   `trustworthy` to `False` regardless of any per-hypothesis challenge
+   value; `NOT_REQUESTED` never affects `trustworthy` on its own — the two
+   cases are kept structurally distinct, not conflated. Tested in
+   `tests/test_hypotheses_batch.py` (the pure completeness check: complete,
+   missing, duplicate, out-of-range, negative, extra, none-requested) and
+   `tests/test_hypotheses_cli.py::TestAdversarialReviewFailsClosedOnIncompleteOrDuplicateIndices`
+   (end-to-end: persisted rows + stderr message for each scenario) and
+   `tests/test_hypotheses_model.py::TestLlmHypothesisTrustworthy` (the
+   `trustworthy` property itself).
+
+2. **Entity context was NOT bounded to the relevant subgraph — a real
+   gap, fixed.** `core/hypotheses/evidence.py::gather_run_evidence`'s own
+   docstring already claimed "every referenced intel_entities row," but
+   the actual query was `SELECT * FROM intel_entities WHERE run_id=?` —
+   every entity the run ever produced, regardless of whether the
+   (possibly batch-limited) relationship selection touched it at all.
+   Fixed: entities are now filtered to exactly the `source_entity`/
+   `target_entity` values the selected relationships reference, via a
+   parameterized `IN (...)` lookup — no graph clustering, just the direct
+   endpoints, per the hardening prompt's own explicit "don't build
+   anything more sophisticated" instruction. A relationship referencing an
+   entity_id with no matching row (should not happen — both columns carry
+   a real FK to `intel_entities` — but defended against regardless) fails
+   safe: the id is simply absent from the result, never a crash, never a
+   fabricated phantom entity. Tested in
+   `tests/test_hypotheses_evidence.py::TestEntityContextBoundToReferencedSubgraph`
+   (unreferenced entities excluded, both source and target included, an
+   entity shared by two relationships appears once, a dangling reference
+   with FK enforcement forced off, empty relationship selection, and the
+   subgraph bound tracking `max_relationships` truncation).
+
+3. **Generation identity: a real (small) gap, fixed without a new
+   table.** Confirmed first: `record_llm_hypotheses` already does a plain
+   `INSERT` per call, never `UPSERT`/`REPLACE` — a second generation
+   against the same `run_id` was already guaranteed to never overwrite a
+   prior one. The actual gap was narrower than "no way to group a
+   generation at all": `generated_at` was computed with a fresh
+   `datetime.now()` call *inside* the per-hypothesis loop, so two rows
+   from the very same call could in principle carry different timestamps,
+   undermining exact grouping by that column alone. Fixed by computing
+   both `generated_at` and a new `generation_id` (a `uuid4().hex`) exactly
+   ONCE per `record_llm_hypotheses` call, shared by every hypothesis it
+   inserts. Judgment call, per the hardening prompt's own invitation not
+   to add structure purely to follow the letter of the request: one new
+   column on the *existing* `intel_llm_hypotheses` table, not a separate
+   generations table — every row in a generation already lives in this
+   table and needed exactly one more shared scalar to be unambiguously
+   groupable; a standalone table would only ever have held that same
+   column plus a foreign key back here. Rollback was also confirmed, not
+   assumed: `record_llm_hypotheses` already wraps every hypothesis and its
+   evidence rows for one call in a single `_connect()` transaction, so a
+   failure partway through (e.g. a constraint violation on the second
+   hypothesis's evidence) already rolled back the first hypothesis too —
+   proven with a dedicated test, not just re-read from the code. Tested in
+   `tests/test_hypotheses_model.py::TestGenerationIdentity` (shared id
+   within one call, distinct ids across two calls, neither generation
+   overwritten, provider/model/timestamp distinguish generations, evidence
+   stays scoped to its own generation) and
+   `TestRecordLlmHypothesesRollsBackOnPartialFailure`.
+
+4. **No hard limits on provider output — a real gap, fixed.** Nothing
+   stopped a provider from returning an unbounded number of hypotheses,
+   an unbounded number of citations on one hypothesis, or arbitrarily long
+   `statement`/`suggested_next_step` text, all of which would have been
+   persisted as-is. Fixed with `core/hypotheses/limits.py`
+   (`validate_hypothesis_batch_limits`, a new `HypothesisBatchLimitError`)
+   — fixed, non-configurable constants (a structural sanity bound, not an
+   operator cost/scope knob like `HYPOTHESIS_MAX_RELATIONSHIPS_PER_BATCH`
+   already is): `MAX_HYPOTHESES_PER_BATCH=20`,
+   `MAX_CITED_RELATIONSHIPS_PER_HYPOTHESIS=20`,
+   `MAX_CITED_ENTITIES_PER_HYPOTHESIS=20`, `MAX_STATEMENT_LENGTH=2000`,
+   `MAX_SUGGESTED_NEXT_STEP_LENGTH=1000`. Called in
+   `core/hypotheses/cli.py` immediately after the primary batch is
+   received; any violation aborts the whole command (no persistence at
+   all) — deliberately a different, more severe response than the
+   reasoning-review case above (which persists with an explicit invalid
+   marker), because a limit violation makes the PRIMARY batch itself
+   structurally untrustworthy, not an optional secondary check coming
+   back incomplete. A batch with one valid hypothesis and one that
+   breaks a limit is rejected whole, never partially accepted. A
+   provider response missing a required field or using an invalid enum
+   value never even reaches this check — pydantic refuses to construct
+   the object one layer earlier, the "estructuralmente malformado" case.
+   Tested in `tests/test_hypotheses_limits.py` (every limit, exactly at
+   the boundary and one over, never-partially-accepted, and the
+   pydantic-construction-time malformed case) and
+   `tests/test_hypotheses_cli.py::TestHardOutputLimitsFailClosed`
+   (end-to-end: rc=1, nothing persisted, clear stderr message).
+
+Schema change for this round (additive, same discipline as every prior
+table/column addition in this document): `intel_llm_hypotheses` gained
+`reasoning_review_status TEXT NOT NULL DEFAULT 'NOT_REQUESTED'` and
+`generation_id TEXT NOT NULL`, plus an index on `generation_id`. No
+existing column was renamed, retyped, or removed.

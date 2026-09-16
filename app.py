@@ -214,6 +214,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the interactive confirmation (required for non-interactive/automated use)",
     )
 
+    hypotheses_p = subparsers.add_parser(
+        "suggest-hypotheses",
+        help=(
+            "Propose investigation leads from a run's already-correlated relationships via "
+            "Claude and/or OpenAI — opt-in, spends real API credits, never run by 'run'"
+        ),
+    )
+    hypotheses_p.add_argument("run_id", help="Run whose relationships/entities to consider")
+    hypotheses_p.add_argument(
+        "--limit",
+        type=int,
+        help="Override HYPOTHESIS_MAX_RELATIONSHIPS_PER_BATCH for this run",
+    )
+    hypotheses_p.add_argument(
+        "--provider",
+        choices=["anthropic", "openai"],
+        help="Primary provider (default: HYPOTHESIS_PROVIDER, itself defaulting to anthropic)",
+    )
+    hypotheses_p.add_argument(
+        "--adversarial-provider",
+        choices=["anthropic", "openai"],
+        help=(
+            "Enable reasoning-soundness review: a second, different provider audits whether "
+            "each hypothesis's conclusion actually follows from the evidence it cited — never "
+            "an independently-generated second hypothesis compared for disagreement. "
+            "(default: HYPOTHESIS_ADVERSARIAL_PROVIDER, unset by default = disabled)"
+        ),
+    )
+    hypotheses_p.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation (required for non-interactive/automated use)",
+    )
+
     return parser
 
 
@@ -600,6 +634,17 @@ def main() -> int:
                 provider=args.provider,
                 adversarial_provider=args.adversarial_provider,
                 allow_fuzzy_grounding=args.allow_fuzzy_grounding,
+            )
+        if args.command == "suggest-hypotheses":
+            from core.hypotheses.cli import cmd_suggest_hypotheses
+
+            return cmd_suggest_hypotheses(
+                settings,
+                args.run_id,
+                limit=args.limit,
+                yes=args.yes,
+                provider=args.provider,
+                adversarial_provider=args.adversarial_provider,
             )
         return 1
 
