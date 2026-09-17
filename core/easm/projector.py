@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 from core.assets import Host
 from core.easm.model import AssetEventType, AssetType
@@ -319,7 +320,9 @@ def project_hosts(
     if already is not None:
         return ProjectionResult(run_id, organization_id, 0, 0, 0, skipped=True)
 
-    run_exists = conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    run_exists = conn.execute(
+        "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
     if run_exists is None:
         raise ValueError(f"unknown run_id: {run_id}")
 
@@ -332,7 +335,7 @@ def project_hosts(
             raise ValueError(f"host {host.domain!r} has no observation timestamp")
 
         state = host_state(host)
-        # Resolve stable identity before reading history.  ``upsert_asset`` also
+        # Resolve stable identity before reading history. ``upsert_asset`` also
         # maintains first_seen/last_seen monotonically for backfills.
         asset_id, created = store.upsert_asset(
             organization_id=organization_id,
@@ -359,7 +362,7 @@ def project_hosts(
         observations_written += 1
 
         if created:
-            # ``upsert_asset`` emitted NEW_ASSET.  Count it as projector output.
+            # ``upsert_asset`` emitted NEW_ASSET. Count it as projector output.
             events_written += 1
         elif previous is not None and not has_future:
             events_written += _emit_transition_events(
