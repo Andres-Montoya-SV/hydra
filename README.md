@@ -249,7 +249,7 @@ Hydra can run, as a "head"):
                                          Hydra Heads
 ┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃ Head              ┃ Active ┃ Opt-in ┃ Role                                                ┃
-┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
 │ whois             │ yes    │ yes    │ whois — domain attribution head                     │
 │ subfinder         │ yes    │ no     │ subfinder — passive subdomain enumeration head      │
 │ ctlogs            │ yes    │ yes    │ ctlogs — certificate-transparency discovery head    │
