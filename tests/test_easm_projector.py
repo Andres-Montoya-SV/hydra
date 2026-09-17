@@ -3,7 +3,13 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from core.assets import Host, HttpService, Port, TechnologyFinding, TlsCertificate
+from core.assets import (
+    Host,
+    HttpService,
+    Port,
+    TechnologyFinding,
+    TlsCertificate,
+)
 from core.easm.projector import project_hosts
 from core.easm.store import EasmStore
 
@@ -155,15 +161,24 @@ def test_projecting_same_run_twice_is_idempotent() -> None:
         cert_fingerprint="cert-one",
     )
 
-    first = project_hosts(conn, organization_id=org_id, run_id="run-1", hosts=[host])
-    second = project_hosts(conn, organization_id=org_id, run_id="run-1", hosts=[host])
+    first = project_hosts(
+        conn, organization_id=org_id, run_id="run-1", hosts=[host]
+    )
+    second = project_hosts(
+        conn, organization_id=org_id, run_id="run-1", hosts=[host]
+    )
 
     assert first.skipped is False
     assert second.skipped is True
     assert conn.execute("SELECT COUNT(*) FROM easm_assets").fetchone()[0] == 1
-    assert conn.execute("SELECT COUNT(*) FROM easm_asset_observations").fetchone()[0] == 1
+    assert (
+        conn.execute("SELECT COUNT(*) FROM easm_asset_observations").fetchone()[0]
+        == 1
+    )
     assert conn.execute("SELECT COUNT(*) FROM easm_asset_events").fetchone()[0] == 1
-    assert conn.execute("SELECT COUNT(*) FROM easm_run_projections").fetchone()[0] == 1
+    assert (
+        conn.execute("SELECT COUNT(*) FROM easm_run_projections").fetchone()[0] == 1
+    )
 
 
 def test_historical_backfill_is_stored_without_false_transition_against_future() -> None:
@@ -196,7 +211,10 @@ def test_historical_backfill_is_stored_without_false_transition_against_future()
     # The historical observation is valuable, but it must not be compared to
     # a future state and turned into a backwards IP/port/certificate change.
     assert after == before
-    assert conn.execute("SELECT COUNT(*) FROM easm_asset_observations").fetchone()[0] == 2
+    assert (
+        conn.execute("SELECT COUNT(*) FROM easm_asset_observations").fetchone()[0]
+        == 2
+    )
 
     asset = conn.execute("SELECT first_seen, last_seen FROM easm_assets").fetchone()
     assert asset["first_seen"] == "2026-09-17T10:00:00+00:00"
