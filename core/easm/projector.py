@@ -2,7 +2,7 @@
 
 The projector is intentionally pure with respect to collection: it consumes
 already-normalized ``Host`` objects and writes persistent asset observations and
-change events.  It never authorizes or performs network activity.
+change events. It never authorizes or performs network activity.
 """
 
 from __future__ import annotations
@@ -111,8 +111,8 @@ def _load_previous_state(
 ) -> tuple[dict[str, Any] | None, bool]:
     """Load the closest observation before ``observed_at``.
 
-    Returns ``(state, has_future)``.  ``has_future`` tells the caller that a
-    newer observation already exists.  In that case this projection is a
+    Returns ``(state, has_future)``. ``has_future`` tells the caller that a
+    newer observation already exists. In that case this projection is a
     historical backfill: the observation is persisted, but transition events
     are not emitted because comparing it with future state would manufacture a
     false chronology.
@@ -226,7 +226,9 @@ def _emit_transition_events(
         severity="medium",
     )
 
-    if (previous.get("dns_records") or []) != (current.get("dns_records") or []):
+    if (previous.get("dns_records") or []) != (
+        current.get("dns_records") or []
+    ):
         store.record_event(
             organization_id=organization_id,
             asset_id=asset_id,
@@ -239,7 +241,9 @@ def _emit_transition_events(
         )
         count += 1
 
-    if (previous.get("technologies") or []) != (current.get("technologies") or []):
+    if (previous.get("technologies") or []) != (
+        current.get("technologies") or []
+    ):
         store.record_event(
             organization_id=organization_id,
             asset_id=asset_id,
@@ -305,7 +309,7 @@ def project_hosts(
     """Project one completed Hydra run into persistent EASM state.
 
     Projection is idempotent per ``(organization_id, run_id,
-    PROJECTOR_VERSION)``.  Existing run-scoped tables remain authoritative raw
+    PROJECTOR_VERSION)``. Existing run-scoped tables remain authoritative raw
     input; this layer is a derived persistent view.
     """
 
