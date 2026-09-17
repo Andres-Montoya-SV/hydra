@@ -44,14 +44,25 @@ class ConsolidatedFinding:
     variants of the same page and, where the underlying issue is the same
     pattern repeated under different labels (several reflected parameters,
     several missing headers), already grouped into one entry listing the
-    distinct labels rather than one entry per raw row."""
+    distinct labels rather than one entry per raw row.
+
+    Every field here is populated once, in `core.client_report.dedup`, so
+    both the Markdown and the Word renderers read the exact same content
+    — neither renderer computes or duplicates any of this on its own
+    (methodology, caveat, and recommendation text all come from
+    `core.client_report.explain`, applied uniformly regardless of
+    severity or how well-known the finding's template_id is).
+    """
 
     category: FindingCategory
     title: str
     explanation: str
+    methodology: str
+    recommendation: str
     host: str
     severity: str
     occurrences: int
     affected_urls: list[str] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
+    caveat: str | None = None
     limitation_note: str | None = None

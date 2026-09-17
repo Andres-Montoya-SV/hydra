@@ -112,14 +112,26 @@ def _summary_line(data: RunReportData) -> str:
 
 
 def _render_item(item: ConsolidatedFinding) -> list[str]:
+    # Every finding gets the exact same structure — qué se encontró, cómo
+    # se encontró, ubicación, limitación específica de la prueba (si
+    # aplica), y una recomendación calibrada por severidad — regardless
+    # of category or severity (docs/CLIENT_REPORT.md: uniform depth;
+    # severity changes tone/urgency, never how much is explained).
     lines = [f"### {item.title}", ""]
-    lines.append(item.explanation)
+    lines.append(f"**Qué significa:** {item.explanation}")
+    lines.append("")
+    lines.append(f"**Cómo se encontró:** {item.methodology}")
     lines.append("")
     lines.append(f"- **Ubicación:** {item.host}")
     if item.affected_urls:
         urls = ", ".join(item.affected_urls[:5])
         lines.append(f"- **Página(s) afectada(s):** {urls}")
     lines.append(f"- **Severidad reportada:** {item.severity}")
+    lines.append("")
+    if item.caveat:
+        lines.append(f"*Limitación de esta prueba: {item.caveat}*")
+        lines.append("")
+    lines.append(f"**Recomendación:** {item.recommendation}")
     lines.append("")
     return lines
 
