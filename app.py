@@ -248,6 +248,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the interactive confirmation (required for non-interactive/automated use)",
     )
 
+    client_report_p = subparsers.add_parser(
+        "client-report",
+        help=(
+            "Generate a plain-language, tool-name-free Markdown draft report from a run's "
+            "persisted findings — a starting point to review and send to a client, never "
+            "run by 'run', never sent automatically"
+        ),
+    )
+    client_report_p.add_argument("run_id", help="Run to generate the client report for")
+    client_report_p.add_argument(
+        "--output",
+        type=Path,
+        help="Where to write the Markdown draft (default: <run_dir>/client_report.md)",
+    )
+
     return parser
 
 
@@ -646,6 +661,10 @@ def main() -> int:
                 provider=args.provider,
                 adversarial_provider=args.adversarial_provider,
             )
+        if args.command == "client-report":
+            from core.client_report.cli import cmd_client_report
+
+            return cmd_client_report(settings, args.run_id, output_path=args.output)
         return 1
 
     except (ConfigurationError, ValidationError, ReconError) as exc:

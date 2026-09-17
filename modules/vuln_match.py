@@ -71,14 +71,15 @@ class VulnMatchPlugin(BaseToolPlugin):
             return self._skip("No technologies with versions to correlate")
 
         self.update_status(context, ToolStatus.RUNNING)
-        cache: dict[tuple[str, str], list[dict[str, object]]] = {}
+        cache: dict[tuple[str, str], tuple[list[dict[str, object]], list[dict[str, str]]]] = {}
         rows: list[dict[str, object]] = []
         raw_chunks: list[str] = []
+        check_failures: list[dict[str, object]] = []
 
         for item in techs:
             key = (item["name"].lower(), item["version"])
             if key not in cache:
-                vulns, raw = _query_sources(
+                vulns, raw, failures = _query_sources(
                     item["name"],
                     item["version"],
                     token=self.settings.wpscan_api_token,
@@ -86,14 +87,16 @@ class VulnMatchPlugin(BaseToolPlugin):
                     proxy_url=self.settings.outbound_proxy_url,
                     user_agent=self.settings.effective_user_agent(),
                 )
-                cache[key] = vulns
+                cache[key] = (vulns, failures)
                 raw_chunks.append(raw)
-            for vuln in cache[key]:
+            cached_vulns, cached_failures = cache[key]
+            for vuln in cached_vulns:
                 row = {
                     "host": item["host"],
                     "url": item.get("url"),
                     "technology": item["name"],
                     "version": item["version"],
+                    "check_status": "checked_vulnerable",
                     "identifier": vuln["identifier"],
                     "severity": vuln["severity"],
                     "source": vuln["source"],
@@ -102,6 +105,31 @@ class VulnMatchPlugin(BaseToolPlugin):
                     "raw_artifact": None,
                 }
                 rows.append(row)
+            # Never collapsed into "checked, nothing found": a source that
+            # could not be queried at all (network error, invalid/expired
+            # token, rate limit, malformed response) must never be
+            # indistinguishable from one that was queried and came back
+            # clean — same fail-visible discipline as
+            # modules/param_fuzz.py's baseline_invalid rows. This is the
+            # ONLY thing this hardening round changes: a technology this
+            # run genuinely verified clean across every applicable source
+            # still produces zero rows, exactly as before.
+            for failure in cached_failures:
+                row = {
+                    "host": item["host"],
+                    "url": item.get("url"),
+                    "technology": item["name"],
+                    "version": item["version"],
+                    "check_status": "check_failed",
+                    "identifier": None,
+                    "severity": None,
+                    "source": failure["source"],
+                    "source_url": None,
+                    "summary": failure["reason"],
+                    "raw_artifact": None,
+                }
+                rows.append(row)
+                check_failures.append(row)
 
         raw_rel = self._write_raw(context, "\n".join(raw_chunks) + "\n")
         for row in rows:
@@ -109,13 +137,37 @@ class VulnMatchPlugin(BaseToolPlugin):
 
         output_path = self._output_path(context, "vuln_match.jsonl")
         count = write_jsonl(output_path, rows, base_dir=context.output_dir)
-        context.metadata["vuln_match_hits"] = count
+        hit_count = sum(1 for row in rows if row["check_status"] == "checked_vulnerable")
+        context.metadata["vuln_match_hits"] = hit_count
+        context.metadata["vuln_match_check_failed"] = [
+            {
+                "host": row["host"],
+                "technology": row["technology"],
+                "version": row["version"],
+                "source": row["source"],
+                "reason": row["summary"],
+            }
+            for row in check_failures
+        ]
+        for row in check_failures:
+            context.add_warning(
+                f"⚠ No se pudo verificar {row['technology']}:{row['version']} contra "
+                f"{row['source']} ({row['summary']}) — tecnología detectada, "
+                "vulnerabilidad no descartada."
+            )
+
         self.update_status(context, ToolStatus.COMPLETED, output_lines=count)
+        message = f"CVE correlation: {hit_count} matching advisory/ies"
+        if check_failures:
+            message += (
+                f"; {len(check_failures)} check(s) could not be completed "
+                "(see warnings — not the same as 'no vulnerabilities')"
+            )
         return PluginResult(
             success=True,
             output_path=output_path,
             lines_produced=count,
-            message=f"CVE correlation: {count} matching advisory/ies",
+            message=message,
         )
 
     def _write_raw(self, context: PipelineContext, content: str) -> str | None:
@@ -164,28 +216,59 @@ def _query_sources(
     timeout: int,
     proxy_url: str | None,
     user_agent: str,
-) -> tuple[list[dict[str, object]], str]:
+) -> tuple[list[dict[str, object]], str, list[dict[str, str]]]:
+    """Returns (vulns, raw_log, check_failures). `check_failures` lists,
+    per source, why that source's query could not be completed — a source
+    that fails is NEVER folded into `vulns` as "queried, nothing found";
+    the caller must surface each failure distinctly (design: `check_failed`
+    is a third state, not a degenerate case of `checked_clean`)."""
     vulns: list[dict[str, object]] = []
     raw_parts: list[str] = []
-    osv, osv_raw = _osv_query(
+    failures: list[dict[str, str]] = []
+
+    osv, osv_raw, osv_error = _osv_query(
         name, version, timeout=timeout, proxy_url=proxy_url, user_agent=user_agent
     )
     raw_parts.append(osv_raw)
-    vulns.extend(osv)
+    if osv_error:
+        failures.append({"source": "osv.dev", "reason": osv_error})
+    else:
+        vulns.extend(osv)
+
     slug = name.lower().replace(" ", "-")
-    if token and ("wordpress" in slug or slug in {"bookly", "woocommerce", "elementor"}):
-        wp, wp_raw = _wpscan_query(
-            slug, version, token=token, timeout=timeout, proxy_url=proxy_url, user_agent=user_agent
-        )
-        raw_parts.append(wp_raw)
-        vulns.extend(wp)
+    is_wp_family = "wordpress" in slug or slug in {"bookly", "woocommerce", "elementor"}
+    if is_wp_family:
+        if not token:
+            # A WPSCAN_API_TOKEN is optional to CONFIGURE, but once a
+            # WordPress-family plugin is detected, WPScan is the
+            # authoritative source for it — OSV rarely carries
+            # WordPress-plugin advisories. Not having a token means this
+            # technology's real vulnerability status was never verified
+            # against the source that matters most for it; that gap must
+            # be visible, not silently absorbed into "OSV said clean."
+            failures.append({"source": "wpscan", "reason": "no WPSCAN_API_TOKEN configured"})
+        else:
+            wp, wp_raw, wp_error = _wpscan_query(
+                slug,
+                version,
+                token=token,
+                timeout=timeout,
+                proxy_url=proxy_url,
+                user_agent=user_agent,
+            )
+            raw_parts.append(wp_raw)
+            if wp_error:
+                failures.append({"source": "wpscan", "reason": wp_error})
+            else:
+                vulns.extend(wp)
+
     # Dedupe by identifier
     unique: dict[str, dict[str, object]] = {}
     for vuln in vulns:
         ident = str(vuln.get("identifier") or "")
         if ident and ident not in unique:
             unique[ident] = vuln
-    return list(unique.values()), "\n".join(raw_parts)
+    return list(unique.values()), "\n".join(raw_parts), failures
 
 
 def _osv_query(
@@ -195,7 +278,13 @@ def _osv_query(
     timeout: int,
     proxy_url: str | None,
     user_agent: str,
-) -> tuple[list[dict[str, object]], str]:
+) -> tuple[list[dict[str, object]], str, str | None]:
+    """Returns (vulns, raw_log, error). `error` is None only when the
+    query genuinely completed — an empty `vulns` with `error is None` is
+    a real "checked, nothing found" answer. Any exception (network error,
+    timeout, non-2xx HTTP status raised by urllib) or unparseable body
+    means the query did NOT complete, so it must never be reported as
+    equivalent to a clean result."""
     payload = json.dumps({"version": version, "package": {"name": name}}).encode("utf-8")
     request = Request(
         _OSV_QUERY,
@@ -207,12 +296,12 @@ def _osv_query(
         with open_url(request, timeout=timeout, proxy_url=proxy_url) as response:
             body = response.read(2_000_000).decode("utf-8", errors="replace")
     except Exception as exc:
-        return [], f"OSV {name}@{version} error: {exc}\n"
+        return [], f"OSV {name}@{version} error: {exc}\n", f"query failed: {exc}"
     vulns = []
     try:
         data = json.loads(body)
     except json.JSONDecodeError:
-        return [], f"OSV {name}@{version} invalid JSON\n"
+        return [], f"OSV {name}@{version} invalid JSON\n", "invalid JSON response"
     for vuln in data.get("vulns") or []:
         ident = ""
         aliases = vuln.get("aliases") or []
@@ -231,7 +320,7 @@ def _osv_query(
                 "summary": str(vuln.get("summary") or "")[:500],
             }
         )
-    return vulns, f"OSV {name}@{version}\n{body[:4000]}\n"
+    return vulns, f"OSV {name}@{version}\n{body[:4000]}\n", None
 
 
 def _osv_score(vuln: dict) -> float | None:
@@ -251,7 +340,20 @@ def _wpscan_query(
     timeout: int,
     proxy_url: str | None,
     user_agent: str,
-) -> tuple[list[dict[str, object]], str]:
+) -> tuple[list[dict[str, object]], str, str | None]:
+    """Returns (vulns, raw_log, error). `error` is None only when the
+    query genuinely completed — an empty `vulns` with `error is None` is
+    a real "checked, nothing found" answer. Any exception — including an
+    HTTP error status urllib raises for a 401/404/429/5xx (invalid or
+    expired token, unknown slug, rate limit, outage) — means the query
+    did NOT complete. Deliberately conservative: this never tries to
+    distinguish "token rejected" from "plugin not in WPScan's database"
+    by status code alone, since the real production case this was fixed
+    from (an invalid WPSCAN_API_TOKEN) surfaced as a plain 404 — treating
+    ANY failed call as `check_failed` is the safe default; a genuinely
+    covered plugin with no advisories only ever reaches the empty-vulns,
+    no-error return below.
+    """
     url = _WPSCAN_PLUGIN.format(slug=quote(slug, safe=""))
     request = Request(
         url,
@@ -261,11 +363,11 @@ def _wpscan_query(
         with open_url(request, timeout=timeout, proxy_url=proxy_url) as response:
             body = response.read(2_000_000).decode("utf-8", errors="replace")
     except Exception as extra:
-        return [], f"WPScan {slug} error: {extra}\n"
+        return [], f"WPScan {slug} error: {extra}\n", f"query failed: {extra}"
     try:
         data = json.loads(body)
     except json.JSONDecodeError:
-        return [], f"WPScan {slug} invalid JSON\n"
+        return [], f"WPScan {slug} invalid JSON\n", "invalid JSON response"
     vulns = []
     for _title, entry in (
         (data.get("vulnerabilities") or {}).items()
@@ -286,4 +388,4 @@ def _wpscan_query(
                 "summary": str(_title)[:500],
             }
         )
-    return vulns, f"WPScan {slug}@{version}\n{body[:4000]}\n"
+    return vulns, f"WPScan {slug}@{version}\n{body[:4000]}\n", None

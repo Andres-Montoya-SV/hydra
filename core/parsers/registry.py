@@ -1339,12 +1339,37 @@ class VulnMatchParser(ToolParser):
             domain = normalize_domain(str(record.get("host", "")))
             if not domain:
                 continue
+            tech = str(record.get("technology") or "")
+            version = str(record.get("version") or "")
+            # `check_failed` rows (hardening round: a query that could not
+            # complete — invalid/missing WPSCAN_API_TOKEN, network error,
+            # rate limit — must never look like "checked, nothing found").
+            # Surfaced as its own info-severity Finding, distinct from a
+            # real match, so it is just as visible in the report as one.
+            if record.get("check_status") == "check_failed":
+                host = by_host.setdefault(domain, Host(domain=domain))
+                source = str(record.get("source") or "")
+                reason = str(record.get("summary") or "")
+                finding = Finding(
+                    host=domain,
+                    template_id="vuln-check-failed",
+                    severity="info",
+                    name=f"Could not verify {tech}:{version} against {source}".strip(),
+                    source="vuln_match",
+                    url=_optional_str(record.get("url")),
+                    description=(
+                        f"{tech} {version} was detected but its vulnerability status "
+                        f"against {source} could not be verified ({reason}). This is not "
+                        "the same as a clean result — the check simply never completed."
+                    ).strip(),
+                    confidence_score=50,
+                )
+                host.findings.append(finding)
+                continue
             ident = str(record.get("identifier") or "")
             if not ident:
                 continue
             host = by_host.setdefault(domain, Host(domain=domain))
-            tech = str(record.get("technology") or "")
-            version = str(record.get("version") or "")
             finding = Finding(
                 host=domain,
                 template_id="vuln-match",
