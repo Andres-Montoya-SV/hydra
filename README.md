@@ -40,6 +40,15 @@ a run's persisted findings into a plain-language, tool-name-free draft
 report — Markdown or Word — ready for a human to review before it ever
 reaches a client (`docs/CLIENT_REPORT.md`).
 
+Driving `run`, then `assess-reportability`, then `client-report` by hand,
+in the right order, is a lot to remember — `python app.py engagement`
+chains exactly those steps into one guided flow, with the same
+cost-estimate-and-confirm gate before it ever calls an LLM and the same
+"never sent automatically" guarantee on the draft it produces. It's
+sugar over the individual commands, not a replacement for them: every
+command above still works exactly the same on its own, and `engagement`
+never runs anything an operator wouldn't have run by hand.
+
 Everything persists to SQLite with real, enforced foreign keys. It ships
 as a non-root Docker image with a minimally-scoped Linux capability set,
 and has real CI across three Python versions plus a containerized
@@ -183,6 +192,44 @@ python app.py relationships virusbarrier.xyz
 (certificate fingerprint, SAN cardinality, cloud tenancy, a named
 confidence band) — never actor/owner/campaign attribution language, by
 design (see Security model below).
+
+### Guided end-to-end: `engagement`
+
+The four commands above (`run`, `investigate`/`verification-flags`,
+`assess-reportability`, `client-report`) are also available as one guided
+flow that runs them in that order and stops to ask before anything
+optional:
+
+```bash
+python app.py engagement -d example.com --program-rules rules.txt
+```
+
+1. Runs the pipeline (headless — no dashboard, so the prompts below print
+   normally) and immediately shows the same `investigate`/
+   `verification-flags` summary those commands print on their own.
+2. If `--program-rules` was given and a provider key is configured, shows
+   the real cost estimate and asks to confirm — the exact same gate
+   `assess-reportability` uses standalone, not a second, different one.
+   No key configured, or `--program-rules` omitted? It skips this step
+   with a clear message instead of asking a question it already knows
+   the answer to.
+3. Asks whether to generate a client-report draft (and in which format).
+4. Prints a final summary of what was generated and where — nothing is
+   sent or published on your behalf.
+
+Declining either question ends the flow cleanly right there (not an
+error) and still shows what was generated up to that point. In a
+non-interactive context (no TTY) it never assumes "yes" for a
+money-spending step — it fails closed instead, unless you pass
+`--skip-reportability` / `--skip-client-report` explicitly:
+
+```bash
+python app.py engagement -d example.com --skip-reportability --skip-client-report
+```
+
+Every one of these commands still works exactly the same when run by
+itself — `engagement` only chains their existing entry points, it doesn't
+replace or weaken any of them.
 
 ## Security model
 
@@ -406,6 +453,10 @@ python app.py suggest-hypotheses RUN_ID \
 
 python app.py client-report RUN_ID                    # Markdown draft (default)
 python app.py client-report RUN_ID --format docx      # Word draft — see docs/CLIENT_REPORT.md
+
+python app.py engagement -d example.com \
+  --program-rules rules.txt                           # run -> reportability -> client-report,
+                                                        # guided, one command at a time (see Example)
 ```
 
 </details>
