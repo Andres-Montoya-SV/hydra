@@ -14,7 +14,12 @@ from core.easm.model import (
     Environment,
     OwnershipState,
 )
-from core.easm.projector import PROJECTOR_VERSION, ProjectionResult, host_state, project_hosts
+from core.easm.projector import (
+    PROJECTOR_VERSION,
+    ProjectionResult,
+    host_state,
+    project_hosts,
+)
 from core.easm.schema import EASM_SCHEMA, ensure_easm_schema
 
 __all__ = [
