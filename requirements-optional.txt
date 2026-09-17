@@ -10,3 +10,9 @@ playwright==1.62.0
 # RateLimitError/InternalServerError/APIStatusError/APIConnectionError).
 anthropic==1.5.0
 openai==3.13.0
+# Client report (docs/CLIENT_REPORT.md) — opt-in, used only by
+# `python app.py client-report ... --format docx`, never by `run`. The
+# Markdown format (the command's default) needs no extra dependency at
+# all; this is only required for the --format docx option.
+python-docx==1.2.0
+

@@ -6,6 +6,24 @@ which is short, English, and written for an analyst reading Hydra's own
 internal report — this module writes for a client with no security
 background, and folds the grouped labels (requirement 3) into the
 narrative itself rather than leaving them as an unexplained list.
+
+Four independent content pieces per template_id, deliberately kept as
+separate functions/maps rather than blended into one paragraph (each can
+be reviewed and corrected on its own, and a renderer picks which pieces
+to show):
+
+- `explain_consolidated` — what was found and why it matters (unchanged
+  from the previous round).
+- `explain_methodology` — HOW it was found, in plain terms, never naming
+  a specific tool/binary.
+- `explain_caveat` — the specific limitation of THIS test, if any (never
+  the general "qué NO cubre" disclaimers, which apply to the whole
+  report, not to one finding type).
+- `severity_recommendation` — a closing recommendation calibrated to the
+  finding's real severity, applied uniformly (including to a template_id
+  this module has never seen before, e.g. a future nuclei match) so tone
+  never depends on whether a specific template happened to get hand-tuned
+  prose.
 """
 
 from __future__ import annotations
@@ -15,12 +33,18 @@ def explain_consolidated(template_id: str, labels: list[str]) -> tuple[str, str]
     """Returns (title, explanation) for one already-grouped finding. Never
     names the underlying tool — describes the activity in plain terms."""
     if template_id == "vuln-match":
+        names = ", ".join(sorted(labels))
+        title = (
+            f"Componente con una vulnerabilidad pública conocida: {names}"
+            if names
+            else "Componente con una vulnerabilidad pública conocida"
+        )
+        lead = f"Se identificó lo siguiente: {names}. " if names else ""
         return (
-            "Componente con una vulnerabilidad pública conocida",
-            "Se identificó un componente del sitio cuya versión coincide con una "
-            "vulnerabilidad ya documentada públicamente. Esto significa que existe "
-            "información pública sobre cómo podría explotarse — se recomienda "
-            "actualizar el componente a la versión más reciente lo antes posible.",
+            title,
+            f"{lead}Esto significa que existe información pública documentada sobre "
+            "cómo podría explotarse esta vulnerabilidad — se recomienda actualizar el "
+            "componente a la versión más reciente lo antes posible.",
         )
     if template_id == "cloud-bucket-public-listable":
         return (
@@ -98,3 +122,144 @@ def explain_consolidated(template_id: str, labels: list[str]) -> tuple[str, str]
         "Este hallazgo fue detectado durante el análisis automatizado. Revisar la "
         "evidencia técnica adjunta para más contexto.",
     )
+
+
+# "Cómo lo encontramos" — the technique in plain terms, never a tool or
+# binary name. Kept as its own map (not blended into
+# `explain_consolidated`'s explanation paragraph) so methodology text can
+# be reviewed and corrected independently of the "qué significa" text —
+# a report renderer decides how to combine them.
+_METHODOLOGY: dict[str, str] = {
+    "vuln-match": (
+        "Se identificó la tecnología y versión exacta en uso, y se comparó contra "
+        "bases de datos públicas de vulnerabilidades documentadas para ese "
+        "componente."
+    ),
+    "cloud-bucket-public-listable": (
+        "Se generaron nombres probables de almacenamiento en la nube a partir del "
+        "nombre de la organización y su dominio, y se verificó cuáles existen y si "
+        "su contenido puede listarse sin autenticación."
+    ),
+    "cloud-bucket-exists-private": (
+        "Se generaron nombres probables de almacenamiento en la nube a partir del "
+        "nombre de la organización y su dominio, y se verificó cuáles existen."
+    ),
+    "urlhaus-known-malicious": (
+        "Se consultó una base de datos pública de amenazas para verificar si alguna "
+        "dirección asociada al sitio ha sido reportada distribuyendo contenido "
+        "malicioso."
+    ),
+    "param-reflected": (
+        "Se probó agregando un valor de identificación única en cada parámetro de "
+        "la URL, y se comparó la respuesta del sitio para ver si ese valor aparecía "
+        "reflejado de vuelta."
+    ),
+    "param-influences-response": (
+        "Se probó agregando un valor de identificación única en cada parámetro de "
+        "la URL, y se comparó la respuesta del sitio para ver si cambiaba según el "
+        "valor enviado."
+    ),
+    "missing-security-header": (
+        "Se inspeccionaron las cabeceras HTTP que el servidor envía en cada "
+        "respuesta, comparándolas contra el conjunto de cabeceras de seguridad "
+        "recomendadas por los estándares actuales de la industria."
+    ),
+    "cloaking-detected": (
+        "Se cargó cada página tanto con una solicitud directa como con un "
+        "navegador real, y se compararon los resultados finales para detectar "
+        "diferencias."
+    ),
+    "vuln-check-failed": (
+        "Se intentó comparar la tecnología detectada contra la fuente de "
+        "vulnerabilidades correspondiente, pero la consulta no pudo completarse."
+    ),
+}
+_DEFAULT_METHODOLOGY = (
+    "Este hallazgo fue producido por una verificación automatizada diseñada "
+    "específicamente para detectar este tipo de patrón."
+)
+
+
+def explain_methodology(template_id: str) -> str:
+    """Never returns an empty string — every finding type, known or not,
+    gets a methodology sentence (docs/CLIENT_REPORT.md: uniform depth
+    regardless of severity or type)."""
+    return _METHODOLOGY.get(template_id, _DEFAULT_METHODOLOGY)
+
+
+# The specific limitation of THIS test — distinct from the report-wide
+# "Qué NO cubre este análisis" section (which applies to everything).
+# None means this particular test genuinely has nothing specific beyond
+# the general disclaimers worth calling out.
+_CAVEATS: dict[str, str] = {
+    "param-reflected": (
+        "Esta prueba usó únicamente un valor de texto plano como marcador — no se "
+        "intentó ningún payload de inyección real (SQL, scripts, etc.), por lo que "
+        "no confirma ni descarta una vulnerabilidad explotable."
+    ),
+    "param-influences-response": (
+        "Esta prueba usó únicamente un valor de texto plano como marcador — no se "
+        "intentó ningún payload de inyección real, por lo que no confirma ni "
+        "descarta una vulnerabilidad explotable."
+    ),
+    "missing-security-header": (
+        "Esta verificación revisa únicamente la presencia de la cabecera en la "
+        "respuesta HTTP, no la configuración interna de la aplicación — algunas de "
+        "estas protecciones podrían implementarse de otras formas no visibles aquí."
+    ),
+    "cloaking-detected": (
+        "Esta comparación se hizo con una única carga de cada página; un "
+        "comportamiento intermitente o dependiente de otros factores (ubicación, "
+        "dispositivo, cookies previas) podría no quedar reflejado aquí."
+    ),
+    "vuln-match": (
+        "La coincidencia se basa en el número de versión que el propio sitio "
+        "reporta — si esa versión fue parchada manualmente o mal identificada, la "
+        "vulnerabilidad documentada podría no aplicar exactamente como se describe."
+    ),
+    "cloud-bucket-public-listable": (
+        "La verificación se limitó a nombres derivados del dominio y la "
+        "organización — pueden existir otros espacios de almacenamiento con "
+        "nombres no relacionados que no formaron parte de esta revisión."
+    ),
+    "cloud-bucket-exists-private": (
+        "La verificación se limitó a nombres derivados del dominio y la "
+        "organización — pueden existir otros espacios de almacenamiento con "
+        "nombres no relacionados que no formaron parte de esta revisión."
+    ),
+    "urlhaus-known-malicious": (
+        "La coincidencia depende de que la base de datos pública consultada tenga "
+        "la dirección registrada en el momento de la revisión; la asociación puede "
+        "ser reciente, histórica, o ya resuelta."
+    ),
+}
+
+
+def explain_caveat(template_id: str) -> str | None:
+    return _CAVEATS.get(template_id)
+
+
+# A closing recommendation calibrated to the finding's REAL severity —
+# applied uniformly to every finding, known template_id or not, so tone
+# never depends on whether a specific type happened to get hand-tuned
+# prose (docs/CLIENT_REPORT.md: never alarmist for low-impact findings,
+# never dismissive of a real one).
+_SEVERITY_RECOMMENDATION: dict[str, str] = {
+    "critical": (
+        "Se recomienda atender esto de forma inmediata — el riesgo real es alto y "
+        "puede tener un impacto directo si no se corrige."
+    ),
+    "high": ("Se recomienda atender esto con prioridad — el riesgo real es " "significativo."),
+    "medium": ("Se recomienda revisar y atender este punto en un plazo razonable."),
+    "low": ("Se recomienda considerar este punto como parte de mejoras futuras."),
+    "info": (
+        "Se recomienda tenerlo en cuenta como referencia — no representa una " "urgencia inmediata."
+    ),
+}
+_DEFAULT_SEVERITY_RECOMMENDATION = (
+    "Se recomienda revisarlo con el equipo técnico para decidir la prioridad " "adecuada."
+)
+
+
+def severity_recommendation(severity: str) -> str:
+    return _SEVERITY_RECOMMENDATION.get(severity.strip().lower(), _DEFAULT_SEVERITY_RECOMMENDATION)

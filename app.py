@@ -251,16 +251,29 @@ def build_parser() -> argparse.ArgumentParser:
     client_report_p = subparsers.add_parser(
         "client-report",
         help=(
-            "Generate a plain-language, tool-name-free Markdown draft report from a run's "
-            "persisted findings — a starting point to review and send to a client, never "
-            "run by 'run', never sent automatically"
+            "Generate a plain-language, tool-name-free draft report (Markdown or Word) from "
+            "a run's persisted findings — a starting point to review and send to a client, "
+            "never run by 'run', never sent automatically"
         ),
     )
     client_report_p.add_argument("run_id", help="Run to generate the client report for")
     client_report_p.add_argument(
         "--output",
         type=Path,
-        help="Where to write the Markdown draft (default: <run_dir>/client_report.md)",
+        help=(
+            "Where to write the draft (default: <run_dir>/client_report.md or "
+            "client_report.docx depending on --format)"
+        ),
+    )
+    client_report_p.add_argument(
+        "--format",
+        dest="report_format",
+        choices=["markdown", "docx"],
+        default="markdown",
+        help=(
+            "Output format — 'markdown' (default, no extra dependency) or 'docx' "
+            "(requires python-docx, requirements-optional.txt)"
+        ),
     )
 
     return parser
@@ -664,7 +677,12 @@ def main() -> int:
         if args.command == "client-report":
             from core.client_report.cli import cmd_client_report
 
-            return cmd_client_report(settings, args.run_id, output_path=args.output)
+            return cmd_client_report(
+                settings,
+                args.run_id,
+                output_path=args.output,
+                output_format=args.report_format,
+            )
         return 1
 
     except (ConfigurationError, ValidationError, ReconError) as exc:

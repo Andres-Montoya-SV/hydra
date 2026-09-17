@@ -255,3 +255,161 @@ class TestDefaultOutputPath:
         rc = cmd_client_report(settings, RUN_ID)
         assert rc == 0
         assert (run_dir / "client_report.md").is_file()
+
+
+class TestUnsupportedFormat:
+    def test_unknown_format_is_rejected(self, tmp_path: Path) -> None:
+        _seed_pilot_run(tmp_path)
+        settings = _settings(tmp_path)
+        rc = cmd_client_report(settings, RUN_ID, output_format="pdf")
+        assert rc == 1
+
+
+class TestDocxFormat:
+    def test_docx_format_writes_a_valid_document(self, tmp_path: Path) -> None:
+        pytest.importorskip("docx")
+        _seed_pilot_run(tmp_path)
+        settings = _settings(tmp_path)
+        output_path = tmp_path / "client_report.docx"
+
+        rc = cmd_client_report(settings, RUN_ID, output_path=output_path, output_format="docx")
+        assert rc == 0
+        assert output_path.is_file()
+
+        import docx
+
+        document = docx.Document(str(output_path))
+        text = "\n".join(p.text for p in document.paragraphs)
+        assert "metaversejustice.com" in text
+        assert "8 parámetros" in text
+        assert "5 cabeceras" in text
+
+    def test_docx_default_output_path_uses_docx_extension(self, tmp_path: Path) -> None:
+        pytest.importorskip("docx")
+        _, run_dir = _seed_pilot_run(tmp_path)
+        settings = _settings(tmp_path)
+        rc = cmd_client_report(settings, RUN_ID, output_format="docx")
+        assert rc == 0
+        assert (run_dir / "client_report.docx").is_file()
+        assert not (run_dir / "client_report.md").exists()
+
+    def test_markdown_remains_the_default_format(self, tmp_path: Path) -> None:
+        _, run_dir = _seed_pilot_run(tmp_path)
+        settings = _settings(tmp_path)
+        rc = cmd_client_report(settings, RUN_ID)
+        assert rc == 0
+        assert (run_dir / "client_report.md").is_file()
+
+    def test_no_tool_names_in_docx_output(self, tmp_path: Path) -> None:
+        pytest.importorskip("docx")
+        _seed_pilot_run(tmp_path)
+        settings = _settings(tmp_path)
+        output_path = tmp_path / "client_report.docx"
+        cmd_client_report(settings, RUN_ID, output_path=output_path, output_format="docx")
+
+        import docx
+
+        document = docx.Document(str(output_path))
+        text_parts = [p.text for p in document.paragraphs]
+        text_parts += [c.text for t in document.tables for row in t.rows for c in row.cells]
+        haystack = "\n".join(text_parts).lower()
+        for tool in (
+            "httpx",
+            "nuclei",
+            "naabu",
+            "wpscan",
+            "param_fuzz",
+            "security_headers",
+            "browser_probe",
+        ):
+            assert tool not in haystack, f"{tool!r} leaked into the .docx report"
+
+
+class TestUniformDepthAcrossAllFourRealFindingTypes:
+    """docs/CLIENT_REPORT.md Task 2 + item 3 of 'Al terminar': every one
+    of the pilot run's real finding types (reflected parameters, browser
+    behavior, missing headers) — plus a confirmed-vulnerability item,
+    exercising the type the WPScan fix can now reveal — must show the
+    exact same structural depth: qué significa, cómo se encontró,
+    ubicación, and a recommendation. Only tone/severity differs.
+    """
+
+    def _four_finding_types(self) -> list:
+        from core.assets import Finding
+
+        return [
+            Finding(
+                host=SEED,
+                template_id="param-reflected",
+                severity="medium",
+                name="Parameter 'cat' reflects input in response body",
+                source="param_fuzz",
+                url=f"https://{SEED}/",
+                description="probe evidence",
+            ),
+            Finding(
+                host=BARE,
+                template_id="cloaking-detected",
+                severity="medium",
+                name="Browser destination differs from HTTP probe",
+                source="browser_probe",
+                url="about:blank",
+                description="d",
+            ),
+            Finding(
+                host=SEED,
+                template_id="missing-security-header",
+                severity="info",
+                name="Missing security header: X-Frame-Options",
+                source="security_headers",
+                url=f"https://{SEED}/",
+                description="d",
+            ),
+            Finding(
+                host=SEED,
+                template_id="vuln-match",
+                severity="high",
+                name="CVE-2026-13395 in Bookly 28.0",
+                source="vuln_match",
+                url=f"https://{SEED}/",
+                description="A real CVE match, now revealed by the WPScan fail-visible fix.",
+            ),
+        ]
+
+    def test_every_type_has_the_same_content_fields_populated(self) -> None:
+        from core.client_report.dedup import consolidate
+
+        consolidated = consolidate(self._four_finding_types())
+        assert len(consolidated) == 4
+        for item in consolidated:
+            assert item.title.strip()
+            assert item.explanation.strip()
+            assert item.methodology.strip()
+            assert item.recommendation.strip()
+            assert item.host.strip()
+            # methodology must be genuinely distinct text from explanation
+            assert item.methodology != item.explanation
+
+    def test_markdown_renders_the_same_structural_fields_for_all_four(self, tmp_path: Path) -> None:
+        from core.client_report.collect import RunReportData
+        from core.client_report.dedup import consolidate
+        from core.client_report.render import render_markdown
+
+        consolidated = consolidate(self._four_finding_types())
+        data = RunReportData(
+            run_id=RUN_ID,
+            targets=[BARE],
+            started_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:30:00Z",
+            duration_seconds=1531.73,
+        )
+        text = render_markdown(data, consolidated)
+        for item in consolidated:
+            assert f"**Qué significa:** {item.explanation}" in text
+            assert f"**Cómo se encontró:** {item.methodology}" in text
+            assert f"- **Ubicación:** {item.host}" in text
+            assert f"**Recomendación:** {item.recommendation}" in text
+        # The confirmed vulnerability must land in its own section,
+        # never mixed with indicios (requirement 2).
+        vulns_section = text.split("## Vulnerabilidades confirmadas")[1].split("## Indicios")[0]
+        assert "CVE-2026-13395" in vulns_section

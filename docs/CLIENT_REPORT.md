@@ -1,30 +1,35 @@
 # `python app.py client-report` — client-facing report generation
 
-Generates a plain-language, tool-name-free Markdown draft from a run's
-already-persisted artifacts — the same kind of document that used to be
-assembled by hand after a pilot engagement (Metaverse Justice). Standalone
-command, opt-in, same operational family as `assess-reportability` and
-`suggest-hypotheses`: **never invoked by `python app.py run`**, and it
-never sends anything anywhere — it only ever writes a Markdown file to
-disk for the operator to review, edit, and convert before sharing it with
-a client.
+Generates a plain-language, tool-name-free draft — Markdown or Word — from
+a run's already-persisted artifacts — the same kind of document that used
+to be assembled by hand after a pilot engagement (Metaverse Justice).
+Standalone command, opt-in, same operational family as
+`assess-reportability` and `suggest-hypotheses`: **never invoked by
+`python app.py run`**, and it never sends anything anywhere — it only ever
+writes a file to disk for the operator to review, edit, and (for the
+Markdown default) convert before sharing it with a client.
 
 ## Usage
 
 ```bash
 python app.py client-report RUN_ID
-# or write it somewhere specific:
+# Word instead of Markdown:
+python app.py client-report RUN_ID --format docx
+# write it somewhere specific:
 python app.py client-report RUN_ID --output /path/to/draft.md
 ```
 
-By default the draft is written to `output/<run_id>/client_report.md`.
-The command prints a short summary (counts per category, any known
-verification gaps) and an explicit reminder that this is a **draft** —
-Hydra does not send it to anyone.
+By default the draft is written to `output/<run_id>/client_report.md`
+(or `client_report.docx` with `--format docx`). The command prints a
+short summary (counts per category, any known verification gaps) and an
+explicit reminder that this is a **draft** — Hydra does not send it to
+anyone.
 
 Requires the run's own `output/<run_id>/` artifacts and its row in
 `output/recon.db` (the same data every other `RUN_ID`-based command
-reads) — no API key, no network access, no extra cost.
+reads) — no API key, no network access, no extra cost. `--format docx`
+additionally requires `python-docx` (`requirements-optional.txt`) —
+`--format markdown` (the default) needs nothing beyond the base install.
 
 ## What it does
 
@@ -59,9 +64,39 @@ reads) — no API key, no network access, no extra cost.
      (tarpit/portspoof defenses, wildcard DNS, soft-404 catch-alls) are
      never shown as client-facing findings at all — they belong to the
      "known limitations" section instead, if relevant.
-4. Writes each entry with a plain-Spanish explanation of what it means
-   and why it matters (`core/client_report/explain.py`) — no tool or
-   binary name ever appears in the document.
+4. Writes each entry with the exact same structure, regardless of
+   severity or category (`core/client_report/explain.py`) — no tool or
+   binary name ever appears in the document:
+   - **Qué significa** — what it means and why it matters, in plain
+     Spanish.
+   - **Cómo se encontró** — the methodology in plain terms, e.g. "se
+     probó agregando un valor de identificación única en cada parámetro
+     de la URL, y se comparó la respuesta del sitio" — never the name of
+     a specific tool or binary. Kept as its own content piece
+     (`explain_methodology`), separate from the "qué significa" text, so
+     either can be corrected independently.
+   - **Ubicación** and the affected page(s).
+   - **Limitación de esta prueba**, when the specific test type has one
+     worth naming (`explain_caveat`) — e.g. a reflected-parameter finding
+     always notes that only plain text was tried, never a real injection
+     payload. This is distinct from the report-wide "Qué NO cubre este
+     análisis" section below; it is the one specific gap in *this*
+     particular check.
+   - **Recomendación** — closing guidance calibrated to the finding's
+     real severity (`severity_recommendation`), applied uniformly so tone
+     never depends on whether a given finding type happens to have
+     hand-tuned prose: calm and non-alarmist for `info`/`low` ("se
+     recomienda tenerlo en cuenta, sin representar una urgencia
+     inmediata"), direct and unambiguous for `high`/`critical` ("se
+     recomienda atender esto de forma inmediata — el riesgo real es
+     alto"), without ever downplaying a real one or dramatizing a minor
+     one.
+
+   Every one of these five pieces is computed once, in
+   `core/client_report/dedup.py`, and attached to the shared
+   `ConsolidatedFinding` object both renderers read — depth is identical
+   for every finding regardless of severity; only wording/urgency scales
+   with severity.
 5. Adds a **Limitaciones conocidas de esta corrida** section, built from
    this specific run's own gaps:
    - Any technology `vuln_match` could not actually verify (invalid or
@@ -97,30 +132,54 @@ honestly — this report's own dedup step (see above) is what actually
 collapses true duplicates, deliberately not relying on that unrelated
 upstream behavior either way.
 
-## Why Markdown, not `.docx`
+## Markdown by default, `.docx` on request — and why both, not one
 
-Two options were considered: generate a `.docx` file directly (matching
-the original hand-built pilot report's own format), or generate a
-Markdown draft the operator converts afterward. Markdown was chosen:
+The first round of this feature shipped Markdown only, with the
+reasoning that a `pandoc`/word-processor conversion was one command away
+and not worth a new dependency. The operator explicitly asked for a
+direct Word output as well, so `--format docx` was added
+(`core/client_report/render_docx.py`, `python-docx` in
+`requirements-optional.txt`) — but Markdown stays the **default** and the
+original reasoning still applies to why it stays that way:
 
-- **No new dependency.** `python-docx` would be a new, fairly heavy
-  dependency for comparatively little benefit — converting Markdown to
-  `.docx` is already a single well-known command
-  (`pandoc client_report.md -o client_report.docx`), and most modern word
-  processors (Google Docs included) import Markdown directly.
-- **Trivially reviewable and testable.** A Markdown file is plain text —
-  diffable in a PR, editable in any editor, and the exact string content
-  can be asserted on directly in tests. A generated `.docx` binary would
-  need a much heavier test harness just to inspect its own content.
-- **Consistent with the rest of the project.** `core/reporter.py` (the
-  main recon report) already generates Markdown and HTML, never a binary
-  document format — this keeps one rendering paradigm project-wide
-  instead of introducing a second one just for this command.
-- **The non-negotiable is already satisfied either way**: the operator
-  reviews and edits before anything reaches a client. A Markdown draft
-  makes that review step *easier*, not harder — and the one-command
-  conversion to `.docx` (or a direct paste into a word processor) happens
-  entirely on the operator's own machine, under their own control.
+- **Markdown needs nothing extra.** No dependency, trivially reviewable
+  and diffable, and the exact string content can be asserted on directly
+  in tests — this is still the fastest path for the operator to skim or
+  patch a draft by hand.
+- **`.docx` is opt-in and lazily imported.** `python-docx` is only
+  required when `--format docx` is actually used — importing
+  `core.client_report.cli` (or generating the Markdown default) never
+  needs it installed at all, same discipline as `anthropic`/`openai` in
+  `core/reportability`/`core/hypotheses`.
+- **No content duplication between the two renderers.** Both
+  `render_markdown` and `render_docx` consume the exact same
+  `RunReportData`/`ConsolidatedFinding` objects — deduplication,
+  categorization, methodology, caveats, and severity-calibrated
+  recommendations are computed once, upstream, in
+  `core/client_report/dedup.py`/`explain.py`. Neither renderer owns a
+  content decision; each owns only its own presentation.
+- **The non-negotiable is unchanged**: the operator reviews and edits
+  before anything reaches a client, in whichever format they generate.
+
+### What the Word output adds visually
+
+No copy of the original hand-built pilot `.docx` was found in this repo
+to match pixel-for-pixel — if the operator has that file, sharing it
+would let a future round match its exact visual style more closely; in
+its absence, `render_docx.py` follows conventional professional pentest-
+report structure:
+
+- A **cover page** — report title, client/target name, generation date,
+  and the run's real duration, with an explicit "BORRADOR" mark so the
+  file can never be mistaken for a finished, sent document even out of
+  context.
+- A **colored severity badge** on every finding — a shaded table cell
+  (red/orange/yellow/blue-gray depending on severity, matching the same
+  severity the Markdown version reports as text) immediately under each
+  finding's heading, not just a severity word in a sentence.
+- A **scope summary table** as the closing section — target(s), run
+  duration, and the same three category counts as the executive summary,
+  in one compact table for a quick final reference.
 
 ## Related: WPScan/OSV never fail silently into "clean" (`modules/vuln_match.py`)
 

@@ -51,6 +51,12 @@ _MERGE_LABELS_TEMPLATE_IDS = frozenset(
 
 _PARAM_NAME_RE = re.compile(r"Parameter '([^']+)'")
 _HEADER_NAME_RE = re.compile(r"Missing security header: (.+)$")
+# core.parsers.registry.VulnMatchParser builds Finding.name as
+# f"{identifier} in {technology} {version}" — parsed back out here so the
+# client report's Spanish text never has to embed that literal English
+# "in" (a pre-existing artifact of the underlying Finding model, not
+# something to work around by rewriting that parser for this report).
+_VULN_MATCH_NAME_RE = re.compile(r"^(\S+) in (.+)$")
 
 
 def normalize_host_for_grouping(host: str) -> str:
@@ -126,6 +132,11 @@ def _extract_label(finding: Finding) -> str:
             return match.group(1)
     if finding.template_id == "cloaking-detected":
         return finding.host
+    if finding.template_id == "vuln-match":
+        match = _VULN_MATCH_NAME_RE.match(finding.name)
+        if match:
+            identifier, component = match.group(1), match.group(2)
+            return f"{identifier} ({component})"
     return finding.name
 
 
@@ -188,10 +199,16 @@ def consolidate(findings: list[Finding]) -> list[ConsolidatedFinding]:
 
 
 def _build_consolidated(acc: dict[str, object]) -> ConsolidatedFinding:
-    from core.client_report.explain import explain_consolidated
+    from core.client_report.explain import (
+        explain_caveat,
+        explain_consolidated,
+        explain_methodology,
+        severity_recommendation,
+    )
 
     category = cast(FindingCategory, acc["category"])
     template_id = str(acc["template_id"])
+    severity = str(acc["severity"])
     hosts = sorted(acc["hosts"])  # type: ignore[arg-type]
     labels = list(acc["labels"])  # type: ignore[arg-type]
     title, explanation = explain_consolidated(template_id, labels)
@@ -199,11 +216,14 @@ def _build_consolidated(acc: dict[str, object]) -> ConsolidatedFinding:
         category=category,
         title=title,
         explanation=explanation,
+        methodology=explain_methodology(template_id),
+        recommendation=severity_recommendation(severity),
         host=" / ".join(hosts),
-        severity=str(acc["severity"]),
+        severity=severity,
         occurrences=int(acc["occurrences"]),
         affected_urls=list(acc["urls"]),  # type: ignore[arg-type]
         labels=labels,
+        caveat=explain_caveat(template_id),
         limitation_note=(
             str(acc["limitation_note"]) if acc["limitation_note"] is not None else None
         ),
