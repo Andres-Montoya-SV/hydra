@@ -53,6 +53,35 @@ def test_asset_identity_survives_repeated_observations() -> None:
     assert event_count == 1
 
 
+def test_out_of_order_replay_does_not_move_last_seen_backwards() -> None:
+    conn = _connection()
+    store = EasmStore(conn)
+    org_id = store.ensure_organization(name="Acme", slug="acme")
+    asset_id, _ = store.upsert_asset(
+        organization_id=org_id,
+        asset_type=AssetType.HOSTNAME,
+        canonical_key="api.example.com",
+        seen_at="2026-09-18T10:00:00+00:00",
+        metadata={"source": "newer-run"},
+    )
+
+    store.upsert_asset(
+        organization_id=org_id,
+        asset_type=AssetType.HOSTNAME,
+        canonical_key="api.example.com",
+        seen_at="2026-09-17T10:00:00+00:00",
+    )
+
+    row = conn.execute(
+        "SELECT first_seen, last_seen, metadata_json FROM easm_assets WHERE asset_id = ?",
+        (asset_id,),
+    ).fetchone()
+    assert row is not None
+    assert row["first_seen"] == "2026-09-17T10:00:00+00:00"
+    assert row["last_seen"] == "2026-09-18T10:00:00+00:00"
+    assert json.loads(row["metadata_json"]) == {"source": "newer-run"}
+
+
 def test_observations_are_additive_and_keep_run_provenance() -> None:
     conn = _connection()
     conn.execute("INSERT INTO runs(run_id) VALUES ('run-1')")
