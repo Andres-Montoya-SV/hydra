@@ -47,6 +47,14 @@ class EasmStore:
             raise ValueError("organization slug must not be empty")
         now = utc_now_iso()
         organization_id = _stable_id("org", slug)
+        existing = self.conn.execute(
+            "SELECT metadata_json FROM easm_organizations WHERE slug = ?", (slug,)
+        ).fetchone()
+        metadata_json = (
+            json.dumps(metadata, sort_keys=True)
+            if metadata is not None
+            else (str(existing[0]) if existing is not None else "{}")
+        )
         self.conn.execute(
             """
             INSERT INTO easm_organizations(
@@ -63,7 +71,7 @@ class EasmStore:
                 slug,
                 now,
                 now,
-                json.dumps(metadata or {}, sort_keys=True),
+                metadata_json,
             ),
         )
         row = self.conn.execute(
@@ -92,12 +100,17 @@ class EasmStore:
 
         existing = self.conn.execute(
             """
-            SELECT asset_id FROM easm_assets
+            SELECT asset_id, metadata_json FROM easm_assets
             WHERE organization_id = ? AND asset_type = ? AND canonical_key = ?
             """,
             (organization_id, kind, key),
         ).fetchone()
         created = existing is None
+        metadata_json = (
+            json.dumps(metadata, sort_keys=True)
+            if metadata is not None
+            else (str(existing["metadata_json"]) if existing is not None else "{}")
+        )
 
         self.conn.execute(
             """
@@ -108,9 +121,22 @@ class EasmStore:
             ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
             ON CONFLICT(organization_id, asset_type, canonical_key) DO UPDATE SET
                 display_name=COALESCE(excluded.display_name, easm_assets.display_name),
-                status='active',
-                last_seen=excluded.last_seen,
-                updated_at=excluded.updated_at,
+                status=CASE
+                    WHEN excluded.last_seen >= easm_assets.last_seen THEN 'active'
+                    ELSE easm_assets.status
+                END,
+                first_seen=CASE
+                    WHEN excluded.first_seen < easm_assets.first_seen
+                    THEN excluded.first_seen ELSE easm_assets.first_seen
+                END,
+                last_seen=CASE
+                    WHEN excluded.last_seen > easm_assets.last_seen
+                    THEN excluded.last_seen ELSE easm_assets.last_seen
+                END,
+                updated_at=CASE
+                    WHEN excluded.last_seen >= easm_assets.last_seen
+                    THEN excluded.updated_at ELSE easm_assets.updated_at
+                END,
                 metadata_json=excluded.metadata_json
             """,
             (
@@ -123,7 +149,7 @@ class EasmStore:
                 now,
                 now,
                 now,
-                json.dumps(metadata or {}, sort_keys=True),
+                metadata_json,
             ),
         )
 
@@ -178,8 +204,14 @@ class EasmStore:
             ),
         )
         self.conn.execute(
-            "UPDATE easm_assets SET last_seen = ?, updated_at = ? WHERE asset_id = ?",
-            (observed_at, observed_at, asset_id),
+            """
+            UPDATE easm_assets
+            SET
+                last_seen=CASE WHEN ? > last_seen THEN ? ELSE last_seen END,
+                updated_at=CASE WHEN ? >= last_seen THEN ? ELSE updated_at END
+            WHERE asset_id = ?
+            """,
+            (observed_at, observed_at, observed_at, observed_at, asset_id),
         )
         return observation_id
 
