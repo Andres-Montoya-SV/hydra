@@ -115,28 +115,33 @@ def build_parser() -> argparse.ArgumentParser:
     investigate.add_argument("--entity", help="Explicit entity value (same as domain)")
     investigate.add_argument("--run-id", help="Run to query (default: latest)")
 
+    # Coherence pass: every `--run-id` below uses the exact same help text
+    # `investigate` already established ("Run to query (default:
+    # latest)") — previously several of these commands left both `domain`
+    # and `--run-id` with no help text at all, so `--help` showed only the
+    # bare argument name.
     graph_p = subparsers.add_parser("graph", help="Show intelligence-graph neighborhood")
     graph_p.add_argument("domain", help="Domain to center the graph on")
     graph_p.add_argument("--run-id", help="Run to query (default: latest)")
 
     rel_p = subparsers.add_parser("relationships", help="List evidence-backed relationships")
-    rel_p.add_argument("domain")
-    rel_p.add_argument("--run-id")
+    rel_p.add_argument("domain", help="Domain to list relationships for")
+    rel_p.add_argument("--run-id", help="Run to query (default: latest)")
 
     ev_p = subparsers.add_parser(
         "evidence",
         help="Show evidence for a domain or a relationship id (no rescan)",
     )
     ev_p.add_argument("domain", help="Domain or 32-char relationship_id")
-    ev_p.add_argument("--run-id")
+    ev_p.add_argument("--run-id", help="Run to query (default: latest)")
 
     cert_p = subparsers.add_parser("certificates", help="Certificates linked to a domain")
-    cert_p.add_argument("domain")
-    cert_p.add_argument("--run-id")
+    cert_p.add_argument("domain", help="Domain to list certificates for")
+    cert_p.add_argument("--run-id", help="Run to query (default: latest)")
 
     ind_p = subparsers.add_parser("indicators", help="Indicator-queue rows for a domain")
-    ind_p.add_argument("domain")
-    ind_p.add_argument("--run-id")
+    ind_p.add_argument("domain", help="Domain to list indicator-queue rows for")
+    ind_p.add_argument("--run-id", help="Run to query (default: latest)")
 
     explain_p = subparsers.add_parser(
         "explain-collection",
@@ -145,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
     explain_p.add_argument(
         "identifier", help="indicator_id, collection_attempt_id, or raw indicator value"
     )
-    explain_p.add_argument("--run-id")
+    explain_p.add_argument("--run-id", help="Run to query (default: latest)")
 
     diff_p = subparsers.add_parser(
         "diff",

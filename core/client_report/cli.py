@@ -84,26 +84,31 @@ def cmd_client_report(
     else:
         dest.write_text(content, encoding="utf-8")  # type: ignore[arg-type]
 
+    # The CLI's own status output stays in English, matching every other
+    # command (assess-reportability, suggest-hypotheses, etc.) — only the
+    # generated document's CONTENT (render.py/render_docx.py/explain.py)
+    # is in Spanish, since that is the actual deliverable for a Spanish-
+    # speaking client. Coherence pass: this file previously printed its
+    # own operator-facing status lines in Spanish too, the one command
+    # that broke from the CLI-wide English convention.
     vulns = sum(1 for f in consolidated if f.category.value == "vulnerabilidad_confirmada")
     indicios = sum(1 for f in consolidated if f.category.value == "indicio")
     mejoras = sum(1 for f in consolidated if f.category.value == "area_mejora")
     print(f"Client report written to: {dest}")
     print(
-        f"{vulns} vulnerabilidad(es) confirmada(s), {indicios} indicio(s), "
-        f"{mejoras} área(s) de mejora."
+        f"{vulns} confirmed vulnerability(ies), {indicios} unconfirmed lead(s), "
+        f"{mejoras} improvement area(s)."
     )
     if data.vuln_check_failed:
         print(
-            f"⚠ {len(data.vuln_check_failed)} verificación(es) de vulnerabilidad no pudieron "
-            "completarse esta corrida — documentado en 'Limitaciones conocidas'."
+            f"⚠ {len(data.vuln_check_failed)} vulnerability check(s) could not be completed "
+            "this run — documented under the report's 'Limitaciones conocidas' section."
         )
     conversion_hint = (
-        ""
-        if output_format == "docx"
-        else " (por ejemplo: pandoc client_report.md -o client_report.docx)"
+        "" if output_format == "docx" else " (e.g.: pandoc client_report.md -o client_report.docx)"
     )
     print(
-        f"\nEsto es un BORRADOR. Revísalo y edítalo{conversion_hint} antes de compartirlo "
-        "con el cliente. Hydra nunca envía este documento automáticamente."
+        f"\nThis is a DRAFT. Review and edit it{conversion_hint} before sharing it with the "
+        "client. Hydra never sends this document automatically."
     )
     return 0
