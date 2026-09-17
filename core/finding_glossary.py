@@ -37,6 +37,16 @@ FINDING_GLOSSARY: dict[str, dict[str, str]] = {
         "what": "A detected technology/version is listed in a public vulnerability database.",
         "why": "Patch or isolate the component; Hydra only reports the identifier the source published.",
     },
+    "vuln-check-failed": {
+        "what": (
+            "A detected technology's vulnerability status could not be verified against "
+            "a database (invalid/missing API token, network error, or rate limit)."
+        ),
+        "why": (
+            "This is NOT a clean result — the check never completed. Treat this "
+            "technology's vulnerability status as unknown, not as verified-safe."
+        ),
+    },
     "missing-security-header": {
         "what": "A recommended HTTP security header was absent on a live response.",
         "why": "Missing headers weaken browser-side defenses (clickjacking, MIME sniffing, HTTPS downgrade).",
