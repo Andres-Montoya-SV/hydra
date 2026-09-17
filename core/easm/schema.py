@@ -114,6 +114,23 @@ CREATE TABLE IF NOT EXISTS easm_exposures (
     FOREIGN KEY(asset_id) REFERENCES easm_assets(asset_id) ON DELETE CASCADE
 );
 
+-- Projection ledger: makes derived EASM projection replay-safe without
+-- mutating the run-scoped source tables.  A future projector version can
+-- coexist with the old one and intentionally rebuild state.
+CREATE TABLE IF NOT EXISTS easm_run_projections (
+    organization_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    projector_version TEXT NOT NULL,
+    projected_at TEXT NOT NULL,
+    asset_count INTEGER NOT NULL DEFAULT 0,
+    observation_count INTEGER NOT NULL DEFAULT 0,
+    event_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(organization_id, run_id, projector_version),
+    FOREIGN KEY(organization_id) REFERENCES easm_organizations(organization_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_easm_assets_org
     ON easm_assets(organization_id, status, asset_type);
 CREATE INDEX IF NOT EXISTS idx_easm_assets_key
@@ -134,6 +151,8 @@ CREATE INDEX IF NOT EXISTS idx_easm_exposures_org
     ON easm_exposures(organization_id, status, severity);
 CREATE INDEX IF NOT EXISTS idx_easm_exposures_asset
     ON easm_exposures(asset_id, status);
+CREATE INDEX IF NOT EXISTS idx_easm_run_projections_run
+    ON easm_run_projections(run_id, organization_id);
 """
 
 
