@@ -5,6 +5,10 @@ this before sending, and Markdown is the easiest format to review, diff,
 and convert (a single `pandoc report.md -o report.docx`, or a direct
 paste into Google Docs) without adding a new binary-document dependency
 to the project.
+
+All fixed wording comes from `core.client_report.i18n` — this module only
+decides document STRUCTURE (section order, what's a heading vs a bullet)
+and never embeds a literal sentence in any language itself.
 """
 
 from __future__ import annotations
@@ -12,175 +16,185 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from core.client_report.collect import RunReportData
+from core.client_report.i18n import DEFAULT_LANGUAGE, not_covered_items, t
 from core.client_report.model import ConsolidatedFinding, FindingCategory
 
-_WHAT_THIS_DOES_NOT_COVER = """\
-## Qué NO cubre este análisis
 
-- No se realizaron pruebas de intrusión activa ni se explotó ninguna \
-condición para confirmar impacto más allá de lo descrito en cada hallazgo.
-- No se probó con credenciales — todo lo aquí descrito es visible desde \
-fuera, sin haber iniciado sesión.
-- No se realizó ingeniería social ni pruebas de phishing.
-- Los indicios (a diferencia de las vulnerabilidades confirmadas) se \
-probaron únicamente con valores de texto plano, nunca con payloads de \
-inyección reales — una prueba más profunda podría confirmar o descartar \
-cada uno.
-- Este análisis refleja el estado del sitio en el momento de la corrida; \
-un cambio posterior en el sitio no queda reflejado aquí.
-- La cobertura de vulnerabilidades públicas depende de que el componente \
-y su versión estén correctamente identificados y catalogados en las \
-fuentes consultadas — un componente sin coincidencias no implica que \
-esté libre de vulnerabilidades, solo que ninguna coincidencia pública \
-fue encontrada con la información disponible.
-"""
-
-
-def render_markdown(data: RunReportData, consolidated: list[ConsolidatedFinding]) -> str:
+def render_markdown(
+    data: RunReportData,
+    consolidated: list[ConsolidatedFinding],
+    language: str = DEFAULT_LANGUAGE,
+) -> str:
     lines: list[str] = []
     target = ", ".join(data.targets) if data.targets else data.run_id
-    lines.append(f"# Informe de seguridad — {target}")
+    lines.append(t(language, "report_title", target=target))
     lines.append("")
-    lines.append(_summary_line(data))
+    lines.append(_summary_line(data, language))
     lines.append("")
 
     vulns = [f for f in consolidated if f.category is FindingCategory.VULNERABILIDAD_CONFIRMADA]
     indicios = [f for f in consolidated if f.category is FindingCategory.INDICIO]
     mejoras = [f for f in consolidated if f.category is FindingCategory.AREA_MEJORA]
 
-    lines.append("## Resumen ejecutivo")
+    lines.extend(_render_tldr(vulns, indicios, language))
+
+    lines.append(f"## {t(language, 'executive_summary_heading')}")
     lines.append("")
     lines.append(
-        f"- **Vulnerabilidades confirmadas:** {len(vulns)}\n"
-        f"- **Indicios a revisar:** {len(indicios)}\n"
-        f"- **Áreas de mejora recomendadas:** {len(mejoras)}"
+        f"- **{t(language, 'confirmed_vulns_label')}:** {len(vulns)}\n"
+        f"- **{t(language, 'indicios_to_review_label')}:** {len(indicios)}\n"
+        f"- **{t(language, 'mejoras_recommended_label')}:** {len(mejoras)}"
     )
     lines.append("")
 
-    lines.append("## Vulnerabilidades confirmadas")
+    lines.append(f"## {t(language, 'vulns_heading')}")
     lines.append("")
     if vulns:
-        lines.append(
-            "Evidencia real de impacto — se recomienda atender estos puntos con prioridad."
-        )
+        lines.append(t(language, "vulns_intro"))
         lines.append("")
         for item in vulns:
-            lines.extend(_render_item(item))
+            lines.extend(_render_item(item, language))
     else:
-        lines.append("No se confirmó ninguna vulnerabilidad con evidencia concluyente de impacto.")
+        lines.append(t(language, "vulns_empty"))
         lines.append("")
 
-    lines.append("## Indicios")
+    lines.append(f"## {t(language, 'indicios_heading')}")
     lines.append("")
     if indicios:
-        lines.append(
-            "Detectados sin evidencia concluyente de explotabilidad — requieren revisión "
-            "manual antes de considerarse un problema confirmado."
-        )
+        lines.append(t(language, "indicios_intro"))
         lines.append("")
         for item in indicios:
-            lines.extend(_render_item(item))
+            lines.extend(_render_item(item, language))
     else:
-        lines.append("No se registraron indicios adicionales en esta corrida.")
+        lines.append(t(language, "indicios_empty"))
         lines.append("")
 
-    lines.append("## Áreas de mejora")
+    lines.append(f"## {t(language, 'mejoras_heading')}")
     lines.append("")
     if mejoras:
-        lines.append("Recomendaciones de endurecimiento — no son vulnerabilidades por sí solas.")
+        lines.append(t(language, "mejoras_intro"))
         lines.append("")
         for item in mejoras:
-            lines.extend(_render_item(item))
+            lines.extend(_render_item(item, language))
     else:
-        lines.append("No se identificaron áreas de mejora adicionales en esta corrida.")
+        lines.append(t(language, "mejoras_empty"))
         lines.append("")
 
-    lines.extend(_render_limitations(data))
-    lines.append(_WHAT_THIS_DOES_NOT_COVER)
+    lines.extend(_render_limitations(data, language))
+    lines.append(_render_not_covered(language))
 
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _summary_line(data: RunReportData) -> str:
+def _render_tldr(
+    vulns: list[ConsolidatedFinding], indicios: list[ConsolidatedFinding], language: str
+) -> list[str]:
+    """Task 2: "Lo que necesitas saber" / "What You Need to Know" — the
+    first section after the title, readable entirely on its own. Always
+    exactly 3-5 lines: a vulns line, an optional indicios line, the
+    always-present scope-limit line, and a closing pointer to the rest of
+    the document."""
+    lines = [f"## {t(language, 'tldr_heading')}", ""]
+    body: list[str] = []
+
+    vuln_count = len(vulns)
+    if vuln_count == 0:
+        body.append(t(language, "tldr_zero_vulns"))
+    else:
+        key = "tldr_vulns_singular" if vuln_count == 1 else "tldr_vulns_plural"
+        body.append(t(language, key, count=vuln_count))
+
+    indicio_count = len(indicios)
+    if indicio_count > 0:
+        key = "tldr_indicios_singular" if indicio_count == 1 else "tldr_indicios_plural"
+        body.append(t(language, key, count=indicio_count))
+
+    body.append(t(language, "tldr_scope_line"))
+    body.append(t(language, "tldr_closing_line"))
+
+    lines.append(" ".join(body))
+    lines.append("")
+    return lines
+
+
+def _summary_line(data: RunReportData, language: str) -> str:
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if data.duration_seconds is not None:
         minutes = data.duration_seconds / 60
-        duration = f"{minutes:.1f} minutos ({data.duration_seconds:.0f} segundos)"
+        duration = t(language, "duration_known", minutes=minutes, seconds=data.duration_seconds)
     else:
-        duration = "no disponible"
-    return f"*Generado: {generated} · Duración de la corrida: {duration}*"
+        duration = t(language, "duration_unknown")
+    return t(language, "generated_line", date=generated, duration=duration)
 
 
-def _render_item(item: ConsolidatedFinding) -> list[str]:
+def _render_item(item: ConsolidatedFinding, language: str) -> list[str]:
     # Every finding gets the exact same structure — qué se encontró, cómo
     # se encontró, ubicación, limitación específica de la prueba (si
     # aplica), y una recomendación calibrada por severidad — regardless
     # of category or severity (docs/CLIENT_REPORT.md: uniform depth;
     # severity changes tone/urgency, never how much is explained).
     lines = [f"### {item.title}", ""]
-    lines.append(f"**Qué significa:** {item.explanation}")
+    lines.append(f"**{t(language, 'what_it_means_label')}:** {item.explanation}")
     lines.append("")
-    lines.append(f"**Cómo se encontró:** {item.methodology}")
+    lines.append(f"**{t(language, 'how_found_label')}:** {item.methodology}")
     lines.append("")
-    lines.append(f"- **Ubicación:** {item.host}")
+    lines.append(f"- **{t(language, 'location_label')}:** {item.host}")
     if item.affected_urls:
         urls = ", ".join(item.affected_urls[:5])
-        lines.append(f"- **Página(s) afectada(s):** {urls}")
-    lines.append(f"- **Severidad reportada:** {item.severity}")
+        lines.append(f"- **{t(language, 'affected_pages_label')}:** {urls}")
+    lines.append(f"- **{t(language, 'severity_label')}:** {item.severity}")
     lines.append("")
     if item.caveat:
-        lines.append(f"*Limitación de esta prueba: {item.caveat}*")
+        lines.append(f"*{t(language, 'test_limitation_label')}: {item.caveat}*")
         lines.append("")
-    lines.append(f"**Recomendación:** {item.recommendation}")
+    lines.append(f"**{t(language, 'recommendation_label')}:** {item.recommendation}")
     lines.append("")
     return lines
 
 
-def _render_limitations(data: RunReportData) -> list[str]:
-    lines = ["## Limitaciones conocidas de esta corrida", ""]
+def _render_limitations(data: RunReportData, language: str) -> list[str]:
+    lines = [f"## {t(language, 'known_limitations_heading')}", ""]
     notes: list[str] = []
 
     for item in data.vuln_check_failed:
         tech = item.get("technology", "?")
         version = item.get("version", "?")
         source = item.get("source", "?")
-        reason = item.get("reason", "razón no especificada")
+        reason = item.get("reason", t(language, "reason_unspecified"))
         notes.append(
-            f"No se pudo verificar **{tech} {version}** contra la fuente de "
-            f"vulnerabilidades correspondiente ({source}: {reason}). Esta tecnología "
-            "fue detectada pero su estado de vulnerabilidad permanece **sin confirmar** "
-            "— no debe interpretarse como libre de vulnerabilidades."
+            t(
+                language,
+                "limitation_vuln_check_failed",
+                tech=tech,
+                version=version,
+                source=source,
+                reason=reason,
+            )
         )
 
     if data.wildcard_dns_detected:
-        roots = ", ".join(data.wildcard_dns_roots) or "el dominio analizado"
-        notes.append(
-            f"Se detectó configuración DNS comodín en {roots} — algunos subdominios "
-            "listados en fuentes pasivas podrían no corresponder a servicios reales."
-        )
+        roots = ", ".join(data.wildcard_dns_roots) or t(language, "default_wildcard_roots")
+        notes.append(t(language, "limitation_wildcard_dns", roots=roots))
 
     if data.soft_404_hosts:
         hosts = ", ".join(data.soft_404_hosts)
-        notes.append(
-            f"{hosts} responde con éxito (HTTP 200) incluso para rutas inexistentes — "
-            "la existencia de una URL específica no puede confirmarse únicamente por "
-            "su código de respuesta en este sitio."
-        )
+        notes.append(t(language, "limitation_soft_404", hosts=hosts))
 
     if data.param_fuzz_baseline_invalid_hosts:
         hosts = ", ".join(
             sorted({str(h.get("host")) for h in data.param_fuzz_baseline_invalid_hosts})
         )
-        notes.append(
-            f"La revisión de parámetros no pudo completarse de forma confiable en "
-            f"{hosts} — la solicitud de referencia fue bloqueada o limitada por el "
-            "propio sitio. Esto no equivale a 'sin hallazgos', sino a que la prueba "
-            "no pudo ejecutarse con confianza."
-        )
+        notes.append(t(language, "limitation_param_fuzz_baseline", hosts=hosts))
 
     if not notes:
-        lines.append("No se identificaron limitaciones específicas más allá de las generales.")
+        lines.append(t(language, "no_specific_limitations"))
     else:
         lines.extend(f"- {note}" for note in notes)
     lines.append("")
     return lines
+
+
+def _render_not_covered(language: str) -> str:
+    heading = f"## {t(language, 'not_covered_heading')}"
+    items = "\n".join(f"- {item}" for item in not_covered_items(language))
+    return f"{heading}\n\n{items}\n"

@@ -25,6 +25,7 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from core.assets import Finding
+from core.client_report.i18n import DEFAULT_LANGUAGE
 from core.client_report.model import ConsolidatedFinding, FindingCategory
 
 # Scan-quality/reliability caveats about the COLLECTION itself, not about
@@ -140,11 +141,16 @@ def _extract_label(finding: Finding) -> str:
     return finding.name
 
 
-def consolidate(findings: list[Finding]) -> list[ConsolidatedFinding]:
+def consolidate(
+    findings: list[Finding], language: str = DEFAULT_LANGUAGE
+) -> list[ConsolidatedFinding]:
     """The full consolidation pass: categorize, drop scan-quality
     caveats, collapse URL-variant duplicates, then group merge-labels
     template_ids by label into one entry each. Order is stable
     (first-seen) so output is deterministic given the same input.
+    `language` only affects the fixed explanatory text attached to each
+    entry (core.client_report.explain) — categorization, grouping, and
+    every dynamic value (hosts, labels, counts) are language-independent.
     """
     # group_key -> accumulator
     groups: dict[tuple[str, str, str, str], dict[str, object]] = {}
@@ -195,10 +201,10 @@ def consolidate(findings: list[Finding]) -> list[ConsolidatedFinding]:
         if category is FindingCategory.LIMITACION and not acc["limitation_note"]:
             acc["limitation_note"] = finding.description
 
-    return [_build_consolidated(groups[key]) for key in order]
+    return [_build_consolidated(groups[key], language) for key in order]
 
 
-def _build_consolidated(acc: dict[str, object]) -> ConsolidatedFinding:
+def _build_consolidated(acc: dict[str, object], language: str) -> ConsolidatedFinding:
     from core.client_report.explain import (
         explain_caveat,
         explain_consolidated,
@@ -211,19 +217,19 @@ def _build_consolidated(acc: dict[str, object]) -> ConsolidatedFinding:
     severity = str(acc["severity"])
     hosts = sorted(acc["hosts"])  # type: ignore[arg-type]
     labels = list(acc["labels"])  # type: ignore[arg-type]
-    title, explanation = explain_consolidated(template_id, labels)
+    title, explanation = explain_consolidated(template_id, labels, language)
     return ConsolidatedFinding(
         category=category,
         title=title,
         explanation=explanation,
-        methodology=explain_methodology(template_id),
-        recommendation=severity_recommendation(severity),
+        methodology=explain_methodology(template_id, language),
+        recommendation=severity_recommendation(severity, language),
         host=" / ".join(hosts),
         severity=severity,
         occurrences=int(acc["occurrences"]),
         affected_urls=list(acc["urls"]),  # type: ignore[arg-type]
         labels=labels,
-        caveat=explain_caveat(template_id),
+        caveat=explain_caveat(template_id, language),
         limitation_note=(
             str(acc["limitation_note"]) if acc["limitation_note"] is not None else None
         ),

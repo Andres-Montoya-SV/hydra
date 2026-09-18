@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from core.client_report.collect import RunNotFoundError, collect
 from core.client_report.dedup import consolidate
+from core.client_report.i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, t
 from core.client_report.render import render_markdown
 from core.intel.cli import default_db
 from core.store import AssetStore
@@ -30,6 +31,7 @@ def cmd_client_report(
     *,
     output_path: Path | None = None,
     output_format: str = "markdown",
+    language: str = DEFAULT_LANGUAGE,
 ) -> int:
     sanitize_run_id(run_id)
 
@@ -37,6 +39,14 @@ def cmd_client_report(
         print(
             f"Error: --format {output_format!r} is not supported — must be one of "
             f"{SUPPORTED_FORMATS}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if language not in SUPPORTED_LANGUAGES:
+        print(
+            f"Error: --language {language!r} is not supported — must be one of "
+            f"{SUPPORTED_LANGUAGES}.",
             file=sys.stderr,
         )
         return 1
@@ -55,8 +65,10 @@ def cmd_client_report(
 
     # Both formats consume the exact same consolidated data — dedup,
     # categorization, methodology/caveat/recommendation text are computed
-    # once here, never duplicated in either renderer.
-    consolidated = consolidate(data.findings)
+    # once here, never duplicated in either renderer. `language` only
+    # selects which fixed wording (core.client_report.i18n) attaches to
+    # that data — real findings/hosts/counts are identical either way.
+    consolidated = consolidate(data.findings, language)
 
     if output_format == "docx":
         # Deferred: python-docx is an optional dependency
@@ -66,14 +78,14 @@ def cmd_client_report(
         from core.client_report.render_docx import DocxRenderError, render_docx
 
         try:
-            content: str | bytes = render_docx(data, consolidated)
+            content: str | bytes = render_docx(data, consolidated, language)
         except DocxRenderError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         default_name = "client_report.docx"
         write_mode = "wb"
     else:
-        content = render_markdown(data, consolidated)
+        content = render_markdown(data, consolidated, language)
         default_name = "client_report.md"
         write_mode = "w"
 
@@ -100,9 +112,10 @@ def cmd_client_report(
         f"{mejoras} improvement area(s)."
     )
     if data.vuln_check_failed:
+        limitations_heading = t(language, "known_limitations_heading")
         print(
             f"⚠ {len(data.vuln_check_failed)} vulnerability check(s) could not be completed "
-            "this run — documented under the report's 'Limitaciones conocidas' section."
+            f"this run — documented under the report's {limitations_heading!r} section."
         )
     conversion_hint = (
         "" if output_format == "docx" else " (e.g.: pandoc client_report.md -o client_report.docx)"

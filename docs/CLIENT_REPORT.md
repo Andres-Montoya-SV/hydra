@@ -17,6 +17,8 @@ python app.py client-report RUN_ID
 python app.py client-report RUN_ID --format docx
 # write it somewhere specific:
 python app.py client-report RUN_ID --output /path/to/draft.md
+# English instead of Spanish:
+python app.py client-report RUN_ID --language en
 ```
 
 By default the draft is written to `output/<run_id>/client_report.md`
@@ -25,6 +27,52 @@ short summary (counts per category, any known verification gaps) and an
 explicit reminder that this is a **draft** — Hydra does not send it to
 anyone.
 
+### Language (`--language en|es`)
+
+First real pilot (Metaverse Justice) surfaced a client-facing gap: the
+client asked for the report in English and received it in Spanish. All
+of the report's *fixed* text — section headings, "what it means"/"how it
+was found" labels, the severity-calibrated recommendation sentences, the
+"what this analysis does NOT cover" disclaimers, everything in
+`core/client_report/i18n.py` — is now available in both languages via
+`--language {en,es}`. It defaults to `es`, so nothing changes for anyone
+who doesn't pass the flag.
+
+Real, dynamic content — the target domain, host names, parameter names,
+header names, counts — is **never** translated in either language; only
+the template wording around it changes. The same finding data produces
+the same counts and the same categorization regardless of `--language`;
+only the words describing it differ.
+
+`core/client_report/i18n.py` is the single place all of that wording
+lives, in both languages, as plain dictionaries — `render.py`,
+`render_docx.py`, `explain.py`, and `dedup.py` never embed a literal
+sentence themselves, they look everything up by key. Adding a third
+language later is adding one more dictionary there; it does not touch
+any document-assembly logic in this package.
+
+### "Lo que necesitas saber" / "What You Need to Know"
+
+Same pilot surfaced a second, unrelated gap: the client never read the
+"what this analysis does NOT cover" section and didn't ask questions,
+suggesting the full document is too long/dense for a non-technical
+reader going through it unaccompanied. The report's first section after
+the title (before the executive summary) is now a 3-5 line, jargon-free
+summary that stands on its own:
+
+1. Whether any vulnerability was confirmed, and how many.
+2. If there are unconfirmed leads worth a manual look, in one sentence
+   (no technical detail — that's still in the finding's own section).
+3. **Always present, in every report**: one sentence stating the report's
+   most important boundary — this is external reconnaissance, not a full
+   penetration test; no active intrusion, no credentialed access.
+4. A closing line pointing to the full detail in the pages that follow.
+
+This section is generated from the run's real, already-consolidated
+findings (`core/client_report/render.py::_render_tldr`,
+`render_docx.py::_add_tldr`) — it is never hand-written per run and never
+drifts from the numbers in the executive summary below it.
+
 Requires the run's own `output/<run_id>/` artifacts and its row in
 `output/recon.db` (the same data every other `RUN_ID`-based command
 reads) — no API key, no network access, no extra cost. `--format docx`
@@ -32,6 +80,12 @@ additionally requires `python-docx` (`requirements-optional.txt`) —
 `--format markdown` (the default) needs nothing beyond the base install.
 
 ## What it does
+
+(Section/label names below are given in Spanish, the tool's default
+`--language` — see "Language" above. Every one of them has an English
+counterpart in `core/client_report/i18n.py` and reads naturally to a
+non-technical English-speaking client, not as a literal word-for-word
+translation.)
 
 1. Reads the run's per-tool JSONL artifacts directly (not the SQLite
    `findings` table — see "Why artifacts, not the findings table" below)

@@ -281,6 +281,16 @@ def build_parser() -> argparse.ArgumentParser:
             "(requires python-docx, requirements-optional.txt)"
         ),
     )
+    client_report_p.add_argument(
+        "--language",
+        choices=["en", "es"],
+        default="es",
+        help=(
+            "Language for the report's fixed text — headings, explanations, "
+            "recommendations (default: es, unchanged from before this flag existed). "
+            "Real findings/hosts/domains are never translated either way."
+        ),
+    )
 
     engagement_p = subparsers.add_parser(
         "engagement",
@@ -344,6 +354,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["markdown", "docx"],
         help=(
             "Client-report format to use if you accept that step " "(default: ask interactively)"
+        ),
+    )
+    engagement_p.add_argument(
+        "--client-report-language",
+        dest="client_report_language",
+        choices=["en", "es"],
+        default="es",
+        help=(
+            "Language for the client-report draft's fixed text, if you accept that "
+            "step (default: es, same as client-report's own default)"
         ),
     )
     engagement_p.add_argument(
@@ -690,9 +710,16 @@ async def cmd_engagement(args: argparse.Namespace, settings: Settings) -> int:
                         report_format = "markdown"
                 from core.client_report.cli import cmd_client_report
 
-                report_rc = cmd_client_report(settings, run_id, output_format=report_format)
+                report_rc = cmd_client_report(
+                    settings,
+                    run_id,
+                    output_format=report_format,
+                    language=args.client_report_language,
+                )
                 if report_rc == 0:
-                    generated.append(f"Client report draft ({report_format})")
+                    generated.append(
+                        f"Client report draft ({report_format}, " f"{args.client_report_language})"
+                    )
             else:
                 print("Declined — no client report generated.")
 
@@ -936,6 +963,7 @@ def main() -> int:
                 args.run_id,
                 output_path=args.output,
                 output_format=args.report_format,
+                language=args.language,
             )
         return 1
 
