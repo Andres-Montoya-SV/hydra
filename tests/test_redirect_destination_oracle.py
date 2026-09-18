@@ -116,24 +116,26 @@ def _context(tmp_path: Path) -> PipelineContext:
     )
 
 
-async def _run_httpx(tmp_path: Path, seed_url: str) -> PipelineContext:
+async def _run_httpx(tmp_path: Path, seed_url: str, httpx_path: Path) -> PipelineContext:
     context = _context(tmp_path)
     hosts_path = context.output_dir / "resolved.txt"
     write_lines(hosts_path, [seed_url], base_dir=context.output_dir)
-    plugin = HttpxPlugin(Settings(project_root=tmp_path))
+    plugin = HttpxPlugin(Settings(project_root=tmp_path, httpx_path=httpx_path))
     await plugin.run(context, hosts_path)
     return context
 
 
 @pytest.mark.asyncio
-async def test_relative_redirect_stays_on_authorized_host(tmp_path: Path) -> None:
+async def test_relative_redirect_stays_on_authorized_host(
+    tmp_path: Path, verified_httpx_path: Path
+) -> None:
     """A same-host relative Location is authorization-preserving: the
     authorized server must receive the follow-up hop."""
     _AllowedHandler.hits = []
     seed_httpd, seed_port, seed_thread = _serve(_AllowedHandler)
     seed_httpd.location = "/relative-hop"  # type: ignore[attr-defined]
     try:
-        await _run_httpx(tmp_path, f"http://127.0.0.1:{seed_port}/")
+        await _run_httpx(tmp_path, f"http://127.0.0.1:{seed_port}/", verified_httpx_path)
         await _wait_until(lambda: "/relative-hop" in _AllowedHandler.hits)
     finally:
         seed_httpd.shutdown()
@@ -150,13 +152,13 @@ async def test_relative_redirect_stays_on_authorized_host(tmp_path: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_scheme_relative_redirect_to_evil_gets_zero_connections(
-    tmp_path: Path, evil_server: int
+    tmp_path: Path, evil_server: int, verified_httpx_path: Path
 ) -> None:
     _AllowedHandler.hits = []
     seed_httpd, seed_port, seed_thread = _serve(_AllowedHandler)
     seed_httpd.location = f"//localhost:{evil_server}/secret"  # type: ignore[attr-defined]
     try:
-        await _run_httpx(tmp_path, f"http://127.0.0.1:{seed_port}/")
+        await _run_httpx(tmp_path, f"http://127.0.0.1:{seed_port}/", verified_httpx_path)
         await _wait_until(lambda: bool(_AllowedHandler.hits))
     finally:
         seed_httpd.shutdown()
@@ -182,7 +184,7 @@ async def test_scheme_relative_redirect_to_evil_gets_zero_connections(
     ],
 )
 async def test_dangerous_scheme_redirect_never_becomes_a_network_destination(
-    tmp_path: Path, evil_server: int, location: str
+    tmp_path: Path, evil_server: int, location: str, verified_httpx_path: Path
 ) -> None:
     """These schemes must never be rewritten into a request that hits the
     evil server (or any other network destination)."""
@@ -190,7 +192,7 @@ async def test_dangerous_scheme_redirect_never_becomes_a_network_destination(
     seed_httpd, seed_port, seed_thread = _serve(_AllowedHandler)
     seed_httpd.location = location  # type: ignore[attr-defined]
     try:
-        context = await _run_httpx(tmp_path, f"http://127.0.0.1:{seed_port}/")
+        context = await _run_httpx(tmp_path, f"http://127.0.0.1:{seed_port}/", verified_httpx_path)
         await _wait_until(lambda: bool(_AllowedHandler.hits))
     finally:
         seed_httpd.shutdown()

@@ -180,7 +180,7 @@ def test_followup_ct_san_marks_evil_observed_not_allowed(tmp_path: Path) -> None
 @pytest.mark.asyncio
 @pytest.mark.skipif(shutil.which("httpx") is None, reason="httpx binary not installed")
 async def test_followup_www_302_to_evil_gets_zero_connections(
-    tmp_path: Path, evil_server: int
+    tmp_path: Path, evil_server: int, verified_httpx_path: Path
 ) -> None:
     """www (authorized follow-up) 302s to evil. The evil server is the
     oracle. Seed alive.txt must still contain the seed afterward."""
@@ -202,7 +202,7 @@ async def test_followup_www_302_to_evil_gets_zero_connections(
         context.collection_scope = CollectionScope.from_seeds(
             ["127.0.0.1"], patterns=["127.0.0.1"], allow_private_network_targets=True
         )
-        plugin = HttpxPlugin(Settings(project_root=tmp_path))
+        plugin = HttpxPlugin(Settings(project_root=tmp_path, httpx_path=verified_httpx_path))
         suffix = "_followup_1"
         context.metadata["httpx_output_suffix"] = suffix
         await plugin.run(context, context.output_dir / "followup_http_targets.txt")

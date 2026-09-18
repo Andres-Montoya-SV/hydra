@@ -8,6 +8,40 @@ import pytest
 
 from config.settings import Settings
 
+# See docs/PAID_API_DESIGN.md's "Round 1 implemented" section for the
+# full incident writeup: the Python `httpx` PyPI package (a test-only
+# dependency, requirements-dev.txt, needed for fastapi.testclient) always
+# installs a console-script entry point also named `httpx`, unconditionally
+# — not gated behind any pip extra — which can outrank the real
+# ProjectDiscovery `httpx` recon binary on PATH once a venv is active.
+# `core/dependencies/service.py` already defends against exactly this for
+# any REAL pipeline run (multi-candidate discovery + identity-marker
+# validation — see its own "handles httpx vs python-httpx" comment); this
+# fixture gives tests that construct a plugin/Settings directly, bypassing
+# that layer on purpose, the same protection.
+
+
+@pytest.fixture
+async def verified_httpx_path() -> Path:
+    """The real ProjectDiscovery `httpx` binary's resolved,
+    identity-verified path (never the bare `Path("httpx")` `Settings`
+    defaults to, which a subprocess call resolves via raw OS PATH search
+    with no identity check at all). Skips the test, rather than failing
+    it, when no genuine binary can be found/verified in this environment
+    — a missing/misidentified tool is an environment fact, not a bug in
+    the test itself."""
+    from core.dependencies.registry import get_tool_definition
+    from core.dependencies.service import DependencyService
+
+    service = DependencyService({"httpx": Path("httpx")})
+    report = await service.analyze_tool(get_tool_definition("httpx"), Path("httpx"), required=True)
+    if report.resolved_path is None:
+        pytest.skip(
+            "No genuine ProjectDiscovery httpx binary found/verified in this "
+            "environment (see docs/PAID_API_DESIGN.md's httpx-shadowing note)"
+        )
+    return report.resolved_path
+
 
 @pytest.fixture
 def project_root(tmp_path: Path) -> Path:

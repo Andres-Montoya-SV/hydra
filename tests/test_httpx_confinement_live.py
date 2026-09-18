@@ -98,7 +98,9 @@ def oos_server() -> Iterator[int]:
 
 
 @pytest.mark.asyncio
-async def test_httpx_reaches_authorized_target_through_confinement_proxy(tmp_path: Path) -> None:
+async def test_httpx_reaches_authorized_target_through_confinement_proxy(
+    tmp_path: Path, verified_httpx_path: Path
+) -> None:
     """Sanity check: routing through the proxy must not break the normal,
     authorized case — the real destination must still be reached."""
     server, port, thread = _serve(_CountingHandler)
@@ -109,7 +111,7 @@ async def test_httpx_reaches_authorized_target_through_confinement_proxy(tmp_pat
         seed_url = f"http://127.0.0.1:{port}/"
         write_lines(hosts_path, [seed_url], base_dir=output_dir)
 
-        settings = Settings(project_root=tmp_path)
+        settings = Settings(project_root=tmp_path, httpx_path=verified_httpx_path)
         context = PipelineContext(
             targets=[DomainTarget(domain="127.0.0.1")],
             output_dir=output_dir,
@@ -130,7 +132,7 @@ async def test_httpx_reaches_authorized_target_through_confinement_proxy(tmp_pat
 
 @pytest.mark.asyncio
 async def test_httpx_redirect_escape_is_blocked_by_confinement_proxy(
-    tmp_path: Path, oos_server: int
+    tmp_path: Path, oos_server: int, verified_httpx_path: Path
 ) -> None:
     """The initial probe is in-scope; the `Location` header points at a
     different host the confinement proxy (not just the Python-level
@@ -143,7 +145,7 @@ async def test_httpx_redirect_escape_is_blocked_by_confinement_proxy(
         seed_url = f"http://127.0.0.1:{seed_port}/"
         write_lines(hosts_path, [seed_url], base_dir=output_dir)
 
-        settings = Settings(project_root=tmp_path)
+        settings = Settings(project_root=tmp_path, httpx_path=verified_httpx_path)
         context = PipelineContext(
             targets=[DomainTarget(domain="127.0.0.1")],
             output_dir=output_dir,
@@ -167,7 +169,7 @@ async def test_httpx_redirect_escape_is_blocked_by_confinement_proxy(
 
 @pytest.mark.asyncio
 async def test_httpx_in_scope_hostname_resolving_to_private_ip_is_blocked(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, oos_server: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, oos_server: int, verified_httpx_path: Path
 ) -> None:
     """The DNS-rebinding/TOCTOU scenario, against the real binary: the seed
     hostname is fully in scope by name, but (per the confinement proxy's
@@ -189,7 +191,7 @@ async def test_httpx_in_scope_hostname_resolving_to_private_ip_is_blocked(
     seed_url = f"http://rebind.httpx-live-test.internal:{oos_server}/"
     write_lines(hosts_path, [seed_url], base_dir=output_dir)
 
-    settings = Settings(project_root=tmp_path)
+    settings = Settings(project_root=tmp_path, httpx_path=verified_httpx_path)
     context = PipelineContext(
         targets=[DomainTarget(domain="rebind.httpx-live-test.internal")],
         output_dir=output_dir,
@@ -206,7 +208,7 @@ async def test_httpx_in_scope_hostname_resolving_to_private_ip_is_blocked(
 
 @pytest.mark.asyncio
 async def test_httpx_sends_attribution_user_agent_through_confinement_proxy(
-    tmp_path: Path,
+    tmp_path: Path, verified_httpx_path: Path
 ) -> None:
     """ATTRIBUTION_USER_AGENT (e.g. Bugcrowd's "include 'bugcrowd' in your
     User-Agent" requirement) must reach the real target request. httpx has
@@ -227,6 +229,7 @@ async def test_httpx_sends_attribution_user_agent_through_confinement_proxy(
         settings = Settings(
             project_root=tmp_path,
             attribution_user_agent="bugcrowd; cosmiccashew",
+            httpx_path=verified_httpx_path,
         )
         context = PipelineContext(
             targets=[DomainTarget(domain="127.0.0.1")],

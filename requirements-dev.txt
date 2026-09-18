@@ -12,18 +12,27 @@ ruff==0.11.2
 #
 # IMPORTANT — name collision with the ProjectDiscovery `httpx` recon binary
 # this project also shells out to (modules/httpx.py): the Python `httpx`
-# PyPI package unconditionally installs a console-script entry point named
-# `httpx` (`httpx:main`) into this venv's bin/ directory. Once the venv is
-# activated, that shim resolves ahead of the real recon binary
-# (`/opt/homebrew/bin/httpx` or wherever it's actually installed) on PATH,
-# silently breaking every live network test that shells out to the real
-# tool (tests/test_httpx_confinement_live.py,
-# tests/test_redirect_destination_oracle.py,
-# tests/test_followup_adversarial_oracle.py — confirmed as the exact root
-# cause of all 10 of their failures the first time this dependency was
-# added). After `pip install -r requirements-dev.txt`, remove the shim so
-# PATH resolves to the real binary again:
-#   rm .venv/bin/httpx
-# This does not affect `import httpx` (the library) at all — only the
-# standalone CLI script pip also installs, which this project never uses.
+# PyPI package's `console_scripts` entry point named `httpx` (`httpx:main`)
+# is UNCONDITIONAL package metadata — confirmed directly via
+# importlib.metadata, not the `cli` extra (`click`/`rich`/`pygments` are
+# gated behind `extra == "cli"`, but the script itself is not; installing
+# plain `httpx`, exactly as pinned below with no extra, still creates it).
+# `pip install` always writes this shim into this venv's bin/ directory,
+# where it can outrank the real recon binary on PATH once the venv is
+# active — this is a genuine, unavoidable-by-pip-flag name collision, not
+# a config mistake to "fix" by changing this line.
+#
+# The pipeline itself is not at risk: core/dependencies/service.py already
+# has a "handles httpx vs python-httpx" multi-candidate discovery +
+# identity-marker validation (httpx's own ToolDefinition in
+# core/dependencies/registry.py declares identity_markers=("projectdiscovery",
+# ...) and a path_denylist covering .venv/site-packages/Python.framework) —
+# any real `PipelineRunner`/`ToolManager`-driven run resolves and verifies
+# the genuine binary regardless of this shim (see
+# tests/test_dependency_binary_identity.py). The narrow gap is test code
+# that constructs a plugin/Settings directly, bypassing that layer on
+# purpose — those tests use the `verified_httpx_path` fixture
+# (tests/conftest.py) to get the same protection explicitly. See
+# docs/PAID_API_DESIGN.md's "Round 1 implemented" section for the full
+# incident writeup.
 httpx==0.28.1

@@ -594,19 +594,45 @@ pip install -r requirements.txt -r requirements-api.txt -r requirements-dev.txt
 
 **Important, and easy to miss**: the Python `httpx` package (needed only
 for `fastapi.testclient.TestClient` in tests) installs a console script
-also named `httpx`, which shadows the real ProjectDiscovery `httpx` recon
-binary this project shells out to once the venv is active. Remove the
-shim after installing, or every live network test (and any real scan
-that reaches the HTTP-probe stage) silently uses the wrong tool:
+also named `httpx`. `pip install httpx` — no extra, exactly as pinned —
+already creates it: confirmed directly via `importlib.metadata` that the
+`console_scripts` entry point is unconditional package metadata, not
+gated behind the `cli` extra (only its runtime dependencies —
+`click`/`rich`/`pygments` — are). There is no pip flag that avoids this;
+it is a real, unavoidable name collision with the ProjectDiscovery
+`httpx` recon binary this project also shells out to
+(`modules/httpx.py`), not a configuration mistake.
+
+**This does not put real scans at risk.** `core/dependencies/service.py`
+already has multi-candidate discovery + identity-marker validation
+specifically built for this — its own comment says "handles httpx vs
+python-httpx" — and `httpx`'s `ToolDefinition`
+(`core/dependencies/registry.py`) already declares
+`identity_markers=("projectdiscovery", ...)` plus a `path_denylist`
+covering `.venv`/`site-packages`/`Python.framework`. Any real
+`PipelineRunner`/`ToolManager`-driven run (`app.py run`, `engagement`,
+and this API's own scan orchestration) resolves and verifies the genuine
+binary regardless of the shim — confirmed with a real impostor script in
+`tests/test_dependency_binary_identity.py`, not just by reading the code.
+
+The narrow gap is test code that constructs a plugin/`Settings` directly,
+bypassing `ToolManager` on purpose to test something else (confinement-
+proxy behavior, not tool discovery) —
+`tests/test_httpx_confinement_live.py`,
+`tests/test_redirect_destination_oracle.py`, and
+`tests/test_followup_adversarial_oracle.py` originally did this and
+inherited the raw-PATH vulnerability as a side effect the first time this
+dependency was added (10 failures, confirmed as this exact cause). They
+now use the `verified_httpx_path` fixture (`tests/conftest.py`) — which
+reuses that same production discovery/validation — to get the same
+protection explicitly, so **no manual remediation is required** for the
+test suite to pass correctly regardless of the shim's presence. If you
+want the shim gone from your shell for ad-hoc `httpx` command-line use
+anyway, it's harmless to remove:
 
 ```bash
-rm .venv/bin/httpx
+rm .venv/bin/httpx    # optional — the test suite no longer depends on this
 ```
-
-(see `requirements-dev.txt`'s comment on the `httpx` line — this is the
-exact root cause that produced 10 failing tests the first time this
-dependency was added, confirmed by reproducing it on a clean checkout
-with only the venv's installed packages differing).
 
 Then run the service:
 
@@ -723,6 +749,15 @@ past directly in the control DB rather than sleeping a day or mocking
 scan lifecycle, cross-account isolation with the exact same `scan_id`,
 and byte-for-byte parity between the API's `client-report` endpoint and
 calling `cmd_client_report` directly against the same account data).
+
+Also added as part of this round's own httpx-shadowing incident (see
+above): `tests/test_dependency_binary_identity.py`, which exercises
+`core/dependencies/`'s pre-existing impostor-rejection mechanism with a
+real fake binary — confirming a same-named script that runs successfully
+but isn't the genuine tool is rejected with a clear reason, and that a
+genuine binary reachable elsewhere is still correctly selected even when
+an impostor scores as the first PATH candidate. That mechanism predates
+this round; it simply had no test coverage before now.
 
 ## Explicitly deferred to Part 2 / Rounds 2-3
 
