@@ -358,6 +358,24 @@ _ES: dict[str, object] = {
         "Indicios",
         "Áreas de mejora",
     ],
+    # --- CLI's own console status output (core.client_report.cli) ---
+    # Unlike every other command's CLI output, this one's operator sees
+    # it right after choosing --language for the document itself, so it
+    # follows the same choice rather than the CLI-wide English default.
+    "cli_report_written_to": "Reporte de cliente escrito en: {dest}",
+    "cli_summary_line": (
+        "{vulns} vulnerabilidad(es) confirmada(s), {indicios} indicio(s), "
+        "{mejoras} área(s) de mejora."
+    ),
+    "cli_vuln_check_failed_warning": (
+        "⚠ {count} verificación(es) de vulnerabilidad no se pudieron completar en esta "
+        "corrida — documentado en la sección {heading!r} del reporte."
+    ),
+    "cli_conversion_hint_pandoc": " (por ejemplo: pandoc client_report.md -o client_report.docx)",
+    "cli_draft_reminder": (
+        "\nEsto es un BORRADOR. Revísalo y edítalo{conversion_hint} antes de compartirlo "
+        "con el cliente. Hydra nunca envía este documento automáticamente."
+    ),
 }
 
 
@@ -672,6 +690,20 @@ _EN: dict[str, object] = {
         "Leads",
         "Areas for Improvement",
     ],
+    "cli_report_written_to": "Client report written to: {dest}",
+    "cli_summary_line": (
+        "{vulns} confirmed vulnerability(ies), {indicios} unconfirmed lead(s), "
+        "{mejoras} improvement area(s)."
+    ),
+    "cli_vuln_check_failed_warning": (
+        "⚠ {count} vulnerability check(s) could not be completed this run — documented "
+        "under the report's {heading!r} section."
+    ),
+    "cli_conversion_hint_pandoc": " (e.g.: pandoc client_report.md -o client_report.docx)",
+    "cli_draft_reminder": (
+        "\nThis is a DRAFT. Review and edit it{conversion_hint} before sharing it with "
+        "the client. Hydra never sends this document automatically."
+    ),
 }
 
 

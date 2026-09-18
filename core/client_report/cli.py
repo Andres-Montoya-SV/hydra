@@ -96,32 +96,27 @@ def cmd_client_report(
     else:
         dest.write_text(content, encoding="utf-8")  # type: ignore[arg-type]
 
-    # The CLI's own status output stays in English, matching every other
-    # command (assess-reportability, suggest-hypotheses, etc.) — only the
-    # generated document's CONTENT (render.py/render_docx.py/explain.py)
-    # is in Spanish, since that is the actual deliverable for a Spanish-
-    # speaking client. Coherence pass: this file previously printed its
-    # own operator-facing status lines in Spanish too, the one command
-    # that broke from the CLI-wide English convention.
+    # This console output follows --language, same as the document itself
+    # — the operator just chose that language and seeing the summary in a
+    # different one right after would be jarring. (Every other command's
+    # own status output stays English, per the project-wide CLI
+    # convention — but none of those commands have a --language of their
+    # own to follow in the first place; this one does, so it does.)
     vulns = sum(1 for f in consolidated if f.category.value == "vulnerabilidad_confirmada")
     indicios = sum(1 for f in consolidated if f.category.value == "indicio")
     mejoras = sum(1 for f in consolidated if f.category.value == "area_mejora")
-    print(f"Client report written to: {dest}")
-    print(
-        f"{vulns} confirmed vulnerability(ies), {indicios} unconfirmed lead(s), "
-        f"{mejoras} improvement area(s)."
-    )
+    print(t(language, "cli_report_written_to", dest=dest))
+    print(t(language, "cli_summary_line", vulns=vulns, indicios=indicios, mejoras=mejoras))
     if data.vuln_check_failed:
         limitations_heading = t(language, "known_limitations_heading")
         print(
-            f"⚠ {len(data.vuln_check_failed)} vulnerability check(s) could not be completed "
-            f"this run — documented under the report's {limitations_heading!r} section."
+            t(
+                language,
+                "cli_vuln_check_failed_warning",
+                count=len(data.vuln_check_failed),
+                heading=limitations_heading,
+            )
         )
-    conversion_hint = (
-        "" if output_format == "docx" else " (e.g.: pandoc client_report.md -o client_report.docx)"
-    )
-    print(
-        f"\nThis is a DRAFT. Review and edit it{conversion_hint} before sharing it with the "
-        "client. Hydra never sends this document automatically."
-    )
+    conversion_hint = "" if output_format == "docx" else t(language, "cli_conversion_hint_pandoc")
+    print(t(language, "cli_draft_reminder", conversion_hint=conversion_hint))
     return 0

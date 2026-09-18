@@ -194,7 +194,10 @@ class TestPilotStructureRegression:
         assert "Qué NO cubre este análisis" in text
 
         out = capsys.readouterr().out
-        assert "DRAFT" in out
+        # Default language is "es" — the console message follows
+        # --language (fix/client-report-console-message-language), so the
+        # default here is "BORRADOR", not the English "DRAFT".
+        assert "BORRADOR" in out
 
     def test_no_tool_names_anywhere_in_the_document(self, tmp_path: Path) -> None:
         _seed_pilot_run(tmp_path)

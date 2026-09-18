@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from config.settings import Settings
-from core.assets import Finding
+from core.assets import Finding, ScanRun
 from core.client_report.cli import cmd_client_report
 from core.client_report.collect import RunReportData
 from core.client_report.dedup import consolidate
@@ -225,3 +225,65 @@ class TestUnsupportedLanguageFailsClearly:
         parser = hydra_app.build_parser()
         with pytest.raises(SystemExit):
             parser.parse_args(["client-report", RUN_ID, "--language", "fr"])
+
+
+def _bare_run(tmp_path: Path) -> Settings:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / RUN_ID).mkdir(parents=True, exist_ok=True)
+    store = AssetStore(output_dir / "recon.db")
+    store.create_run(
+        ScanRun(run_id=RUN_ID, started_at="2026-01-01T00:00:00Z", targets=[REAL_DOMAIN])
+    )
+    return Settings(project_root=tmp_path)
+
+
+class TestConsoleMessageFollowsLanguage:
+    """fix/client-report-console-message-language: the operator just chose
+    --language for the document; seeing the summary printed right after in
+    a different language would be inconsistent, even though every other
+    command's own console output stays English (none of them have a
+    --language of their own to follow)."""
+
+    def test_spanish_console_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        settings = _bare_run(tmp_path)
+        rc = cmd_client_report(settings, RUN_ID, language="es")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Reporte de cliente escrito en:" in out
+        assert "vulnerabilidad(es) confirmada(s)" in out
+        assert "indicio(s)" in out
+        assert "área(s) de mejora" in out
+        assert "Esto es un BORRADOR" in out
+        assert "Hydra nunca envía este documento automáticamente" in out
+        # No English text leaking into the Spanish console message.
+        assert "Client report written to" not in out
+        assert "This is a DRAFT" not in out
+
+    def test_english_console_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        settings = _bare_run(tmp_path)
+        rc = cmd_client_report(settings, RUN_ID, language="en")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Client report written to:" in out
+        assert "confirmed vulnerability(ies)" in out
+        assert "unconfirmed lead(s)" in out
+        assert "improvement area(s)" in out
+        assert "This is a DRAFT" in out
+        assert "Hydra never sends this document automatically" in out
+        # No Spanish text leaking into the English console message.
+        assert "Reporte de cliente escrito en" not in out
+        assert "BORRADOR" not in out
+
+    def test_default_language_is_spanish_console_message_too(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        settings = _bare_run(tmp_path)
+        rc = cmd_client_report(settings, RUN_ID)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "BORRADOR" in out
