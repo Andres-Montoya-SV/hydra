@@ -53,6 +53,10 @@ ignore = [
 "tests/*" = ["S101", "S104", "S105", "S108", "S301", "B017"]
 "app.py" = ["E402"]
 "core/store.py" = ["S608"]
+# B008: FastAPI's dependency-injection convention IS `= Depends(...)` in
+#   an argument default — that's how the framework recognizes a
+#   dependency, not a real "mutable default"/eager-call bug.
+"api/routers/*.py" = ["B008"]
 "modules/naabu.py" = ["S105"]  # probe_pass is not a password
 
 [tool.mypy]

@@ -1,0 +1,17 @@
+# Paid EASM API (docs/PAID_API_DESIGN.md, api/) — a separately deployable
+# service, never required by app.py or the CLI. Install with:
+#   pip install -r requirements.txt -r requirements-api.txt
+#
+# FastAPI: confirmed against current docs (fastapi.tiangolo.com) as the
+# sensible choice for an async Python service that queues long-running
+# work (~25 min scans) without blocking, and serves fast status/report
+# GETs — native async def support, actively maintained.
+fastapi==0.141.1
+# uvicorn[standard]: FastAPI's own recommended ASGI server; the "standard"
+# extra pulls in the faster event loop / HTTP parser used for local dev
+# and the `--reload` flag.
+uvicorn[standard]==0.53.0
+# argon2-cffi: API key hashing (docs/PAID_API_DESIGN.md Part C) — Argon2id
+# is deliberately slow/salted, unlike the fast SHA256 lookup index stored
+# alongside it (see api/security.py).
+argon2-cffi==25.1.0

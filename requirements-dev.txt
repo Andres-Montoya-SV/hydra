@@ -6,3 +6,24 @@ mypy==1.15.0
 pytest==8.3.5
 pytest-asyncio==0.25.3
 ruff==0.11.2
+# httpx: only needed for fastapi.testclient.TestClient (tests/test_api_*.py)
+# — the API itself (requirements-api.txt) makes no outbound HTTP calls in
+# Round 1, so this is a test-only dependency, not a runtime one.
+#
+# IMPORTANT — name collision with the ProjectDiscovery `httpx` recon binary
+# this project also shells out to (modules/httpx.py): the Python `httpx`
+# PyPI package unconditionally installs a console-script entry point named
+# `httpx` (`httpx:main`) into this venv's bin/ directory. Once the venv is
+# activated, that shim resolves ahead of the real recon binary
+# (`/opt/homebrew/bin/httpx` or wherever it's actually installed) on PATH,
+# silently breaking every live network test that shells out to the real
+# tool (tests/test_httpx_confinement_live.py,
+# tests/test_redirect_destination_oracle.py,
+# tests/test_followup_adversarial_oracle.py — confirmed as the exact root
+# cause of all 10 of their failures the first time this dependency was
+# added). After `pip install -r requirements-dev.txt`, remove the shim so
+# PATH resolves to the real binary again:
+#   rm .venv/bin/httpx
+# This does not affect `import httpx` (the library) at all — only the
+# standalone CLI script pip also installs, which this project never uses.
+httpx==0.28.1

@@ -556,10 +556,187 @@ than needing to separately duplicate an authorization check.
 - https://docs.wompi.sv/autenticacion/autenticacion.md — OAuth2 client-credentials flow for Hydra→Wompi API auth
 - https://docs.wompi.sv/llms.txt — full documentation index (used to confirm no per-customer subscription-creation endpoint exists beyond the shared recurring-link model)
 
-## Explicitly deferred to Part 2
+---
 
-- Web framework choice (FastAPI/Flask/etc.)
-- Actual endpoint implementation, request/response schemas beyond what's sketched above
-- Client-facing dashboard/frontend
-- The exact per-subscriber identification mechanism for `EnlacePagoRecurrente` webhooks (D.1's open item) — needs a real Wompi sandbox account to observe
-- Postgres+RLS migration, if/when cross-tenant aggregate reporting is actually needed (F.2)
+## Round 1 implemented (`api/`) — Parts C, E, F
+
+Round 1 built the multi-tenant core, `X-API-Key` auth, and the async scan
+lifecycle — Parts A (domain-ownership verification), B (tiers/quotas),
+and D (Wompi) are deferred to Rounds 2/3. **Any authenticated account can
+scan any domain without restriction right now** — that is intentional
+scope for this round, not an oversight; it lets the core plumbing be
+proven before authorization/billing complexity sits in front of it.
+
+### Framework choice, confirmed against current docs, not memory
+
+FastAPI (`fastapi==0.141.1`, `uvicorn[standard]==0.53.0`) — confirmed
+directly against `fastapi.tiangolo.com` before pinning: actively
+maintained (a 2026 FastAPI Conf is scheduled), native `async def` request
+handlers, and `uvicorn` as its own documented recommended ASGI server.
+The scan orchestration itself uses a plain `asyncio.create_task` (no
+Celery/RQ + Redis) — see "Known Round 1 limitations" below for exactly
+what that trades away.
+
+### Repo layout
+
+`api/` is a separate, independently-deployable package — never imported
+by `app.py`, and it imports `app.py`'s own `_external_mode_preflight` /
+`_run_headless_pipeline` (deferred, inside `api/scan_orchestrator.py`)
+rather than reimplementing pipeline orchestration. `core/client_report/`
+is reused directly for `POST /scans/{id}/client-report` — that endpoint
+calls the exact same `cmd_client_report` the CLI does.
+
+### Running it locally
+
+```bash
+pip install -r requirements.txt -r requirements-api.txt -r requirements-dev.txt
+```
+
+**Important, and easy to miss**: the Python `httpx` package (needed only
+for `fastapi.testclient.TestClient` in tests) installs a console script
+also named `httpx`, which shadows the real ProjectDiscovery `httpx` recon
+binary this project shells out to once the venv is active. Remove the
+shim after installing, or every live network test (and any real scan
+that reaches the HTTP-probe stage) silently uses the wrong tool:
+
+```bash
+rm .venv/bin/httpx
+```
+
+(see `requirements-dev.txt`'s comment on the `httpx` line — this is the
+exact root cause that produced 10 failing tests the first time this
+dependency was added, confirmed by reproducing it on a clean checkout
+with only the venv's installed packages differing).
+
+Then run the service:
+
+```bash
+uvicorn api.main:app --reload
+# or, to control where account/scan data is stored:
+HYDRA_API_DATA_DIR=/path/to/data uvicorn api.main:app --reload
+```
+
+### Creating an account and a first key
+
+Round 1's `POST /accounts` is deliberately unauthenticated — there is no
+tier or billing gate to sit behind yet (Rounds 2/3). **This must be
+removed or gated behind payment/tier logic before this service is ever
+exposed publicly** (also stated in `api/routers/accounts.py`'s own
+module docstring, so it isn't missed when Part D lands):
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/accounts
+# {"account_id": "...", "api_key": "hydra_live_...", "key_id": "..."}
+```
+
+Save `api_key` now — it is never retrievable again, only revocable
+(`POST /keys/{key_id}/revoke`) or rotated with a 24h dual-validity window
+(`POST /keys/{key_id}/rotate`).
+
+### Full cycle — real sequence of calls and responses
+
+Captured from a real `uvicorn` process actually running on
+`127.0.0.1`, hit with real `curl` requests over a real TCP socket. The
+scan's own network collectors (subfinder/dnsx/httpx) were stubbed at the
+plugin-class boundary — the same "fixture fiel" pattern
+`tests/test_api_scans.py` uses — purely so this demonstration finishes in
+seconds instead of ~25 minutes; everything from the HTTP layer down
+through the control-plane database, per-account SQLite isolation, and
+`client-report` generation is the real, unstubbed production path.
+
+```
+$ curl -s -X POST http://127.0.0.1:8124/accounts
+{"account_id":"365e63d7fe988a6f49f08356b2a5b8e6","api_key":"hydra_live_e2cd76050d450109ba79236e0b7c12593bfa940e23b4b6c179be306262060f6d","key_id":"4917a887f85a499688d1ecd2ca9ac71d"}
+HTTP_STATUS:201
+
+$ curl -s -X POST http://127.0.0.1:8124/scans \
+    -H "X-API-Key: hydra_live_e2cd76050d450109ba79236e0b7c12593bfa940e23b4b6c179be306262060f6d" \
+    -d '{"domain": "demo-target.example"}'
+{"scan_id":"e0affa088c9c19f09b26ea3336456154","status":"queued"}
+HTTP_STATUS:202
+
+$ curl -s http://127.0.0.1:8124/scans/e0affa088c9c19f09b26ea3336456154 \
+    -H "X-API-Key: hydra_live_e2cd..."
+{"scan_id":"e0affa088c9c19f09b26ea3336456154","domain":"demo-target.example","status":"completed", ...}
+HTTP_STATUS:200
+
+$ curl -s http://127.0.0.1:8124/scans/e0affa088c9c19f09b26ea3336456154/report \
+    -H "X-API-Key: hydra_live_e2cd..."
+{"targets_count":1,"subdomains_count":1,"resolved_count":1,"alive_count":1, ...}
+HTTP_STATUS:200
+
+$ curl -s -X POST http://127.0.0.1:8124/scans/e0affa088c9c19f09b26ea3336456154/client-report \
+    -H "X-API-Key: hydra_live_e2cd..." -d '{"format":"markdown","language":"en"}'
+Security Report — demo-target.example
+...
+## What You Need to Know
+
+No vulnerability was confirmed with real evidence of impact in this review. ...
+HTTP_STATUS:200
+
+# A second account, with the EXACT same scan_id, gets a plain 404 — the
+# scan effectively doesn't exist from its point of view:
+$ curl -s -X POST http://127.0.0.1:8124/accounts   # second, unrelated account
+{"account_id":"c34387bcaaab0d7af8091c34a0f896c4", "api_key": "hydra_live_787ff3...", ...}
+$ curl -s http://127.0.0.1:8124/scans/e0affa088c9c19f09b26ea3336456154 \
+    -H "X-API-Key: hydra_live_787ff3..."
+{"detail":"Scan not found"}
+HTTP_STATUS:404
+```
+
+A real (non-stubbed) attempt against `example.com` was also run during
+this round's verification — it correctly progressed through
+`queued → running` (real WHOIS + subfinder execution, visible in the
+server's own logs) before ultimately failing with a genuine `dnsx`
+timeout under external-target-mode's conservative rate limiting, the
+same characteristic already documented from this project's Docker
+Quickstart validation (a similar public domain returned 22,000+
+subdomains for that same conservative-rate-limit machinery to resolve
+within its timeout). That's a real, expected pipeline characteristic for
+a large attack surface under conservative defaults, not an API bug — the
+scan's `status` correctly transitioned to `"failed"` with a real,
+specific `error_message`, which is exactly the behavior `GET /scans/{id}`
+exists to surface.
+
+### Known Round 1 limitations (stated explicitly, not silently assumed away)
+
+- **Scan orchestration is single-process, in-memory** (`asyncio.create_task`
+  in `api/scan_orchestrator.py`) — correct for one `uvicorn` worker, not a
+  durable job queue. A process restart abandons in-flight scans (their
+  `scans` row stays `"running"` forever; no reconciliation job exists yet
+  to detect and requeue/fail them).
+- **Rate limiting is single-process, in-memory** (`api/rate_limit.py`) —
+  resets on restart, doesn't coordinate across multiple worker processes.
+- **`POST /accounts` is unauthenticated** — acceptable only because there
+  is nothing to gate it with yet; must be closed off before Part D ships.
+- Both limitations above are the same "correct for one worker, not yet
+  correct at scale" tradeoff, made once and stated once rather than
+  hidden in two different files.
+
+### Tests
+
+`tests/test_api_auth.py` (account/key creation, revocation, the 24h
+rotation dual-validity window — tested by moving `expires_at` into the
+past directly in the control DB rather than sleeping a day or mocking
+`datetime.now()` globally —, and per-key rate limiting), plus
+`tests/test_api_scans.py`/`tests/test_api_client_report.py` (full async
+scan lifecycle, cross-account isolation with the exact same `scan_id`,
+and byte-for-byte parity between the API's `client-report` endpoint and
+calling `cmd_client_report` directly against the same account data).
+
+## Explicitly deferred to Part 2 / Rounds 2-3
+
+- Web framework choice — resolved in Round 1: FastAPI, confirmed above.
+- Domain-ownership verification (Part A), tiers/quotas (Part B), Wompi
+  billing (Part D) — Round 1 has none of these; any authenticated
+  account can scan any domain without restriction.
+- Client-facing dashboard/frontend (built separately, Next.js/Firebase —
+  this API never knows Firebase exists; `X-API-Key` only).
+- A durable job queue and a shared (Redis-backed) rate limiter, for a
+  multi-worker deployment — Round 1's in-memory versions are correct for
+  a single `uvicorn` worker only (see "Known Round 1 limitations" above).
+- The exact per-subscriber identification mechanism for
+  `EnlacePagoRecurrente` webhooks (Part D.1's open item) — needs a real
+  Wompi sandbox account to observe.
+- Postgres+RLS migration, if/when cross-tenant aggregate reporting is
+  actually needed (Part F.2).
