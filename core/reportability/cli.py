@@ -46,11 +46,15 @@ _PROGRAM_RULES_ARTIFACT_NAME = "program_rules_snapshot.txt"
 _ADVERSARIAL_OVERHEAD_TOKENS_PER_FINDING = 150
 
 
-def _provider_env_var(provider_name: str) -> str:
+def provider_env_var(provider_name: str) -> str:
+    """Public: also used by `engagement` to skip this step quietly when
+    unconfigured, instead of duplicating this provider/env-var mapping.
+    """
     return "ANTHROPIC_API_KEY" if provider_name == "anthropic" else "OPENAI_API_KEY"
 
 
-def _provider_credentials(settings: Settings, provider_name: str) -> tuple[str | None, str]:
+def provider_credentials(settings: Settings, provider_name: str) -> tuple[str | None, str]:
+    """Public: see `provider_env_var` above — same reuse reason."""
     if provider_name == "anthropic":
         return settings.anthropic_api_key, settings.anthropic_model
     return settings.openai_api_key, settings.openai_model
@@ -103,10 +107,10 @@ def cmd_assess_reportability(
             )
             return 1
 
-    api_key, model = _provider_credentials(settings, provider_name)
+    api_key, model = provider_credentials(settings, provider_name)
     if not api_key:
         print(
-            f"Error: {_provider_env_var(provider_name)} is not configured. This command is "
+            f"Error: {provider_env_var(provider_name)} is not configured. This command is "
             "opt-in and does nothing without it — see docs/REPORTABILITY_AGENT_DESIGN.md and "
             "config/.env.example.",
             file=sys.stderr,
@@ -116,10 +120,10 @@ def cmd_assess_reportability(
     adversarial_api_key: str | None = None
     adversarial_model = ""
     if adversarial_name is not None:
-        adversarial_api_key, adversarial_model = _provider_credentials(settings, adversarial_name)
+        adversarial_api_key, adversarial_model = provider_credentials(settings, adversarial_name)
         if not adversarial_api_key:
             print(
-                f"Error: {_provider_env_var(adversarial_name)} is not configured — required "
+                f"Error: {provider_env_var(adversarial_name)} is not configured — required "
                 "for --adversarial-provider.",
                 file=sys.stderr,
             )

@@ -17,6 +17,7 @@ from config.settings import Settings
 from core.exceptions import ConfigurationError, ReconError, ValidationError
 from core.heads import HEAD_BLURBS, print_banner
 from core.logger import get_logger, setup_logging
+from core.models import PipelineContext
 from core.runner import PipelineRunner
 from core.tool_manager import ToolManager
 from ui.dashboard import run_with_dashboard
@@ -281,6 +282,81 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    engagement_p = subparsers.add_parser(
+        "engagement",
+        help=(
+            "Run recon, then walk through reportability assessment and a client-report "
+            "draft in one guided flow — same confirmation gates as running each step by "
+            "hand, never skips a money-spending confirmation, always headless (no dashboard)"
+        ),
+    )
+    engagement_p.add_argument("-d", "--domain", help="Single target domain (e.g. example.com)")
+    engagement_p.add_argument(
+        "-f",
+        "--file",
+        type=Path,
+        dest="targets_file",
+        help="File with target domains (one per line)",
+    )
+    engagement_p.add_argument("--run-id", help="Custom run identifier for output directory")
+    engagement_p.add_argument(
+        "--no-banner",
+        action="store_true",
+        help="Suppress the startup ASCII banner (also: HYDRA_NO_BANNER=1)",
+    )
+    engagement_p.add_argument(
+        "--external",
+        action="store_true",
+        help=(
+            "Force external-target-mode conservative defaults (lower rate limits; "
+            "confirm before running active modules) regardless of OWNED_DOMAINS. "
+            "Applied automatically when the target isn't in OWNED_DOMAINS."
+        ),
+    )
+    engagement_p.add_argument(
+        "--program-rules",
+        type=Path,
+        help=(
+            "Path to the program's rules text — enables the reportability-assessment "
+            "step below. Omit to skip that step automatically (same effect as "
+            "--skip-reportability)."
+        ),
+    )
+    engagement_p.add_argument(
+        "--provider",
+        choices=["anthropic", "openai"],
+        help=(
+            "Reportability primary provider, if that step runs "
+            "(default: REPORTABILITY_PROVIDER, itself defaulting to anthropic)"
+        ),
+    )
+    engagement_p.add_argument(
+        "--adversarial-provider",
+        choices=["anthropic", "openai"],
+        help=(
+            "Reportability adversarial provider, if that step runs "
+            "(default: REPORTABILITY_ADVERSARIAL_PROVIDER, unset by default = disabled)"
+        ),
+    )
+    engagement_p.add_argument(
+        "--client-report-format",
+        dest="client_report_format",
+        choices=["markdown", "docx"],
+        help=(
+            "Client-report format to use if you accept that step " "(default: ask interactively)"
+        ),
+    )
+    engagement_p.add_argument(
+        "--skip-reportability",
+        action="store_true",
+        help="Never offer the reportability-assessment step, interactive or not",
+    )
+    engagement_p.add_argument(
+        "--skip-client-report",
+        action="store_true",
+        help="Never offer the client-report-draft step, interactive or not",
+    )
+
     return parser
 
 
@@ -392,6 +468,57 @@ def _external_mode_preflight(args: argparse.Namespace, settings: Settings) -> bo
     return True
 
 
+async def _run_headless_pipeline(
+    settings: Settings,
+    *,
+    domain: str | None,
+    targets_file: Path | None,
+    run_id: str | None,
+) -> tuple[int, PipelineContext]:
+    """Run the reconnaissance pipeline without the terminal dashboard,
+    printing the exact same dependency report / completion line /
+    verification-flags summary line `run --no-ui` has always printed.
+    Shared by `cmd_run` and the `engagement` orchestrator below, so the
+    latter never reimplements pipeline execution — it only chains onto it.
+    """
+    setup_logging(settings.log_level, settings.project_root / settings.logs_directory)
+    from ui.dependency_report import render_dependency_report
+
+    manager = ToolManager(settings)
+    reports = await manager.dependency_service.analyze_all()
+    enabled = frozenset(p.name for p in manager.get_all_plugins() if p.is_enabled()) | {
+        "subfinder",
+        "dnsx",
+        "httpx",
+    }
+    render_dependency_report(reports, enabled_only=True, enabled_names=enabled)
+
+    app_logger = get_logger("app")
+    app_logger.info("Starting pipeline: %s", settings.to_safe_dict())
+
+    runner = PipelineRunner(settings)
+    context = await runner.run(domain=domain, targets_file=targets_file, run_id=run_id)
+    if context.errors:
+        for err in context.errors:
+            app_logger.error(err)
+    print(f"\nComplete. Output: {context.output_dir}")
+    print(
+        f"Subdomains: {len(context.subdomains)} | "
+        f"Resolved: {len(context.resolved)} | "
+        f"Alive: {len(context.alive_urls)}"
+    )
+    if context.run_id:
+        from core.store import AssetStore
+        from core.verification.grounding import summarize_verification_flags
+        from ui.tables import verification_summary_line
+
+        db_path = settings.project_root / settings.output_directory / "recon.db"
+        if db_path.exists():
+            flags = AssetStore(db_path).get_verification_flags(context.run_id)
+            print(verification_summary_line(summarize_verification_flags(flags)))
+    return (1 if context.errors else 0), context
+
+
 async def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
     """Execute the reconnaissance pipeline."""
     if not args.domain and not args.targets_file:
@@ -404,46 +531,10 @@ async def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
         return 1
 
     if args.no_ui:
-        setup_logging(settings.log_level, settings.project_root / settings.logs_directory)
-        from ui.dependency_report import render_dependency_report
-
-        manager = ToolManager(settings)
-        reports = await manager.dependency_service.analyze_all()
-        enabled = frozenset(p.name for p in manager.get_all_plugins() if p.is_enabled()) | {
-            "subfinder",
-            "dnsx",
-            "httpx",
-        }
-        render_dependency_report(reports, enabled_only=True, enabled_names=enabled)
-
-        app_logger = get_logger("app")
-        app_logger.info("Starting pipeline: %s", settings.to_safe_dict())
-
-        runner = PipelineRunner(settings)
-        context = await runner.run(
-            domain=args.domain,
-            targets_file=args.targets_file,
-            run_id=args.run_id,
+        rc, _context = await _run_headless_pipeline(
+            settings, domain=args.domain, targets_file=args.targets_file, run_id=args.run_id
         )
-        if context.errors:
-            for err in context.errors:
-                app_logger.error(err)
-        print(f"\nComplete. Output: {context.output_dir}")
-        print(
-            f"Subdomains: {len(context.subdomains)} | "
-            f"Resolved: {len(context.resolved)} | "
-            f"Alive: {len(context.alive_urls)}"
-        )
-        if context.run_id:
-            from core.store import AssetStore
-            from core.verification.grounding import summarize_verification_flags
-            from ui.tables import verification_summary_line
-
-            db_path = settings.project_root / settings.output_directory / "recon.db"
-            if db_path.exists():
-                flags = AssetStore(db_path).get_verification_flags(context.run_id)
-                print(verification_summary_line(summarize_verification_flags(flags)))
-        return 1 if context.errors else 0
+        return rc
 
     context = await run_with_dashboard(
         settings,
@@ -452,6 +543,161 @@ async def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
         run_id=args.run_id,
     )
     return 1 if context.errors else 0
+
+
+def _print_engagement_summary(generated: list[str]) -> None:
+    print(f"\n{'=' * 70}")
+    print("ENGAGEMENT SUMMARY")
+    print("=" * 70)
+    for line in generated:
+        print(f"  - {line}")
+    print(
+        "\nNothing above was sent or published automatically — review each artifact "
+        "yourself before sharing it."
+    )
+
+
+async def cmd_engagement(args: argparse.Namespace, settings: Settings) -> int:
+    """`python app.py engagement` — the one-command version of the manual
+    run -> investigate/verification-flags -> assess-reportability ->
+    client-report sequence an operator otherwise has to remember and drive
+    by hand. It chains those commands' own existing entry points, in that
+    order, unchanged — every individual command still works exactly as it
+    does today for anyone who wants to run a step by itself. Always runs
+    the pipeline headless (no dashboard), since the guided prompts below
+    need a normal top-to-bottom terminal flow.
+    """
+    if not args.domain and not args.targets_file:
+        print("Error: Provide --domain or --file", file=sys.stderr)
+        return 1
+
+    _validate_cli_paths(args)
+
+    if not _external_mode_preflight(args, settings):
+        return 1
+
+    rc, context = await _run_headless_pipeline(
+        settings, domain=args.domain, targets_file=args.targets_file, run_id=args.run_id
+    )
+    if rc != 0 or not context.run_id:
+        print(
+            "\nReconnaissance run did not complete cleanly — stopping before the "
+            "optional reportability/client-report steps.",
+            file=sys.stderr,
+        )
+        return rc or 1
+
+    run_id = context.run_id
+    domain = args.domain or (context.targets[0].domain if context.targets else "")
+    generated = [f"Reconnaissance run {run_id!r}: {context.output_dir}"]
+
+    from core.intel.cli import cmd_investigate, cmd_verification_flags, default_db
+
+    db_path = default_db(settings.project_root, settings.output_directory)
+    print(f"\n{'=' * 70}")
+    print("RUN SUMMARY")
+    print("=" * 70)
+    if db_path.exists() and domain:
+        cmd_investigate(db_path, domain, run_id, None)
+        cmd_verification_flags(db_path, run_id)
+
+    # --- Reportability assessment: opt-in, spends real API credits. Reuses
+    # assess-reportability's own cost-estimate + confirmation gate
+    # unmodified — this step never asks a second, different question, it
+    # just decides whether to invoke that exact same flow.
+    if args.skip_reportability:
+        print("\nSkipping reportability assessment (--skip-reportability).")
+    elif not args.program_rules:
+        print(
+            "\nSkipping reportability assessment — no --program-rules file provided "
+            "(same as --skip-reportability)."
+        )
+    else:
+        from core.reportability.cli import (
+            cmd_assess_reportability,
+            provider_credentials,
+            provider_env_var,
+        )
+        from core.reportability.provider import SUPPORTED_PROVIDERS
+
+        provider_name = args.provider or settings.reportability_provider
+        api_key = None
+        if provider_name in SUPPORTED_PROVIDERS:
+            api_key, _ = provider_credentials(settings, provider_name)
+        if not api_key:
+            env_var = (
+                provider_env_var(provider_name)
+                if provider_name in SUPPORTED_PROVIDERS
+                else "ANTHROPIC_API_KEY/OPENAI_API_KEY"
+            )
+            print(
+                f"\nSkipping reportability assessment — {env_var} is not configured. "
+                "This step is opt-in and does nothing without it — see "
+                "docs/REPORTABILITY_AGENT_DESIGN.md and config/.env.example."
+            )
+        else:
+            print(f"\n{'=' * 70}")
+            print("REPORTABILITY ASSESSMENT — optional, spends real API credits")
+            print("=" * 70)
+            if not sys.stdin.isatty():
+                print(
+                    "Non-interactive stdin — refusing to spend API credits without "
+                    "confirmation (fail closed). Re-run with a terminal attached to "
+                    "confirm, or pass --skip-reportability in an automated context "
+                    "you control.",
+                    file=sys.stderr,
+                )
+                return 1
+            assess_rc = cmd_assess_reportability(
+                settings,
+                run_id,
+                args.program_rules,
+                provider=args.provider,
+                adversarial_provider=args.adversarial_provider,
+                yes=False,
+            )
+            if assess_rc != 0:
+                # Declined, fail-closed, or a real error — assess-reportability
+                # already printed the specific reason itself. Either way this
+                # optional step didn't complete, so the chain stops here
+                # without asking about a client report next.
+                _print_engagement_summary(generated)
+                return 0
+            generated.append(f"Reportability assessment: persisted for run {run_id!r}")
+
+    # --- Client report draft: never sent anywhere automatically. ---
+    if args.skip_client_report:
+        print("\nSkipping client report draft (--skip-client-report).")
+    else:
+        print(f"\n{'=' * 70}")
+        print("CLIENT REPORT DRAFT — optional")
+        print("=" * 70)
+        if not sys.stdin.isatty():
+            print(
+                "Non-interactive stdin — skipping the client report draft (never "
+                "assumes yes). Pass --skip-client-report to silence this, or run "
+                "`client-report` directly once you can confirm interactively."
+            )
+        else:
+            answer = input("Generate a client report draft? [y/N]: ")
+            if answer.strip().lower() in {"y", "yes"}:
+                report_format = args.client_report_format
+                if report_format is None:
+                    fmt_answer = input("Format — markdown or docx? [markdown]: ").strip().lower()
+                    report_format = fmt_answer or "markdown"
+                    if report_format not in {"markdown", "docx"}:
+                        print(f"Unrecognized format {report_format!r} — using markdown.")
+                        report_format = "markdown"
+                from core.client_report.cli import cmd_client_report
+
+                report_rc = cmd_client_report(settings, run_id, output_format=report_format)
+                if report_rc == 0:
+                    generated.append(f"Client report draft ({report_format})")
+            else:
+                print("Declined — no client report generated.")
+
+    _print_engagement_summary(generated)
+    return 0
 
 
 async def cmd_check_tools(settings: Settings) -> int:
@@ -625,6 +871,9 @@ def main() -> int:
             # be able to run against an invalid configuration to explain it.
             settings.validate_or_raise()
             return asyncio.run(cmd_run(args, settings))
+        if args.command == "engagement":
+            settings.validate_or_raise()
+            return asyncio.run(cmd_engagement(args, settings))
         if args.command == "check-tools":
             return asyncio.run(cmd_check_tools(settings))
         if args.command == "list-plugins":
