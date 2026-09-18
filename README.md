@@ -14,23 +14,40 @@ mandatory, most optional) orchestrated by an async runner, gated
 end-to-end by a real scope/authorization layer and a live confinement
 proxy that routes every tool-issued connection — not just the initial
 input file — through an authorization check before it reaches the
-network. On top of that sit three independent, tested intelligence
-layers: an OSINT correlation engine that turns shared certificates/IPs
-into evidence-backed relationships (never attribution), a deterministic
-verification agent that doubts Hydra's own results before they reach a
-report, and an LLM-backed reportability agent (Claude and/or OpenAI, with
-optional adversarial cross-validation between the two) that triages
-whether a finding is likely eligible under a program's own bounty rules —
-never authoritative over scope or evidence, always a standalone,
-opt-in step a human reviews. Everything persists to SQLite with real,
-enforced foreign keys. It ships as a non-root Docker image with a
-minimally-scoped Linux capability set, and has real CI across three
-Python versions plus a containerized network-confinement re-verification
-on every pull request. As of the most recent full audit
-(`docs/FINAL_PROJECT_AUDIT.md`), 844 tests pass consistently and
-reproducibly — see that document, and the "Known limitations" section
-below, for exactly what does not work yet rather than a marketing gloss
-over it.
+network. On top of that sit four independent, tested intelligence layers,
+each a standalone, opt-in step a human reviews — never authoritative over
+scope or evidence on its own:
+
+- An OSINT **correlation engine** that turns shared certificates/IPs into
+  evidence-backed relationships, never attribution
+  (`docs/CORRELATION_ENGINE_DESIGN.md`).
+- A deterministic **verification agent** that doubts Hydra's own results
+  before they reach a report (`docs/VERIFICATION_AGENT_DESIGN.md`).
+- An LLM-backed **reportability agent** (`python app.py
+  assess-reportability`; Claude and/or OpenAI, with optional adversarial
+  cross-validation between the two) that triages whether a finding is
+  likely eligible under a program's own bounty rules
+  (`docs/REPORTABILITY_AGENT_DESIGN.md`).
+- An LLM-backed **hypothesis engine** (`python app.py
+  suggest-hypotheses`) that reads a run's already-correlated
+  relationships and proposes investigation leads a human analyst would
+  want to look at — every factual claim it cites is mechanically
+  re-verified against the real SQLite data for that run, never trusted on
+  the LLM's word alone (`docs/HYPOTHESIS_ENGINE_DESIGN.md`).
+
+A fifth, non-LLM standalone command (`python app.py client-report`) turns
+a run's persisted findings into a plain-language, tool-name-free draft
+report — Markdown or Word — ready for a human to review before it ever
+reaches a client (`docs/CLIENT_REPORT.md`).
+
+Everything persists to SQLite with real, enforced foreign keys. It ships
+as a non-root Docker image with a minimally-scoped Linux capability set,
+and has real CI across three Python versions plus a containerized
+network-confinement re-verification on every pull request. As of the
+most recent full audit (`docs/FINAL_PROJECT_AUDIT.md`), 844 tests pass
+consistently and reproducibly — see that document, and the "Known
+limitations" section below, for exactly what does not work yet rather
+than a marketing gloss over it.
 
 ## Why it exists
 
@@ -349,7 +366,8 @@ authoritative list with inline documentation for every variable.
 | `MAX_DISCOVERY_DEPTH` | Follow-up depth (0 = seeds only) | `1` |
 | `ENABLE_FOLLOWUP_COLLECTION` | One bounded follow-up pass after the seed collect | `true` |
 | `REPORTABILITY_PROVIDER` / `REPORTABILITY_ADVERSARIAL_PROVIDER` | LLM provider(s) for `assess-reportability` (`anthropic`/`openai`) | `anthropic` / unset |
-| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Credentials for the reportability agent — only consulted by `assess-reportability`, never by `run` | — |
+| `HYPOTHESIS_PROVIDER` / `HYPOTHESIS_ADVERSARIAL_PROVIDER` | LLM provider(s) for `suggest-hypotheses` — same shape as the reportability pair above, same shared credentials below | `anthropic` / unset |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Shared credentials for both LLM-backed commands (`assess-reportability`, `suggest-hypotheses`) — only consulted when one of those is actually run, never by `run` | — |
 | `X_HACKERONE_RESEARCHER` / `RESEARCHER_ATTRIBUTION_HEADER` / `ATTRIBUTION_USER_AGENT` | Program-mandated researcher identification | — |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
 
@@ -375,11 +393,19 @@ python app.py relationships example.com
 python app.py evidence example.com
 python app.py certificates example.com
 python app.py indicators example.com
+python app.py explain-collection <id>                # why an indicator was/wasn't collected
 python app.py diff example.com                       # or: diff run_a run_b
+python app.py verification-flags RUN_ID              # contradiction flags for a run
 
 python app.py assess-reportability RUN_ID \
   --program-rules rules.txt \
   --provider anthropic --adversarial-provider openai  # opt-in, spends real API credits
+
+python app.py suggest-hypotheses RUN_ID \
+  --provider anthropic --adversarial-provider openai  # opt-in, spends real API credits
+
+python app.py client-report RUN_ID                    # Markdown draft (default)
+python app.py client-report RUN_ID --format docx      # Word draft — see docs/CLIENT_REPORT.md
 ```
 
 </details>
@@ -391,7 +417,12 @@ Each run writes to `output/<run_id>/`: per-tool artifacts (`httpx.json`,
 `dnsx_records.jsonl`, …), `summary.json`, `overview.md`, and an
 interactive HTML report. Everything also persists to the shared
 `output/recon.db` SQLite database, queryable across runs without
-re-scanning (see the CLI reference above).
+re-scanning (see the CLI reference above). `assess-reportability`,
+`suggest-hypotheses`, and `client-report` each add their own artifact to
+the same run directory when explicitly run (a `program_rules_snapshot.txt`,
+persisted rows queryable via the CLI, and `client_report.md`/`.docx`
+respectively) — none of them run automatically, and none of their output
+is generated unless the operator invokes that command by name.
 
 </details>
 

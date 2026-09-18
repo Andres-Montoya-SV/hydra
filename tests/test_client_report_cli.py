@@ -194,7 +194,7 @@ class TestPilotStructureRegression:
         assert "Qué NO cubre este análisis" in text
 
         out = capsys.readouterr().out
-        assert "BORRADOR" in out
+        assert "DRAFT" in out
 
     def test_no_tool_names_anywhere_in_the_document(self, tmp_path: Path) -> None:
         _seed_pilot_run(tmp_path)
