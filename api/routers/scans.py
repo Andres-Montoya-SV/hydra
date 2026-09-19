@@ -14,11 +14,13 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from api.auth import AuthContext, require_api_key
-from api.control_db import ControlDB, ScanRecord
+from api.control_db import ControlDB, DomainVerificationRecord, ScanRecord
+from api.domain_verification import classify_scan_gate, normalize_domain
 from api.scan_orchestrator import execute_scan
 from api.schemas import (
     ClientReportRequest,
@@ -47,6 +49,38 @@ def _owned_scan_or_404(control_db: ControlDB, scan_id: str, account_id: str) -> 
     return scan
 
 
+def _require_verified_domain_or_403(control_db: ControlDB, account_id: str, domain: str) -> None:
+    """Part A's non-negotiable gate (docs/PAID_API_DESIGN.md) — lives
+    directly in `create_scan` below, on the exact same mandatory
+    `account_id` every other account-scoped lookup in this file already
+    requires, rather than as a separate dependency/middleware layer a
+    future route could add without remembering to include it."""
+    status, record = classify_scan_gate(
+        domain,
+        active_verifications=control_db.get_verified_domains_for_account(account_id),
+        all_verifications=control_db.get_all_verifications_for_account(account_id),
+    )
+    if status == "covered":
+        return
+    if status == "expired":
+        expired = cast(DomainVerificationRecord, record)
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Verification for {expired.domain!r} expired on {expired.expires_at}. "
+                f"POST /domains {{'domain': '{expired.domain}'}} to re-verify before scanning."
+            ),
+        )
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"Domain {domain!r} is not verified for this account. "
+            f"POST /domains {{'domain': '{domain}'}} to start verification, then "
+            "POST /domains/{domain}/verify."
+        ),
+    )
+
+
 @router.post("", response_model=CreateScanResponse, status_code=202)
 async def create_scan(
     body: CreateScanRequest,
@@ -56,10 +90,13 @@ async def create_scan(
     control_db = _control_db(request)
     api_settings = _api_settings(request)
 
+    domain = normalize_domain(body.domain)
+    _require_verified_domain_or_403(control_db, auth.account_id, domain)
+
     scan_id = secrets.token_hex(16)
     db_path = str(account_settings(api_settings, auth.account_id).project_root)
     control_db.create_scan(
-        scan_id=scan_id, account_id=auth.account_id, domain=body.domain, db_path=db_path
+        scan_id=scan_id, account_id=auth.account_id, domain=domain, db_path=db_path
     )
 
     # Fire-and-forget: the request returns immediately with "queued";
@@ -72,7 +109,7 @@ async def create_scan(
             control_db=control_db,
             account_id=auth.account_id,
             scan_id=scan_id,
-            domain=body.domain,
+            domain=domain,
         )
     )
     request.app.state.background_tasks.add(task)

@@ -15,3 +15,22 @@ uvicorn[standard]==0.53.0
 # is deliberately slow/salted, unlike the fast SHA256 lookup index stored
 # alongside it (see api/security.py).
 argon2-cffi==25.1.0
+# dnspython: a real DNS TXT query for domain-ownership verification
+# (docs/PAID_API_DESIGN.md Part A, api/domain_verification.py::verify_dns_txt)
+# — stdlib `socket` has no TXT-record support (only A/AAAA via
+# getaddrinfo). Pure-Python, no external `dig`/`nslookup` binary needed,
+# so this works the same whether or not the deployment host happens to
+# have Hydra's own recon tools (dnsx) installed — the API must not depend
+# on those being present.
+dnspython==2.8.0
+# httpx: now a REAL runtime dependency, not just test tooling — the
+# well-known-file verification method
+# (api/domain_verification.py::verify_well_known_file) makes a real
+# outbound HTTPS GET to the domain being verified. Previously only
+# requirements-dev.txt needed this (fastapi.testclient.TestClient); kept
+# pinned there too, at the same version, for anyone who installs test
+# dependencies without deploying the API. See that file's own comment for
+# the console-script name-collision this package's `pip install` causes
+# with the ProjectDiscovery `httpx` recon binary — already defended
+# against (core/dependencies/), not a new concern introduced here.
+httpx==0.28.1

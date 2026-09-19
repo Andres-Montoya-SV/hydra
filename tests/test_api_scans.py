@@ -22,6 +22,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("argon2")
 pytest.importorskip("httpx")
 
+from _verified_domain import seed_verified_domain  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from api.main import create_app  # noqa: E402
@@ -111,8 +112,16 @@ def _client(tmp_path: Path) -> TestClient:
     return TestClient(create_app(settings))
 
 
-def _create_account(client: TestClient) -> str:
-    return client.post("/accounts").json()["api_key"]
+def _create_account(client: TestClient, *, verified_domain: str = SEED) -> str:
+    """Creates an account and pre-seeds it as the verified owner of
+    `verified_domain` (Round 2's mandatory gate — see
+    tests/_verified_domain.py) so this file's Round-1-era tests, whose
+    subject is the scan lifecycle/isolation, can call `POST /scans`
+    exactly as before rather than performing real domain verification in
+    every test."""
+    body = client.post("/accounts").json()
+    seed_verified_domain(client, body["account_id"], verified_domain)
+    return body["api_key"]
 
 
 def _wait_for_terminal_status(

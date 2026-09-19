@@ -58,6 +58,31 @@ CREATE TABLE IF NOT EXISTS scans (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_scans_account_id ON scans(account_id);
+
+-- Part A (docs/PAID_API_DESIGN.md) domain-ownership verification. One row
+-- per verification ATTEMPT, not per (account, domain) — a new attempt
+-- (re-verify, retry after a failed check, renewal after expiry) is a new
+-- row, never an in-place mutation of history. `status` is one of
+-- 'pending' (token issued, no successful check yet), 'verified' (a real
+-- DNS/HTTP check succeeded), 'failed' (a real check was attempted and did
+-- not confirm the token), 'superseded' (this account's own older
+-- verified/pending row for the same domain, replaced by a newer one).
+CREATE TABLE IF NOT EXISTS domain_verifications (
+    verification_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(account_id),
+    domain TEXT NOT NULL,
+    token TEXT NOT NULL,
+    method TEXT,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    verified_at TEXT,
+    expires_at TEXT,
+    last_checked_at TEXT,
+    last_check_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_domain_verifications_domain ON domain_verifications(domain);
+CREATE INDEX IF NOT EXISTS idx_domain_verifications_account
+    ON domain_verifications(account_id, domain);
 """
 
 
@@ -86,6 +111,21 @@ class ScanRecord:
     error_message: str | None
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class DomainVerificationRecord:
+    verification_id: str
+    account_id: str
+    domain: str
+    token: str
+    method: str | None
+    status: str
+    created_at: str
+    verified_at: str | None
+    expires_at: str | None
+    last_checked_at: str | None
+    last_check_error: str | None
 
 
 class ControlDB:
@@ -242,6 +282,151 @@ class ControlDB:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    # --- domain verification (Part A) --------------------------------
+
+    def create_domain_verification(
+        self, *, account_id: str, domain: str, token: str
+    ) -> DomainVerificationRecord:
+        verification_id = secrets.token_hex(16)
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO domain_verifications "
+                "(verification_id, account_id, domain, token, method, status, created_at) "
+                "VALUES (?, ?, ?, ?, NULL, 'pending', ?)",
+                (verification_id, account_id, domain, token, now),
+            )
+        return DomainVerificationRecord(
+            verification_id=verification_id,
+            account_id=account_id,
+            domain=domain,
+            token=token,
+            method=None,
+            status="pending",
+            created_at=now,
+            verified_at=None,
+            expires_at=None,
+            last_checked_at=None,
+            last_check_error=None,
+        )
+
+    def get_latest_pending_verification(
+        self, account_id: str, domain: str
+    ) -> DomainVerificationRecord | None:
+        """The token a client is currently trying to prove — the most
+        recent 'pending' row for this exact (account, domain). Never
+        returns another account's row (account_id is always part of the
+        WHERE clause, same discipline as every other lookup here)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM domain_verifications "
+                "WHERE account_id = ? AND domain = ? AND status = 'pending' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (account_id, domain),
+            ).fetchone()
+        return None if row is None else _verification_record_from_row(row)
+
+    def get_active_verification_for_domain(
+        self, domain: str, *, now: str | None = None
+    ) -> DomainVerificationRecord | None:
+        """The current, unexpired 'verified' row for `domain`, across ALL
+        accounts — used only for the conflict check at the moment a NEW
+        verification is about to succeed (Task 3.2: first successful
+        verification wins). Never used to authorize a scan directly —
+        that always goes through `get_active_verifications_for_account`,
+        scoped to one account, never a bare domain lookup."""
+        now = now or _now_iso()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM domain_verifications "
+                "WHERE domain = ? AND status = 'verified' AND expires_at > ? "
+                "ORDER BY verified_at DESC LIMIT 1",
+                (domain, now),
+            ).fetchone()
+        return None if row is None else _verification_record_from_row(row)
+
+    def get_all_verifications_for_account(self, account_id: str) -> list[DomainVerificationRecord]:
+        """Every row this account has ever had, any domain, newest
+        first — used to distinguish "never verified" from "verified
+        once, now expired" (Task 3, test 6) by filtering for domain
+        coverage in Python (api/domain_verification.py::domain_is_covered),
+        the same subdomain-aware matching the scan gate itself uses,
+        rather than a second, narrower SQL-only exact-match notion of
+        "the same domain"."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM domain_verifications WHERE account_id = ? "
+                "ORDER BY created_at DESC",
+                (account_id,),
+            ).fetchall()
+        return [_verification_record_from_row(row) for row in rows]
+
+    def get_verified_domains_for_account(
+        self, account_id: str, *, now: str | None = None
+    ) -> list[DomainVerificationRecord]:
+        """Every currently-active (verified, unexpired) domain this
+        account holds — the scan gate checks scan target coverage
+        against this list in Python (subdomain matching), not SQL."""
+        now = now or _now_iso()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM domain_verifications "
+                "WHERE account_id = ? AND status = 'verified' AND expires_at > ?",
+                (account_id, now),
+            ).fetchall()
+        return [_verification_record_from_row(row) for row in rows]
+
+    def mark_verification_succeeded(
+        self, verification_id: str, *, method: str, verified_at: str, expires_at: str
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE domain_verifications SET status = 'verified', method = ?, "
+                "verified_at = ?, expires_at = ?, last_checked_at = ?, last_check_error = NULL "
+                "WHERE verification_id = ?",
+                (method, verified_at, expires_at, verified_at, verification_id),
+            )
+
+    def mark_verification_failed(self, verification_id: str, *, method: str, error: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE domain_verifications SET method = ?, last_checked_at = ?, "
+                "last_check_error = ? WHERE verification_id = ?",
+                (method, _now_iso(), error, verification_id),
+            )
+
+    def supersede_other_verifications(
+        self, account_id: str, domain: str, *, keep_verification_id: str
+    ) -> None:
+        """After a new verification succeeds, mark this SAME account's
+        other rows for the SAME domain as superseded — exactly one
+        canonical row per (account, domain) going forward, so "the
+        account's active verification for this domain" is never
+        ambiguous between two simultaneously-verified rows."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE domain_verifications SET status = 'superseded' "
+                "WHERE account_id = ? AND domain = ? AND verification_id != ? "
+                "AND status IN ('pending', 'verified')",
+                (account_id, domain, keep_verification_id),
+            )
+
+
+def _verification_record_from_row(row: sqlite3.Row) -> DomainVerificationRecord:
+    return DomainVerificationRecord(
+        verification_id=row["verification_id"],
+        account_id=row["account_id"],
+        domain=row["domain"],
+        token=row["token"],
+        method=row["method"],
+        status=row["status"],
+        created_at=row["created_at"],
+        verified_at=row["verified_at"],
+        expires_at=row["expires_at"],
+        last_checked_at=row["last_checked_at"],
+        last_check_error=row["last_check_error"],
+    )
 
 
 def _key_record_from_row(row: sqlite3.Row) -> ApiKeyRecord:

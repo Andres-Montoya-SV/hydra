@@ -21,6 +21,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("argon2")
 pytest.importorskip("httpx")
 
+from _verified_domain import seed_verified_domain  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from api.main import create_app  # noqa: E402
@@ -126,6 +127,7 @@ class TestClientReportMatchesCli:
             account = client.post("/accounts").json()
             api_key = account["api_key"]
             account_id = account["account_id"]
+            seed_verified_domain(client, account_id, SEED)
 
             scan_id = client.post(
                 "/scans", json={"domain": SEED}, headers={"X-API-Key": api_key}
@@ -169,7 +171,9 @@ class TestClientReportMatchesCli:
         pytest.importorskip("docx")
         _install_pipeline_stubs(monkeypatch)
         with TestClient(create_app(APISettings(data_dir=tmp_path / "api_data"))) as client:
-            api_key = client.post("/accounts").json()["api_key"]
+            account = client.post("/accounts").json()
+            api_key = account["api_key"]
+            seed_verified_domain(client, account["account_id"], SEED)
             scan_id = client.post(
                 "/scans", json={"domain": SEED}, headers={"X-API-Key": api_key}
             ).json()["scan_id"]
@@ -191,7 +195,9 @@ class TestClientReportMatchesCli:
     ) -> None:
         _install_pipeline_stubs(monkeypatch)
         with TestClient(create_app(APISettings(data_dir=tmp_path / "api_data"))) as client:
-            api_key = client.post("/accounts").json()["api_key"]
+            account = client.post("/accounts").json()
+            api_key = account["api_key"]
+            seed_verified_domain(client, account["account_id"], SEED)
             scan_id = client.post(
                 "/scans", json={"domain": SEED}, headers={"X-API-Key": api_key}
             ).json()["scan_id"]

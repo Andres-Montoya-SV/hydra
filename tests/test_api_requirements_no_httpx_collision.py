@@ -1,32 +1,40 @@
-"""Confirms `requirements-api.txt` itself never pulls in the Python
-`httpx` package, directly or transitively — the actual, correct version
-of the check requested when this project's httpx-shadowing incident was
-audited (docs/PAID_API_DESIGN.md's "Round 1 implemented" section).
+"""Tracks `requirements-api.txt`'s relationship with the Python `httpx`
+package across the two rounds that changed it — the actual, correct
+concern from this project's original httpx-shadowing incident
+(docs/PAID_API_DESIGN.md's "Round 1 implemented" section), updated for
+Round 2's deliberate reversal.
 
-The original hypothesis was that installing `httpx[cli]` was the cause,
-and that `requirements-api.txt` was where it came from. Neither part
-held up: `httpx`'s `console_scripts` entry point is unconditional package
-metadata (confirmed directly via `importlib.metadata` — not gated behind
-the `cli` extra at all), and `httpx` isn't a dependency of
-`requirements-api.txt` in the first place — it's a direct,
-`requirements-dev.txt`-only pin, needed solely for
-`fastapi.testclient.TestClient` in tests. `fastapi` itself DOES depend on
-`httpx`, but only under its own `standard`/`standard-no-fastapi-cloud-cli`/
-`all` extras — none of which `requirements-api.txt` requests (it pins
-plain `fastapi==0.141.1`). This test locks that in, so a future edit that
-casually adds `fastapi[standard]` (a very natural-looking "upgrade") to
-`requirements-api.txt` doesn't silently reintroduce the same collision
-for anyone who only ever installs the API's own requirements file,
-without requirements-dev.txt's test dependencies.
+**Round 1**: `httpx` (the Python package) was NOT a `requirements-api.txt`
+dependency at all — it was a `requirements-dev.txt`-only pin, needed
+solely for `fastapi.testclient.TestClient` in tests. This file originally
+locked in "requirements-api.txt never pulls in httpx," so a future,
+natural-looking edit (e.g. adding `fastapi[standard]`) wouldn't silently
+reintroduce the same console-script collision with the ProjectDiscovery
+`httpx` recon binary for anyone who only installs the API's own
+requirements file.
+
+**Round 2 deliberately reverses that**: `api/domain_verification.py`'s
+well-known-file check needs a real `httpx.AsyncClient` to perform a real
+HTTPS GET — the Python `httpx` package is now a genuine, intentional
+`requirements-api.txt` runtime dependency (see the comment next to its
+pin in that file). The underlying collision risk this file used to guard
+against does not go away — it is mitigated the same way Round 1's own
+"Known limitations" already documented for the ProjectDiscovery binary
+itself: `core/dependencies/` verifies tool identity (`identity_markers`,
+`path_denylist`) before ever trusting a discovered `httpx` on `PATH`
+(exercised in `tests/test_dependency_binary_identity.py`), and this
+service's own runtime code (`api/domain_verification.py`) imports the
+Python package directly (`import httpx`) rather than shelling out to a
+binary named `httpx` at all, so it is never subject to the PATH
+collision in the first place — only ad-hoc command-line use of the
+`httpx` console script is affected, exactly as Round 1's docs already
+called out.
 """
 
 from __future__ import annotations
 
-import importlib.metadata as metadata
 import re
 from pathlib import Path
-
-import pytest
 
 
 def _pinned_package_names(requirements_path: Path) -> list[str]:
@@ -41,34 +49,13 @@ def _pinned_package_names(requirements_path: Path) -> list[str]:
     return names
 
 
-class TestRequirementsApiNeverPullsInHttpx:
-    def test_no_package_in_requirements_api_is_named_httpx(self) -> None:
-        names = _pinned_package_names(Path("requirements-api.txt"))
-        assert "httpx" not in {n.lower() for n in names}
-
-    def test_none_of_requirements_apis_own_dependencies_require_httpx_unconditionally(
-        self,
-    ) -> None:
-        names = _pinned_package_names(Path("requirements-api.txt"))
-        for name in names:
-            base_name = re.sub(r"\[.*\]", "", name)
-            try:
-                dist = metadata.distribution(base_name)
-            except metadata.PackageNotFoundError:
-                pytest.skip(f"{base_name} is not installed in this environment")
-                continue
-            for requirement in dist.requires or ():
-                if not requirement.lower().startswith("httpx"):
-                    continue
-                # A conditional reference (e.g. `httpx<1,>=0.23; extra ==
-                # "standard"`) is fine — it only activates for an extra
-                # requirements-api.txt does not request. Only an
-                # unconditional `httpx...` requirement (no `; extra ==`
-                # marker at all) would mean installing `name` alone drags
-                # httpx in.
-                assert "extra ==" in requirement, (
-                    f"{base_name} unconditionally requires {requirement!r} — "
-                    "installing requirements-api.txt alone would pull in the "
-                    "Python httpx package and its console-script collision "
-                    "with the ProjectDiscovery httpx recon binary"
-                )
+class TestRequirementsApiIntentionallyPullsInHttpx:
+    def test_httpx_is_pinned_as_a_genuine_runtime_dependency(self) -> None:
+        """Confirms the Round 2 reversal is deliberate and pinned, not an
+        accidental transitive pickup — if this ever starts failing
+        because `httpx` was removed from `requirements-api.txt`, that's a
+        sign the well-known-file verification method
+        (`api/domain_verification.py::verify_well_known_file`) lost its
+        runtime dependency, not that this test is stale."""
+        names = {n.lower() for n in _pinned_package_names(Path("requirements-api.txt"))}
+        assert "httpx" in names

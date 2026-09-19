@@ -18,7 +18,7 @@ from fastapi import FastAPI
 
 from api.control_db import ControlDB
 from api.rate_limit import TokenBucketLimiter
-from api.routers import accounts, keys, scans
+from api.routers import accounts, domains, keys, scans
 from api.settings import APISettings, load_api_settings
 
 
@@ -41,14 +41,16 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app = FastAPI(
         title="Hydra EASM API",
         description=(
-            "Round 1: multi-tenant core, X-API-Key auth, async scan lifecycle. "
-            "No domain-ownership verification, tiers, or billing yet — see "
-            "docs/PAID_API_DESIGN.md."
+            "Round 2: domain-ownership verification (DNS TXT or well-known "
+            "file) now gates every scan — Round 1's multi-tenant core, "
+            "X-API-Key auth, and async scan lifecycle underneath. Tiers/quotas "
+            "and Wompi billing still not implemented — see docs/PAID_API_DESIGN.md."
         ),
         lifespan=lifespan,
     )
     app.include_router(accounts.router)
     app.include_router(keys.router)
+    app.include_router(domains.router)
     app.include_router(scans.router)
     return app
 
