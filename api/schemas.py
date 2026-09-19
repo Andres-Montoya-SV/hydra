@@ -57,3 +57,37 @@ class ClientReportRequest(BaseModel):
 class ErrorResponse(BaseModel):
     error: str
     detail: str
+
+
+class RegisterDomainRequest(BaseModel):
+    domain: str = Field(min_length=1, description="Domain to verify, e.g. example.com")
+
+
+class DnsInstructions(BaseModel):
+    record_type: Literal["TXT"] = "TXT"
+    name: str
+    value: str
+
+
+class FileInstructions(BaseModel):
+    path: str
+    content: str
+
+
+class RegisterDomainResponse(BaseModel):
+    domain: str
+    token: str
+    dns_instructions: DnsInstructions
+    file_instructions: FileInstructions
+
+
+class VerifyDomainRequest(BaseModel):
+    method: Literal["dns_txt", "well_known_file"]
+
+
+class VerifyDomainResponse(BaseModel):
+    domain: str
+    status: Literal["verified"]
+    method: Literal["dns_txt", "well_known_file"]
+    verified_at: str
+    expires_at: str

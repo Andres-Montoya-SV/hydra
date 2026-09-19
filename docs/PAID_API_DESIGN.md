@@ -30,6 +30,18 @@ real legal exposure for the operator. No scan against a domain may be
 queued — not even the first one — until that domain has a **current**
 verification record tied to the requesting account.
 
+> **Implemented in Round 2** (see "Round 2 implemented" below for the
+> full writeup, tests, and live demonstration). A.1 and A.4 below were
+> implemented exactly as drafted. **A.2 and A.3's final decisions differ
+> from the draft text below** — the draft proposed a 30-day freshness
+> window with automatic re-verification and a "current control always
+> wins" transfer policy; Round 2 instead shipped a 90-day expiry with no
+> automatic re-check and a "first successful verification wins, second
+> account gets a conflict" policy. Both are simpler, deliberately-chosen
+> alternatives — see "Round 2 implemented" for the reasoning — and the
+> text in A.2/A.3 is kept below as the original design record, not
+> silently rewritten.
+
 ### A.1 Mechanism: both DNS TXT and well-known file, client's choice
 
 Support both, exactly as the two most common patterns (Google Search
@@ -759,12 +771,173 @@ genuine binary reachable elsewhere is still correctly selected even when
 an impostor scores as the first PATH candidate. That mechanism predates
 this round; it simply had no test coverage before now.
 
+## Round 2 implemented (`api/`) — Part A, domain ownership verification
+
+Round 2 closes the gap Round 1 left open on purpose: `POST /scans` now
+**rejects** any domain the requesting account has not currently verified,
+with a `403` and a clear message on how to fix it. This lives in the same
+mandatory-`account_id` code path as Round 1's scan-ownership checks
+(`api/routers/scans.py`'s `_require_verified_domain_or_403`, called from
+`create_scan` before any scan row is created) — not a separate
+middleware/dependency layer a future route could add without remembering
+to include it.
+
+### A.1/A.4 — implemented exactly as drafted
+
+Both DNS TXT and well-known-file methods, client's choice
+(`api/domain_verification.py`). `POST /domains {"domain": "example.com"}`
+generates a per-`(account_id, domain)` token (`secrets.token_hex(16)`)
+and returns both sets of instructions; `POST /domains/{domain}/verify`
+performs a real, live check — a real DNS query via `dnspython`
+(`dns.asyncresolver`) against `_hydra-verification.<domain>` for the TXT
+method, or a real `httpx.AsyncClient` HTTPS GET against
+`/.well-known/hydra-verification-<token>.txt` for the file method. The
+API never trusts a client's claim that a record/file exists; a
+verification record is only ever created as the side effect of Hydra's
+own successful active check, exactly as A.1 specifies. Verifying
+`example.com` covers `*.example.com` (A.4), reusing the same
+`domain_is_covered` prefix-match semantics as `CollectionScope`'s
+existing bare-domain convention — tested explicitly, including the
+`notexample.com` vs `example.com` false-positive-prefix edge case.
+
+### A.2 — decided: 90-day expiry, no automatic re-check per scan
+
+The draft above proposed a 30-day window with Hydra automatically
+re-running the active check on every stale scan request. Round 2 instead
+ships:
+
+- A verification is valid for **90 days** from `verified_at`
+  (`DEFAULT_EXPIRY_DAYS` in `api/domain_verification.py`).
+- `POST /scans` checks only the **persisted** status/expiry
+  (`ControlDB.get_verified_domains_for_account` /
+  `get_all_verifications_for_account`, joined in
+  `classify_scan_gate`) — it never performs a live DNS/HTTP check as a
+  side effect of queuing a scan.
+- Expired: the scan is rejected with a `403` that explicitly says
+  *expired* (distinct from *never verified*) and names the expiry date,
+  telling the client to `POST /domains/{domain}` again to restart
+  verification.
+
+**Trade-off, stated explicitly**: this is less safe than a live
+re-check on every stale scan (a domain could theoretically change hands
+within the 90-day window without Hydra noticing until the next scan
+attempt lands after expiry) but is simpler, cheaper, and avoids exactly
+the problem A.2's own draft text flagged with the well-known-file method
+— an automatic re-check performed as a side effect of an unrelated
+`POST /scans` call is indistinguishable, from the target's perspective,
+from Hydra's own reconnaissance traffic starting early. 90 days (versus
+the draft's 30) reduces how often a legitimate, still-owning client is
+interrupted, at the cost of a longer window before a genuine transfer is
+caught — judged an acceptable trade for this round given verification
+is re-checked at the top of every registration/verify call anyway,
+never silently assumed forever.
+
+### A.3 — decided: first successful verification wins; second account sees a conflict
+
+The draft above proposed "current control always wins" (a second
+account's successful check silently supersedes the first). Round 2
+instead ships **first-verification-wins**:
+
+- `ControlDB.get_active_verification_for_domain(domain)` is checked,
+  cross-account, at the moment a *second* account's active check
+  succeeds (`POST /domains/{domain}/verify` in
+  `api/routers/domains.py`).
+- If another account already holds a current, unexpired verification
+  for that domain, the second account's otherwise-successful check is
+  rejected with `409 Conflict` — `"... already verified by another
+  account"` — and no record is created or superseded for either
+  account.
+- The original account's verification is untouched; nothing is emailed
+  or superseded, because nothing changed.
+
+**Why this differs from the draft, and from the general "current
+control wins" instinct**: this round's task explicitly called for
+treating same-domain-two-accounts as the anomalous case it almost always
+actually is (a support/dispute situation, not a routine transfer) rather
+than an automatic, silent hand-off — silently reassigning a domain's
+verified-owner status the moment *any* other account can pass the same
+public check removes the original account's ability to notice or
+dispute it before their authorization is revoked. A genuine transfer
+(the previous owner deliberately gave up the domain) is handled instead
+by the *original* account's verification simply expiring at the 90-day
+mark (A.2) and the new controller registering and verifying normally
+once nothing active blocks them — slower, but never silent. Documented
+in full, with this same reasoning, in `api/domain_verification.py`'s
+module docstring next to `classify_scan_gate`.
+
+### Dev/test override — explicit, off by default
+
+`api/settings.py`'s `dev_dns_nameserver` / `dev_dns_port` /
+`dev_well_known_base_url` let tests (and only tests) point the real
+DNS/HTTP checks at a local test server instead of the live internet —
+all three default to `None` and are only ever set via the explicit
+`HYDRA_API_DEV_DNS_NAMESERVER` / `HYDRA_API_DEV_DNS_PORT` /
+`HYDRA_API_DEV_WELL_KNOWN_BASE_URL` environment variables. Real
+production behavior (live DNS resolution, live HTTPS GET against the
+actual domain) is the unconditional default; there is no code path that
+silently skips the real check.
+
+### Tests
+
+`tests/test_api_domain_verification_logic.py` (16 tests) — pure-function
+coverage of normalization, subdomain coverage (including the
+`notexample.com` false-positive-prefix case), and `classify_scan_gate`'s
+covered/expired/never-verified classification, with no I/O.
+
+`tests/test_api_domain_verification_live.py` (9 tests) — `verify_dns_txt`
+and `verify_well_known_file` directly, against real local servers: a
+hand-built minimal DNS server speaking real wire-format DNS (via
+dnspython's own message-parsing classes, `tests/_dns_test_server.py`)
+for the TXT method, and a real `http.server` instance for the file
+method — the same "real server as arbiter" pattern already established
+by `tests/test_httpx_confinement_live.py`, extended to DNS.
+
+`tests/test_api_domain_verification_endpoints.py` (7 tests) — full
+HTTP end-to-end through the real FastAPI app (`TestClient`): register →
+verify → scan succeeds (both methods); verify fails clearly when the
+record/file is missing; a never-verified domain gets `403` and creates
+no scan row; a subdomain of a verified domain is covered; two accounts
+racing for the same domain get the A.3 conflict; an expired verification
+is rejected with a message distinguishable from never-verified.
+
+**A real bug this round's own test infrastructure surfaced and fixed
+(documented here since it's a load-bearing lesson for future
+network-backed test servers, not just a footnote):** the first version
+of `tests/_dns_test_server.py` used `asyncio.DatagramProtocol` on the
+calling coroutine's own event loop. `fastapi.testclient.TestClient` runs
+the ASGI app on its *own* event loop in a separate thread via anyio's
+`BlockingPortal`; a synchronous `client.post(...)` call blocks the
+calling thread until the response returns, which starves whatever
+asyncio loop that same thread owns — so the DNS test server's own
+`datagram_received` callback never got to run while a `client.post(...)`
+call to `/domains/{domain}/verify` was in flight, and every DNS-backed
+endpoint test timed out at the query's own 10s `lifetime`, despite the
+server having the exact right record configured and being independently
+reachable outside `TestClient`. Fixed by rewriting the server to use
+`socketserver.UDPServer.serve_forever()` on a genuine background OS
+thread — no asyncio-loop dependency at all — mirroring the thread-based
+`socketserver.TCPServer` pattern
+`tests/test_httpx_confinement_live.py`'s `_serve()` already used
+successfully for HTTP. Any future in-process test server consumed by
+`TestClient`-driven code should use this same thread-based pattern, not
+asyncio, for exactly this reason.
+
+**CI network note**: all DNS/HTTP checks exercised in the test suite run
+against local, in-process servers (loopback only) — no test depends on
+live public DNS or the live internet, specifically because this sandbox
+environment was independently confirmed to block outbound UDP/53 to
+public resolvers even though macOS's own system resolver (`dig`,
+`getaddrinfo`) works fine via a different code path. CI's network
+environment should therefore behave identically regardless of its own
+outbound DNS policy, since none of these tests ever leave loopback.
+
 ## Explicitly deferred to Part 2 / Rounds 2-3
 
 - Web framework choice — resolved in Round 1: FastAPI, confirmed above.
-- Domain-ownership verification (Part A), tiers/quotas (Part B), Wompi
-  billing (Part D) — Round 1 has none of these; any authenticated
-  account can scan any domain without restriction.
+- Domain-ownership verification (Part A) — resolved in Round 2, see
+  above.
+- Tiers/quotas (Part B), Wompi billing (Part D) — still deferred to
+  Round 3; any verified account can scan at unlimited volume right now.
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
   this API never knows Firebase exists; `X-API-Key` only).
 - A durable job queue and a shared (Redis-backed) rate limiter, for a

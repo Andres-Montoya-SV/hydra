@@ -25,6 +25,16 @@ class APISettings:
     data_dir: Path = field(default_factory=lambda: _PROJECT_ROOT / "api_data")
     rate_limit_per_minute: int = 60
     key_rotation_grace_hours: int = 24
+    # Domain verification (Part A) always makes a REAL DNS/HTTP check
+    # against the real internet by default — these two are None unless an
+    # operator explicitly opts in via the env vars below, for local
+    # development/demo only (e.g. pointing DNS checks at an in-process
+    # test server instead of the live internet). Never set in production;
+    # there is no way to enable this by accident — both require an
+    # explicit environment variable, never a default.
+    dev_dns_nameserver: str | None = None
+    dev_dns_port: int | None = None
+    dev_well_known_base_url: str | None = None
 
     @property
     def control_db_path(self) -> Path:
@@ -47,4 +57,9 @@ def load_api_settings() -> APISettings:
     rate_limit = os.getenv("HYDRA_API_RATE_LIMIT_PER_MINUTE")
     if rate_limit:
         settings.rate_limit_per_minute = int(rate_limit)
+    settings.dev_dns_nameserver = os.getenv("HYDRA_API_DEV_DNS_NAMESERVER") or None
+    dev_dns_port = os.getenv("HYDRA_API_DEV_DNS_PORT")
+    if dev_dns_port:
+        settings.dev_dns_port = int(dev_dns_port)
+    settings.dev_well_known_base_url = os.getenv("HYDRA_API_DEV_WELL_KNOWN_BASE_URL") or None
     return settings
