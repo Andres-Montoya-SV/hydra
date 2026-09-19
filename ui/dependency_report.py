@@ -66,7 +66,17 @@ def render_dependency_report(
         style = _HEALTH_STYLE.get(report.health, "white")
         label = _HEALTH_LABEL.get(report.health, report.health.value)
         version = report.version or "—"
-        location = str(report.resolved_path) if report.resolved_path else "—"
+        if report.resolved_path:
+            location = str(report.resolved_path)
+        elif report.discovery and report.discovery.found and report.discovery.path:
+            # A MISSING report's resolved_path is always None, even when
+            # something was found there (core/dependencies/service.py) —
+            # still show the operator where the rejected binary lives, so
+            # "Binary found but failed health checks" is actionable, just
+            # never presented as if it were the trusted resolved path.
+            location = f"{report.discovery.path} (unverified)"
+        else:
+            location = "—"
         fix = report.recommendation or (
             "—" if report.health == ToolHealth.HEALTHY else report.install_hint
         )

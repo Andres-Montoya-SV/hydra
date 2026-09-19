@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import http.server
-import shutil
 import socketserver
 import threading
 from collections.abc import Iterator
@@ -33,7 +32,10 @@ from core.models import DomainTarget, PipelineContext
 from modules.httpx import HttpxPlugin
 from utils.files import write_lines
 
-pytestmark = pytest.mark.skipif(shutil.which("httpx") is None, reason="httpx binary not installed")
+# No module-level `skipif(shutil.which("httpx") is None, ...)` here anymore
+# — see tests/test_httpx_confinement_live.py's identical note. Every test
+# below takes `verified_httpx_path` (tests/conftest.py), which skips
+# itself when nothing genuine is found/verified.
 
 
 class _QuietHandler(http.server.BaseHTTPRequestHandler):

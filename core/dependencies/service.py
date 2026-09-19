@@ -103,7 +103,19 @@ class DependencyService:
                 required=is_required,
                 health=ToolHealth.MISSING,
                 configured_path=str(configured),
-                resolved_path=fallback.path if fallback.found else None,
+                # Never `fallback.path` here even when something was found —
+                # `fallback` is `discover()`'s unvalidated first candidate
+                # (the same one, or an equally-unverified one, that the loop
+                # above already tried and rejected). `resolved_path` is the
+                # field callers treat as "safe to execute"
+                # (core/tool_manager.py's `is_runnable`/`resolved_binaries`
+                # gate on health first, but a bare `report.resolved_path`
+                # read anywhere else must never silently be an impostor's
+                # path just because health happens to be MISSING). The
+                # found-but-rejected location is still available, for
+                # diagnostics only, via `discovery.path` below — a
+                # different field, a different contract.
+                resolved_path=None,
                 status_reason=reason,
                 recommendation=f"Install: {install_hint}",
                 install_hint=install_hint,

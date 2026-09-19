@@ -27,6 +27,7 @@ from core.dependencies.models import ToolDefinition
 from core.dependencies.registry import get_tool_definition
 from core.dependencies.service import DependencyService
 from core.dependencies.validation import HealthValidator
+from core.platform import MacArch, OSType, PlatformInfo
 
 
 def _write_impostor_script(path: Path, *, output: str, exit_code: int = 0) -> None:
@@ -146,31 +147,132 @@ class TestDependencyServiceSkipsTheImpostorForTheRealBinary:
         assert report.health.value == "healthy"
 
     @pytest.mark.asyncio
-    async def test_impostor_only_reachable_via_path_never_wins_even_when_first(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    async def test_real_binary_elsewhere_beats_an_impostor_first_on_path(
+        self, tmp_path: Path, verified_httpx_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With PATH pointing *only* at the impostor's directory (the
-        real incident's shape — a venv's bin/ prepended, nothing else
-        reachable via bare PATH search), discovery still finds Homebrew's
-        installation independently (a fixed, known filesystem location,
-        not a PATH lookup — confirmed directly: `detect_platform()`
-        resolves `homebrew_bin` regardless of PATH). The invariant that
-        actually matters, and that holds either way: the resolved binary
-        is never the impostor, and the tool is never reported HEALTHY
-        while pointing at it."""
+        """With PATH pointing at the impostor's directory FIRST (the real
+        incident's shape — a venv's bin/ prepended ahead of the real
+        tool's directory), a genuine binary reachable elsewhere (this
+        machine's real Homebrew install) must still be selected — never
+        the impostor, regardless of PATH order."""
         impostor_dir = tmp_path / "fake_bin"
         impostor_dir.mkdir()
         impostor = impostor_dir / "httpx"
         _write_impostor_script(impostor, output=IMPOSTOR_OUTPUT)
 
-        monkeypatch.setenv("PATH", str(impostor_dir))
+        monkeypatch.setenv("PATH", f"{impostor_dir}:{os.environ['PATH']}")
 
         service = DependencyService({"httpx": Path("httpx")})
         report = await service.analyze_tool(
             get_tool_definition("httpx"), Path("httpx"), required=True
         )
 
+        assert report.resolved_path == verified_httpx_path
         assert report.resolved_path != impostor
-        if report.health.value == "healthy":
-            assert report.resolved_path is not None
-            assert report.resolved_path != impostor
+        assert report.health.value == "healthy"
+
+    @pytest.mark.asyncio
+    async def test_impostor_only_anywhere_is_missing_with_resolved_path_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exact CI failure shape: a synthetic platform with NO
+        Homebrew, NO Go install locations, and PATH pointing only at the
+        impostor — matching a bare `hostedtoolcache/Python` runner that
+        never installed any real Go-based recon tool. Bug 1's fix:
+        `resolved_path` must be `None`, never the impostor, whenever
+        health isn't HEALTHY — a caller must never be able to observe
+        `health=MISSING` and a `resolved_path` that points at the exact
+        binary that caused that result."""
+        impostor_dir = tmp_path / "fake_bin"
+        impostor_dir.mkdir()
+        impostor = impostor_dir / "httpx"
+        _write_impostor_script(impostor, output=IMPOSTOR_OUTPUT)
+
+        # BinaryDiscovery also calls shutil.which() directly, which reads
+        # the real os.environ["PATH"] independent of PlatformInfo.path_dirs
+        # below — both must be restricted for this to genuinely simulate
+        # "nothing real reachable anywhere," not just "not in this one list."
+        monkeypatch.setenv("PATH", str(impostor_dir))
+
+        fake_platform = PlatformInfo(
+            os_type=OSType.LINUX,
+            mac_arch=MacArch.UNKNOWN,
+            is_macos=False,
+            is_linux=True,
+            home=tmp_path,
+            path_dirs=(impostor_dir,),
+            gobin=None,
+            gopath_bin=tmp_path / "go" / "bin",  # deliberately does not exist
+            homebrew_bin=None,
+            homebrew_prefix=None,
+        )
+        service = DependencyService({"httpx": Path("httpx")}, platform=fake_platform)
+        report = await service.analyze_tool(
+            get_tool_definition("httpx"), Path("httpx"), required=True
+        )
+
+        assert report.health.value == "missing"
+        assert report.resolved_path is None
+        assert "identity verification" in (report.status_reason or "").lower()
+        # The rejected location is still surfaced for diagnostics, just
+        # never as `resolved_path` — see ui/dependency_report.py.
+        assert report.discovery is not None
+        assert report.discovery.path == impostor
+
+
+class TestLiveConfinementTestsSkipCleanlyRatherThanFailOnAnImpostor:
+    """Bug 2: `shutil.which("httpx") is None` used to be the skip
+    condition on the three live-network confinement test files — that
+    finds an impostor just fine (it exists, it's executable), so the
+    skip stopped firing the moment requirements-dev.txt put one on PATH,
+    and the tests ran against the wrong binary and failed instead of
+    skipping. Those files no longer have that module-level skipif at
+    all; every test in them now takes `verified_httpx_path`
+    (tests/conftest.py), whose own `pytest.skip()` call is exercised
+    directly here — proving the actual mechanism a real impostor-only
+    environment (a bare `hostedtoolcache/Python` CI runner, matching the
+    real GitHub Actions failure this responds to) hits."""
+
+    @pytest.mark.asyncio
+    async def test_skip_fires_with_a_clear_message_when_only_an_impostor_exists(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from _httpx_verification import verified_tool_path_or_skip
+
+        impostor_dir = tmp_path / "fake_bin"
+        impostor_dir.mkdir()
+        _write_impostor_script(impostor_dir / "httpx", output=IMPOSTOR_OUTPUT)
+        monkeypatch.setenv("PATH", str(impostor_dir))
+        # core/dependencies/service.py does `from core.platform import
+        # ... detect_platform` — that's its own local binding, so the
+        # patch target is the importing module's name, not the origin.
+        monkeypatch.setattr(
+            "core.dependencies.service.detect_platform",
+            lambda: PlatformInfo(
+                os_type=OSType.LINUX,
+                mac_arch=MacArch.UNKNOWN,
+                is_macos=False,
+                is_linux=True,
+                home=tmp_path,
+                path_dirs=(impostor_dir,),
+                gobin=None,
+                gopath_bin=tmp_path / "go" / "bin",
+                homebrew_bin=None,
+                homebrew_prefix=None,
+            ),
+        )
+
+        with pytest.raises(pytest.skip.Exception) as exc_info:
+            await verified_tool_path_or_skip("httpx")
+
+        assert "no genuine httpx binary" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_does_not_skip_when_a_genuine_binary_is_reachable(
+        self, verified_httpx_path: Path
+    ) -> None:
+        """Sanity check on the test above: the fixture only skips when
+        genuinely warranted — on a normal dev machine with the real tool
+        installed, it returns a real path instead, exactly like every
+        other passing test in the three live-confinement files relies on."""
+        assert verified_httpx_path.is_file()

@@ -84,7 +84,12 @@ def _health_to_availability(report: ToolReport) -> ToolAvailability:
         return ToolAvailability.AVAILABLE
     if report.health == ToolHealth.DEGRADED:
         return ToolAvailability.NOT_IN_PATH
-    if report.resolved_path and not report.can_execute:
+    # `resolved_path` is never set on a MISSING report (it's reserved for
+    # a path this code has actually verified usable) — the "something was
+    # found here but rejected" signal for this diagnostic-only distinction
+    # lives in `discovery.found`/`discovery.path` instead. See
+    # core/dependencies/service.py's analyze_tool MISSING branch.
+    if report.discovery and report.discovery.found:
         if report.status_reason.startswith("Binary found but not executable"):
             return ToolAvailability.NOT_EXECUTABLE
         return ToolAvailability.PROBE_FAILED

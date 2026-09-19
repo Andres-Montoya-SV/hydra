@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import http.server
-import shutil
 import socketserver
 import threading
 from collections.abc import Iterator
@@ -178,7 +177,6 @@ def test_followup_ct_san_marks_evil_observed_not_allowed(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(shutil.which("httpx") is None, reason="httpx binary not installed")
 async def test_followup_www_302_to_evil_gets_zero_connections(
     tmp_path: Path, evil_server: int, verified_httpx_path: Path
 ) -> None:

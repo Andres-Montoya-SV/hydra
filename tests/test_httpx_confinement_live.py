@@ -20,7 +20,6 @@ subprocess, without needing control over real DNS infrastructure.
 from __future__ import annotations
 
 import http.server
-import shutil
 import socketserver
 import threading
 from collections.abc import Iterator
@@ -34,7 +33,16 @@ from core.models import DomainTarget, PipelineContext
 from modules.httpx import HttpxPlugin
 from utils.files import write_lines
 
-pytestmark = pytest.mark.skipif(shutil.which("httpx") is None, reason="httpx binary not installed")
+# No module-level `skipif(shutil.which("httpx") is None, ...)` here anymore
+# — `shutil.which` finds *anything* named httpx, including the Python
+# package's own console script, which made this skip stop firing once
+# requirements-dev.txt started putting that shim on PATH (Bug 2 of the
+# httpx-shadowing incident: the skip needs identity, not just existence).
+# Every test below takes `verified_httpx_path` (tests/conftest.py), which
+# resolves through the same identity-verified discovery a real pipeline
+# run uses and calls `pytest.skip(...)` itself when nothing genuine is
+# found/verified — the skip condition now lives with the one thing that
+# can actually answer it correctly.
 
 
 class _QuietHandler(http.server.BaseHTTPRequestHandler):

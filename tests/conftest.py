@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
-from config.settings import Settings
+# conftest.py is imported by pytest's own bootstrap, before it necessarily
+# puts this directory on sys.path the way it does for collected test
+# modules — insert it explicitly so a plain sibling-module import below
+# works regardless of how pytest was invoked.
+sys.path.insert(0, str(Path(__file__).parent))
+
+from _httpx_verification import verified_tool_path_or_skip  # noqa: E402
+
+from config.settings import Settings  # noqa: E402
 
 # See docs/PAID_API_DESIGN.md's "Round 1 implemented" section for the
 # full incident writeup: the Python `httpx` PyPI package (a test-only
@@ -30,17 +39,7 @@ async def verified_httpx_path() -> Path:
     it, when no genuine binary can be found/verified in this environment
     — a missing/misidentified tool is an environment fact, not a bug in
     the test itself."""
-    from core.dependencies.registry import get_tool_definition
-    from core.dependencies.service import DependencyService
-
-    service = DependencyService({"httpx": Path("httpx")})
-    report = await service.analyze_tool(get_tool_definition("httpx"), Path("httpx"), required=True)
-    if report.resolved_path is None:
-        pytest.skip(
-            "No genuine ProjectDiscovery httpx binary found/verified in this "
-            "environment (see docs/PAID_API_DESIGN.md's httpx-shadowing note)"
-        )
-    return report.resolved_path
+    return await verified_tool_path_or_skip("httpx")
 
 
 @pytest.fixture
