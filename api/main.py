@@ -18,8 +18,9 @@ from fastapi import FastAPI
 
 from api.control_db import ControlDB
 from api.rate_limit import TokenBucketLimiter
-from api.routers import accounts, domains, keys, scans
+from api.routers import accounts, domains, hypotheses, keys, reportability, scans, subscription
 from api.settings import APISettings, load_api_settings
+from api.wompi_client import WompiClient
 
 
 def create_app(api_settings: APISettings | None = None) -> FastAPI:
@@ -32,6 +33,12 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
         app.state.rate_limiter = TokenBucketLimiter(
             requests_per_minute=settings.rate_limit_per_minute
         )
+        app.state.wompi_client = WompiClient(
+            client_id=settings.wompi_client_id,
+            client_secret=settings.wompi_client_secret,
+            id_base_url=settings.dev_wompi_id_base_url,
+            api_base_url=settings.dev_wompi_api_base_url,
+        )
         app.state.background_tasks = set()
         yield
         # Round 1 has no durable job queue (see scan_orchestrator's module
@@ -41,10 +48,14 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app = FastAPI(
         title="Hydra EASM API",
         description=(
-            "Round 2: domain-ownership verification (DNS TXT or well-known "
-            "file) now gates every scan — Round 1's multi-tenant core, "
-            "X-API-Key auth, and async scan lifecycle underneath. Tiers/quotas "
-            "and Wompi billing still not implemented — see docs/PAID_API_DESIGN.md."
+            "Round 3: Free/Medium/Pro/Ultra tiers gate scan quotas, verified-"
+            "domain counts, report formats/languages, and the assess-"
+            "reportability/suggest-hypotheses LLM features; Wompi billing "
+            "(OAuth client-credentials, webhook-signature-verified tier "
+            "activation, payment-failure grace period) sits behind "
+            "POST /account/subscription. Round 2's domain-ownership "
+            "verification and Round 1's multi-tenant core/auth/async scans "
+            "underneath — see docs/PAID_API_DESIGN.md."
         ),
         lifespan=lifespan,
     )
@@ -52,6 +63,9 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(keys.router)
     app.include_router(domains.router)
     app.include_router(scans.router)
+    app.include_router(reportability.router)
+    app.include_router(hypotheses.router)
+    app.include_router(subscription.router)
     return app
 
 

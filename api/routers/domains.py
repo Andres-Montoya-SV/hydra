@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 if TYPE_CHECKING:
     import dns.asyncresolver
 
+from api import subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB
 from api.domain_verification import (
@@ -152,6 +153,17 @@ async def verify_domain(
                 "already claimed first."
             ),
         )
+
+    subscription = subscriptions.get_or_create_subscription(control_db, auth.account_id)
+    limits = subscriptions.effective_limits(subscription)
+    ok, reason = subscriptions.check_verified_domain_limit(
+        control_db, auth.account_id, limits, renewing_domain=domain
+    )
+    if not ok:
+        control_db.mark_verification_failed(
+            pending.verification_id, method=body.method, error=reason or "tier domain limit reached"
+        )
+        raise HTTPException(status_code=403, detail=reason)
 
     verified_at = datetime.now(timezone.utc)
     expires_at = verified_at + timedelta(days=DEFAULT_EXPIRY_DAYS)

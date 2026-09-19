@@ -83,6 +83,113 @@ CREATE TABLE IF NOT EXISTS domain_verifications (
 CREATE INDEX IF NOT EXISTS idx_domain_verifications_domain ON domain_verifications(domain);
 CREATE INDEX IF NOT EXISTS idx_domain_verifications_account
     ON domain_verifications(account_id, domain);
+
+-- Part B (docs/PAID_API_DESIGN.md, Round 3) tier/subscription state. One
+-- row per account, created at account-creation time defaulting to
+-- 'free' (api/routers/accounts.py) — every account has exactly one
+-- current tier, never zero, never ambiguous between two rows.
+-- `retention_days_override` is only ever meaningful for an Ultra account
+-- ("configurable por cuenta" — api/tiers.py::retention_days_for); NULL
+-- for every other tier.
+-- `billing_email` is set once a paid enrollment activates
+-- (api/routers/subscription.py's webhook handler) — it is what lets a
+-- LATER webhook (a recurring monthly charge, success or failure) be
+-- correlated back to this account even after the original
+-- `wompi_pending_enrollments` row has done its one job and been marked
+-- 'matched'. NULL for an account that has never had a paid tier.
+CREATE TABLE IF NOT EXISTS subscriptions (
+    account_id TEXT PRIMARY KEY REFERENCES accounts(account_id),
+    tier TEXT NOT NULL,
+    status TEXT NOT NULL,
+    billing_email TEXT,
+    grace_period_started_at TEXT,
+    retention_days_override INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_billing_email ON subscriptions(billing_email);
+
+-- Monthly usage counters, one row per (account, calendar month, UTC).
+-- "Monthly" = calendar month, not a rolling 30-day or per-account
+-- billing-anniversary window — simpler, and matches how the tier table
+-- itself talks about limits ("Scans/mes"), not "scans per rolling 30
+-- days." `period_key` is 'YYYY-MM'.
+CREATE TABLE IF NOT EXISTS monthly_usage (
+    account_id TEXT NOT NULL REFERENCES accounts(account_id),
+    period_key TEXT NOT NULL,
+    scans_used INTEGER NOT NULL DEFAULT 0,
+    reportability_spend_usd REAL NOT NULL DEFAULT 0.0,
+    hypotheses_spend_usd REAL NOT NULL DEFAULT 0.0,
+    PRIMARY KEY (account_id, period_key)
+);
+
+-- Part E.1's estimate-then-confirm pattern, extended to reportability/
+-- hypotheses (Round 3). One row per `GET .../estimate` call; `POST
+-- .../assessment` (or hypotheses' equivalent) must reference a row here
+-- that is unexpired AND not yet consumed — never trusts a cost figure
+-- the client merely claims it saw.
+CREATE TABLE IF NOT EXISTS cost_estimates (
+    estimate_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(account_id),
+    scan_id TEXT NOT NULL,
+    feature TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    adversarial_provider TEXT,
+    degraded_from_adversarial INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL,
+    params_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cost_estimates_account ON cost_estimates(account_id);
+
+-- Wompi billing (Part D, Round 3). `wompi_pending_enrollments`: created
+-- at `POST /account/subscription {"tier": ...}` time, one row per
+-- upgrade *attempt* — the best-effort subscriber-identification
+-- mechanism (docs/PAID_API_DESIGN.md's "Round 3 implemented" section
+-- documents this honestly as unconfirmed against a real Wompi sandbox):
+-- match an incoming webhook's `cliente.Email` against a still-'pending'
+-- row's `billing_email` for the same tier/product.
+CREATE TABLE IF NOT EXISTS wompi_pending_enrollments (
+    enrollment_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(account_id),
+    tier TEXT NOT NULL,
+    billing_email TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    matched_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wompi_pending_email ON wompi_pending_enrollments(billing_email);
+
+-- Idempotency + audit log for every webhook Wompi (or anyone claiming to
+-- be Wompi) ever POSTs to this service — `transaction_id` is Wompi's own
+-- `IdTransaccion`, unique, so a redelivered webhook (Wompi's own retry
+-- behavior, or a replay attempt) is never double-processed.
+CREATE TABLE IF NOT EXISTS wompi_webhook_events (
+    transaction_id TEXT PRIMARY KEY,
+    outcome TEXT NOT NULL,
+    matched_account_id TEXT,
+    raw_body TEXT NOT NULL,
+    received_at TEXT NOT NULL
+);
+
+-- The manual-reconciliation backstop (Task's own explicit requirement):
+-- any webhook that passed signature verification (so it IS genuinely
+-- from Wompi) but could not be matched to a pending enrollment lands
+-- here instead of being discarded or guessed — an operator resolves it
+-- via `POST /admin/wompi/reconcile`, never automatically.
+CREATE TABLE IF NOT EXISTS wompi_unmatched_payments (
+    unmatched_id TEXT PRIMARY KEY,
+    transaction_id TEXT NOT NULL,
+    payer_email TEXT,
+    product_name TEXT,
+    amount REAL,
+    raw_body TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_account_id TEXT
+);
 """
 
 
@@ -111,6 +218,54 @@ class ScanRecord:
     error_message: str | None
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class SubscriptionRecord:
+    account_id: str
+    tier: str
+    status: str
+    billing_email: str | None
+    grace_period_started_at: str | None
+    retention_days_override: int | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class MonthlyUsageRecord:
+    account_id: str
+    period_key: str
+    scans_used: int
+    reportability_spend_usd: float
+    hypotheses_spend_usd: float
+
+
+@dataclass(frozen=True)
+class CostEstimateRecord:
+    estimate_id: str
+    account_id: str
+    scan_id: str
+    feature: str
+    provider: str
+    adversarial_provider: str | None
+    degraded_from_adversarial: bool
+    estimated_cost_usd: float
+    params_json: str
+    created_at: str
+    expires_at: str
+    consumed_at: str | None
+
+
+@dataclass(frozen=True)
+class WompiPendingEnrollmentRecord:
+    enrollment_id: str
+    account_id: str
+    tier: str
+    billing_email: str
+    status: str
+    created_at: str
+    matched_at: str | None
 
 
 @dataclass(frozen=True)
@@ -411,6 +566,389 @@ class ControlDB:
                 "AND status IN ('pending', 'verified')",
                 (account_id, domain, keep_verification_id),
             )
+
+    # --- subscriptions / tiers (Part B, Round 3) ------------------------
+
+    def create_default_subscription(self, account_id: str, *, tier: str = "free") -> None:
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO subscriptions "
+                "(account_id, tier, status, created_at, updated_at) "
+                "VALUES (?, ?, 'active', ?, ?)",
+                (account_id, tier, now, now),
+            )
+
+    def get_subscription(self, account_id: str) -> SubscriptionRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM subscriptions WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        return None if row is None else _subscription_record_from_row(row)
+
+    def set_tier(
+        self,
+        account_id: str,
+        tier: str,
+        *,
+        status: str = "active",
+        billing_email: str | None = None,
+    ) -> None:
+        """`billing_email` is only ever passed (and only ever overwrites
+        the stored value) when a NEW paid activation just happened
+        (`api/routers/subscription.py`'s webhook handler) — a plain
+        upgrade/downgrade call (`POST /account/subscription` for
+        tier='free', or the admin reconciliation endpoint) leaves
+        whatever billing email is already on file untouched."""
+        with self._connect() as conn:
+            if billing_email is not None:
+                conn.execute(
+                    "UPDATE subscriptions SET tier = ?, status = ?, billing_email = ?, "
+                    "grace_period_started_at = NULL, updated_at = ? WHERE account_id = ?",
+                    (tier, status, billing_email.strip().lower(), _now_iso(), account_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE subscriptions SET tier = ?, status = ?, "
+                    "grace_period_started_at = NULL, updated_at = ? WHERE account_id = ?",
+                    (tier, status, _now_iso(), account_id),
+                )
+
+    def find_account_id_by_billing_email(self, billing_email: str) -> str | None:
+        """Correlates a RECURRING charge webhook (success or failure) —
+        one that arrives after the original `wompi_pending_enrollments`
+        row already did its one job — back to the account it belongs to.
+        Same "no guessing" discipline as
+        `find_pending_enrollment_by_email`: more than one account
+        sharing a billing email is unusual enough to not guess between,
+        so only an exact single match resolves."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT account_id FROM subscriptions WHERE billing_email = ?",
+                (billing_email.strip().lower(),),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        return rows[0]["account_id"]
+
+    def set_subscription_status(
+        self, account_id: str, status: str, *, grace_period_started_at: str | None = None
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE subscriptions SET status = ?, grace_period_started_at = ?, "
+                "updated_at = ? WHERE account_id = ?",
+                (status, grace_period_started_at, _now_iso(), account_id),
+            )
+
+    def set_retention_override(self, account_id: str, retention_days: int | None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE subscriptions SET retention_days_override = ?, updated_at = ? "
+                "WHERE account_id = ?",
+                (retention_days, _now_iso(), account_id),
+            )
+
+    # --- monthly usage (Part B) -----------------------------------------
+
+    def get_monthly_usage(self, account_id: str, period_key: str) -> MonthlyUsageRecord:
+        """Always returns a record — a period with no activity yet is
+        all-zeros, never `None`, so callers never need a separate
+        "no row yet" branch just to compare against a limit."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM monthly_usage WHERE account_id = ? AND period_key = ?",
+                (account_id, period_key),
+            ).fetchone()
+        if row is None:
+            return MonthlyUsageRecord(
+                account_id=account_id,
+                period_key=period_key,
+                scans_used=0,
+                reportability_spend_usd=0.0,
+                hypotheses_spend_usd=0.0,
+            )
+        return MonthlyUsageRecord(
+            account_id=row["account_id"],
+            period_key=row["period_key"],
+            scans_used=row["scans_used"],
+            reportability_spend_usd=row["reportability_spend_usd"],
+            hypotheses_spend_usd=row["hypotheses_spend_usd"],
+        )
+
+    def increment_scan_usage(self, account_id: str, period_key: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO monthly_usage (account_id, period_key, scans_used) "
+                "VALUES (?, ?, 1) "
+                "ON CONFLICT(account_id, period_key) "
+                "DO UPDATE SET scans_used = scans_used + 1",
+                (account_id, period_key),
+            )
+
+    def add_llm_spend(
+        self, account_id: str, period_key: str, *, feature: str, amount_usd: float
+    ) -> None:
+        # column is one of exactly two hardcoded literals chosen above,
+        # never external input — same "identifier is a literal, values
+        # are bound params" shape as core/store.py::get_findings's own
+        # dynamic-column query (also suppressed below for the same reason).
+        column = "reportability_spend_usd" if feature == "reportability" else "hypotheses_spend_usd"
+        with self._connect() as conn:
+            conn.execute(
+                f"INSERT INTO monthly_usage (account_id, period_key, {column}) "  # noqa: S608  # nosec B608
+                f"VALUES (?, ?, ?) "
+                f"ON CONFLICT(account_id, period_key) "
+                f"DO UPDATE SET {column} = {column} + excluded.{column}",
+                (account_id, period_key, amount_usd),
+            )
+
+    # --- cost estimates (Part E.1, extended to LLM features) -----------
+
+    def create_cost_estimate(
+        self,
+        *,
+        account_id: str,
+        scan_id: str,
+        feature: str,
+        provider: str,
+        adversarial_provider: str | None,
+        degraded_from_adversarial: bool,
+        estimated_cost_usd: float,
+        params_json: str,
+        ttl_minutes: int = 10,
+    ) -> CostEstimateRecord:
+        estimate_id = secrets.token_hex(16)
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(minutes=ttl_minutes)).isoformat()
+        created_at = now.isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO cost_estimates (estimate_id, account_id, scan_id, feature, "
+                "provider, adversarial_provider, degraded_from_adversarial, "
+                "estimated_cost_usd, params_json, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    estimate_id,
+                    account_id,
+                    scan_id,
+                    feature,
+                    provider,
+                    adversarial_provider,
+                    int(degraded_from_adversarial),
+                    estimated_cost_usd,
+                    params_json,
+                    created_at,
+                    expires_at,
+                ),
+            )
+        return CostEstimateRecord(
+            estimate_id=estimate_id,
+            account_id=account_id,
+            scan_id=scan_id,
+            feature=feature,
+            provider=provider,
+            adversarial_provider=adversarial_provider,
+            degraded_from_adversarial=degraded_from_adversarial,
+            estimated_cost_usd=estimated_cost_usd,
+            params_json=params_json,
+            created_at=created_at,
+            expires_at=expires_at,
+            consumed_at=None,
+        )
+
+    def get_valid_cost_estimate(
+        self, estimate_id: str, account_id: str, *, scan_id: str, feature: str
+    ) -> CostEstimateRecord | None:
+        """Only returns a row that is this account's, for this exact
+        scan+feature, unexpired, AND not already consumed — the same
+        single-use/short-lived/bound-to-what-was-shown discipline Part
+        E.1 established for the scan cost-estimate flow."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM cost_estimates WHERE estimate_id = ? AND account_id = ? "
+                "AND scan_id = ? AND feature = ? AND consumed_at IS NULL "
+                "AND expires_at > ?",
+                (estimate_id, account_id, scan_id, feature, _now_iso()),
+            ).fetchone()
+        return None if row is None else _cost_estimate_record_from_row(row)
+
+    def consume_cost_estimate(self, estimate_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE cost_estimates SET consumed_at = ? WHERE estimate_id = ?",
+                (_now_iso(), estimate_id),
+            )
+
+    # --- Wompi billing (Part D, Round 3) --------------------------------
+
+    def create_pending_enrollment(
+        self, *, account_id: str, tier: str, billing_email: str
+    ) -> WompiPendingEnrollmentRecord:
+        enrollment_id = secrets.token_hex(16)
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO wompi_pending_enrollments "
+                "(enrollment_id, account_id, tier, billing_email, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'pending', ?)",
+                (enrollment_id, account_id, tier, billing_email.strip().lower(), now),
+            )
+        return WompiPendingEnrollmentRecord(
+            enrollment_id=enrollment_id,
+            account_id=account_id,
+            tier=tier,
+            billing_email=billing_email.strip().lower(),
+            status="pending",
+            created_at=now,
+            matched_at=None,
+        )
+
+    def find_pending_enrollment_by_email(
+        self, billing_email: str, *, tier: str | None = None
+    ) -> WompiPendingEnrollmentRecord | None:
+        """The best-effort webhook->account correlation (documented as
+        unconfirmed against a real Wompi sandbox — see
+        docs/PAID_API_DESIGN.md's "Round 3 implemented" section). Matches
+        the most recent still-'pending' enrollment for this email,
+        optionally narrowed by tier/product. Returns None (never a
+        guess) when there's no unambiguous match — the caller then routes
+        to manual reconciliation instead of activating anything."""
+        query = (
+            "SELECT * FROM wompi_pending_enrollments "
+            "WHERE billing_email = ? AND status = 'pending'"
+        )
+        params: list[str] = [billing_email.strip().lower()]
+        if tier is not None:
+            query += " AND tier = ?"
+            params.append(tier)
+        query += " ORDER BY created_at DESC"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        if len(rows) != 1:
+            # Zero matches: nothing pending for this email. More than
+            # one: ambiguous (e.g. two different tier upgrades requested
+            # with the same email) — neither case is safe to guess from.
+            return None
+        return _pending_enrollment_record_from_row(rows[0])
+
+    def mark_enrollment_matched(self, enrollment_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE wompi_pending_enrollments SET status = 'matched', matched_at = ? "
+                "WHERE enrollment_id = ?",
+                (_now_iso(), enrollment_id),
+            )
+
+    def webhook_event_already_processed(self, transaction_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM wompi_webhook_events WHERE transaction_id = ?",
+                (transaction_id,),
+            ).fetchone()
+        return row is not None
+
+    def record_webhook_event(
+        self,
+        *,
+        transaction_id: str,
+        outcome: str,
+        matched_account_id: str | None,
+        raw_body: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO wompi_webhook_events "
+                "(transaction_id, outcome, matched_account_id, raw_body, received_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (transaction_id, outcome, matched_account_id, raw_body, _now_iso()),
+            )
+
+    def create_unmatched_payment(
+        self,
+        *,
+        transaction_id: str,
+        payer_email: str | None,
+        product_name: str | None,
+        amount: float | None,
+        raw_body: str,
+    ) -> str:
+        unmatched_id = secrets.token_hex(16)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO wompi_unmatched_payments "
+                "(unmatched_id, transaction_id, payer_email, product_name, amount, "
+                "raw_body, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    unmatched_id,
+                    transaction_id,
+                    payer_email,
+                    product_name,
+                    amount,
+                    raw_body,
+                    _now_iso(),
+                ),
+            )
+        return unmatched_id
+
+    def get_unresolved_payments(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM wompi_unmatched_payments WHERE resolved_at IS NULL "
+                "ORDER BY received_at ASC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def resolve_unmatched_payment(self, unmatched_id: str, *, account_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE wompi_unmatched_payments SET resolved_at = ?, resolved_account_id = ? "
+                "WHERE unmatched_id = ? AND resolved_at IS NULL",
+                (_now_iso(), account_id, unmatched_id),
+            )
+        return cursor.rowcount > 0
+
+
+def _subscription_record_from_row(row: sqlite3.Row) -> SubscriptionRecord:
+    return SubscriptionRecord(
+        account_id=row["account_id"],
+        tier=row["tier"],
+        status=row["status"],
+        billing_email=row["billing_email"],
+        grace_period_started_at=row["grace_period_started_at"],
+        retention_days_override=row["retention_days_override"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _cost_estimate_record_from_row(row: sqlite3.Row) -> CostEstimateRecord:
+    return CostEstimateRecord(
+        estimate_id=row["estimate_id"],
+        account_id=row["account_id"],
+        scan_id=row["scan_id"],
+        feature=row["feature"],
+        provider=row["provider"],
+        adversarial_provider=row["adversarial_provider"],
+        degraded_from_adversarial=bool(row["degraded_from_adversarial"]),
+        estimated_cost_usd=row["estimated_cost_usd"],
+        params_json=row["params_json"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+        consumed_at=row["consumed_at"],
+    )
+
+
+def _pending_enrollment_record_from_row(row: sqlite3.Row) -> WompiPendingEnrollmentRecord:
+    return WompiPendingEnrollmentRecord(
+        enrollment_id=row["enrollment_id"],
+        account_id=row["account_id"],
+        tier=row["tier"],
+        billing_email=row["billing_email"],
+        status=row["status"],
+        created_at=row["created_at"],
+        matched_at=row["matched_at"],
+    )
 
 
 def _verification_record_from_row(row: sqlite3.Row) -> DomainVerificationRecord:

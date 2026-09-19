@@ -18,6 +18,7 @@ from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
+from api import subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, DomainVerificationRecord, ScanRecord
 from api.domain_verification import classify_scan_gate, normalize_domain
@@ -81,6 +82,28 @@ def _require_verified_domain_or_403(control_db: ControlDB, account_id: str, doma
     )
 
 
+def _require_billing_and_quota_ok(control_db: ControlDB, account_id: str):
+    """Part B/D's gate, in the exact same place and spirit as Round 2's
+    domain-verification gate above — reused, not duplicated as a second
+    "quota check" layer a future route could forget to call. Billing
+    status is checked first (`402`, distinct from a quota `403`): an
+    account with a lapsed payment shouldn't be told "quota exceeded" when
+    the real reason is unrelated to how many scans it has run."""
+    subscription = subscriptions.get_or_create_subscription(control_db, account_id)
+    if subscriptions.access_blocked_by_billing(subscription):
+        raise HTTPException(
+            status_code=402,
+            detail="This account's subscription is suspended (payment past due beyond the "
+            f"{subscriptions.GRACE_PERIOD_DAYS}-day grace period). Resolve billing via "
+            "POST /account/subscription to resume scanning.",
+        )
+    limits = subscriptions.effective_limits(subscription)
+    ok, reason = subscriptions.check_scan_quota(control_db, account_id, limits)
+    if not ok:
+        raise HTTPException(status_code=403, detail=reason)
+    return limits
+
+
 @router.post("", response_model=CreateScanResponse, status_code=202)
 async def create_scan(
     body: CreateScanRequest,
@@ -90,6 +113,7 @@ async def create_scan(
     control_db = _control_db(request)
     api_settings = _api_settings(request)
 
+    _require_billing_and_quota_ok(control_db, auth.account_id)
     domain = normalize_domain(body.domain)
     _require_verified_domain_or_403(control_db, auth.account_id, domain)
 
@@ -98,6 +122,7 @@ async def create_scan(
     control_db.create_scan(
         scan_id=scan_id, account_id=auth.account_id, domain=domain, db_path=db_path
     )
+    control_db.increment_scan_usage(auth.account_id, subscriptions.current_period_key())
 
     # Fire-and-forget: the request returns immediately with "queued";
     # the scan itself (~25 minutes) runs as a background asyncio task in
@@ -163,6 +188,14 @@ def post_client_report(
     from core.client_report.cli import cmd_client_report
 
     control_db = _control_db(request)
+    subscription = subscriptions.get_or_create_subscription(control_db, auth.account_id)
+    limits = subscriptions.effective_limits(subscription)
+    ok, reason = subscriptions.check_report_options(
+        limits, report_format=body.format, language=body.language, white_label=body.white_label
+    )
+    if not ok:
+        raise HTTPException(status_code=403, detail=reason)
+
     scan = _owned_scan_or_404(control_db, scan_id, auth.account_id)
     if scan.status != "completed":
         raise HTTPException(status_code=409, detail=f"Scan is {scan.status!r}, not completed yet")

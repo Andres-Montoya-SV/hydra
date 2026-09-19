@@ -67,18 +67,31 @@ INPUT_PRICE_PER_MTOK: dict[str, float] = {
 }
 
 
+def estimated_cost_usd(model: str, tokens: int) -> float | None:
+    """The raw dollar figure `cost_line` formats for display — factored
+    out so callers that need the number itself (not a human-readable
+    string), such as the paid API's monthly LLM-spend ceiling
+    enforcement (docs/PAID_API_DESIGN.md Part B, Round 3), don't
+    duplicate this pricing lookup. Returns `None` when there's no
+    published price on file for `model`, same "don't guess" fallback
+    `cost_line` already uses."""
+    price_per_mtok = INPUT_PRICE_PER_MTOK.get(model)
+    if price_per_mtok is None:
+        return None
+    return tokens / 1_000_000 * price_per_mtok
+
+
 def cost_line(provider_name: str, model: str, tokens: int, *, approximate: bool) -> str:
     """Human-readable pre-spend cost estimate for one call — used by both
     `assess-reportability` and `suggest-hypotheses`'s cost-estimate step
     (design Part D)."""
     label = "~" if approximate else ""
-    price_per_mtok = INPUT_PRICE_PER_MTOK.get(model)
-    if price_per_mtok is None:
+    cost = estimated_cost_usd(model, tokens)
+    if cost is None:
         return (
             f"{label}{tokens:,} tokens for {provider_name}/{model}. No published price is on "
             f"file for this model — check the provider's current pricing page."
         )
-    cost = tokens / 1_000_000 * price_per_mtok
     return f"{label}{tokens:,} tokens for {provider_name}/{model} (~${cost:.4f})"
 
 
