@@ -128,6 +128,10 @@ class TestClientReportMatchesCli:
             api_key = account["api_key"]
             account_id = account["account_id"]
             seed_verified_domain(client, account_id, SEED)
+            # Free tier only permits markdown+es (Round 3's report-option
+            # gate) — this test's subject is report-content parity, not
+            # tier gating (covered separately), so upgrade past it.
+            client.app.state.control_db.set_tier(account_id, "ultra")
 
             scan_id = client.post(
                 "/scans", json={"domain": SEED}, headers={"X-API-Key": api_key}
@@ -174,6 +178,10 @@ class TestClientReportMatchesCli:
             account = client.post("/accounts").json()
             api_key = account["api_key"]
             seed_verified_domain(client, account["account_id"], SEED)
+            # docx + en is a Medium+ feature (Round 3's report-option
+            # gate) — this test's subject is docx media-type wiring, not
+            # tier gating (covered separately), so upgrade past it.
+            client.app.state.control_db.set_tier(account["account_id"], "medium")
             scan_id = client.post(
                 "/scans", json={"domain": SEED}, headers={"X-API-Key": api_key}
             ).json()["scan_id"]

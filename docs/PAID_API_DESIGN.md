@@ -931,20 +931,390 @@ public resolvers even though macOS's own system resolver (`dig`,
 environment should therefore behave identically regardless of its own
 outbound DNS policy, since none of these tests ever leave loopback.
 
-## Explicitly deferred to Part 2 / Rounds 2-3
+## Round 3 implemented (`api/`) — Part B (Free/Medium/Pro/Ultra tiers) and Part D (Wompi)
 
-- Web framework choice — resolved in Round 1: FastAPI, confirmed above.
-- Domain-ownership verification (Part A) — resolved in Round 2, see
-  above.
-- Tiers/quotas (Part B), Wompi billing (Part D) — still deferred to
-  Round 3; any verified account can scan at unlimited volume right now.
+Round 3 closes the two remaining gaps Round 1 stated explicitly:
+unlimited scanning per verified account, and no billing at all. **This
+round's tier table is a different, more specific instruction than Part
+B's original Starter/Pro/Agency draft above** — four tiers
+(Free/Medium/Pro/Ultra) with exact numbers given by the task, not the
+three-tier draft — implemented as given, the same "more specific,
+more recent instruction wins" reasoning Round 2 already applied to Part
+A.2/A.3. See `api/tiers.py`'s own docstring/table for the authoritative
+current limits; this section covers the reasoning, the honest gaps, and
+what was confirmed against real Wompi documentation versus inferred.
+
+### Task 1 — Tiers: Free's $0 ceiling is structural, not a low limit
+
+`api/tiers.py::TierLimits.reportability`/`.hypotheses` are `None` for
+Free — there is no code path to reject, because there is no ceiling
+object to check in the first place. `api/routers/reportability.py` and
+`api/routers/hypotheses.py` both gate on this being `None` as the
+FIRST thing they do, before even resolving `scan_id`, and respond `404`
+— identical to a route that was never registered, never `403` (which
+would confirm the feature exists but is merely forbidden; Part F.3's
+"a mismatch reads identically to not found" principle, reused one level
+up for tier gating instead of ownership).
+
+**Numbers the task left for this round to pick, and the reasoning
+used** (the task explicitly said "define un techo razonable" /
+"decide cuál, documenta la elección" for these):
+
+- Ultra's scan "fair use" ceiling: 500/month, the task's own suggested
+  example.
+- Pro's `assess-reportability` monthly ceiling: **$40** — no figure was
+  given (only Medium's $10 and Ultra's $100 examples), so this splits
+  the gap closer to Medium (Pro's likely usage shape — one active
+  tester/small team, not agency-scale volume) while still being
+  meaningfully higher for the added cross-validation cost.
+- Pro's/Ultra's `suggest-hypotheses` ceilings ($25/$60): scaled from
+  their respective reportability ceilings by roughly the same ratio the
+  table itself uses between Pro's and Ultra's reportability numbers,
+  since hypothesis generation runs on a smaller per-call input
+  (relationships/entities, not full findings batches) and is
+  proportionately cheaper.
+- Medium + adversarial cross-validation requested: **auto-degrades to
+  single-provider**, never rejected outright (the task offered both
+  options and asked for a documented pick) — rejecting the whole
+  request over one extra parameter the client is only one tier away
+  from having felt disproportionate; the response always carries
+  `degraded_from_adversarial: true` so this is never silently invisible
+  (`api/subscriptions.py::resolve_adversarial_provider`).
+- Ultra's "configurable por cuenta" retention: no fixed tier default;
+  resolved per-account via `subscriptions.retention_days_override`
+  (settable only through the admin reconciliation endpoint today),
+  falling back to a 730-day default (`DEFAULT_ULTRA_RETENTION_DAYS`) if
+  the operator never set one explicitly.
+
+**Reused, not rebuilt**: the task said to extend Round 1's per-key rate
+limiting (`api/rate_limit.py`'s `TokenBucketLimiter`, still
+unmodified) rather than rebuild it — Round 3's tier quotas are a
+different, complementary axis (monthly scan/spend ceilings, not
+requests-per-minute) and live in a new sibling module
+(`api/subscriptions.py`) that both `api/routers/scans.py` and
+`api/routers/domains.py` call from the exact same mandatory-`account_id`
+gate position Round 2 already established — `_require_billing_and_
+quota_ok` sits directly next to `_require_verified_domain_or_403` in
+`create_scan`, not a separately bolted-on layer.
+
+**Stated honestly, not silently built**: `TierLimits.priority_queue`
+is recorded (Pro/Ultra: `True`) and surfaced via `GET
+/account/subscription`, but Round 1's scan execution is still a plain
+`asyncio.create_task` per scan with no real job queue to reorder
+(already a documented Round 1 limitation) — this field is a no-op today,
+present so a real scheduler landing later has something to read. The
+`white_label` flag on `POST /scans/{id}/client-report` is
+tier-validated (only Ultra can set it `true`) but does **not** yet
+change the generated report's content — `core/client_report/` has no
+white-label rendering mode, and building one was out of this round's
+tested scope (the task's six required tests don't exercise it). Flagged
+here rather than silently claimed.
+
+### Task 2 — Wompi OAuth client: confirmed against real docs.wompi.sv
+
+Directly re-verified (not assumed from the earlier design doc) before
+writing `api/wompi_client.py::WompiClient`:
+
+- `POST https://id.wompi.sv/connect/token`, form-encoded
+  (`grant_type=client_credentials&audience=wompi_api&client_id=...&
+  client_secret=...`) → `{"access_token", "expires_in", "token_type":
+  "Bearer", "scope"}`.
+- The REST API host is `https://api.wompi.sv` — confirmed from that
+  page's own literal example (`POST https://api.wompi.sv/EnlacePago`),
+  not assumed to be the same host as `id.wompi.sv`.
+- The token is cached and refreshed 60 seconds before its own
+  `expires_in`, never re-requested on every call, per Wompi's own
+  documented guidance.
+
+Tested against a real local HTTP server standing in for both hosts
+(`tests/_fake_wompi_server.py`, `tests/test_wompi_client.py`) — real
+form-encoding, real caching behavior, real expiry-driven refetch.
+**One real, live call was also made** against the actual
+`id.wompi.sv` with the operator's real `WOMPI_CLIENT_ID`/
+`WOMPI_CLIENT_SECRET` (side-effect-free — a token exchange spends no
+money and creates nothing) as part of this round's live demonstration;
+see below for the captured result.
+
+### Task 3 — Webhook authenticity: confirmed mechanism, one honest inference
+
+Confirmed directly against `docs.wompi.sv/webhook/validar-webhook.md`:
+the signature header is literally `wompi_hash`, the algorithm is
+HMAC-SHA256 over the **exact raw request body bytes** (never a
+re-serialized/re-parsed-then-dumped version), and the comparison uses
+`hmac.compare_digest` (`api/wompi_client.py::verify_webhook_signature`),
+never `==` — a timing-safe comparison, so this can't be brute-forced one
+byte at a time. `api/routers/subscription.py::wompi_webhook` reads
+`await request.body()` before any JSON parsing, specifically so the
+bytes hashed are the bytes Wompi actually sent, and performs Part D.2's
+second, independent check (`GET /TransaccionCompra/{id}`) before ever
+activating anything from the webhook body alone.
+
+**The one inference, stated as plainly as the task asked for**: Wompi's
+OAuth documentation
+(`docs.wompi.sv/autenticacion/autenticacion.md`) calls the OAuth2
+`client_secret` the merchant's **"API Secret"**; the webhook validation
+documentation (`docs.wompi.sv/webhook/validar-webhook.md`)
+independently calls the HMAC key the merchant's **"API Secret"** too —
+same term, on two otherwise-unrelated pages. This implementation uses
+`WOMPI_CLIENT_SECRET` as the webhook HMAC key on the strength of that
+terminology match. **No Wompi sandbox account was available to enroll a
+test card, trigger a real webhook, and confirm the `wompi_hash` value
+against a known secret end-to-end** — this is a documentation-
+terminology-confirmed inference, not an observed-in-production-confirmed
+one. If a sandbox becomes available before this goes live, confirming
+this one point is the single highest-value thing to check first.
+
+**Subscriber identification — the task's own explicitly-flagged open
+question, and the fallback it asked for**: `docs.wompi.sv`'s
+`EnlacePagoRecurrente` creation/response schema
+(`metodos-api/crear-enlace-pago-recurrentes.md`) has no merchant-
+settable per-subscriber reference field, and the subscriber-list
+endpoint (`GET /EnlacePagoRecurrente/{id}/suscripciones`) is named in
+the docs but its response body is not documented — both re-confirmed
+directly, not assumed from the earlier design doc. No sandbox account
+was available to observe either endpoint's real behavior. Implemented,
+exactly as the task's fallback instructed:
+
+1. `POST /account/subscription {"tier": "pro", "billing_email": "..."}`
+   records a `wompi_pending_enrollments` row (account_id, tier,
+   billing_email) and returns that tier's pre-configured, shared
+   `EnlacePagoRecurrente` URL — Part D.1's "one link per tier, not per
+   customer" reused unchanged.
+2. The webhook handler matches an incoming success payload's
+   `cliente.Email` (case-insensitive) against a still-`'pending'` row
+   for the same tier/product. A match activates the tier and stores
+   `billing_email` on the account's `subscriptions` row, so a LATER
+   recurring charge (success or failure) can be matched the same way
+   without a pending-enrollment row still existing.
+3. **No match → `wompi_unmatched_payments`, never discarded, never
+   guessed** (Task 3's non-negotiable) — `GET /admin/wompi/unmatched`
+   lists them, `POST /admin/wompi/reconcile` links one to an account by
+   hand. The admin endpoints are gated by a single static
+   `HYDRA_API_ADMIN_TOKEN` — an honestly-temporary MVP mechanism (no
+   real operator/admin auth system exists yet, the same kind of stated
+   gap Round 1's unauthenticated `POST /accounts` already has), not a
+   production-grade admin auth system.
+
+### Task 3.2 — Payment failure / grace period (Part D.3, confirmed as drafted)
+
+3-day grace period (`GRACE_PERIOD_DAYS`, `api/subscriptions.py`): a
+webhook reporting anything other than `"ExitosaAprobada"` for an
+already-billing-email-linked account starts `status = "past_due"` —
+scans and existing API keys keep working exactly as `"active"` does
+during grace (Part D.3's own reasoning: a client shouldn't lose access
+over a single declined card while actively investigating something).
+Only `status == "suspended"` blocks `POST /scans`, with `402` (never
+`403` — this is a billing state, not an authorization/quota one).
+**Not built this round, stated honestly**: the scheduled job that
+detects a grace period's 3 days elapsing with no resolving webhook and
+flips `past_due` → `suspended` automatically — `grace_period_expired()`
+exists as a pure function ready for that job to call, but no scheduler
+invokes it yet (the same "no durable job queue this round" limitation
+already documented for scan orchestration and retention purging).
+`GET` on an already-completed report is never gated by billing status
+at all (checked nowhere in `api/subscriptions.py`) — the client already
+paid for that specific, already-delivered data.
+
+### Task 3.3 — Card data (Part D.4, unchanged, reconfirmed)
+
+Unchanged from the original design: the recurring-tier flow never sends
+card data to Hydra at all — it's entered directly on Wompi's own hosted
+enrollment page (`urlEnlace`). Hydra's backend never implements a card
+form, never accepts a PAN/CVV over its own API for the subscription
+flow, and this round did not add a one-off top-up/tokenization endpoint
+(Part B's LLM-budget top-up is still deferred — not part of this
+round's required tests).
+
+### Task 4 — Subscription management endpoints
+
+`GET /account/subscription` (current tier, status, this period's scan/
+LLM usage, verified-domain count, effective retention) and `POST
+/account/subscription {"tier": ...}` — `tier: "free"` switches
+immediately (no payment involved, Part D.1's $0-tier reasoning reused);
+`tier` set to a paid tier requires `billing_email` and returns that
+tier's payment link, but does **not** change the account's actual tier
+— only a confirmed webhook does that (Task 3). `POST /account/
+subscription`'s response always reports whether the target tier would
+leave the account over its new domain/scan limits
+(`exceeds_domain_limit`/`exceeds_scan_limit`) so a client sees the
+consequence up front, not as a later, unexplained 403 — see the next
+section for what "over the limit" actually does.
+
+### Task-implied decision — downgrade never silently revokes anything
+
+Not explicitly asked as a numbered task, but required by Task 5's test
+6: a tier change applies its new scan-quota/LLM-ceiling/domain-count
+limits **immediately, looking forward only** — an already-used scan
+count for the current month is never reset or backdated, and an account
+that now holds more verified domains than its new tier allows keeps
+every one of them fully valid until each one's own Round-2 expiry.
+Downgrading only ever blocks NEW consumption past the new, stricter
+ceiling (a new domain registration once over the limit; a new scan once
+already at/over the new monthly count) — nothing already obtained is
+taken away as a side effect of a plan change. `api/subscriptions.py`'s
+own module docstring documents the full reasoning, including why this
+was chosen over an automatic revoke/purge.
+
+### Tests
+
+`tests/test_api_tiers_and_subscriptions_logic.py` (35 tests) — pure
+tier-table/quota/budget/tier-change logic, no I/O.
+`tests/test_wompi_client.py` (14 tests) — OAuth caching, transaction
+lookup, and webhook-signature verification against a real local server
+(`tests/_fake_wompi_server.py`), never a mocked `httpx` call.
+`tests/test_api_subscription_endpoints.py` (18 tests) — full HTTP
+end-to-end: all six of Task 5's required scenarios (Free-tier route
+gating returns `404`; valid/invalid/missing webhook signatures;
+duplicate-webhook idempotency; unknown-reference → manual reconciliation
+→ resolved; scan-quota-reached names the upgrade tier; suspended vs.
+past-due billing states; tier-change consequences on both scans and
+domains), plus the transaction-double-check and payment-failure-grace
+paths. `tests/test_api_reportability_hypotheses_endpoints.py` (3 tests)
+— Medium's auto-degrade end-to-end (with the real reportability-
+assessment pipeline reused, LLM provider mocked, a real completed scan
+with a real finding seeded through `AssetStore`), Pro's real cross-
+validation path, and the LLM budget ceiling actually blocking a request.
+
+**A real bug this round's own effort to wire in LLM credentials
+surfaced, and a decision about it, stated honestly**:
+`api/tenancy.py::account_settings()` builds each account's pipeline
+`Settings` with a bare `Settings(project_root=...)` constructor, never
+`Settings.from_env()` — meaning no account's scan pipeline has ever
+actually inherited the operator's real `.env` configuration (tool
+enable flags, thread counts, rate limits, LLM keys, etc.) since Round 1;
+every field silently falls back to the dataclass's own built-in
+defaults instead. This was NOT changed in Round 3: fixing it would touch
+the exact scan-orchestration code path Round 1/2 already tested and
+shipped, for a concern outside this round's actual task (tiers/Wompi),
+and risked a real regression for no benefit to this round's own work.
+Instead, `api/reportability_orchestrator.py`/`api/hypotheses_orchestrator.py`
+each load a SEPARATE, purpose-built `_operator_settings()` (a fresh
+`Settings.from_env()` pointed at the real repo-root `.env`) specifically
+to read the operator-wide `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/
+`REPORTABILITY_*`/`HYPOTHESIS_*` config — correct for this round's own
+need (LLM credentials are legitimately operator-wide, not per-account,
+per Part B's own "Hydra's own cost, not client price" framing) without
+touching the pre-existing, already-tested per-account settings path.
+Flagged here as a known, pre-existing gap for a future round to
+consider, not something Round 3 fixed or hid.
+
+**CI/environment independence, stated explicitly per this project's own
+process**: every reportability/hypotheses test replaces
+`_operator_settings` with fake, deterministic credentials via
+`monkeypatch` — verified concretely by moving the real (gitignored)
+`.env` aside and re-running the full file, confirming it still passes
+with zero dependency on real ambient environment or secrets. The Wompi
+webhook/OAuth tests never contact the real `id.wompi.sv`/`api.wompi.sv`
+either — only the one documented live OAuth call below does, and it is
+outside the automated suite.
+
+### A second real bug the live demonstration itself caught
+
+`api/settings.py::load_api_settings()` read only `os.environ` directly
+and never loaded the repo-root `.env` file at all — unlike
+`config.settings.Settings.from_env()` (the CLI/pipeline's own loader),
+which has always called `load_dotenv()` first. This has been true since
+Round 1, harmlessly, because Round 1/2's own env vars
+(`HYDRA_API_DATA_DIR`, dev DNS/well-known overrides) are the kind an
+operator either accepts as defaults or actually exports. Round 3 made it
+consequential: an operator who puts `WOMPI_CLIENT_ID`/
+`WOMPI_CLIENT_SECRET` in `.env` — the obvious, already-documented place,
+confirmed as this project's real convention (`config/.env.example`,
+every other credential in this repo's own `.env`) — would have every
+Wompi call silently fail with "not configured," discovered only by
+running the live demonstration below and watching the real OAuth call
+fail with `No module named 'api'`... then, after fixing that import
+path, succeed suspiciously without ever having exported anything.
+Fixed: `load_api_settings()` now calls `load_dotenv(repo_root/".env",
+override=False)` before reading any variable — `override=False` means
+an already-exported real environment variable still always wins; this
+only fills in what a `.env` file provides and nothing was already set.
+Confirmed via the live run below (the real OAuth call actually
+succeeded against `id.wompi.sv` afterward) and via the full test suite
+(no test calls `load_api_settings()` or the bare module-level
+`api.main.app` directly, so this fix has zero effect on any test's
+behavior — verified by re-running the full Round 3 test files
+afterward, unchanged pass count).
+
+### Live demonstration
+
+Captured from a real `uvicorn` process (throwaway `/tmp` data
+directory), hit with real HTTP requests, a real local DNS test server
+for the domain-verification step, and one real call to the actual
+`id.wompi.sv` using the operator's real `WOMPI_CLIENT_ID`/
+`WOMPI_CLIENT_SECRET` (side-effect-free — a token exchange spends
+nothing and creates nothing):
+
+```
+=== 1. Real OAuth token exchange against the REAL id.wompi.sv ===
+[demo] real access_token received (prefix): eyJhbGciOiJS...
+
+=== 2. Create account (defaults to Free tier) ===
+HTTP 201
+{"account_id":"bf44dfdab934cf220acba46b60499635","api_key":"hydra_live_1da963f8b3a6f5687fc414547b5aa770f0a8c9e51c398f1192645440a41a0c71","key_id":"e2e16c0a74694ee78ef23e5c3f9c0145"}
+
+=== 3. Free tier: assess-reportability route behaves as if it does not exist ===
+HTTP 404
+{"detail":"Not Found"}
+
+=== 4. Register + verify a real domain (real DNS wire protocol) ===
+HTTP 200
+{"domain":"hydra-round3-demo.example","status":"verified","method":"dns_txt","verified_at":"2026-09-19T14:51:08.417030+00:00","expires_at":"2026-12-18T14:51:08.417030+00:00"}
+
+=== 5. First scan succeeds (Free = 1/month) ===
+HTTP 202
+{"scan_id":"ea0c121a6aee504f224f9da34a5b6f5b","status":"queued"}
+
+=== 6. Second scan this month is blocked, names the tier that would help ===
+HTTP 403
+{"detail":"Monthly scan quota reached (1 for the 'free' tier). Upgrade to 'medium' for a higher monthly limit."}
+
+=== 7. POST /account/subscription tier=pro -> returns the configured payment link ===
+HTTP 200
+{"tier":"free","status":"active","payment_url":"https://pay.example/pro-demo-link","previous_tier":null,"exceeds_domain_limit":false,"exceeds_scan_limit":false}
+
+=== 8. A locally-simulated Wompi webhook, signed with the REAL WOMPI_CLIENT_SECRET ===
+HTTP 502
+{"detail":"Could not independently confirm this transaction: Wompi TransaccionCompra lookup failed: HTTP 404 {\"servicioError\":\"Transaccion\",\"mensajes\":[\"La transaccion al que desea acceder no existe\"],\"subTipoError\":\"ElementoNoExiste\"}"}
+
+=== 9. Confirm subscription is still Free (no real transaction backs the demo webhook) ===
+{"tier":"free","status":"active","scans_used_this_period":1,"scans_limit":1,"verified_domains_count":1,"verified_domains_limit":1,"grace_period_started_at":null,"retention_days":7}
+```
+
+**Step 8 is the single most informative result in this whole
+demonstration, stated plainly rather than glossed over**: the simulated
+webhook body was signed with the real `WOMPI_CLIENT_SECRET` and DID pass
+this service's own `wompi_hash` verification (it never got the `401` an
+actually-wrong signature produces in the automated test suite) — but
+Part D.2's independent `GET /TransaccionCompra/{id}` check against the
+REAL `api.wompi.sv` correctly found that `demo-txn-1` does not exist
+there (a real, well-formed `ElementoNoExiste` error from Wompi's own
+API) and refused to activate anything. This is the belt-and-suspenders
+safeguard actually firing for real, against Wompi's real infrastructure,
+not a simulated pass — proof that a validly-HMAC-signed payload alone
+is never sufficient in this implementation, exactly as Task 3 required.
+No tier was ever activated by anything other than a webhook this service
+could independently confirm.
+
+## Explicitly deferred beyond Round 3
+
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
   this API never knows Firebase exists; `X-API-Key` only).
 - A durable job queue and a shared (Redis-backed) rate limiter, for a
-  multi-worker deployment — Round 1's in-memory versions are correct for
-  a single `uvicorn` worker only (see "Known Round 1 limitations" above).
-- The exact per-subscriber identification mechanism for
-  `EnlacePagoRecurrente` webhooks (Part D.1's open item) — needs a real
-  Wompi sandbox account to observe.
+  multi-worker deployment (Round 1's own limitation, still unresolved) —
+  also what a real "priority queue" for Pro/Ultra scans would need.
+- The scheduled jobs Part B/D describe but this round did not build: the
+  retention-purge job (Part B), and the grace-period-expiry-without-a-
+  webhook detector (Part D.3).
+- Confirming the webhook-secret inference and the email-based subscriber
+  correlation mechanism against a REAL Wompi sandbox account, per this
+  round's own honesty requirement — both are implemented and tested
+  against real local stand-ins, neither is observed-in-production-
+  confirmed yet.
+- White-label report content rendering (`core/client_report/` itself) —
+  the tier gate exists; the actual branding-free output does not yet.
+- One-off LLM-budget top-ups via Wompi tokenization (Part B/D.4's
+  `POST /Tokenizacion` flow) — still not built, not required by this
+  round's tests.
 - Postgres+RLS migration, if/when cross-tenant aggregate reporting is
   actually needed (Part F.2).

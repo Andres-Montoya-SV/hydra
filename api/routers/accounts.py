@@ -32,6 +32,7 @@ def _control_db(request: Request) -> ControlDB:
 def create_account(request: Request) -> CreateAccountResponse:
     control_db = _control_db(request)
     account_id = control_db.create_account()
+    control_db.create_default_subscription(account_id, tier="free")
 
     raw_key, prefix = generate_raw_key()
     key_id = uuid.uuid4().hex
