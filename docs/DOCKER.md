@@ -68,6 +68,32 @@ a version number for `httpx`/`naabu`/`katana`/`dnsx`/`amass`), and for
 major version is installed. See `docs/HARDENING_ROUND2_P1.md` for the full
 audit and the exact bug reproductions.
 
+### A native install shares your PATH with Python venvs — same-named tools can collide
+
+This project's own `api/` service needed the Python `httpx` PyPI package
+(a test dependency, unrelated to the recon tool) and that package's `pip
+install` unconditionally creates a console script also named `httpx` —
+confirmed a real incident, not a hypothetical, in
+`docs/PAID_API_DESIGN.md`'s "Round 1 implemented" section. Any Python
+dependency — present or future, in this project's own `requirements*.txt`
+or in something a contributor installs locally — that happens to declare
+a console script matching one of this table's tool names (`httpx`,
+`amass`, `naabu`, `dnsx`, …) can do the same thing once its venv is
+activated, since a venv's `bin/` is prepended ahead of wherever the real
+Go binary actually lives.
+
+**This does not put a real recon run at risk** — `core/dependencies/`
+already resolves and verifies the genuine binary regardless (multi-
+candidate discovery preferring Homebrew/GOPATH locations over a bare PATH
+hit, plus per-tool `identity_markers` output-content verification for
+tools known to be collision-prone; see `core/dependencies/registry.py`
+and `tests/test_dependency_binary_identity.py`). The risk is narrower and
+specific to code that shells out to a bare tool name directly, bypassing
+that resolution layer on purpose or by oversight — if you ever add such
+code, resolve the binary through `core/dependencies`/`ToolManager`
+first, the same way every existing plugin does via
+`context.resolved_binaries`, rather than trusting raw PATH search.
+
 2. **`final`** (`python:3.11-slim-bookworm`) — the runtime:
    - The 7 Go binaries above, copied from the builder stage.
    - `nmap`, `jq` (apt) — the non-Go tools Hydra's plugins call. (No

@@ -6,3 +6,33 @@ mypy==1.15.0
 pytest==8.3.5
 pytest-asyncio==0.25.3
 ruff==0.11.2
+# httpx: only needed for fastapi.testclient.TestClient (tests/test_api_*.py)
+# — the API itself (requirements-api.txt) makes no outbound HTTP calls in
+# Round 1, so this is a test-only dependency, not a runtime one.
+#
+# IMPORTANT — name collision with the ProjectDiscovery `httpx` recon binary
+# this project also shells out to (modules/httpx.py): the Python `httpx`
+# PyPI package's `console_scripts` entry point named `httpx` (`httpx:main`)
+# is UNCONDITIONAL package metadata — confirmed directly via
+# importlib.metadata, not the `cli` extra (`click`/`rich`/`pygments` are
+# gated behind `extra == "cli"`, but the script itself is not; installing
+# plain `httpx`, exactly as pinned below with no extra, still creates it).
+# `pip install` always writes this shim into this venv's bin/ directory,
+# where it can outrank the real recon binary on PATH once the venv is
+# active — this is a genuine, unavoidable-by-pip-flag name collision, not
+# a config mistake to "fix" by changing this line.
+#
+# The pipeline itself is not at risk: core/dependencies/service.py already
+# has a "handles httpx vs python-httpx" multi-candidate discovery +
+# identity-marker validation (httpx's own ToolDefinition in
+# core/dependencies/registry.py declares identity_markers=("projectdiscovery",
+# ...) and a path_denylist covering .venv/site-packages/Python.framework) —
+# any real `PipelineRunner`/`ToolManager`-driven run resolves and verifies
+# the genuine binary regardless of this shim (see
+# tests/test_dependency_binary_identity.py). The narrow gap is test code
+# that constructs a plugin/Settings directly, bypassing that layer on
+# purpose — those tests use the `verified_httpx_path` fixture
+# (tests/conftest.py) to get the same protection explicitly. See
+# docs/PAID_API_DESIGN.md's "Round 1 implemented" section for the full
+# incident writeup.
+httpx==0.28.1
