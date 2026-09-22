@@ -11,16 +11,20 @@ full local-run walkthrough, including how to create a test account).
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from api.control_db import ControlDB
+from api.email_sender import ConsoleEmailSender
 from api.rate_limit import TokenBucketLimiter
 from api.routers import accounts, domains, hypotheses, keys, reportability, scans, subscription
 from api.settings import APISettings, load_api_settings
 from api.wompi_client import WompiClient
+
+logger = logging.getLogger("hydra.api")
 
 
 def create_app(api_settings: APISettings | None = None) -> FastAPI:
@@ -39,6 +43,25 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             id_base_url=settings.dev_wompi_id_base_url,
             api_base_url=settings.dev_wompi_api_base_url,
         )
+        # Hallazgo 1: no real email provider is wired up yet — see
+        # api/email_sender.py's own module docstring for what MUST
+        # change before this is exposed to real, non-operator users.
+        app.state.email_sender = ConsoleEmailSender()
+
+        # Hallazgo 2: a scan that is 'queued'/'running' at the exact
+        # moment THIS process starts can only be leftover state from a
+        # previous process that died without updating it — this process
+        # has queued/started nothing yet. Reconciled before the app
+        # accepts a single request, so no client ever observes a scan
+        # stuck in an unresolvable status because of a restart.
+        orphaned = app.state.control_db.fail_orphaned_scans(reason="interrupted by server restart")
+        if orphaned:
+            logger.warning(
+                "Marked %d scan(s) as failed on startup (interrupted by server restart): %s",
+                len(orphaned),
+                ", ".join(orphaned),
+            )
+
         app.state.background_tasks = set()
         yield
         # Round 1 has no durable job queue (see scan_orchestrator's module
@@ -55,7 +78,11 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             "activation, payment-failure grace period) sits behind "
             "POST /account/subscription. Round 2's domain-ownership "
             "verification and Round 1's multi-tenant core/auth/async scans "
-            "underneath — see docs/PAID_API_DESIGN.md."
+            "underneath. Post-Round-3 hardening: POST /accounts is "
+            "per-IP rate limited and gated by email verification before "
+            "POST /scans will run anything, and any scan left "
+            "queued/running by a server restart is reconciled to failed "
+            "at startup — see docs/PAID_API_DESIGN.md."
         ),
         lifespan=lifespan,
     )

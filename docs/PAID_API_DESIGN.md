@@ -1296,6 +1296,187 @@ is never sufficient in this implementation, exactly as Task 3 required.
 No tier was ever activated by anything other than a webhook this service
 could independently confirm.
 
+## Post-Round-3 hardening — two production gaps closed (frontend-team review)
+
+An independent review from the `hydra-styling` frontend team, verified
+against the real code before being acted on, found two real gaps —
+both closed on `fix/account-abuse-and-orphaned-scans`, off `main` after
+Round 3 merged.
+
+### Hallazgo 1 — unauthenticated `POST /accounts` enabled unlimited Free-tier abuse
+
+Before this fix, anyone could create unlimited Free accounts with no
+verification at all — combined with Free's 1-scan/month quota
+(Part B), a script could create a fresh account every time its quota
+ran out and scan indefinitely for free. `POST /accounts` cannot simply
+require `X-API-Key` (it's the entry point where an account is born —
+there is no key yet), so the fix attacks the abuse itself along two
+independent, complementary axes, neither of which blocks a real user
+creating their one real account:
+
+1. **Per-source-IP rate limit** (`api/routers/accounts.py::_require_
+   account_creation_not_rate_limited`): a rolling 24-hour window, not a
+   calendar day (a fixed midnight reset would let a script simply wait
+   and burst again) — default 3 accounts per IP per 24h
+   (`APISettings.account_creation_rate_limit_per_ip_per_day`, env
+   `HYDRA_API_ACCOUNT_CREATION_RATE_LIMIT_PER_IP_PER_DAY`). Persisted in
+   a new `account_creation_attempts` table (`api/control_db.py`), not
+   Round 1's in-memory per-key `TokenBucketLimiter` — that limiter only
+   ever runs AFTER authentication, and this endpoint has none; a
+   persisted counter also means the limit survives a process restart,
+   unlike an in-memory one. A failed attempt (e.g. a duplicate email,
+   see below) still counts against the limit — recorded BEFORE the
+   creation attempt itself — so probing for already-registered emails
+   can't be used to dodge it.
+
+2. **Email verification before the account can scan**:
+   `POST /accounts` still returns a working `api_key` immediately (the
+   multi-tenant plumbing keeps working unchanged for anyone who
+   completes verification) but the account starts with
+   `email_verified_at = NULL`. `POST /scans`
+   (`api/routers/scans.py::_require_verified_email_or_403`, checked
+   FIRST, before billing/quota/domain gates) refuses to run anything
+   until `POST /accounts/verify-email {"token": "..."}` confirms the
+   token sent to that address. This is what actually raises the cost of
+   abuse: a script now needs a real, distinct, receivable email address
+   per account, not just a different IP. `accounts.email` carries a
+   partial unique index (`WHERE email IS NOT NULL`) — enforced by the
+   database itself, not just application logic — so two accounts can
+   never share an email; `ControlDB.create_account` raises
+   `DuplicateEmailError` (→ `409`) on a collision.
+
+**`EmailSender` is a `Protocol`, not a hard dependency**
+(`api/email_sender.py`) — the same structural-interface choice
+`core/reportability/provider.py::ReportabilityProvider` already made.
+**Only one implementation exists: `ConsoleEmailSender`**, which logs the
+verification token/instructions via the standard `logging` module.
+**Stated as plainly as the task required: connecting a real provider
+(SendGrid, AWS SES, Postmark, ...) is NOT built and must happen before
+this flow is exposed to real, non-operator users** — until then, every
+"sent" email is only ever visible in this process's own logs.
+
+**Backward compatibility, verified explicitly**: an account created
+before this fix shipped (`email` column never populated) is treated as
+already verified — `_require_verified_email_or_403` only gates an
+account that genuinely HAS an email on file and hasn't confirmed it.
+Retroactively locking out every already-onboarded account the moment
+this shipped would have been an unannounced regression, not a security
+fix. `tests/test_api_account_verification.py`'s own
+`test_a_pre_fix_account_with_no_email_on_file_is_treated_as_already_
+verified` constructs exactly this legacy shape (bypassing `POST
+/accounts` entirely, calling `ControlDB.create_account()` the old,
+email-less way) and confirms it can still scan.
+
+**A real schema-migration gap this fix had to solve, not just a new
+table**: `accounts` already existed (Round 1) with real rows in it by
+the time this fix landed — `CREATE TABLE IF NOT EXISTS` never adds
+columns to a table that's already on disk. `ControlDB.__init__` now
+runs `_migrate_accounts_table` (checks `PRAGMA table_info(accounts)`,
+`ALTER TABLE ... ADD COLUMN` for whatever's missing) BEFORE the schema
+script — otherwise the schema script's own `CREATE UNIQUE INDEX ... ON
+accounts(email)` would fail with "no such column" against any
+`control.db` created by an earlier round.
+
+**Also added**: `POST /accounts/resend-verification` (authenticated by
+the account's own already-issued `api_key` — an unverified account can
+still authenticate, it just can't scan; regenerating a token always
+invalidates the previous one outright) — not explicitly asked for, but
+a direct, low-cost consequence of "don't block a real user": a lost or
+expired verification email should never permanently strand a legitimate
+account.
+
+### Hallazgo 2 — a server restart left `running`/`queued` scans stuck forever
+
+Scans run as a plain `asyncio.create_task` inside the same process
+serving HTTP requests (a known, already-documented Round 1 limitation —
+no durable job queue). If that process restarts (deploy, crash) while a
+scan is `running`, the row stayed `running` forever, with no signal it
+had actually died — worse than a clean failure, since the client sees a
+status that never resolves.
+
+**Not a durable job queue** (explicitly out of scope for this fix,
+per the task) — the actual recovery this round ships:
+`ControlDB.fail_orphaned_scans(reason=...)`, called once in
+`api/main.py`'s lifespan, immediately after `ControlDB` is constructed
+and BEFORE the app accepts a single request. Any scan found
+`queued`/`running` at that exact moment can only be leftover state from
+a previous, now-dead process — this process has queued or started
+nothing yet — and is marked `failed` with
+`error_message = "interrupted by server restart"`, unconditionally, no
+exceptions. A scan that had already resolved (`completed`/`failed`)
+before the "restart" is left completely untouched.
+
+**Stated honestly, exactly as the task asked**: this is reconciliation
+of STATUS, not recovery of WORK — the scan itself is never resumed,
+its partial progress (if any) is discarded, and the client must start a
+fresh scan if they still want the result. A real durable job queue
+(Celery, RQ, or similar) is the actual next architectural step if real
+high-availability recovery (resuming, not just cleanly failing) is ever
+needed — not built here, and not pretended to be.
+
+### Tests
+
+`tests/test_api_account_verification.py` (12 tests) — rate limiting
+under/over the ceiling (including the failed-duplicate-attempt-still-
+counts case), an unverified account's scan attempt rejected with a
+clear message, a verified account scanning exactly as before,
+duplicate-email rejection, expired/invalid/already-consumed tokens, the
+resend flow, and the pre-fix-account backward-compatibility case.
+`tests/test_api_orphaned_scan_recovery.py` (3 tests) — `queued`/
+`running` rows seeded directly (simulating a dead previous process)
+resolve to `failed` with the exact reason on the next app startup, an
+already-`completed` scan is left untouched, and a scan started and
+completed within the SAME process (no restart at all) is unaffected —
+the explicit no-regression case. `tests/_verified_account.py` (new
+shared test-support module, matching `tests/_verified_domain.py`'s
+established split) creates an account through the real `POST /accounts`
+(so the now-mandatory email field and uniqueness constraint are
+genuinely exercised) and short-circuits verification directly in
+`ControlDB` for the many existing tests across Round 1-3 whose actual
+subject is something else entirely — every one of those files (`tests/
+test_api_auth.py`, `test_api_scans.py`, `test_api_client_report.py`,
+`test_api_domain_verification_endpoints.py`,
+`test_api_subscription_endpoints.py`,
+`test_api_reportability_hypotheses_endpoints.py`) was updated to use it
+instead of the old, now-invalid bare `client.post("/accounts")`.
+
+### Live demonstration
+
+Captured from a real `uvicorn` process, real `curl`/HTTP requests, and
+— for Hallazgo 2 — an actual process kill and relaunch (not a
+simulated restart inside one test process) against the same on-disk
+`control.db`:
+
+```
+=== HALLAZGO 1: per-IP rate limit on POST /accounts ===
+account 0: HTTP 201
+account 1: HTTP 201
+account 2: HTTP 201
+4th account (over limit): HTTP 429
+{"detail":"Too many accounts created from this network recently (limit: 3 per 24 hours). Try again later."}
+
+=== HALLAZGO 1: unverified account cannot scan ===
+reusing account 823fab6246adad6c24ecdb64f991ad04, api_key issued, unverified
+scan attempt on unverified account: HTTP 403
+{"detail":"This account's email address has not been verified yet. Check your inbox for the verification link, or POST /accounts/resend-verification for a new one."}
+
+=== HALLAZGO 2 setup: seed a scan stuck in 'running' directly in control.db ===
+before restart: scan status = 'running'
+
+=== HALLAZGO 2: restart the SAME process against the SAME control.db ===
+after restart: scan status = 'failed', error = 'interrupted by server restart'
+```
+
+The Hallazgo 2 sequence is the more load-bearing of the two to have run
+for real rather than only inside a `TestClient`: the demo script
+`terminate()`s the actual `uvicorn` OS process, seeds a `'running'` scan
+row directly against the on-disk SQLite file with no app running at
+all (genuinely simulating a crash mid-scan, not a mock of one), then
+launches a brand-new `uvicorn` process pointed at that same file —
+confirming the startup reconciliation runs correctly across a real
+process boundary, not just within one long-lived Python interpreter a
+unit test never actually exits.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —

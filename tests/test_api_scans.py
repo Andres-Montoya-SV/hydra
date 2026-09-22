@@ -22,6 +22,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("argon2")
 pytest.importorskip("httpx")
 
+from _verified_account import unique_email  # noqa: E402
 from _verified_domain import seed_verified_domain  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -115,11 +116,13 @@ def _client(tmp_path: Path) -> TestClient:
 def _create_account(client: TestClient, *, verified_domain: str = SEED) -> str:
     """Creates an account and pre-seeds it as the verified owner of
     `verified_domain` (Round 2's mandatory gate — see
-    tests/_verified_domain.py) so this file's Round-1-era tests, whose
-    subject is the scan lifecycle/isolation, can call `POST /scans`
-    exactly as before rather than performing real domain verification in
-    every test."""
-    body = client.post("/accounts").json()
+    tests/_verified_domain.py), and marks its email verified (the
+    account-abuse fix's mandatory gate — see tests/_verified_account.py)
+    so this file's Round-1-era tests, whose subject is the scan
+    lifecycle/isolation, can call `POST /scans` exactly as before rather
+    than performing real domain/email verification in every test."""
+    body = client.post("/accounts", json={"email": unique_email()}).json()
+    client.app.state.control_db.mark_email_verified(body["account_id"])
     seed_verified_domain(client, body["account_id"], verified_domain)
     return body["api_key"]
 

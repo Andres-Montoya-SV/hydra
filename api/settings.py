@@ -74,6 +74,16 @@ class APISettings:
     # closed), never "admin auth is optional."
     admin_token: str | None = None
 
+    # Hallazgo 1 (account-creation abuse) fix. `account_creation_rate_
+    # limit_per_ip_per_day`: a rolling 24h window, not a calendar day
+    # (a fixed reset lets a script burst again right at midnight) —
+    # "3 cuentas por IP por día" from the finding, implemented as
+    # "3 per IP in the trailing 24 hours." `email_verification_token_
+    # ttl_hours`: how long a verification token/email stays valid before
+    # a resend is required.
+    account_creation_rate_limit_per_ip_per_day: int = 3
+    email_verification_token_ttl_hours: int = 24
+
     @property
     def control_db_path(self) -> Path:
         return self.data_dir / "control.db"
@@ -124,4 +134,10 @@ def load_api_settings() -> APISettings:
     settings.wompi_link_url_pro = os.getenv("HYDRA_WOMPI_LINK_URL_PRO") or None
     settings.wompi_link_url_ultra = os.getenv("HYDRA_WOMPI_LINK_URL_ULTRA") or None
     settings.admin_token = os.getenv("HYDRA_API_ADMIN_TOKEN") or None
+    rate_limit_per_ip = os.getenv("HYDRA_API_ACCOUNT_CREATION_RATE_LIMIT_PER_IP_PER_DAY")
+    if rate_limit_per_ip:
+        settings.account_creation_rate_limit_per_ip_per_day = int(rate_limit_per_ip)
+    token_ttl = os.getenv("HYDRA_API_EMAIL_VERIFICATION_TOKEN_TTL_HOURS")
+    if token_ttl:
+        settings.email_verification_token_ttl_hours = int(token_ttl)
     return settings

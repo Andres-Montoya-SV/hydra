@@ -21,6 +21,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("argon2")
 pytest.importorskip("httpx")
 
+from _verified_account import unique_email  # noqa: E402
 from _verified_domain import seed_verified_domain  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -124,7 +125,8 @@ class TestClientReportMatchesCli:
         _install_pipeline_stubs(monkeypatch)
         api_settings = APISettings(data_dir=tmp_path / "api_data")
         with TestClient(create_app(api_settings)) as client:
-            account = client.post("/accounts").json()
+            account = client.post("/accounts", json={"email": unique_email()}).json()
+            client.app.state.control_db.mark_email_verified(account["account_id"])
             api_key = account["api_key"]
             account_id = account["account_id"]
             seed_verified_domain(client, account_id, SEED)
@@ -175,7 +177,8 @@ class TestClientReportMatchesCli:
         pytest.importorskip("docx")
         _install_pipeline_stubs(monkeypatch)
         with TestClient(create_app(APISettings(data_dir=tmp_path / "api_data"))) as client:
-            account = client.post("/accounts").json()
+            account = client.post("/accounts", json={"email": unique_email()}).json()
+            client.app.state.control_db.mark_email_verified(account["account_id"])
             api_key = account["api_key"]
             seed_verified_domain(client, account["account_id"], SEED)
             # docx + en is a Medium+ feature (Round 3's report-option
@@ -203,7 +206,8 @@ class TestClientReportMatchesCli:
     ) -> None:
         _install_pipeline_stubs(monkeypatch)
         with TestClient(create_app(APISettings(data_dir=tmp_path / "api_data"))) as client:
-            account = client.post("/accounts").json()
+            account = client.post("/accounts", json={"email": unique_email()}).json()
+            client.app.state.control_db.mark_email_verified(account["account_id"])
             api_key = account["api_key"]
             seed_verified_domain(client, account["account_id"], SEED)
             scan_id = client.post(

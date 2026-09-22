@@ -82,6 +82,26 @@ def _require_verified_domain_or_403(control_db: ControlDB, account_id: str, doma
     )
 
 
+def _require_verified_email_or_403(control_db: ControlDB, account_id: str) -> None:
+    """Hallazgo 1's other half (the rate limit is at `POST /accounts`
+    itself): an account exists and can authenticate the moment it's
+    created, but may not RUN anything until its email is confirmed —
+    checked first, before quota/billing/domain gates, since "is this
+    even a confirmed account" is the more fundamental question. A
+    pre-Round-4 account with no email on file at all (`email is None`)
+    is treated as already verified — there was nothing to confirm when
+    it was created, and retroactively locking out every existing account
+    the moment this shipped would be a real, unannounced regression for
+    already-onboarded users, not a security fix."""
+    account = control_db.get_account(account_id)
+    if account is not None and account.email is not None and not account.is_email_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="This account's email address has not been verified yet. Check your inbox "
+            "for the verification link, or POST /accounts/resend-verification for a new one.",
+        )
+
+
 def _require_billing_and_quota_ok(control_db: ControlDB, account_id: str):
     """Part B/D's gate, in the exact same place and spirit as Round 2's
     domain-verification gate above — reused, not duplicated as a second
@@ -113,6 +133,7 @@ async def create_scan(
     control_db = _control_db(request)
     api_settings = _api_settings(request)
 
+    _require_verified_email_or_403(control_db, auth.account_id)
     _require_billing_and_quota_ok(control_db, auth.account_id)
     domain = normalize_domain(body.domain)
     _require_verified_domain_or_403(control_db, auth.account_id, domain)

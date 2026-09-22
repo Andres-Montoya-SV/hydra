@@ -6,9 +6,30 @@ evolve independently of the engine's internals.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# A minimal, pragmatic format check — not full RFC 5322 validation
+# (pydantic's `EmailStr` would need the `email-validator` extra, a new
+# dependency this fix doesn't need: the real proof of a working address
+# is the verification email actually arriving and its token being used,
+# not a stricter regex at the door).
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class CreateAccountRequest(BaseModel):
+    email: str = Field(
+        description="Required — a verification link is sent here before the account can scan."
+    )
+
+    @field_validator("email")
+    @classmethod
+    def _looks_like_an_email(cls, value: str) -> str:
+        if not _EMAIL_PATTERN.match(value.strip()):
+            raise ValueError("must look like a real email address")
+        return value.strip().lower()
 
 
 class CreateAccountResponse(BaseModel):
@@ -17,6 +38,24 @@ class CreateAccountResponse(BaseModel):
         description="Shown exactly once. Store it now — it cannot be retrieved again, only revoked/rotated."
     )
     key_id: str
+    email_verification_required: bool = Field(
+        default=True,
+        description="POST /scans is refused until POST /accounts/verify-email confirms this address.",
+    )
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=1)
+
+
+class VerifyEmailResponse(BaseModel):
+    account_id: str
+    status: Literal["verified"]
+
+
+class ResendVerificationResponse(BaseModel):
+    account_id: str
+    status: Literal["verification_email_resent"]
 
 
 class CreateApiKeyResponse(BaseModel):
