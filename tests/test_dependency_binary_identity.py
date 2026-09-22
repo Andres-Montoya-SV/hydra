@@ -51,6 +51,41 @@ def _write_impostor_script(path: Path, *, output: str, exit_code: int = 0) -> No
 
 IMPOSTOR_OUTPUT = "usage: httpx [OPTIONS] URL\n\nA next generation HTTP client for Python.\n"
 
+_SYSTEM_BIN_DIRS = (Path("/usr/local/bin"), Path("/usr/bin"), Path("/bin"))
+
+
+def _hide_real_system_bin_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`core/dependencies/discovery.py::BinaryDiscovery._build_candidates`
+    unconditionally ALSO checks `/usr/local/bin`, `/usr/bin`, `/bin` as a
+    fallback — hardcoded, independent of any `PlatformInfo` field a test
+    can override. A synthetic `PlatformInfo`/restricted `PATH` alone
+    (both already done by the tests calling this) is not enough to
+    simulate "no real tool reachable anywhere" on a machine that
+    genuinely has one installed at one of these three paths — and this
+    project's OWN Dockerfile does exactly that
+    (`COPY --from=go-builder /out/bin/ /usr/local/bin/`): the real,
+    Go-compiled `httpx` binary genuinely lives at `/usr/local/bin/httpx`
+    inside the CI Docker image (`docker` job,
+    `.github/workflows/ci.yml`), which is exactly the environment these
+    tests need to rule out to mean what their own docstrings claim. A
+    real CI failure inside that container — `health=degraded` instead
+    of the expected `missing`, and a skip that never fired — is what
+    caught this gap; it was never visible on a bare `hostedtoolcache/
+    Python` runner (the `check` job) or a normal dev machine without
+    these tools installed system-wide. Patches `Path.is_dir` narrowly,
+    only for these three exact paths, so the test is deterministic
+    regardless of what the machine actually running it has installed —
+    the production fallback itself is correct and untouched, only this
+    test's isolation was incomplete."""
+    real_is_dir = Path.is_dir
+
+    def fake_is_dir(self: Path) -> bool:
+        if self in _SYSTEM_BIN_DIRS:
+            return False
+        return real_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", fake_is_dir)
+
 
 class TestIdentityMarkersRejectAnImpostor:
     """The exact mechanism the task asked to confirm: a same-named binary
@@ -193,6 +228,10 @@ class TestDependencyServiceSkipsTheImpostorForTheRealBinary:
         # below — both must be restricted for this to genuinely simulate
         # "nothing real reachable anywhere," not just "not in this one list."
         monkeypatch.setenv("PATH", str(impostor_dir))
+        # Also independent of PlatformInfo entirely — see this helper's
+        # own docstring for why (a real httpx binary genuinely lives at
+        # /usr/local/bin inside this project's own Docker CI image).
+        _hide_real_system_bin_dirs(monkeypatch)
 
         fake_platform = PlatformInfo(
             os_type=OSType.LINUX,
@@ -243,6 +282,7 @@ class TestLiveConfinementTestsSkipCleanlyRatherThanFailOnAnImpostor:
         impostor_dir.mkdir()
         _write_impostor_script(impostor_dir / "httpx", output=IMPOSTOR_OUTPUT)
         monkeypatch.setenv("PATH", str(impostor_dir))
+        _hide_real_system_bin_dirs(monkeypatch)
         # core/dependencies/service.py does `from core.platform import
         # ... detect_platform` — that's its own local binding, so the
         # patch target is the importing module's name, not the origin.
