@@ -1348,12 +1348,10 @@ creating their one real account:
 **`EmailSender` is a `Protocol`, not a hard dependency**
 (`api/email_sender.py`) — the same structural-interface choice
 `core/reportability/provider.py::ReportabilityProvider` already made.
-**Only one implementation exists: `ConsoleEmailSender`**, which logs the
-verification token/instructions via the standard `logging` module.
-**Stated as plainly as the task required: connecting a real provider
-(SendGrid, AWS SES, Postmark, ...) is NOT built and must happen before
-this flow is exposed to real, non-operator users** — until then, every
-"sent" email is only ever visible in this process's own logs.
+At the time this fix shipped, only one implementation existed
+(`ConsoleEmailSender`, log-only) — **a real provider was connected in a
+follow-up, "Wire a Real Email Provider (Postmark)" below**; that section
+is now the current source of truth for this gap, not this paragraph.
 
 **Backward compatibility, verified explicitly**: an account created
 before this fix shipped (`email` column never populated) is treated as
@@ -1476,6 +1474,249 @@ launches a brand-new `uvicorn` process pointed at that same file —
 confirming the startup reconciliation runs correctly across a real
 process boundary, not just within one long-lived Python interpreter a
 unit test never actually exits.
+
+## Wire a Real Email Provider (Postmark) — 2026-09-22
+
+Follow-up to Hallazgo 1's own explicitly-stated gap above
+("`ConsoleEmailSender`... is NOT built and must happen before this flow
+is exposed to real, non-operator users"). Closes it with a real
+provider — **Postmark** (`postmarkapp.com`), a deliberate choice made
+before this task started (dedicated transactional-only sending
+reputation, no sandbox/production-access approval gate to go live,
+simple REST API, negligible cost at Hydra's actual volume) — not
+substituted for SES/SendGrid/Resend/SMTP.
+
+### What's actually true now, confirmed against Postmark's own current docs
+
+Re-verified directly against `postmarkapp.com`'s documentation before
+writing `api/email_sender.py::PostmarkEmailSender` (not assumed from
+memory), the same discipline `api/wompi_client.py` already established
+for Wompi:
+
+- `POST https://api.postmarkapp.com/email`
+  (`postmarkapp.com/developer/api/email-api`) — JSON body, header
+  `X-Postmark-Server-Token` for auth (confirmed: not a bearer token,
+  not a query parameter).
+- Error responses (`postmarkapp.com/developer/api/overview`): `401`
+  (missing/invalid server token), `422` (validation failure — malformed
+  or suppressed recipient), `429` (rate limited); body always
+  `{"ErrorCode": <int>, "Message": <str>}` on any non-2xx.
+- Domain verification (needed before Postmark will send from an address
+  on your own domain, `postmarkapp.com/support/article/1046-how-do-i-
+  verify-a-domain`): a DKIM **TXT** record plus a Return-Path **CNAME**
+  record (hostname `pm_bounces`, value `pm.mtasv.net`), each verified
+  within Postmark's own dashboard — confirmed to typically show as
+  verified within 48 hours of the DNS records propagating, or sooner via
+  the manual "Verify" button once they're live. DMARC is recommended but
+  optional below Postmark's own bulk-sending threshold.
+
+### Selection logic — zero-config path is unchanged, byte-for-byte
+
+`api/main.py::create_app`'s `lifespan` selects `PostmarkEmailSender`
+only when BOTH `POSTMARK_SERVER_TOKEN` and `HYDRA_API_EMAIL_FROM` are
+set; otherwise `ConsoleEmailSender` — the exact same object, same
+behavior, as before this task. Verified two ways, not just by reading
+the code: `tests/test_api_email_provider_selection.py`'s
+`test_no_postmark_env_vars_selects_console_email_sender` constructs a
+real `TestClient(create_app(settings))` with no Postmark fields set and
+asserts the wired sender's type directly, and the full pre-existing test
+suite (which sets no Postmark configuration anywhere) is part of this
+task's own 3x-green confirmation below. A single INFO-level log line at
+startup states which mode is active in plain words ("Postmark
+configured — sending real verification emails." /
+"No email provider configured — verification emails are only logged,
+not sent."), so this is never ambiguous from the logs alone.
+
+**Partial configuration fails loudly at startup, not at the first
+request**: `api/settings.py::validate_email_provider_config`, called
+from `create_app()` itself (before `ControlDB` is even constructed),
+raises `EmailProviderMisconfiguredError` — naming the specific missing
+variable — if exactly one of the two is set. A half-configured boot
+that only surfaces as a confusing failure on the first real
+`POST /accounts` would be strictly worse than refusing to start at all.
+
+### The failure-handling decision, made and stated explicitly
+
+A `PostmarkEmailSender` send failure — Postmark returning a non-2xx, or
+the request itself raising (timeout, DNS, connection refused) — is
+caught **inside** `send_verification_email` and never propagates.
+**`POST /accounts` always succeeds and returns a real, usable `api_key`
+regardless of whether the email actually sent**; the failure is logged
+at `ERROR` with the HTTP status and Postmark's own `ErrorCode`/`Message`
+(or the exception type for a network failure), never swallowed
+silently.
+
+Reasoning: `POST /accounts/resend-verification` (Hallazgo 1) already
+exists as the exact recovery path for "the email never arrived" — a
+transient Postmark outage or a misconfiguration not yet fixed (wrong
+server token, unverified sender) blocking the ENTIRE account-creation
+endpoint would be a strictly worse failure mode than an account that
+exists, authenticates, and can retry verification once the underlying
+problem is fixed. This mirrors the existing precedent in this codebase
+for a degraded-but-not-fatal external dependency (Part D.3's
+payment-failure grace period: a third party being unreliable is never
+treated as the client's fault).
+
+**The one hard rule enforced regardless**: the Postmark server token
+itself must never appear in a log line, an exception message, or
+anything that could reach `control_db`/an HTTP response body. Every
+error path builds its log message from Postmark's own returned
+`ErrorCode`/`Message`/HTTP status, or the exception's type name — never
+from the outgoing request (whose headers carry the token). Verified by
+a dedicated test
+(`test_a_401_response_never_logs_the_server_token`,
+`test_a_network_error_never_leaks_the_server_token_in_a_log_line`), not
+just asserted in a comment.
+
+### Configuration — three environment variables
+
+Same pattern `wompi_client_id`/`wompi_client_secret` already established
+(`api/settings.py`): a dataclass field, read via `os.getenv(...) or
+None` in `load_api_settings()`, `.env` loaded first via `load_dotenv`.
+
+| Variable | Required together? | Default | Purpose |
+|---|---|---|---|
+| `POSTMARK_SERVER_TOKEN` | Yes, with the next one | `None` (→ console sender) | The Server API Token from your Postmark server's "API Tokens" tab. |
+| `HYDRA_API_EMAIL_FROM` | Yes, with the previous one | `None` | The verified sender address (must be on a domain you've verified in Postmark — see below). |
+| `HYDRA_API_EMAIL_FROM_NAME` | No | `"Hydra"` | Display name on the `From` header. |
+
+**No real credentials exist anywhere in this branch** — not in code,
+not in tests (`tests/_fake_postmark_server.py`/
+`tests/test_postmark_email_sender.py` use
+`postmark-server-token-placeholder`/`noreply@example.com`, obviously
+fake), not in `.env` (only `config/.env.example` gets the new
+placeholder entries), not in this document (only variable *names*
+above, never a value). `docker-compose.yml`'s single `hydra` service
+already loads `.env` wholesale (`env_file: .env`) the exact same way
+`WOMPI_CLIENT_ID`/`WOMPI_CLIENT_SECRET` already do — no new plumbing was
+needed or added there; confirmed by reading it, not assumed.
+
+### What Andrés still has to do by hand before real email sends
+
+1. Create a Postmark account at `postmarkapp.com` (free to start; no
+   credit card required to send a low volume).
+2. Create a **Server** in the Postmark dashboard (e.g. "Hydra API") —
+   this is the sending context the Server API Token below belongs to.
+3. Verify a **sending domain** (Sender Signatures / Domains in the
+   dashboard) — the address in `HYDRA_API_EMAIL_FROM` must be on a
+   domain verified here, not an unverified address:
+   - Add the DKIM **TXT** record Postmark shows you to your domain's
+     DNS.
+   - Add the Return-Path **CNAME** record (hostname `pm_bounces`, value
+     `pm.mtasv.net`).
+   - Wait for Postmark to show both as verified (usually well under 48
+     hours once the DNS records are live), or click "Verify" once
+     you've confirmed the records have propagated.
+4. Copy the **Server API Token** from that server's "API Tokens" tab.
+5. Set three environment variables (in `.env`, or exported in your real
+   deployment's environment) and restart the process:
+   ```bash
+   POSTMARK_SERVER_TOKEN=<the real token from step 4>
+   HYDRA_API_EMAIL_FROM=<the verified address from step 3>
+   HYDRA_API_EMAIL_FROM_NAME=Hydra   # optional, this is the default
+   ```
+6. Confirm it took: the startup log should read "Postmark configured —
+   sending real verification emails." — if it instead reads "No email
+   provider configured," re-check step 5 (both variables must be set
+   together, and `load_api_settings()` only reads `.env` from the repo
+   root, `_PROJECT_ROOT / ".env"`).
+
+Nothing else is required — no code change, no redeploy beyond a
+restart.
+
+### Tests
+
+`tests/test_postmark_email_sender.py` (8 tests) — against a real local
+HTTP server standing in for `api.postmarkapp.com`
+(`tests/_fake_postmark_server.py`, the same "real server as arbiter"
+pattern `tests/_fake_wompi_server.py` already established): correct
+request shape (headers, endpoint, recipient, from address), no
+clickable link in the body, a `401`/`422`/network-error response never
+raises and never leaks the server token into any log line, and a slow
+server past the configured timeout is actually cut off (not left to
+hang) — a real, enforced timeout, not merely a documented intention.
+`tests/test_api_email_provider_selection.py` (7 tests) — the zero-config
+default (`ConsoleEmailSender`, including a full account-creation request
+through it, unaffected), `PostmarkEmailSender` selected when both
+variables are present, and partial configuration raising
+`EmailProviderMisconfiguredError` before `ControlDB` is even
+constructed, in both directions (token-without-from,
+from-without-token).
+
+### A real logging gap this task's own requirement surfaced, fixed along the way
+
+Stated honestly, not silently patched around: **nothing in `api/` ever
+configured Python's `logging` module** — no `basicConfig`, no handler,
+no level. Without one, the stdlib's own "handler of last resort" is all
+that's active (stderr, `WARNING`+ only), which meant every `INFO`-level
+line — this task's own "log, once, at startup, which mode is active" for
+Postmark, and the pre-existing Hallazgo 2 orphaned-scan-reconciliation
+log — was silently dropped in a real `uvicorn` process's actual console
+output, never visible at all. Confirmed the hard way: captured a real
+`uvicorn` process's stdout before and after the fix (below). Fixed with
+one `logging.basicConfig(level=logging.INFO, ...)` call at the top of
+`api/main.py` — a no-op if a real deployment's own logging setup already
+attached a handler before this module imports (checked: `basicConfig`
+only acts on a root logger with zero handlers), so this can't clobber
+anyone's own configuration, only provide a sane default where none
+existed.
+
+### Live demonstration
+
+No real Postmark credentials exist anywhere in this task, by design (the
+operator supplies those after merge) — so unlike the Wompi OAuth
+integration's one real live call, this demonstration proves the real,
+wired-up HTTP call against a real LOCAL server standing in for
+`api.postmarkapp.com`, through a real `uvicorn` process, not a mocked
+function call:
+
+```
+=== 1. Zero-config: no Postmark env vars -> ConsoleEmailSender ===
+HTTP 201 — account created without any Postmark config
+startup log confirmed: 'No email provider configured...'
+
+=== 2. Real HTTP call to a real local server standing in for Postmark ===
+HTTP 201 — account created
+Postmark stub received: To=real-flow-demo@example.com, From=Hydra <noreply@example.com>, Subject='Confirm your Hydra account'
+Server token header present: True
+startup log confirmed: 'Postmark configured...'
+
+=== 3. Partial configuration fails loudly at startup ===
+exit code: 1
+Confirmed: app refuses to construct, naming the missing variable.
+```
+
+Step 1 and step 2 are two SEPARATE real `uvicorn` process launches (not
+the same process reconfigured), each with its own captured stdout,
+specifically to prove the startup log line differs correctly based on
+which configuration that particular process actually has — the fix from
+the section above is what made either log line observable at all. Step
+3 shells out to `python3 -c "from api.main import create_app;
+create_app()"` as its own subprocess specifically so the raised
+`EmailProviderMisconfiguredError` and its exit code are captured
+independently of this demo script's own process.
+
+### Explicit non-goals for this pass — deferred, not silently skipped
+
+- **Bounce/complaint/suppression webhook handling from Postmark.** A
+  hard-bounced or complained-about address currently has no feedback
+  loop back into Hydra at all — it will simply keep failing sends
+  silently-to-the-user (loudly-to-the-operator's logs) on every
+  `resend-verification` attempt. A real fix needs a new inbound webhook
+  endpoint and is a large enough addition to warrant its own task.
+- **Any email besides the verification one.** Scan-complete
+  notifications, billing emails, password reset — none of that exists
+  yet; `EmailSender`'s Protocol shape (`send_verification_email`
+  specifically, not a generic `send`) doesn't even support them without
+  its own extension.
+- **A clickable verification link.** No frontend base URL exists yet to
+  build one against — token-only email stays correct, exactly as
+  `ConsoleEmailSender` already documented; `_verification_email_content`
+  is factored out specifically so this is a one-line change later.
+- **Choosing between Postmark's transactional/broadcast message
+  streams.** Only one kind of email is sent today, so there's no second
+  option to choose between yet — no stream-selection config was added
+  for a choice that doesn't exist.
 
 ## Explicitly deferred beyond Round 3
 

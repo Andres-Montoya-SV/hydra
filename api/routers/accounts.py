@@ -26,10 +26,13 @@ which blocks a real user creating their one real account:
    individually (a real, distinct, receivable email per account), not
    just the rate of creating them.
 
-This still must be removed/hardened further (a real admin auth system,
-a real email provider — see `api/email_sender.py`) before this service
-is exposed publicly outside of trusted testing, same honest caveat
-Round 1 already carried.
+Real email delivery (Postmark) is now wired up — see
+`api/email_sender.py` for the two `EmailSender` implementations and how
+`api/main.py` selects between them. What still must be hardened further
+before this service is exposed publicly outside of trusted testing: a
+real admin auth system (`POST /admin/wompi/reconcile` still uses a
+single static token) — same honest caveat Round 1 already carried, now
+narrower.
 """
 
 from __future__ import annotations
