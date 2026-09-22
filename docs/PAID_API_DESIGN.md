@@ -235,9 +235,12 @@ happens automatically.
 cost control (raw per-tool JSONL artifacts for a 25-minute scan against a
 large attack surface are not small), enforced by a scheduled job that
 purges `output/<run_id>/` artifacts and rows past the account's retention
-window — never mid-scan, and the purge itself should be logged (what was
+window — never mid-scan, and the purge itself is logged (what was
 deleted, when, for which account) for the same audit-trail reasons as
-Part A.3.
+Part A.3. **Built** as of "Automatic billing enforcement and data
+retention purge" below (`api/reconciliation_worker.py::run_retention_purge_job`)
+— this paragraph described a future job for two rounds; it is no longer
+one.
 
 ---
 
@@ -391,7 +394,12 @@ leaked a valid-looking HMAC. Do both.
   `402`, but `GET` on already-completed reports keeps working
   indefinitely (the client already paid for that data; withholding
   already-delivered results over a *later* billing failure is a
-  different, harder-to-justify penalty than blocking new work).
+  different, harder-to-justify penalty than blocking new work). **Built**
+  as of "Automatic billing enforcement and data retention purge" below —
+  `start_grace_period` was wired to the webhook handler since Round 3,
+  but nothing actually enforced the deadline until now
+  (`api/reconciliation_worker.py::run_grace_period_job`, which also
+  emails the account when it suspends it).
 - **Wompi itself unreachable** around an expected billing date (Hydra
   can't confirm success *or* failure): treat as **unknown**, not failure
   — never suspend an account because a third-party dependency, not the
@@ -1107,16 +1115,16 @@ during grace (Part D.3's own reasoning: a client shouldn't lose access
 over a single declined card while actively investigating something).
 Only `status == "suspended"` blocks `POST /scans`, with `402` (never
 `403` — this is a billing state, not an authorization/quota one).
-**Not built this round, stated honestly**: the scheduled job that
-detects a grace period's 3 days elapsing with no resolving webhook and
-flips `past_due` → `suspended` automatically — `grace_period_expired()`
-exists as a pure function ready for that job to call, but no scheduler
-invokes it yet. `api/scan_worker.py`'s durable queue (see "Durable,
-multi-worker-safe scan execution" below) is purpose-built for SCANS
-specifically, not a general-purpose periodic-job scheduler — this and
-retention purging would each need their own periodic sweep, the same
-shape but a different table, not something the scan queue already
-covers for free.
+**Built** as of "Automatic billing enforcement and data retention purge"
+below (`api/reconciliation_worker.py::run_grace_period_job`): the
+scheduled job that detects a grace period's 3 days elapsing with no
+resolving webhook and flips `past_due` → `suspended` automatically now
+exists and runs daily — `grace_period_expired()` was a pure function
+ready for that job to call for two rounds; it's now actually called, on
+its own periodic sweep, separate from `api/scan_worker.py`'s durable
+queue (which remains purpose-built for SCANS specifically, not a
+general-purpose scheduler — this job and retention purging share their
+OWN sweep instead, same shape, different tables).
 `GET` on an already-completed report is never gated by billing status
 at all (checked nowhere in `api/subscriptions.py`) — the client already
 paid for that specific, already-delivered data.
@@ -1984,6 +1992,161 @@ still-valid no-orphans-is-a-no-op and normal-lifecycle-unaffected cases.
   priority_queue` remains a recorded-but-inert field — the claim query
   is strict FIFO by `created_at`, no tier-aware reordering.
 
+## Automatic billing enforcement and data retention purge — 2026-09-22
+
+Closes the two remaining gaps an independent audit (reading `api/
+subscriptions.py` and `api/tiers.py`, not just the docs) found and this
+document's own "Explicitly deferred beyond Round 3" list had named by
+name since Round 3: `grace_period_expired`/`suspend_account` were fully
+implemented and tested as pure functions but never actually invoked from
+anywhere — a `past_due` account stayed `past_due` (full access) forever
+unless a human manually suspended it — and no retention-purge job existed
+at all, so every account's `output/<run_id>/` artifacts and `scans` rows
+grew forever regardless of tier or payment status.
+
+**Scheduling mechanism, and why it's a SECOND loop, not folded into the
+scan queue's**: an in-process `asyncio` loop
+(`api/reconciliation_worker.py::run_reconciliation_loop`), started in
+`api/main.py`'s `lifespan` alongside the scan worker's — same "started
+in lifespan, stopped via a shared `stop_event`" shape, deliberately a
+separate `asyncio.create_task` with its own interval. The scan worker
+polls every 0.5s by default because claim latency matters against a
+25-minute scan; grace periods are measured in days
+(`GRACE_PERIOD_DAYS = 3`) and retention windows in months. Running both
+concerns through one shared interval would mean either the scan queue
+claims work once a day, or this job re-scans every account's
+subscription/retention state every half second for nothing — two
+independent loops sharing one lifecycle-management pattern is the
+honest generalization, not a new scheduler abstraction. Both jobs run
+once immediately at startup (recovering a deadline that passed while the
+process was down) and then every `HYDRA_API_RECONCILIATION_INTERVAL_SECONDS`
+(default 86400s / 24h).
+
+No message broker was introduced — same SQLite-only posture the durable
+scan queue already established, still correct at this scale. No changes
+to `docker-compose.yml`/`docs/DOCKER.md` either, for the same reason the
+durable-queue task made none: confirmed by re-reading both that the API
+still has no Docker representation of its own — this loop runs inside
+the same bare `uvicorn api.main:app` process everything else already
+runs in, nothing new to containerize.
+
+### Job 1 — grace-period enforcement (`run_grace_period_job`)
+
+Reuses `grace_period_expired`/`api/subscriptions.py`'s existing 3-day
+math unchanged; this job's only responsibility is invoking it on a
+schedule. **The race the task called out, closed by construction, not
+by careful sequencing**: the candidate list (every currently `past_due`
+account) is gathered once, but each candidate is re-read fresh
+(`ControlDB.get_subscription`) immediately before acting on it, and even
+a fresh-and-still-`past_due` read is only ever turned into a write via a
+new method, `ControlDB.suspend_if_still_past_due` — a single atomic,
+conditional `UPDATE ... WHERE status = 'past_due'` (the same discipline
+`claim_next_queued_scan` uses for the scan-claim race), not a
+blind-write `suspend_account` call. This closes the window a plain
+check-then-write pair would leave open if this loop and a payment
+webhook land in different worker processes at nearly the same moment.
+`suspend_account` itself is untouched and remains correct for its other
+caller (the admin manual-reconciliation endpoint), where no concurrent
+job is racing it.
+
+**Worked example**: a subscription whose `grace_period_started_at` is
+`2026-09-01T00:00:00+00:00` is still `past_due`-but-active through
+`2026-09-03`; `grace_period_expired` first returns `True` at
+`2026-09-04T00:00:00+00:00`, so the first reconciliation cycle to run on
+or after that instant suspends it (`tests/test_reconciliation_worker.py::
+TestGracePeriodJob::test_account_past_the_grace_window_gets_suspended_and_emailed`
+exercises exactly this shape against real wall-clock time).
+
+**Suspension notice — built, not deferred**: `EmailSender` gained a
+second Protocol method, `send_account_suspended_email(*, to, account_id)`
+(`api/email_sender.py`), implemented by both `ConsoleEmailSender` (log
+only) and `PostmarkEmailSender` (real send, sharing the same
+request/error-handling code `send_verification_email` already used, now
+factored into a private `_send` helper). A generic "send arbitrary
+content" method was considered and rejected: every existing method here
+takes structured, purpose-specific arguments so each implementation
+decides its own subject/body — a generic method would push that
+decision onto every caller instead, breaking the "one content-builder
+function per email kind" pattern this module already uses. Sent to
+`accounts.email` (the account's own registered address), not
+`subscriptions.billing_email` (which is billing-specific and can be
+`None` for an account that never had it set) — if an account somehow has
+no email on file, the suspension still happens and is logged; only the
+notice is skipped.
+
+### Job 2 — retention purge (`run_retention_purge_job`)
+
+**Scope, stated explicitly**: only the control-plane `scans` row
+(`ControlDB.delete_scan`) and the on-disk `output/<scan_id>/` directory
+are ever touched. The account's own `recon.db`
+(`api/tenancy.py`'s per-account `AssetStore`) is **never** purged by this
+job — that database is the durable, structured findings/asset record an
+account's cross-scan analysis (reportability, hypotheses, historical
+comparison) depends on, a fundamentally different product than the raw
+per-tool JSONL artifacts Part B's own retention language describes
+("purges `output/<run_id>/` artifacts and rows"). Reuses
+`api/tiers.py::retention_days_for` verbatim — tier/override logic is
+never recomputed here, only read.
+
+**Terminal state only, enforced structurally**: `ControlDB.
+list_purgeable_scans_for_account`'s query itself filters
+`status IN ('completed', 'failed')` — a `running` or `queued` scan can
+never be a candidate no matter how old its `created_at` is, including an
+unusually long scan on an old account whose nominal window has already
+passed by wall-clock time. This is a WHERE clause, not a runtime check
+that could be forgotten later; tested directly
+(`TestRetentionPurgeJob::test_a_running_scan_past_its_nominal_window_is_never_purged`).
+
+**Idempotent**: `shutil.rmtree(..., ignore_errors=True)` on an
+already-purged directory is a silent no-op; `ControlDB.delete_scan` on an
+already-deleted row affects zero rows. Running the job twice in a row (or
+twice concurrently) purges nothing extra the second time — tested
+directly, not just asserted.
+
+**Batched, never one giant transaction**: bounded to
+`HYDRA_API_RETENTION_PURGE_BATCH_SIZE` scans per account per cycle
+(default 200); every scan's row delete is its own short
+connection/transaction (the same per-row-connection shape every other
+single-row `ControlDB` writer already uses), so a large backlog never
+holds a lock that could stall `POST /scans` or any other route — the rest
+of the backlog simply finishes across the next scheduled cycle(s).
+
+**Dry run — built**: `HYDRA_API_RETENTION_PURGE_DRY_RUN` (default
+`false`, i.e. real deletion happens). When set, every candidate is
+logged (`[DRY RUN] would purge scan ...`) and nothing is deleted from
+disk or the database — an operator has to opt IN to a rehearsal, never
+opt into the actually-destructive behavior by omission, matching this
+task's own explicit "the design bar is higher than for the scan-queue
+task" instruction for anything destructive/irreversible.
+
+**Logging**: every reconciliation cycle emits exactly one INFO summary
+line with real counts —
+`Reconciliation cycle complete: %d account(s) suspended (grace period
+expired), %d scan(s) purged%s.` — the same "never ambiguous from the
+logs alone" bar the Postmark task's `logging.basicConfig` fix
+established.
+
+### New settings (env-configurable, `api/settings.py`)
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HYDRA_API_RECONCILIATION_INTERVAL_SECONDS` | `86400` | How often both jobs run, in the same cycle. |
+| `HYDRA_API_RETENTION_PURGE_BATCH_SIZE` | `200` | Max scans purged per account per cycle. |
+| `HYDRA_API_RETENTION_PURGE_DRY_RUN` | `false` | `true`/`1`/`yes` logs candidates without deleting anything. |
+
+### Explicit non-goals — deferred, not silently skipped
+
+- **Any UI/dashboard for reviewing what got purged or suspended.** Logs
+  are the audit trail, same posture the durable-queue task took for
+  queue depth.
+- **A soft-delete/undo window for purged data.** The retention policy IS
+  the product's stated data lifecycle (Part B); the dry-run mode is the
+  safety net, deliberately not a second one on top of it.
+- **Changing the retention windows themselves.** Part B's numbers are
+  unchanged; this task only made them actually enforced.
+- **Purging the account's own `recon.db`/`AssetStore`.** Stated above,
+  repeated here: out of scope by design, not an oversight.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
@@ -1999,9 +2162,14 @@ still-valid no-orphans-is-a-no-op and normal-lifecycle-unaffected cases.
   still a recorded-but-inert field) would still need more than this —
   the claim mechanism has no concept of priority ordering today, only
   FIFO by `created_at`.
-- The scheduled jobs Part B/D describe but this round did not build: the
+- ~~The scheduled jobs Part B/D describe but this round did not build: the
   retention-purge job (Part B), and the grace-period-expiry-without-a-
-  webhook detector (Part D.3).
+  webhook detector (Part D.3).~~ — **resolved**, see "Automatic billing
+  enforcement and data retention purge" below. What that section does
+  NOT claim: mid-scan-safe purging beyond a simple terminal-state check
+  (already covered by the durable queue's own status semantics), a
+  purge-review UI, or a soft-delete/undo window — all stated as explicit
+  non-goals there.
 - Confirming the webhook-secret inference and the email-based subscriber
   correlation mechanism against a REAL Wompi sandbox account, per this
   round's own honesty requirement — both are implemented and tested

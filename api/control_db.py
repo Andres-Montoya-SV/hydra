@@ -1000,6 +1000,81 @@ class ControlDB:
                 (status, grace_period_started_at, _now_iso(), account_id),
             )
 
+    # --- scheduled reconciliation (grace-period enforcement, Part D.3) --
+
+    def list_past_due_account_ids(self) -> list[str]:
+        """The candidate list `api/reconciliation_worker.py`'s grace-
+        period job starts from — deliberately just account_ids, not
+        full `SubscriptionRecord`s: the job re-reads each one fresh
+        (`get_subscription`) right before acting on it, so a row this
+        query saw as `'past_due'` a moment ago but that has since been
+        resolved (a payment landed, `restore_active_status`) is never
+        acted on based on this now-stale snapshot."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT account_id FROM subscriptions WHERE status = 'past_due'"
+            ).fetchall()
+        return [row["account_id"] for row in rows]
+
+    def suspend_if_still_past_due(self, account_id: str) -> bool:
+        """Atomically suspends `account_id` ONLY if its subscription is
+        STILL `'past_due'` at the exact moment this statement executes
+        — the same single-statement, conditional-UPDATE discipline
+        `claim_next_queued_scan` uses to close a claim race, applied
+        here to close the analogous race against a payment webhook
+        restoring the account to `'active'` in a different worker
+        process between this job's fresh re-read and its write. Returns
+        whether a row was actually changed (i.e., whether this call is
+        the one that suspended it) — `False` means something else
+        already moved the account off `'past_due'` first, and this call
+        correctly did nothing."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE subscriptions SET status = 'suspended', updated_at = ? "
+                "WHERE account_id = ? AND status = 'past_due'",
+                (_now_iso(), account_id),
+            )
+        return cursor.rowcount > 0
+
+    # --- scheduled reconciliation (retention purge, Part B) --------------
+
+    def list_account_ids(self) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT account_id FROM accounts").fetchall()
+        return [row["account_id"] for row in rows]
+
+    def list_purgeable_scans_for_account(
+        self, account_id: str, *, cutoff: str, limit: int
+    ) -> list[ScanRecord]:
+        """Every scan of this account old enough (`created_at < cutoff`,
+        the account's own effective retention window) to purge —
+        `status IN ('completed', 'failed')` is enforced HERE, in the
+        query itself, not as a filter the caller has to remember to
+        apply: a `'running'` or `'queued'` scan can never be a
+        candidate no matter how old its `created_at` is, regardless of
+        how long an unusually slow scan has been executing."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scans WHERE account_id = ? "
+                "AND status IN ('completed', 'failed') AND created_at < ? "
+                "ORDER BY created_at ASC LIMIT ?",
+                (account_id, cutoff, limit),
+            ).fetchall()
+        return [_scan_record_from_row(row) for row in rows]
+
+    def delete_scan(self, scan_id: str, account_id: str) -> None:
+        """Deletes the control-plane `scans` row only — the caller
+        (`api/reconciliation_worker.py`) is responsible for removing
+        the corresponding `output/<scan_id>/` directory on disk itself,
+        since that's filesystem, not database, state. Idempotent:
+        deleting a `scan_id` that's already gone affects zero rows and
+        raises nothing, so running the purge job twice in a row is a
+        safe no-op the second time."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM scans WHERE scan_id = ? AND account_id = ?", (scan_id, account_id)
+            )
+
     def set_retention_override(self, account_id: str, retention_days: int | None) -> None:
         with self._connect() as conn:
             conn.execute(
