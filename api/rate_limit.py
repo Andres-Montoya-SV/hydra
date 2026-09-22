@@ -5,19 +5,34 @@ and must produce a visibly different error than a quota/auth failure so a
 client can tell "you're going too fast" apart from "you're not
 authorized" or "you're out of scans this month" (Part C: "429 vs 403").
 
-Round 1 scope, stated honestly: this is a single-process, in-memory
-token bucket. It resets on restart and does not coordinate across
-multiple worker processes — correct for one `uvicorn` worker (this
-round's deployment target), not yet correct for a horizontally-scaled
-multi-worker deployment, which would need a shared store (Redis) instead.
-Flagged here rather than silently assumed away, same as the async scan
-orchestration's own single-process scope note in `api/scan_orchestrator.py`.
+**`PersistentTokenBucketLimiter` is what `api/main.py` actually wires up
+today** — a `ControlDB`-backed limiter (durable-queue fix,
+docs/PAID_API_DESIGN.md's "Durable, multi-worker-safe scan execution"
+section) that enforces the SAME limit whether one `uvicorn` worker
+process serves a key's requests or several do, and survives a restart
+instead of silently resetting every bucket to full. It exposes the
+exact same `.check(key_id)` / `RateLimitExceededError` shape
+`TokenBucketLimiter` below always had, so `api/auth.py` needed zero
+changes to switch to it — same interface, different (now shared,
+durable) state.
+
+`TokenBucketLimiter` (in-memory, single-process, resets on restart) is
+kept below, unused by the real app, ONLY because nothing about its own
+correctness changed and deleting a working, self-contained class that
+costs nothing to keep would be removal for its own sake — it's a
+legitimate, simpler choice for a caller that genuinely never needs
+cross-process/restart durability. `require_api_key`'s own real request
+path uses `PersistentTokenBucketLimiter` exclusively.
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from api.control_db import ControlDB
 
 
 @dataclass
@@ -27,11 +42,17 @@ class _Bucket:
 
 
 class RateLimitExceededError(Exception):
-    """Raised by `TokenBucketLimiter.check` when a key is over its limit
-    — the API layer turns this into a 429, distinct from 401/403."""
+    """Raised by `.check()` (either limiter below) when a key is over
+    its limit — the API layer turns this into a 429, distinct from
+    401/403."""
 
 
 class TokenBucketLimiter:
+    """In-memory, single-process — see this module's own docstring for
+    why this is no longer what the real app wires up, and kept only as
+    a simpler, self-contained option for a caller that doesn't need
+    cross-process durability."""
+
     def __init__(self, *, requests_per_minute: int) -> None:
         self._capacity = float(requests_per_minute)
         self._refill_rate = requests_per_minute / 60.0  # tokens per second
@@ -55,3 +76,24 @@ class TokenBucketLimiter:
         if bucket.tokens < 1.0:
             raise RateLimitExceededError(f"Rate limit exceeded for key {key_id!r}")
         bucket.tokens -= 1.0
+
+
+class PersistentTokenBucketLimiter:
+    """`ControlDB.check_and_consume_rate_limit_token` does the actual
+    atomic refill-and-consume in one SQL statement — this class is a
+    thin adapter exposing the exact interface `TokenBucketLimiter`
+    already had (`.check(key_id)` / `RateLimitExceededError`), so
+    `api/auth.py::require_api_key` never needed to know which
+    implementation is behind `app.state.rate_limiter`."""
+
+    def __init__(self, *, control_db: ControlDB, requests_per_minute: int) -> None:
+        self._control_db = control_db
+        self._capacity = float(requests_per_minute)
+        self._refill_rate_per_second = requests_per_minute / 60.0
+
+    def check(self, key_id: str) -> None:
+        allowed = self._control_db.check_and_consume_rate_limit_token(
+            key_id, capacity=self._capacity, refill_rate_per_second=self._refill_rate_per_second
+        )
+        if not allowed:
+            raise RateLimitExceededError(f"Rate limit exceeded for key {key_id!r}")

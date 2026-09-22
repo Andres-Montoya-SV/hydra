@@ -11,7 +11,6 @@ returns 404, identical to a `scan_id` that doesn't exist at all — never
 
 from __future__ import annotations
 
-import asyncio
 import json
 import secrets
 from typing import cast
@@ -22,7 +21,6 @@ from api import subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, DomainVerificationRecord, ScanRecord
 from api.domain_verification import classify_scan_gate, normalize_domain
-from api.scan_orchestrator import execute_scan
 from api.schemas import (
     ClientReportRequest,
     CreateScanRequest,
@@ -145,22 +143,15 @@ async def create_scan(
     )
     control_db.increment_scan_usage(auth.account_id, subscriptions.current_period_key())
 
-    # Fire-and-forget: the request returns immediately with "queued";
-    # the scan itself (~25 minutes) runs as a background asyncio task in
-    # this same process. See api/scan_orchestrator.py's module docstring
-    # for this round's single-process scope note.
-    task = asyncio.create_task(
-        execute_scan(
-            api_settings=api_settings,
-            control_db=control_db,
-            account_id=auth.account_id,
-            scan_id=scan_id,
-            domain=domain,
-        )
-    )
-    request.app.state.background_tasks.add(task)
-    task.add_done_callback(request.app.state.background_tasks.discard)
-
+    # The request returns immediately with "queued" — the row just sits
+    # in the `scans` table. `api/scan_worker.py`'s worker loop (running
+    # continuously in the background, started in api/main.py's
+    # lifespan) is what actually claims and executes it, on its own
+    # poll cycle — this request handler never spawns the scan directly
+    # anymore. See that module's own docstring for the full durable-
+    # queue design (this is what makes a scan survive this process
+    # restarting mid-execution, which a directly-spawned asyncio task
+    # here never could).
     return CreateScanResponse(scan_id=scan_id, status="queued")
 
 

@@ -738,18 +738,20 @@ exists to surface.
 
 ### Known Round 1 limitations (stated explicitly, not silently assumed away)
 
-- **Scan orchestration is single-process, in-memory** (`asyncio.create_task`
-  in `api/scan_orchestrator.py`) — correct for one `uvicorn` worker, not a
-  durable job queue. A process restart abandons in-flight scans (their
-  `scans` row stays `"running"` forever; no reconciliation job exists yet
-  to detect and requeue/fail them).
-- **Rate limiting is single-process, in-memory** (`api/rate_limit.py`) —
-  resets on restart, doesn't coordinate across multiple worker processes.
-- **`POST /accounts` is unauthenticated** — acceptable only because there
-  is nothing to gate it with yet; must be closed off before Part D ships.
-- Both limitations above are the same "correct for one worker, not yet
-  correct at scale" tradeoff, made once and stated once rather than
-  hidden in two different files.
+- ~~Scan orchestration is single-process, in-memory~~ — **resolved**, see
+  "Durable, multi-worker-safe scan execution" below: scans now run on a
+  SQLite-backed queue (`api/scan_worker.py`), and a scan interrupted by a
+  worker crash or restart is automatically requeued and re-executed
+  (bounded by a retry ceiling), not abandoned at `"running"` forever.
+- ~~Rate limiting is single-process, in-memory~~ — **resolved**, same
+  section: `api/rate_limit.py::PersistentTokenBucketLimiter` persists
+  bucket state in `control.db`, enforcing the same limit whether one
+  `uvicorn` worker process serves a key's requests or several do, and
+  surviving a restart instead of resetting.
+- **`POST /accounts` is unauthenticated** — narrowed since Round 1
+  (per-IP rate limited, email-verification-gated before anything can
+  scan — Hallazgo 1), but still no tier/billing gate of its own; still
+  worth hardening further before wide-open public exposure.
 
 ### Tests
 
@@ -1109,8 +1111,12 @@ Only `status == "suspended"` blocks `POST /scans`, with `402` (never
 detects a grace period's 3 days elapsing with no resolving webhook and
 flips `past_due` → `suspended` automatically — `grace_period_expired()`
 exists as a pure function ready for that job to call, but no scheduler
-invokes it yet (the same "no durable job queue this round" limitation
-already documented for scan orchestration and retention purging).
+invokes it yet. `api/scan_worker.py`'s durable queue (see "Durable,
+multi-worker-safe scan execution" below) is purpose-built for SCANS
+specifically, not a general-purpose periodic-job scheduler — this and
+retention purging would each need their own periodic sweep, the same
+shape but a different table, not something the scan queue already
+covers for free.
 `GET` on an already-completed report is never gated by billing status
 at all (checked nowhere in `api/subscriptions.py`) — the client already
 paid for that specific, already-delivered data.
@@ -1384,6 +1390,15 @@ expired verification email should never permanently strand a legitimate
 account.
 
 ### Hallazgo 2 — a server restart left `running`/`queued` scans stuck forever
+
+> **Superseded — see "Durable, multi-worker-safe scan execution"
+> below.** This section is kept as the original design record (what the
+> problem was, what this fix's own — deliberately narrow — scope was),
+> but `ControlDB.fail_orphaned_scans` described below no longer exists
+> in the code; a later task replaced the "mark everything failed once at
+> startup" mechanism with automatic requeue-and-actually-re-execute,
+> bounded by a retry ceiling. Read the section below for what's actually
+> true today.
 
 Scans run as a plain `asyncio.create_task` inside the same process
 serving HTTP requests (a known, already-documented Round 1 limitation —
@@ -1718,13 +1733,272 @@ independently of this demo script's own process.
   option to choose between yet — no stream-selection config was added
   for a choice that doesn't exist.
 
+## Durable, multi-worker-safe scan execution — 2026-09-22
+
+Closes the two remaining gaps every prior round's own documentation
+named honestly and left open: scan orchestration was single-process,
+in-memory `asyncio.create_task` (a restart abandoned in-flight scans,
+only cleanly-failed by Hallazgo 2's later fix, never actually
+recovered), and `api/rate_limit.py`'s per-key limiter was single-
+process, in-memory (reset on restart, never coordinated across worker
+processes).
+
+**Architecture, stated plainly**: no message broker, no Celery/RQ/
+Redis — SQLite, already this project's own chosen source of truth for
+every other piece of cross-cutting control-plane state (accounts, keys,
+domain verification, billing, the account-creation rate limit), is
+enough at Hydra's real current scale. `docker-compose.yml`'s only
+service (`hydra`) is the CLI/recon-pipeline tool, not this API —
+confirmed by reading it, not assumed. The paid API has no Docker story
+of its own at all today; it runs as a bare `uvicorn api.main:app`
+process directly on the host ("Running it locally," earlier in this
+document). There is no second container to run a separate worker
+process in without inventing both a worker AND an entire containerized-
+API deployment nobody has built — so the worker is an in-process
+`asyncio` loop (`api/scan_worker.py::run_worker_loop`), started in
+`api/main.py`'s `lifespan` alongside the HTTP server, not a separate
+`python -m api.worker` process. No changes were made to `docker-
+compose.yml`/`docs/DOCKER.md` for this task — there was nothing there
+to extend (Wompi's own env vars were never threaded through either,
+confirmed the same way during the Postmark task). The claim mechanism
+itself doesn't care which model is running it: it's a single atomic SQL
+statement (`ControlDB.claim_next_queued_scan`) keyed only on the
+`scans` table's own `status`, correct whether one `uvicorn` worker
+process calls it or several do — `uvicorn --workers N` (the realistic
+next scaling step on one machine, if the API ever does get a real
+Docker deployment) needs zero code changes here, each process just runs
+its own copy of this exact loop against the same `control.db`.
+
+### What "durable" means here — and does NOT mean
+
+This is status durability and automatic re-EXECUTION from scratch, not
+true mid-scan resumption. A scan interrupted 80% of the way through
+does not continue from 80% — it restarts the whole pipeline run against
+the same `scan_id`, exactly like a client manually resubmitting would,
+just automatic instead of requiring the client to notice and retry.
+Real partial-progress resumption would mean checkpointing
+`_run_headless_pipeline`'s internal state — a substantially bigger
+project, explicitly out of scope, not attempted here.
+
+### The queue: `scans` table, three new columns
+
+`retry_count` / `worker_id` / `heartbeat_at`, added to the existing
+`scans` table (migrated onto an existing `control.db` the same way
+Hallazgo 1 added `accounts.email` — `_migrate_table_columns`, now
+generalized from that fix's accounts-only version rather than
+duplicated). No new table for the queue itself — `scans` already had
+everything else a queue row needs (`status`, `created_at`).
+
+- `ControlDB.claim_next_queued_scan(worker_id)` — one `UPDATE ...
+  WHERE scan_id = (SELECT ... ORDER BY created_at LIMIT 1) AND status =
+  'queued' RETURNING *` statement. SQLite serializes writers; by the
+  time a second concurrent claimer's own UPDATE actually executes, its
+  subquery re-evaluates against the now-current state and finds a
+  different row (or none) — never the one the first claimer just took.
+  **Verified under real concurrent access, not just reasoned about**:
+  `tests/test_scan_queue_durability.py::TestDoubleClaimRace` hammers a
+  single queued row with 20 threads racing via a `threading.Barrier`
+  (maximizing actual contention, not just sequential calls) and asserts
+  exactly one wins, plus a 15-scan/10-worker version asserting every
+  scan is claimed exactly once, never twice.
+- **Liveness, not just a status flag**: `status='running'` alone can't
+  tell a genuinely-executing scan apart from one whose worker died
+  without updating it, once more than one worker process can exist.
+  Each claimed scan gets a concurrent heartbeat sub-task
+  (`api/scan_worker.py::_heartbeat_loop`) touching `heartbeat_at` every
+  `scan_heartbeat_interval_seconds` (default 30s) for as long as
+  execution is genuinely in progress.
+- `ControlDB.sweep_stale_running_scans` — runs every poll cycle (every
+  `scan_poll_interval_seconds`, default 0.5s in this codebase's own
+  test-friendly default; negligible against a ~25-minute scan), not
+  just once at startup. This is what lets an ALREADY-RUNNING other
+  worker reclaim a scan whose worker just died, without waiting for any
+  process to restart at all. A `running` scan whose `heartbeat_at` is
+  `NULL` or older than `scan_stale_after_seconds` (default 120s —
+  comfortably 4 heartbeat intervals, so one slow/delayed write under
+  load never false-triggers a requeue of a scan that's actually fine)
+  is either requeued (`retry_count` incremented, `worker_id`/
+  `heartbeat_at` cleared, status back to `'queued'`) or, if already
+  requeued `scan_max_retries` times (default **3**), given up on as
+  `failed` with a diagnosable reason
+  (`"...: exceeded 3 retries after repeated interruption"`).
+
+  **Why 3**: a scan interrupted this many times in a row is far more
+  likely to be one that reliably crashes the process itself (a genuine
+  bug, a domain that triggers a fatal pipeline error) than one that's
+  just been unlucky with restart timing. Requeuing it forever would
+  occupy a concurrency slot indefinitely and never surface the real
+  problem to anyone; giving up after a bounded number of attempts is
+  what actually protects the rest of the queue. Verified explicitly
+  (`TestSweepRequeueAndRetryCeiling::test_exceeding_the_retry_ceiling_
+  gives_up_with_a_diagnosable_reason`): requeued exactly `max_retries`
+  times, then `failed` on the next interruption, and never requeued
+  again after that.
+
+### Concurrency limit
+
+`max_concurrent_scans` (default **3**) — naabu/httpx/nuclei subprocesses
+are real host resources, not free just because they're invoked from
+async code. A scan beyond this ceiling simply stays `'queued'` — the
+worker loop's claim step only runs while `len(active) <
+max_concurrent_scans`; nothing is ever silently dropped, it just waits
+its turn on the same FIFO-by-`created_at` ordering every other queued
+scan uses.
+
+### What the client sees
+
+Nothing new. `GET /scans/{id}` already returns
+`queued`/`running`/`completed`/`failed`; a requeue-after-interruption
+sets status back to exactly `'queued'`, the SAME value it had before
+ever being claimed the first time — the client's existing poll loop
+sees it resume naturally through `queued → running → completed/failed`
+with no new status value invented. The only observable difference from
+before this task is that a scan interrupted mid-run now eventually
+completes instead of permanently ending in an unresolvable `failed`
+(Hallazgo 2's old behavior) or staying stuck at `running` forever
+(Round 1's original gap).
+
+### The persisted rate limiter
+
+`api/rate_limit.py::PersistentTokenBucketLimiter` replaces (not
+supplements — running both would just be two sources of truth for the
+same decision) the old in-memory `TokenBucketLimiter` as what
+`api/main.py` actually wires up to `app.state.rate_limiter`. Same
+`.check(key_id)` / `RateLimitExceededError` interface, so
+`api/auth.py::require_api_key` needed zero changes. The refill-and-
+consume decision happens in ONE atomic SQL statement
+(`ControlDB.check_and_consume_rate_limit_token`, an
+`INSERT ... ON CONFLICT DO UPDATE ... WHERE <refilled tokens> >= 1.0`)
+— the `WHERE` clause on the conflict branch is what makes this a real
+atomic gate: if there aren't enough tokens, NEITHER branch changes
+anything, `cursor.rowcount` comes back `0`, and that's the "denied"
+signal, with no separate read-then-write (which would itself be a race
+between two processes checking the same key at once) ever happening.
+Wall-clock (`_now_iso()`), never `time.monotonic()` — Round 1's
+in-memory version used monotonic time freely, safe only because it
+never needed comparing across processes with independent monotonic-
+clock epochs; wall-clock is the only meaningful choice once this state
+is shared.
+
+**Verified under real concurrent access AND across real separate
+`ControlDB`/limiter instances**, per the task's own explicit
+requirement: `TestPersistedRateLimiterCrossProcess::
+test_two_separate_limiter_instances_share_the_same_persisted_limit`
+constructs two independent `ControlDB`/`PersistentTokenBucketLimiter`
+pairs against the SAME on-disk file (simulating two worker processes)
+and confirms the limit is enforced across both combined, not doubled;
+`test_concurrent_callers_never_exceed_capacity` hammers one bucket with
+30 threads racing via a barrier and confirms exactly `capacity` of them
+are allowed, never more.
+
+`TokenBucketLimiter` (the old in-memory class) is kept in
+`api/rate_limit.py`, unused by the real app — removing a working,
+self-contained, still-correct-for-its-narrower-use-case class would
+have been deletion for its own sake, not a real simplification.
+
+### Verified against a REAL separate process, kill and relaunch — not simulated
+
+Per the task's own explicit requirement (the same standard Hallazgo 2's
+own live demonstration set): `tests/test_scan_queue_durability.py::
+TestKillAndRelaunchAgainstARealSeparateProcess` launches a genuinely
+separate Python process
+(`tests/_scan_worker_subprocess_helper.py` — a standalone launcher
+needed because a `monkeypatch`-installed pipeline stub in the pytest
+parent process has no effect on a truly separate process's own fresh
+imports), creates an account and a scan through real HTTP against that
+real child process, waits for the real worker loop inside it to
+actually claim the scan (`status` observed as `'running'` over real
+HTTP, not asserted from inside the same process), then **hard-kills
+that process** (`proc.kill()` — no graceful shutdown, no cooperative
+signal handling) mid-execution. A second, genuinely separate process is
+then launched against the SAME on-disk `control.db`; the test asserts
+the scan's status is observed reaching `'completed'` through that
+SECOND process's own real HTTP server, with `retry_count >= 1` as real
+evidence it actually went through the requeue path, not a lucky
+re-claim of a scan that somehow never got marked `running` in the first
+place.
+
+**Real captured output from this exact test** (`pytest -s
+--log-cli-level=INFO`, second process's own log — `port 8602` is
+process 2, launched fresh against process 1's abandoned `control.db`
+after `proc1.kill()`):
+
+```
+INFO:     127.0.0.1:51659 - "GET /scans/da0f65ce... HTTP/1.1" 200 OK
+2026-09-22 12:11:56 | INFO | recon.runner | Subfinder: OK
+2026-09-22 12:11:56 | INFO | recon.runner | Stage: dnsx Resolving DNS
+2026-09-22 12:11:56 | INFO | recon.runner | dnsx: OK
+2026-09-22 12:11:56 | INFO | recon.runner | Stage: httpx Probing HTTP services
+2026-09-22 12:11:56 | INFO | recon.runner | httpx: OK
+2026-09-22 12:11:56 | INFO | recon.runner | Pipeline complete in 5.1s
+
+Complete. Output: .../accounts/6778f0e3.../output/da0f65ce0a0da013ab95c7ee6226ab41
+Subdomains: 1 | Resolved: 1 | Alive: 1
+INFO:     127.0.0.1:51659 - "GET /scans/da0f65ce... HTTP/1.1" 200 OK
+```
+
+This is the SAME `run_id`/output directory process 1 would have used
+had it not been killed — process 2 never knew process 1 existed, it
+just found a stale `running` row via the sweep, requeued it, reclaimed
+it via its own `claim_next_queued_scan`, and ran the real pipeline
+(stubbed subfinder/dnsx/httpx, real `PipelineRunner`/`AssetStore`
+underneath, unstubbed) against it from scratch — exactly the "re-
+execution, not resumption" contract this section states.
+
+### Tests
+
+`tests/test_scan_queue_durability.py` (12 tests) — the double-claim
+race (two variants: single hot row under 20-way contention, and a
+15-scan/10-worker version), the sweep/requeue/retry-ceiling logic
+(fresh heartbeat never swept, stale heartbeat requeued with incremented
+`retry_count`, a requeued scan claimable by a DIFFERENT worker,
+exceeding the retry ceiling gives up with a diagnosable reason and is
+never requeued again after that, a `completed` scan is never touched),
+the persisted rate limiter (cross-instance sharing, independent
+per-key buckets, real wall-clock refill timing, 30-way concurrent-caller
+race never exceeding capacity), and the real process kill+relaunch
+scenario above. `tests/test_api_orphaned_scan_recovery.py` (3 tests,
+rewritten) — Hallazgo 2's original test asserted the now-superseded
+"everything becomes failed" behavior; updated to assert what's actually
+true now (a scan left `running` by a dead process is requeued and
+ACTUALLY completes, with `retry_count >= 1` as evidence), plus the
+still-valid no-orphans-is-a-no-op and normal-lifecycle-unaffected cases.
+
+### Explicit non-goals — deferred, not silently skipped
+
+- **True mid-scan resumption.** Stated above and worth repeating here:
+  a requeued scan restarts the pipeline from scratch. No checkpointing
+  of `_run_headless_pipeline`'s internal progress was attempted.
+- **Multi-machine/distributed worker coordination.** The claim/sweep/
+  rate-limit mechanisms are all correct for multiple PROCESSES sharing
+  one SQLite file on one machine; none of them were designed for or
+  tested against multiple machines contending for the same file over a
+  network filesystem, which SQLite itself does not reliably support
+  regardless of anything this task could add on top.
+- **A dashboard or admin UI showing queue depth/worker health.** The
+  existing `logger.warning`/`logger.error` lines on every requeue/
+  give-up (now actually visible thanks to the logging-configuration fix
+  from the Postmark task) are what exists today; a real operator-facing
+  view was judged unnecessary for this task's scope.
+- **Real priority ordering for Pro/Ultra scans.** `TierLimits.
+  priority_queue` remains a recorded-but-inert field — the claim query
+  is strict FIFO by `created_at`, no tier-aware reordering.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
   this API never knows Firebase exists; `X-API-Key` only).
-- A durable job queue and a shared (Redis-backed) rate limiter, for a
-  multi-worker deployment (Round 1's own limitation, still unresolved) —
-  also what a real "priority queue" for Pro/Ultra scans would need.
+- ~~A durable job queue and a shared rate limiter~~ — **resolved**, see
+  "Durable, multi-worker-safe scan execution" below (SQLite-backed, not
+  Redis — a deliberate choice stated and justified there). What that
+  section does NOT claim: true mid-scan resumption (a requeued scan
+  restarts the pipeline from scratch, it doesn't continue from where it
+  left off) or multi-MACHINE coordination (a real broker) — both stated
+  as explicit non-goals there, not silently assumed away. A real
+  "priority queue" for Pro/Ultra scans (`TierLimits.priority_queue` is
+  still a recorded-but-inert field) would still need more than this —
+  the claim mechanism has no concept of priority ordering today, only
+  FIFO by `created_at`.
 - The scheduled jobs Part B/D describe but this round did not build: the
   retention-purge job (Part B), and the grace-period-expiry-without-a-
   webhook detector (Part D.3).
