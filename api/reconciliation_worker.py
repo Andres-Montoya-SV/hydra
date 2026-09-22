@@ -229,7 +229,13 @@ async def run_reconciliation_loop(
             purged_count,
             " [DRY RUN — nothing actually deleted]" if api_settings.retention_purge_dry_run else "",
         )
-        with contextlib.suppress(TimeoutError):
+        # `asyncio.TimeoutError`, never the bare builtin `TimeoutError` —
+        # see api/scan_worker.py's identical fix for the full story: on
+        # Python 3.10 these are different classes (unified only from
+        # 3.11 on), so the builtin form silently failed to catch this
+        # loop's own every-cycle timeout, crashing the task after its
+        # first iteration on 3.10 specifically.
+        with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(
                 stop_event.wait(), timeout=api_settings.reconciliation_interval_seconds
             )

@@ -181,7 +181,19 @@ async def run_worker_loop(
                 active.add(task)
                 task.add_done_callback(active.discard)
 
-            with contextlib.suppress(TimeoutError):
+            # `asyncio.TimeoutError`, never the bare builtin `TimeoutError`
+            # — a REAL, CI-only bug found the hard way: before Python
+            # 3.11, `asyncio.TimeoutError` is its OWN class, not the
+            # builtin one (they're unified from 3.11 on, which is why
+            # this was invisible on any dev machine running 3.11+).
+            # `contextlib.suppress(TimeoutError)` silently failed to
+            # catch it on Python 3.10, so this `wait_for`'s ordinary,
+            # expected-every-cycle timeout crashed this loop's task
+            # outright after its first iteration — the scan worker never
+            # ran a second poll cycle, so every scan stayed 'queued'
+            # forever. `asyncio.TimeoutError` catches the exception on
+            # every supported Python version, 3.10 included.
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(
                     stop_event.wait(), timeout=api_settings.scan_poll_interval_seconds
                 )
