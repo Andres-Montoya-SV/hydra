@@ -84,6 +84,22 @@ class APISettings:
     account_creation_rate_limit_per_ip_per_day: int = 3
     email_verification_token_ttl_hours: int = 24
 
+    # Real email delivery (Postmark, postmarkapp.com) for the
+    # verification email above — `api/email_sender.py::PostmarkEmailSender`.
+    # Both `postmark_server_token` and `email_from_address` must be set
+    # together or not at all (`validate_email_provider_config` below,
+    # called from `api/main.py::create_app`) — `None`/`None` means
+    # `ConsoleEmailSender` (log-only, the zero-config default, unchanged
+    # from before Postmark support existed).
+    postmark_server_token: str | None = None
+    email_from_address: str | None = None
+    email_from_name: str = "Hydra"
+    # api.postmarkapp.com is the real, confirmed host
+    # (postmarkapp.com/developer/api/email-api) — overridable only for
+    # tests, same explicit-field-required discipline as the Wompi/DNS/
+    # well-known dev overrides above. Never set in production.
+    dev_postmark_send_url: str | None = None
+
     @property
     def control_db_path(self) -> Path:
         return self.data_dir / "control.db"
@@ -140,4 +156,37 @@ def load_api_settings() -> APISettings:
     token_ttl = os.getenv("HYDRA_API_EMAIL_VERIFICATION_TOKEN_TTL_HOURS")
     if token_ttl:
         settings.email_verification_token_ttl_hours = int(token_ttl)
+    settings.postmark_server_token = os.getenv("POSTMARK_SERVER_TOKEN") or None
+    settings.email_from_address = os.getenv("HYDRA_API_EMAIL_FROM") or None
+    settings.email_from_name = os.getenv("HYDRA_API_EMAIL_FROM_NAME") or "Hydra"
+    settings.dev_postmark_send_url = os.getenv("HYDRA_API_DEV_POSTMARK_SEND_URL") or None
     return settings
+
+
+class EmailProviderMisconfiguredError(RuntimeError):
+    """Raised by `validate_email_provider_config` — the app refuses to
+    boot rather than silently falling back to `ConsoleEmailSender` (which
+    would mean real users' verification emails silently go nowhere but
+    the server's own logs) or silently failing every send later (which
+    would surface as a confusing runtime error on the first
+    `POST /accounts` instead of an immediate, clear one at startup)."""
+
+
+def validate_email_provider_config(settings: APISettings) -> None:
+    """`postmark_server_token`/`email_from_address` must be set TOGETHER
+    or NOT AT ALL — a startup-time check beats a runtime surprise.
+    Called from `api/main.py::create_app` for every `APISettings`
+    regardless of whether it came from `load_api_settings()` (a real
+    deployment) or was constructed directly (tests), so this can never
+    be bypassed by whichever path constructed the settings object."""
+    token_set = bool(settings.postmark_server_token)
+    from_set = bool(settings.email_from_address)
+    if token_set == from_set:
+        return
+    missing = "HYDRA_API_EMAIL_FROM" if token_set else "POSTMARK_SERVER_TOKEN"
+    present = "POSTMARK_SERVER_TOKEN" if token_set else "HYDRA_API_EMAIL_FROM"
+    raise EmailProviderMisconfiguredError(
+        f"{present} is set but {missing} is not — Postmark needs both to send real "
+        f"email. Set {missing} too, or unset {present} to keep using the console/"
+        "log-only email sender."
+    )

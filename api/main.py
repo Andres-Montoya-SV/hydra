@@ -18,17 +18,37 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from api.control_db import ControlDB
-from api.email_sender import ConsoleEmailSender
+from api.email_sender import ConsoleEmailSender, PostmarkEmailSender
 from api.rate_limit import TokenBucketLimiter
 from api.routers import accounts, domains, hypotheses, keys, reportability, scans, subscription
-from api.settings import APISettings, load_api_settings
+from api.settings import APISettings, load_api_settings, validate_email_provider_config
 from api.wompi_client import WompiClient
+
+# A real gap this task's own "never ambiguous from the logs alone"
+# requirement surfaced: nothing in this service ever configured Python
+# logging. Without a handler, the stdlib's "handler of last resort"
+# (stderr, WARNING+) is all that's active — an INFO-level line (this
+# module's own email-provider-selection log, and the pre-existing
+# Hallazgo 2 orphaned-scan reconciliation log) is silently dropped by
+# default, never actually visible in a real `uvicorn` process's console
+# output. `basicConfig` is a no-op if the root logger already has a
+# handler (a real deployment's own explicit logging config, set up
+# before this module imports, always wins) — safe to call
+# unconditionally as a sensible zero-config default otherwise.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 logger = logging.getLogger("hydra.api")
 
 
 def create_app(api_settings: APISettings | None = None) -> FastAPI:
     settings = api_settings or load_api_settings()
+    # Fails loudly HERE, synchronously, at app-construction time — never
+    # a silent half-configured boot that only breaks on the first real
+    # POST /accounts (api/settings.py::validate_email_provider_config's
+    # own docstring has the full reasoning). Runs for every APISettings
+    # regardless of whether it came from load_api_settings() (a real
+    # deployment) or was constructed directly (tests).
+    validate_email_provider_config(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -43,10 +63,25 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             id_base_url=settings.dev_wompi_id_base_url,
             api_base_url=settings.dev_wompi_api_base_url,
         )
-        # Hallazgo 1: no real email provider is wired up yet — see
-        # api/email_sender.py's own module docstring for what MUST
-        # change before this is exposed to real, non-operator users.
-        app.state.email_sender = ConsoleEmailSender()
+        # Hallazgo 1 follow-up: PostmarkEmailSender only when BOTH a
+        # server token and a from-address are configured (already
+        # enforced together-or-not-at-all above) — ConsoleEmailSender
+        # (log-only) remains the unconditional zero-config default.
+        # Logged once, in plain words, so it's never ambiguous from the
+        # logs alone which mode a running deployment is in.
+        if settings.postmark_server_token and settings.email_from_address:
+            app.state.email_sender = PostmarkEmailSender(
+                server_token=settings.postmark_server_token,
+                from_address=settings.email_from_address,
+                from_name=settings.email_from_name,
+                send_url=settings.dev_postmark_send_url,
+            )
+            logger.info("Postmark configured — sending real verification emails.")
+        else:
+            app.state.email_sender = ConsoleEmailSender()
+            logger.info(
+                "No email provider configured — verification emails are only logged, " "not sent."
+            )
 
         # Hallazgo 2: a scan that is 'queued'/'running' at the exact
         # moment THIS process starts can only be leftover state from a
@@ -80,9 +115,10 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             "verification and Round 1's multi-tenant core/auth/async scans "
             "underneath. Post-Round-3 hardening: POST /accounts is "
             "per-IP rate limited and gated by email verification before "
-            "POST /scans will run anything, and any scan left "
-            "queued/running by a server restart is reconciled to failed "
-            "at startup — see docs/PAID_API_DESIGN.md."
+            "POST /scans will run anything (real delivery via Postmark "
+            "when configured, console-logged otherwise), and any scan "
+            "left queued/running by a server restart is reconciled to "
+            "failed at startup — see docs/PAID_API_DESIGN.md."
         ),
         lifespan=lifespan,
     )
