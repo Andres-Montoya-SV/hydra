@@ -11,6 +11,7 @@ full local-run walkthrough, including how to create a test account).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -19,8 +20,9 @@ from fastapi import FastAPI
 
 from api.control_db import ControlDB
 from api.email_sender import ConsoleEmailSender, PostmarkEmailSender
-from api.rate_limit import TokenBucketLimiter
+from api.rate_limit import PersistentTokenBucketLimiter
 from api.routers import accounts, domains, hypotheses, keys, reportability, scans, subscription
+from api.scan_worker import generate_worker_id, run_worker_loop
 from api.settings import APISettings, load_api_settings, validate_email_provider_config
 from api.wompi_client import WompiClient
 
@@ -54,8 +56,12 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.api_settings = settings
         app.state.control_db = ControlDB(settings.control_db_path)
-        app.state.rate_limiter = TokenBucketLimiter(
-            requests_per_minute=settings.rate_limit_per_minute
+        # Durable-queue fix: persisted, cross-process-safe — see
+        # api/rate_limit.py's own module docstring for why this replaced
+        # the old in-memory TokenBucketLimiter as what the real app
+        # wires up.
+        app.state.rate_limiter = PersistentTokenBucketLimiter(
+            control_db=app.state.control_db, requests_per_minute=settings.rate_limit_per_minute
         )
         app.state.wompi_client = WompiClient(
             client_id=settings.wompi_client_id,
@@ -83,25 +89,28 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
                 "No email provider configured — verification emails are only logged, " "not sent."
             )
 
-        # Hallazgo 2: a scan that is 'queued'/'running' at the exact
-        # moment THIS process starts can only be leftover state from a
-        # previous process that died without updating it — this process
-        # has queued/started nothing yet. Reconciled before the app
-        # accepts a single request, so no client ever observes a scan
-        # stuck in an unresolvable status because of a restart.
-        orphaned = app.state.control_db.fail_orphaned_scans(reason="interrupted by server restart")
-        if orphaned:
-            logger.warning(
-                "Marked %d scan(s) as failed on startup (interrupted by server restart): %s",
-                len(orphaned),
-                ", ".join(orphaned),
+        # Durable-queue fix: supersedes Hallazgo 2's old one-time
+        # startup-only `fail_orphaned_scans` — a `'running'` scan whose
+        # heartbeat has gone stale is now automatically REQUEUED (and
+        # actually re-executed) rather than unconditionally marked
+        # `failed`, and this sweep runs continuously (every poll cycle),
+        # not just once at process start. See api/scan_worker.py's own
+        # module docstring for the full design.
+        worker_id = generate_worker_id()
+        stop_event = asyncio.Event()
+        worker_task = asyncio.create_task(
+            run_worker_loop(
+                api_settings=settings,
+                control_db=app.state.control_db,
+                worker_id=worker_id,
+                stop_event=stop_event,
             )
+        )
+        logger.info("Scan worker loop started (worker_id=%s).", worker_id)
 
-        app.state.background_tasks = set()
         yield
-        # Round 1 has no durable job queue (see scan_orchestrator's module
-        # docstring) — in-flight background scan tasks are simply
-        # abandoned on shutdown, same as a hard process kill would do.
+        stop_event.set()
+        await worker_task
 
     app = FastAPI(
         title="Hydra EASM API",
@@ -114,11 +123,14 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             "POST /account/subscription. Round 2's domain-ownership "
             "verification and Round 1's multi-tenant core/auth/async scans "
             "underneath. Post-Round-3 hardening: POST /accounts is "
-            "per-IP rate limited and gated by email verification before "
-            "POST /scans will run anything (real delivery via Postmark "
-            "when configured, console-logged otherwise), and any scan "
-            "left queued/running by a server restart is reconciled to "
-            "failed at startup — see docs/PAID_API_DESIGN.md."
+            "per-IP rate limited (persisted, cross-process-safe) and "
+            "gated by email verification before POST /scans will run "
+            "anything (real delivery via Postmark when configured, "
+            "console-logged otherwise). Scans run on a durable, SQLite-"
+            "backed queue (api/scan_worker.py) — a scan interrupted by "
+            "a worker crash or restart is automatically requeued and "
+            "re-executed, up to a bounded retry ceiling, rather than "
+            "silently abandoned — see docs/PAID_API_DESIGN.md."
         ),
         lifespan=lifespan,
     )

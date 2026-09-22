@@ -35,7 +35,7 @@ _SCHEMA = """
 -- but starts unverified — POST /scans refuses to run anything for it
 -- until `email_verified_at` is set. A fresh DB gets these columns
 -- directly from this CREATE TABLE; an EXISTING control.db from an
--- earlier round gets them via `_migrate_accounts_table` below (SQLite's
+-- earlier round gets them via `_migrate_table_columns` below (SQLite's
 -- `CREATE TABLE IF NOT EXISTS` never adds columns to an already-existing
 -- table on disk).
 CREATE TABLE IF NOT EXISTS accounts (
@@ -63,6 +63,19 @@ CREATE TABLE IF NOT EXISTS api_keys (
 CREATE INDEX IF NOT EXISTS idx_api_keys_lookup_hash ON api_keys(lookup_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_account_id ON api_keys(account_id);
 
+-- `retry_count`/`worker_id`/`heartbeat_at` are the durable-queue fix
+-- (docs/PAID_API_DESIGN.md's "Durable, multi-worker-safe scan
+-- execution" section): `worker_id` + `heartbeat_at` let any worker
+-- process (this one or another) tell a genuinely-still-running scan
+-- apart from one whose worker died without updating it — a bare
+-- `status='running'` alone can't make that distinction once more than
+-- one worker process can exist. `retry_count` bounds how many times a
+-- scan gets automatically requeued after an apparent interruption
+-- before it's given up on as `failed` instead — see
+-- `api/scan_worker.py`'s own module docstring for the exact numbers
+-- and reasoning. A fresh DB gets these columns directly from this
+-- CREATE TABLE; an existing `control.db` from an earlier round gets
+-- them via `_migrate_table_columns` below.
 CREATE TABLE IF NOT EXISTS scans (
     scan_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(account_id),
@@ -71,9 +84,30 @@ CREATE TABLE IF NOT EXISTS scans (
     status TEXT NOT NULL,
     error_message TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    worker_id TEXT,
+    heartbeat_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scans_account_id ON scans(account_id);
+CREATE INDEX IF NOT EXISTS idx_scans_status ON scans(status);
+
+-- Durable-queue fix, continued: a persisted replacement for
+-- `api/rate_limit.py`'s old in-memory `TokenBucketLimiter` — one row
+-- per API key, holding the bucket's current token count and when it
+-- was last refilled, so the SAME limit is enforced correctly whether
+-- one worker process serves the request or ten do, and survives a
+-- restart instead of silently resetting everyone's bucket to full.
+-- `last_refill_at` is wall-clock (ISO 8601), never `time.monotonic()`
+-- (Round 1's in-memory version used monotonic time freely — safe only
+-- because it never needed to be compared across processes/restarts,
+-- which have independent monotonic-clock epochs; wall-clock is the
+-- only meaningful choice once this state is shared).
+CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+    key_id TEXT PRIMARY KEY,
+    tokens REAL NOT NULL,
+    last_refill_at TEXT NOT NULL
+);
 
 -- Hallazgo 1's IP-based rate limit on POST /accounts (the frontend-team
 -- finding this fix closes) — one row per account-creation ATTEMPT,
@@ -272,6 +306,9 @@ class ScanRecord:
     error_message: str | None
     created_at: str
     updated_at: str
+    retry_count: int
+    worker_id: str | None
+    heartbeat_at: str | None
 
 
 @dataclass(frozen=True)
@@ -344,29 +381,43 @@ _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("email_verification_token_expires_at", "TEXT"),
 )
 
+# Durable-queue fix: an existing `scans` table (every account with a
+# scan predating this fix) needs these three columns added the same way
+# `accounts` needed its email-verification columns added.
+_SCANS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("worker_id", "TEXT"),
+    ("heartbeat_at", "TEXT"),
+)
 
-def _migrate_accounts_table(conn: sqlite3.Connection) -> None:
+
+def _migrate_table_columns(
+    conn: sqlite3.Connection, table: str, columns: tuple[tuple[str, str], ...]
+) -> None:
     """`CREATE TABLE IF NOT EXISTS` never adds columns to a table that
-    already exists on disk — an `accounts` table from Round 1/2/3 (before
-    email verification existed) needs these columns added explicitly, or
-    the schema script's own `CREATE UNIQUE INDEX ... ON accounts(email)`
-    right after it would fail with "no such column." A brand-new database
-    never reaches this function with any work to do (the table doesn't
-    exist yet, so there's nothing to migrate) — checked explicitly rather
-    than assumed, since running `ALTER TABLE` on a table that was never
-    created would itself fail."""
+    already exists on disk — generalized from the accounts-table-only
+    version this project's own Hallazgo 1 fix originally wrote (single
+    caller became two, so this is now a shared helper rather than a
+    second, drifting copy of the same four lines). `table`/`columns`
+    are always literal, module-level constants below, never external
+    input. A brand-new database never reaches the `ALTER TABLE` branch
+    with any work to do (the table doesn't exist yet, so there's
+    nothing to migrate) — checked explicitly rather than assumed, since
+    running `ALTER TABLE` on a table that was never created would
+    itself fail."""
     table_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounts'"
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
     ).fetchone()
     if table_exists is None:
         return
-    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(accounts)")}
-    for column, column_type in _ACCOUNTS_MIGRATION_COLUMNS:
+    existing_columns = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})")  # noqa: S608  # nosec B608
+    }
+    for column, column_type in columns:
         if column not in existing_columns:
-            # column/column_type both come from the fixed literal tuple
-            # above, never from external input.
             conn.execute(
-                f"ALTER TABLE accounts ADD COLUMN {column} {column_type}"
+                f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
             )  # noqa: S608  # nosec B608
 
 
@@ -380,7 +431,8 @@ class ControlDB:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
-            _migrate_accounts_table(conn)
+            _migrate_table_columns(conn, "accounts", _ACCOUNTS_MIGRATION_COLUMNS)
+            _migrate_table_columns(conn, "scans", _SCANS_MIGRATION_COLUMNS)
             conn.executescript(_SCHEMA)
         for suffix in ("", "-wal", "-shm"):
             path = Path(f"{self.db_path}{suffix}")
@@ -495,29 +547,51 @@ class ControlDB:
             ).fetchone()
         return int(row["n"])
 
-    # --- orphaned-scan reconciliation (Hallazgo 2) ----------------------
+    # --- persisted per-key rate limiting (durable-queue fix) -------------
 
-    def fail_orphaned_scans(self, *, reason: str) -> list[str]:
-        """Called once, at process startup, before the app accepts any
-        request — a scan that is `'queued'`/`'running'` at the exact
-        moment a NEW process is starting can only be leftover state from
-        a previous process that died without updating it (this process
-        has not queued or started anything yet). Returns the scan_ids it
-        fixed, so the caller can log how many (zero is the common,
-        healthy case after a clean shutdown)."""
+    def check_and_consume_rate_limit_token(
+        self, key_id: str, *, capacity: float, refill_rate_per_second: float
+    ) -> bool:
+        """The cross-process-safe replacement for
+        `api/rate_limit.py`'s old in-memory `TokenBucketLimiter` — one
+        `INSERT ... ON CONFLICT DO UPDATE ... WHERE` statement does the
+        entire refill-then-consume decision atomically in SQL, never a
+        Python read-then-write (which would itself be a race between
+        two processes checking the same key at once). The `WHERE`
+        clause on the `DO UPDATE` is what makes this a real gate, not
+        just bookkeeping: if the refilled token count would be below
+        1.0, the clause is false, so NEITHER the insert NOR the update
+        branch actually changes anything — `cursor.rowcount` comes back
+        `0`, and the caller knows to reject the request without a
+        separate check. Returns `True` (token consumed, request
+        allowed) or `False` (no tokens available, request denied).
+        Verified under real concurrent callers, not just reasoned
+        about, by `tests/test_scan_queue_durability.py`."""
         now = _now_iso()
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT scan_id FROM scans WHERE status IN ('queued', 'running')"
-            ).fetchall()
-            orphaned_ids = [row["scan_id"] for row in rows]
-            if orphaned_ids:
-                conn.execute(
-                    "UPDATE scans SET status = 'failed', error_message = ?, updated_at = ? "
-                    "WHERE status IN ('queued', 'running')",
-                    (reason, now),
-                )
-        return orphaned_ids
+            cursor = conn.execute(
+                "INSERT INTO rate_limit_buckets (key_id, tokens, last_refill_at) "
+                "VALUES (?, ? - 1, ?) "
+                "ON CONFLICT(key_id) DO UPDATE SET "
+                "    tokens = MIN(?, tokens + (julianday(?) - julianday(last_refill_at)) "
+                "        * 86400.0 * ?) - 1, "
+                "    last_refill_at = ? "
+                "WHERE MIN(?, tokens + (julianday(?) - julianday(last_refill_at)) "
+                "    * 86400.0 * ?) >= 1.0",
+                (
+                    key_id,
+                    capacity,
+                    now,
+                    capacity,
+                    now,
+                    refill_rate_per_second,
+                    now,
+                    capacity,
+                    now,
+                    refill_rate_per_second,
+                ),
+            )
+        return cursor.rowcount == 1
 
     # --- api keys -----------------------------------------------------
 
@@ -621,18 +695,107 @@ class ControlDB:
                 "SELECT * FROM scans WHERE scan_id = ? AND account_id = ?",
                 (scan_id, account_id),
             ).fetchone()
-        if row is None:
-            return None
-        return ScanRecord(
-            scan_id=row["scan_id"],
-            account_id=row["account_id"],
-            domain=row["domain"],
-            db_path=row["db_path"],
-            status=row["status"],
-            error_message=row["error_message"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-        )
+        return None if row is None else _scan_record_from_row(row)
+
+    # --- durable scan queue -------------------------------------------
+
+    def claim_next_queued_scan(self, worker_id: str) -> ScanRecord | None:
+        """Atomically claims the oldest `'queued'` scan for `worker_id`
+        — one UPDATE statement, so this is safe under real concurrent
+        callers (verified explicitly by
+        `tests/test_scan_queue_durability.py`'s race test, two threads
+        hammering this on the same single queued row, never both
+        winning). The `WHERE scan_id = (SELECT ...) AND status =
+        'queued'` shape means that even if two callers' subqueries both
+        pick the same candidate row before either has committed,
+        SQLite's own writer serialization guarantees only the FIRST to
+        actually execute its UPDATE changes anything — by the time the
+        second one runs, its own subquery re-evaluates against the
+        now-current state and either picks a different row or finds
+        none, never double-claiming the first caller's row. Returns
+        `None` when there's nothing queued (the common, healthy case
+        between bursts of traffic)."""
+        now = _now_iso()
+        with self._connect() as conn:
+            # RETURNING (SQLite 3.35+) hands back the exact row this
+            # statement just updated, in the same atomic operation —
+            # no separate SELECT afterward that could, in principle,
+            # pick up a DIFFERENT row this same worker_id claimed a
+            # microsecond later (a real risk with a two-statement
+            # claim-then-lookup under a tight, fast poll loop).
+            row = conn.execute(
+                "UPDATE scans SET status = 'running', worker_id = ?, heartbeat_at = ?, "
+                "updated_at = ? "
+                "WHERE scan_id = ("
+                "    SELECT scan_id FROM scans WHERE status = 'queued' "
+                "    ORDER BY created_at ASC LIMIT 1"
+                ") AND status = 'queued' "
+                "RETURNING *",
+                (worker_id, now, now),
+            ).fetchone()
+        return None if row is None else _scan_record_from_row(row)
+
+    def update_scan_heartbeat(self, scan_id: str) -> None:
+        """Called periodically (`api/scan_worker.py`'s heartbeat
+        sub-task) by whichever worker is actively executing this scan —
+        proof of liveness distinct from `status='running'` alone, which
+        can't tell a genuinely-still-executing scan apart from one whose
+        worker process died without updating it."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE scans SET heartbeat_at = ? WHERE scan_id = ?",
+                (_now_iso(), scan_id),
+            )
+
+    def sweep_stale_running_scans(
+        self, *, stale_after_seconds: int, max_retries: int, reason_prefix: str
+    ) -> tuple[list[str], list[str]]:
+        """Finds every `'running'` scan whose `heartbeat_at` is older
+        than `stale_after_seconds` — a worker was executing it and has
+        not proven it's still alive recently, which can only mean that
+        worker died (crashed, was killed, the process restarted)
+        without ever getting to mark the scan `completed`/`failed`
+        itself. Each one is either requeued (status back to `'queued'`,
+        `retry_count` incremented, `worker_id`/`heartbeat_at` cleared so
+        any worker — not necessarily this one — can claim it next) or,
+        if it's already been requeued `max_retries` times, given up on
+        as `failed` with a diagnosable reason instead of requeued
+        forever. Returns `(requeued_scan_ids, failed_scan_ids)`."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)).isoformat()
+        now = _now_iso()
+        with self._connect() as conn:
+            stale_rows = conn.execute(
+                "SELECT scan_id, retry_count FROM scans "
+                "WHERE status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < ?)",
+                (cutoff,),
+            ).fetchall()
+            requeued: list[str] = []
+            failed: list[str] = []
+            for row in stale_rows:
+                scan_id = row["scan_id"]
+                retry_count = row["retry_count"]
+                if retry_count >= max_retries:
+                    conn.execute(
+                        "UPDATE scans SET status = 'failed', error_message = ?, "
+                        "worker_id = NULL, heartbeat_at = NULL, updated_at = ? "
+                        "WHERE scan_id = ? AND status = 'running'",
+                        (
+                            f"{reason_prefix}: exceeded {max_retries} retries after "
+                            "repeated interruption",
+                            now,
+                            scan_id,
+                        ),
+                    )
+                    failed.append(scan_id)
+                else:
+                    conn.execute(
+                        "UPDATE scans SET status = 'queued', retry_count = retry_count + 1, "
+                        "worker_id = NULL, heartbeat_at = NULL, updated_at = ? "
+                        "WHERE scan_id = ? AND status = 'running'",
+                        (now, scan_id),
+                    )
+                    requeued.append(scan_id)
+        return requeued, failed
 
     # --- domain verification (Part A) --------------------------------
 
@@ -1172,6 +1335,22 @@ def _key_record_from_row(row: sqlite3.Row) -> ApiKeyRecord:
         revoked_at=row["revoked_at"],
         expires_at=row["expires_at"],
         last_used_at=row["last_used_at"],
+    )
+
+
+def _scan_record_from_row(row: sqlite3.Row) -> ScanRecord:
+    return ScanRecord(
+        scan_id=row["scan_id"],
+        account_id=row["account_id"],
+        domain=row["domain"],
+        db_path=row["db_path"],
+        status=row["status"],
+        error_message=row["error_message"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        retry_count=row["retry_count"],
+        worker_id=row["worker_id"],
+        heartbeat_at=row["heartbeat_at"],
     )
 
 

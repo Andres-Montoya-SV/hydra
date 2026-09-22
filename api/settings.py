@@ -100,6 +100,37 @@ class APISettings:
     # well-known dev overrides above. Never set in production.
     dev_postmark_send_url: str | None = None
 
+    # Durable, multi-worker-safe scan execution
+    # (docs/PAID_API_DESIGN.md's "Durable, multi-worker-safe scan
+    # execution" section) — see `api/scan_worker.py`'s own module
+    # docstring for the full reasoning behind each number below.
+    #
+    # How many scans this ONE process executes concurrently — naabu/
+    # httpx/nuclei subprocesses are real host resources, not free just
+    # because they're async. A scan beyond this ceiling stays `queued`
+    # until a slot frees up; it is never dropped.
+    max_concurrent_scans: int = 3
+    # How often the worker loop checks for claimable queued work and
+    # sweeps for stale running scans, in the same cycle. Against a scan
+    # that takes ~25 minutes, even a full second of claim latency is
+    # noise — kept well under that (0.5s) mainly so the existing test
+    # suite's stubbed-pipeline scans (near-instant once claimed) don't
+    # pay multiple seconds of avoidable poll latency each.
+    scan_poll_interval_seconds: float = 0.5
+    # How often an actively-executing scan proves it's still alive.
+    scan_heartbeat_interval_seconds: float = 30.0
+    # A `running` scan whose heartbeat is older than this is treated as
+    # orphaned (its worker died) — comfortably more than one heartbeat
+    # interval so a single slow/delayed heartbeat write under load never
+    # false-triggers a requeue of a scan that's actually fine.
+    scan_stale_after_seconds: int = 120
+    # A scan that gets interrupted (worker died) this many times in a
+    # row stops being automatically requeued and is given up on as
+    # `failed` instead — an unbounded requeue loop on a scan that
+    # reliably crashes the process on every attempt would itself become
+    # an outage (the same slot never frees up for other work).
+    scan_max_retries: int = 3
+
     @property
     def control_db_path(self) -> Path:
         return self.data_dir / "control.db"
@@ -160,6 +191,21 @@ def load_api_settings() -> APISettings:
     settings.email_from_address = os.getenv("HYDRA_API_EMAIL_FROM") or None
     settings.email_from_name = os.getenv("HYDRA_API_EMAIL_FROM_NAME") or "Hydra"
     settings.dev_postmark_send_url = os.getenv("HYDRA_API_DEV_POSTMARK_SEND_URL") or None
+    max_concurrent = os.getenv("HYDRA_API_MAX_CONCURRENT_SCANS")
+    if max_concurrent:
+        settings.max_concurrent_scans = int(max_concurrent)
+    poll_interval = os.getenv("HYDRA_API_SCAN_POLL_INTERVAL_SECONDS")
+    if poll_interval:
+        settings.scan_poll_interval_seconds = float(poll_interval)
+    heartbeat_interval = os.getenv("HYDRA_API_SCAN_HEARTBEAT_INTERVAL_SECONDS")
+    if heartbeat_interval:
+        settings.scan_heartbeat_interval_seconds = float(heartbeat_interval)
+    stale_after = os.getenv("HYDRA_API_SCAN_STALE_AFTER_SECONDS")
+    if stale_after:
+        settings.scan_stale_after_seconds = int(stale_after)
+    max_retries = os.getenv("HYDRA_API_SCAN_MAX_RETRIES")
+    if max_retries:
+        settings.scan_max_retries = int(max_retries)
     return settings
 
 

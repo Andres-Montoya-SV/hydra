@@ -7,16 +7,17 @@ always is) and `_run_headless_pipeline` (the same function `cmd_run
 new thing on top of those: recording status transitions in the control-
 plane `scans` table so `GET /scans/{id}` has something durable to read.
 
-Round 1 scope, stated honestly: scans run as an `asyncio.create_task`
-inside the same process serving HTTP requests — no separate worker
-process, no durable job queue (Celery/RQ + Redis). This is correct for
-a single `uvicorn` worker (this round's deployment target) and means a
-process restart loses in-flight scan progress (the `scans` row would be
-stuck at "running" — a future round's reconciliation job, not built
-here, would need to detect and re-queue or fail those). Flagged
-explicitly rather than silently assumed away; moving to a durable queue
-is a Round 2/3-scale concern, not a Round 1 correctness bug for the
-single-worker target this round ships as.
+Called only by `api/scan_worker.py`'s worker loop, AFTER
+`ControlDB.claim_next_queued_scan` has already atomically transitioned
+the row to `'running'` — this function never sets that status itself
+(it would be redundant, and touching `updated_at` again right after the
+claim already did is pointless churn). It only ever moves the row
+forward from there, to `'completed'` or `'failed'`.
+
+Durable execution (surviving a worker crash mid-scan, bounded automatic
+retries) is `api/scan_worker.py`'s concern, not this module's — see that
+module's own docstring for the full design (heartbeat liveness, the
+retry ceiling, what "durable" does and does not mean here).
 """
 
 from __future__ import annotations
@@ -41,7 +42,6 @@ async def execute_scan(
 ) -> None:
     import app as hydra_app  # deferred: heavy import graph (ToolManager, plugins, …)
 
-    control_db.update_scan_status(scan_id, "running")
     try:
         settings = account_settings(api_settings, account_id)
         settings.validate_or_raise()
