@@ -28,10 +28,26 @@ from pathlib import Path
 from core.store import connect_sqlite
 
 _SCHEMA = """
+-- `email`/`email_verified_at`/`email_verification_token`/
+-- `email_verification_token_expires_at` are Hallazgo 1's account-abuse
+-- fix (docs/PAID_API_DESIGN.md's own section on it): an account is
+-- created immediately (so the client gets a usable api_key right away)
+-- but starts unverified — POST /scans refuses to run anything for it
+-- until `email_verified_at` is set. A fresh DB gets these columns
+-- directly from this CREATE TABLE; an EXISTING control.db from an
+-- earlier round gets them via `_migrate_accounts_table` below (SQLite's
+-- `CREATE TABLE IF NOT EXISTS` never adds columns to an already-existing
+-- table on disk).
 CREATE TABLE IF NOT EXISTS accounts (
     account_id TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    email TEXT,
+    email_verified_at TEXT,
+    email_verification_token TEXT,
+    email_verification_token_expires_at TEXT
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email)
+    WHERE email IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS api_keys (
     key_id TEXT PRIMARY KEY,
@@ -58,6 +74,24 @@ CREATE TABLE IF NOT EXISTS scans (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_scans_account_id ON scans(account_id);
+
+-- Hallazgo 1's IP-based rate limit on POST /accounts (the frontend-team
+-- finding this fix closes) — one row per account-creation ATTEMPT,
+-- keyed by source IP, so "how many accounts has this IP created
+-- recently" is a real, persisted count that survives a process restart
+-- (unlike Round 1's in-memory per-key `TokenBucketLimiter`, which is
+-- the wrong tool here: that limiter only runs AFTER authentication,
+-- and this endpoint is deliberately unauthenticated — see
+-- api/routers/accounts.py's own docstring). Never pruned automatically;
+-- rows older than the rate-limit window are simply never counted again
+-- (a genuinely low-volume table — a few rows per IP per day at most).
+CREATE TABLE IF NOT EXISTS account_creation_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip_address TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_account_creation_attempts_ip
+    ON account_creation_attempts(ip_address, created_at);
 
 -- Part A (docs/PAID_API_DESIGN.md) domain-ownership verification. One row
 -- per verification ATTEMPT, not per (account, domain) — a new attempt
@@ -197,6 +231,26 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class DuplicateEmailError(Exception):
+    """Raised by `ControlDB.create_account` when `email` is already
+    registered to a different account (Hallazgo 1's "distinct email per
+    account" requirement) — the router turns this into a 409."""
+
+
+@dataclass(frozen=True)
+class AccountRecord:
+    account_id: str
+    created_at: str
+    email: str | None
+    email_verified_at: str | None
+    email_verification_token: str | None
+    email_verification_token_expires_at: str | None
+
+    @property
+    def is_email_verified(self) -> bool:
+        return self.email_verified_at is not None
+
+
 @dataclass(frozen=True)
 class ApiKeyRecord:
     key_id: str
@@ -283,6 +337,39 @@ class DomainVerificationRecord:
     last_check_error: str | None
 
 
+_ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("email", "TEXT"),
+    ("email_verified_at", "TEXT"),
+    ("email_verification_token", "TEXT"),
+    ("email_verification_token_expires_at", "TEXT"),
+)
+
+
+def _migrate_accounts_table(conn: sqlite3.Connection) -> None:
+    """`CREATE TABLE IF NOT EXISTS` never adds columns to a table that
+    already exists on disk — an `accounts` table from Round 1/2/3 (before
+    email verification existed) needs these columns added explicitly, or
+    the schema script's own `CREATE UNIQUE INDEX ... ON accounts(email)`
+    right after it would fail with "no such column." A brand-new database
+    never reaches this function with any work to do (the table doesn't
+    exist yet, so there's nothing to migrate) — checked explicitly rather
+    than assumed, since running `ALTER TABLE` on a table that was never
+    created would itself fail."""
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounts'"
+    ).fetchone()
+    if table_exists is None:
+        return
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(accounts)")}
+    for column, column_type in _ACCOUNTS_MIGRATION_COLUMNS:
+        if column not in existing_columns:
+            # column/column_type both come from the fixed literal tuple
+            # above, never from external input.
+            conn.execute(
+                f"ALTER TABLE accounts ADD COLUMN {column} {column_type}"
+            )  # noqa: S608  # nosec B608
+
+
 class ControlDB:
     """One instance per process, backed by one SQLite file
     (`APISettings.control_db_path`) — this is the only database in the
@@ -293,6 +380,7 @@ class ControlDB:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            _migrate_accounts_table(conn)
             conn.executescript(_SCHEMA)
         for suffix in ("", "-wal", "-shm"):
             path = Path(f"{self.db_path}{suffix}")
@@ -307,13 +395,39 @@ class ControlDB:
 
     # --- accounts ---------------------------------------------------
 
-    def create_account(self) -> str:
+    def create_account(
+        self,
+        *,
+        email: str | None = None,
+        email_verification_token: str | None = None,
+        email_verification_token_expires_at: str | None = None,
+    ) -> str:
+        """`email`/the token fields are optional here (not on
+        `POST /accounts` itself — `api/routers/accounts.py` always
+        supplies them) so pre-existing direct callers (a handful of
+        tests whose subject is unrelated to email verification) keep
+        working unchanged. Raises `DuplicateEmailError` if `email` is
+        already registered to a different account — enforced by the
+        table's own partial unique index (`WHERE email IS NOT NULL`),
+        not just application-level convention, so this can never be
+        bypassed by a second, uncoordinated code path."""
         account_id = secrets.token_hex(16)
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO accounts (account_id, created_at) VALUES (?, ?)",
-                (account_id, _now_iso()),
-            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO accounts (account_id, created_at, email, "
+                    "email_verification_token, email_verification_token_expires_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        account_id,
+                        _now_iso(),
+                        email,
+                        email_verification_token,
+                        email_verification_token_expires_at,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateEmailError(f"{email!r} is already registered") from exc
         return account_id
 
     def account_exists(self, account_id: str) -> bool:
@@ -322,6 +436,88 @@ class ControlDB:
                 "SELECT 1 FROM accounts WHERE account_id = ?", (account_id,)
             ).fetchone()
         return row is not None
+
+    def get_account(self, account_id: str) -> AccountRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        return None if row is None else _account_record_from_row(row)
+
+    def get_account_by_verification_token(self, token: str) -> AccountRecord | None:
+        """Only ever used by `POST /accounts/verify-email` — matches on
+        the token alone (it's the credential here, the same way an API
+        key or a domain-verification token is), never combined with any
+        other caller-supplied identifier."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM accounts WHERE email_verification_token = ?", (token,)
+            ).fetchone()
+        return None if row is None else _account_record_from_row(row)
+
+    def mark_email_verified(self, account_id: str) -> None:
+        """Clears the token on success — a consumed verification token
+        is never reusable, the same single-use discipline
+        `domain_verifications`/`cost_estimates` already established."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET email_verified_at = ?, email_verification_token = NULL, "
+                "email_verification_token_expires_at = NULL WHERE account_id = ?",
+                (_now_iso(), account_id),
+            )
+
+    def set_email_verification_token(self, account_id: str, *, token: str, expires_at: str) -> None:
+        """Used both at account creation and by a resend — regenerating
+        always replaces any previous token outright (never two
+        simultaneously-valid tokens for the same account)."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET email_verification_token = ?, "
+                "email_verification_token_expires_at = ? WHERE account_id = ?",
+                (token, expires_at, account_id),
+            )
+
+    # --- account-creation rate limiting (Hallazgo 1) --------------------
+
+    def record_account_creation_attempt(self, ip_address: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO account_creation_attempts (ip_address, created_at) VALUES (?, ?)",
+                (ip_address, _now_iso()),
+            )
+
+    def count_recent_account_creations_from_ip(self, ip_address: str, *, since: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM account_creation_attempts "
+                "WHERE ip_address = ? AND created_at >= ?",
+                (ip_address, since),
+            ).fetchone()
+        return int(row["n"])
+
+    # --- orphaned-scan reconciliation (Hallazgo 2) ----------------------
+
+    def fail_orphaned_scans(self, *, reason: str) -> list[str]:
+        """Called once, at process startup, before the app accepts any
+        request — a scan that is `'queued'`/`'running'` at the exact
+        moment a NEW process is starting can only be leftover state from
+        a previous process that died without updating it (this process
+        has not queued or started anything yet). Returns the scan_ids it
+        fixed, so the caller can log how many (zero is the common,
+        healthy case after a clean shutdown)."""
+        now = _now_iso()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT scan_id FROM scans WHERE status IN ('queued', 'running')"
+            ).fetchall()
+            orphaned_ids = [row["scan_id"] for row in rows]
+            if orphaned_ids:
+                conn.execute(
+                    "UPDATE scans SET status = 'failed', error_message = ?, updated_at = ? "
+                    "WHERE status IN ('queued', 'running')",
+                    (reason, now),
+                )
+        return orphaned_ids
 
     # --- api keys -----------------------------------------------------
 
@@ -976,4 +1172,15 @@ def _key_record_from_row(row: sqlite3.Row) -> ApiKeyRecord:
         revoked_at=row["revoked_at"],
         expires_at=row["expires_at"],
         last_used_at=row["last_used_at"],
+    )
+
+
+def _account_record_from_row(row: sqlite3.Row) -> AccountRecord:
+    return AccountRecord(
+        account_id=row["account_id"],
+        created_at=row["created_at"],
+        email=row["email"],
+        email_verified_at=row["email_verified_at"],
+        email_verification_token=row["email_verification_token"],
+        email_verification_token_expires_at=row["email_verification_token_expires_at"],
     )

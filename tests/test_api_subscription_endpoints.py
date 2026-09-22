@@ -26,6 +26,7 @@ from _fake_wompi_server import (  # noqa: E402
     start_fake_wompi_server,
     stop_fake_wompi_server,
 )
+from _verified_account import create_verified_account  # noqa: E402
 from _verified_domain import seed_verified_domain  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -66,8 +67,7 @@ def wompi_backed_client(tmp_path: Path):
 
 
 def _create_account(client: TestClient) -> tuple[str, str]:
-    body = client.post("/accounts").json()
-    return body["api_key"], body["account_id"]
+    return create_verified_account(client)
 
 
 def _sign(body: bytes) -> str:

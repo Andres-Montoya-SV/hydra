@@ -14,6 +14,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("argon2")
 pytest.importorskip("httpx")
 
+from _verified_account import unique_email  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from api.control_db import ControlDB  # noqa: E402
@@ -28,8 +29,18 @@ def _client(tmp_path: Path, *, rate_limit_per_minute: int = 60) -> TestClient:
     return TestClient(create_app(settings))
 
 
+def _post_account(client: TestClient):
+    """None of this file's tests are about email verification itself
+    (that's tests/test_api_account_verification.py) — GET /scans/{id}
+    (what every test here actually calls) was never gated by it, only
+    POST /scans was. Each call just needs a fresh, distinct email to
+    satisfy the now-mandatory field and the accounts.email uniqueness
+    constraint."""
+    return client.post("/accounts", json={"email": unique_email()})
+
+
 def _create_account(client: TestClient) -> tuple[str, str]:
-    resp = client.post("/accounts")
+    resp = _post_account(client)
     assert resp.status_code == 201
     body = resp.json()
     return body["account_id"], body["api_key"]
@@ -38,7 +49,7 @@ def _create_account(client: TestClient) -> tuple[str, str]:
 class TestAccountCreation:
     def test_creates_account_and_returns_a_usable_key_once(self, tmp_path: Path) -> None:
         with _client(tmp_path) as client:
-            resp = client.post("/accounts")
+            resp = _post_account(client)
             assert resp.status_code == 201
             body = resp.json()
             assert body["account_id"]
@@ -67,7 +78,7 @@ class TestAccountCreation:
 class TestRevocation:
     def test_revoked_key_fails_immediately_with_401(self, tmp_path: Path) -> None:
         with _client(tmp_path) as client:
-            account_resp = client.post("/accounts").json()
+            account_resp = _post_account(client).json()
             api_key = account_resp["api_key"]
             key_id = account_resp["key_id"]
 
@@ -82,7 +93,7 @@ class TestRevocation:
         self, tmp_path: Path
     ) -> None:
         with _client(tmp_path) as client:
-            account_resp = client.post("/accounts").json()
+            account_resp = _post_account(client).json()
             first_key = account_resp["api_key"]
             first_key_id = account_resp["key_id"]
 
@@ -110,7 +121,7 @@ class TestRevocation:
         self, tmp_path: Path
     ) -> None:
         with _client(tmp_path) as client:
-            account_resp = client.post("/accounts").json()
+            account_resp = _post_account(client).json()
             key_id = account_resp["key_id"]
             api_key = account_resp["api_key"]
             assert (
@@ -124,8 +135,8 @@ class TestRevocation:
 
     def test_cannot_revoke_a_different_accounts_key(self, tmp_path: Path) -> None:
         with _client(tmp_path) as client:
-            account_a = client.post("/accounts").json()
-            account_b = client.post("/accounts").json()
+            account_a = _post_account(client).json()
+            account_b = _post_account(client).json()
             resp = client.post(
                 f"/keys/{account_a['key_id']}/revoke",
                 headers={"X-API-Key": account_b["api_key"]},
@@ -138,7 +149,7 @@ class TestRotation:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with _client(tmp_path) as client:
-            account_resp = client.post("/accounts").json()
+            account_resp = _post_account(client).json()
             old_key = account_resp["api_key"]
             old_key_id = account_resp["key_id"]
 
@@ -167,7 +178,7 @@ class TestRotation:
 
     def test_rotating_an_already_revoked_key_is_a_clean_error(self, tmp_path: Path) -> None:
         with _client(tmp_path) as client:
-            account_resp = client.post("/accounts").json()
+            account_resp = _post_account(client).json()
             api_key = account_resp["api_key"]
             key_id = account_resp["key_id"]
             assert (

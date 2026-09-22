@@ -21,6 +21,7 @@ pytest.importorskip("httpx")
 pytest.importorskip("anthropic")
 pytest.importorskip("pydantic")
 
+from _verified_account import unique_email  # noqa: E402
 from _verified_domain import seed_verified_domain  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -79,9 +80,10 @@ class _FakeProvider:
 def client_with_completed_scan(tmp_path: Path):
     settings = APISettings(data_dir=tmp_path / "api_data")
     with TestClient(create_app(settings)) as client:
-        account = client.post("/accounts").json()
+        account = client.post("/accounts", json={"email": unique_email()}).json()
         api_key = account["api_key"]
         account_id = account["account_id"]
+        client.app.state.control_db.mark_email_verified(account_id)
         seed_verified_domain(client, account_id, DOMAIN)
 
         control_db = client.app.state.control_db

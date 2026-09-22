@@ -20,6 +20,7 @@ pytest.importorskip("dns")
 pytest.importorskip("httpx")
 
 from _dns_test_server import start_dns_test_server, stop_dns_test_server  # noqa: E402
+from _verified_account import create_verified_account  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from api.domain_verification import dns_record_name, dns_record_value  # noqa: E402
@@ -54,7 +55,13 @@ def dns_backed_client(tmp_path: Path):
 
 
 def _create_account(client: TestClient) -> str:
-    return client.post("/accounts").json()["api_key"]
+    """This file's subject is domain verification/the scan gate, not
+    account creation itself (that's tests/test_api_account_verification.py)
+    — accounts here are created via the real POST /accounts (so the now-
+    mandatory email field is genuinely exercised) and immediately marked
+    verified, matching tests/_verified_account.py's split."""
+    api_key, _ = create_verified_account(client)
+    return api_key
 
 
 class TestDnsTxtEndToEndThroughTheRealApi:
