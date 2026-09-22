@@ -1105,6 +1105,70 @@ exactly as the task's fallback instructed:
    gap Round 1's unauthenticated `POST /accounts` already has), not a
    production-grade admin auth system.
 
+### Task 3, attempted confirmation against a real sandbox — 2026-09-22, still unconfirmed
+
+A real Wompi merchant account was switched to development mode, real
+`WOMPI_CLIENT_ID`/`WOMPI_CLIENT_SECRET` were set, and a real
+`EnlacePagoRecurrente` link was created and configured
+(`HYDRA_WOMPI_LINK_URL_MEDIUM`, a genuine `s.wompi.sv` URL). Confirmed
+live against this real service, with real network calls:
+
+- The OAuth2 client-credentials exchange against the real
+  `id.wompi.sv` succeeds with these credentials (a real access token
+  was received).
+- `POST /account/subscription {"tier":"medium","billing_email":...}`
+  against a real, locally-running instance of this app returns the
+  real, configured `s.wompi.sv` payment link (not a placeholder) and
+  records a real `wompi_pending_enrollments` row.
+
+**What is still NOT confirmed**: no real webhook has been received by
+this service. `wompi_webhook_events` and `wompi_unmatched_payments` are
+both empty after this attempt — meaning either the actual sandbox
+payment was never completed, or (far more likely, since nothing in
+this codebase can control this) no publicly-reachable URL was ever
+registered with Wompi's dashboard for webhook delivery. **This is
+infrastructure, not a code defect** — no amount of additional
+defensiveness in `api/wompi_client.py`/`api/routers/subscription.py`
+can compensate for a webhook that was never sent to a reachable
+address. The one honest inference from Task 3 above (the OAuth
+`client_secret` doubling as the webhook HMAC key) therefore remains
+exactly what it was: documentation-terminology-confirmed, not
+observed-in-production-confirmed. This still needs: (1) the API
+running somewhere Wompi can reach it (a tunnel, or a real deployment),
+(2) that URL registered as the webhook URL in the Wompi dashboard, (3)
+an actual completed payment on the real `payment_url` from a real
+browser.
+
+**What WAS improved as a direct result of this attempt, so the same
+"empty tables, no signal" ambiguity can't happen silently again**:
+`api/routers/subscription.py::wompi_webhook` now logs at every stage —
+webhook received (source IP, content length, whether a signature
+header was even present) BEFORE verification; a WARNING on signature
+failure; an ERROR on missing `WOMPI_CLIENT_SECRET` configuration; an
+ERROR on the independent `TransaccionCompra` lookup failing; and an
+INFO/WARNING line naming the transaction and account for every terminal
+outcome (activated, renewal confirmed, grace period started, unmatched).
+None of this logs the raw (unverified-until-checked) request body or
+the real secret — tested directly
+(`tests/test_api_subscription_endpoints.py::TestWompiWebhook::
+test_an_invalid_signature_is_logged_without_leaking_the_body_or_secret`).
+This closes the actual gap this round's blocked attempt exposed: an
+operator retrying this confirmation next time will have a real log
+trail even if the webhook once again never arrives, instead of two
+empty database tables and no way to tell why.
+
+**On "preventing fake transactions," restated plainly since it was
+asked directly**: this was already the design, not a gap this round
+found — `verify_webhook_signature`'s HMAC check (timing-safe,
+byte-exact raw body) rejects a forged signature before any code even
+looks at the payload, and even a validly-signed-looking payload is
+never enough on its own — the independent `GET /TransaccionCompra/{id}`
+call against Wompi's own real API (Part D.2's belt-and-suspenders
+check) must also confirm the transaction exists and is approved before
+anything is activated. A forged or fabricated transaction cannot pass
+both checks. What changed today is visibility into this working (or a
+real webhook being rejected), not the mechanism's correctness itself.
+
 ### Task 3.2 — Payment failure / grace period (Part D.3, confirmed as drafted)
 
 3-day grace period (`GRACE_PERIOD_DAYS`, `api/subscriptions.py`): a

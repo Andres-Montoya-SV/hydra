@@ -178,6 +178,42 @@ class TestWompiWebhook:
         assert sub["tier"] == "pro"
         assert sub["status"] == "active"
 
+    def test_a_repeated_upgrade_request_before_paying_still_activates_cleanly(
+        self, wompi_backed_client: TestClient
+    ) -> None:
+        """The real gap a live sandbox attempt surfaced: calling
+        `POST /account/subscription` more than once before ever
+        completing payment (retrying because nothing seemed to happen)
+        used to leave more than one 'pending' row for the same account —
+        `find_pending_enrollment_by_email` correctly refuses to guess
+        between them, so a later genuinely-successful webhook would
+        silently fall through to `wompi_unmatched_payments` instead of
+        activating anything. `create_pending_enrollment` now supersedes
+        this account's own prior pending row first, so only the latest
+        attempt is ever a live candidate."""
+        api_key, _ = _create_account(wompi_backed_client)
+        for _ in range(3):  # simulates three retries before ever paying
+            resp = wompi_backed_client.post(
+                "/account/subscription",
+                json={"tier": "pro", "billing_email": "retrier@example.com"},
+                headers={"X-API-Key": api_key},
+            )
+            assert resp.status_code == 200
+
+        body = _webhook_payload(
+            transaction_id="txn-retry-1", email="retrier@example.com", product_name="Hydra Pro"
+        )
+        resp = wompi_backed_client.post(
+            "/webhooks/wompi", content=body, headers={"wompi_hash": _sign(body)}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "activated"  # not "unmatched_pending_manual_reconciliation"
+
+        sub = wompi_backed_client.get(
+            "/account/subscription", headers={"X-API-Key": api_key}
+        ).json()
+        assert sub["tier"] == "pro"
+
     def test_invalid_signature_is_rejected_and_never_activates(
         self, wompi_backed_client: TestClient
     ) -> None:
@@ -206,6 +242,50 @@ class TestWompiWebhook:
         )
         resp = wompi_backed_client.post("/webhooks/wompi", content=body)
         assert resp.status_code == 401
+
+    def test_an_invalid_signature_is_logged_without_leaking_the_body_or_secret(
+        self, wompi_backed_client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The real gap a live sandbox run surfaced: an empty
+        `wompi_webhook_events` table can't distinguish "nothing ever
+        arrived" from "something arrived and was rejected." A failed
+        signature must now leave a visible trace — metadata only, never
+        the unverified body or the real secret."""
+        body = _webhook_payload(
+            transaction_id="txn-101b", email="buyer2@example.com", product_name="Hydra Pro"
+        )
+        with caplog.at_level("WARNING", logger="hydra.api.wompi_webhook"):
+            resp = wompi_backed_client.post(
+                "/webhooks/wompi", content=body, headers={"wompi_hash": "0" * 64}
+            )
+        assert resp.status_code == 401
+        full_log = "\n".join(record.message for record in caplog.records)
+        assert "verification FAILED" in full_log
+        assert "buyer2@example.com" not in full_log  # never the unverified body's own content
+        assert WEBHOOK_SECRET not in full_log
+
+    def test_a_successful_activation_is_logged_with_the_account_and_tier(
+        self, wompi_backed_client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        api_key, _ = _create_account(wompi_backed_client)
+        wompi_backed_client.post(
+            "/account/subscription",
+            json={"tier": "pro", "billing_email": "logged-activation@example.com"},
+            headers={"X-API-Key": api_key},
+        )
+        body = _webhook_payload(
+            transaction_id="txn-log-1",
+            email="logged-activation@example.com",
+            product_name="Hydra Pro",
+        )
+        with caplog.at_level("INFO", logger="hydra.api.wompi_webhook"):
+            resp = wompi_backed_client.post(
+                "/webhooks/wompi", content=body, headers={"wompi_hash": _sign(body)}
+            )
+        assert resp.status_code == 200
+        full_log = "\n".join(record.message for record in caplog.records)
+        assert "activated" in full_log
+        assert "txn-log-1" in full_log
 
     def test_a_replayed_webhook_is_idempotent_not_double_processed(
         self, wompi_backed_client: TestClient

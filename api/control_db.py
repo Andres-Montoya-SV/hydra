@@ -218,7 +218,16 @@ CREATE INDEX IF NOT EXISTS idx_cost_estimates_account ON cost_estimates(account_
 -- mechanism (docs/PAID_API_DESIGN.md's "Round 3 implemented" section
 -- documents this honestly as unconfirmed against a real Wompi sandbox):
 -- match an incoming webhook's `cliente.Email` against a still-'pending'
--- row's `billing_email` for the same tier/product.
+-- row's `billing_email` for the same tier/product. `status` is one of
+-- 'pending' (no matching webhook yet), 'matched' (activated a real
+-- account), or 'superseded' (this account requested another upgrade
+-- before this one was ever matched — `create_pending_enrollment`
+-- superseded it so at most one 'pending' row per account ever exists,
+-- closing a real ambiguity a live sandbox attempt surfaced: more than
+-- one 'pending' row for the same email/tier makes
+-- `find_pending_enrollment_by_email` correctly refuse to guess,
+-- silently sending a later genuinely-successful webhook to
+-- `wompi_unmatched_payments` instead of activating anything).
 CREATE TABLE IF NOT EXISTS wompi_pending_enrollments (
     enrollment_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(account_id),
@@ -1219,9 +1228,31 @@ class ControlDB:
     def create_pending_enrollment(
         self, *, account_id: str, tier: str, billing_email: str
     ) -> WompiPendingEnrollmentRecord:
+        """A real gap a live sandbox attempt surfaced: a client that
+        calls `POST /account/subscription` more than once before ever
+        completing payment (retrying because nothing seemed to happen,
+        changing their mind on tier, or simply double-clicking) used to
+        accumulate multiple `'pending'` rows for the same account.
+        `find_pending_enrollment_by_email` correctly refuses to guess
+        between more than one match — but that means a LATER, genuinely
+        successful webhook would silently fall through to
+        `wompi_unmatched_payments` instead of activating anything,
+        indistinguishable from a real correlation failure. Superseding
+        this account's own other still-`'pending'` rows first (same
+        pattern `supersede_other_verifications` already uses for domain
+        verification) means only the MOST RECENT upgrade attempt is ever
+        a live candidate — exactly matching what a real user actually
+        wants ("I asked to upgrade again, that's the one that should
+        count"), and it can never be forgotten by a future caller since
+        it happens here, not at each call site."""
         enrollment_id = secrets.token_hex(16)
         now = _now_iso()
         with self._connect() as conn:
+            conn.execute(
+                "UPDATE wompi_pending_enrollments SET status = 'superseded' "
+                "WHERE account_id = ? AND status = 'pending'",
+                (account_id,),
+            )
             conn.execute(
                 "INSERT INTO wompi_pending_enrollments "
                 "(enrollment_id, account_id, tier, billing_email, status, created_at) "
