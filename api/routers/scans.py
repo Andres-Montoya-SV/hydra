@@ -212,8 +212,26 @@ def post_client_report(
     if scan.status != "completed":
         raise HTTPException(status_code=409, detail=f"Scan is {scan.status!r}, not completed yet")
 
+    branding: str | None = None
+    if body.white_label:
+        # Already confirmed Ultra-tier-eligible by check_report_options
+        # above — this is purely "did they actually configure a name
+        # yet," never a second tier check. A silent fallback to
+        # unbranded output would be a real, avoidable surprise for a
+        # reseller paying specifically for their OWN identity to appear
+        # here — a clear 422 beats guessing what they meant.
+        branding = subscription.white_label_company_name
+        if not branding:
+            raise HTTPException(
+                status_code=422,
+                detail="white_label=true but no branding is configured for this account — "
+                "set one first via PUT /account/branding.",
+            )
+
     settings = account_settings(_api_settings(request), auth.account_id)
-    rc = cmd_client_report(settings, scan_id, output_format=body.format, language=body.language)
+    rc = cmd_client_report(
+        settings, scan_id, output_format=body.format, language=body.language, branding=branding
+    )
     if rc != 0:
         raise HTTPException(status_code=500, detail="client-report generation failed")
 

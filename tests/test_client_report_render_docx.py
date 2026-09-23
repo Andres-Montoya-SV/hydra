@@ -93,6 +93,36 @@ class TestRenderDocxProducesAValidDocument:
         assert "no disponible" in text
 
 
+class TestWhiteLabelBranding:
+    """docs/PAID_API_DESIGN.md's white-label section — `branding=None`
+    (the default) must render byte-for-byte identical output to every
+    prior round; a real value adds one attribution line, nothing else."""
+
+    def test_no_branding_produces_byte_for_byte_identical_output_to_before(self) -> None:
+        data = _data()
+        with_default_arg = render_docx(data, [])
+        with_explicit_none = render_docx(data, [], branding=None)
+        assert with_default_arg == with_explicit_none
+
+    def test_branding_adds_an_attribution_line_without_removing_anything(self) -> None:
+        data = _data(targets=["metaversejustice.com"])
+        unbranded_text = "\n".join(
+            p.text for p in _document_from_bytes(render_docx(data, [])).paragraphs
+        )
+        branded_text = "\n".join(
+            p.text
+            for p in _document_from_bytes(
+                render_docx(data, [], branding="Acme Security Consulting")
+            ).paragraphs
+        )
+        assert "Acme Security Consulting" not in unbranded_text
+        assert "Acme Security Consulting" in branded_text
+        assert "Preparado por: Acme Security Consulting" in branded_text  # default language: es
+        # Nothing existing was removed — the target/cover content is
+        # still present in the branded version too.
+        assert "metaversejustice.com" in branded_text
+
+
 class TestSeverityBadgesAreVisualNotJustText:
     def test_finding_has_a_shaded_table_cell_with_severity(self) -> None:
         findings = [_param_finding("cat", "https://www.metaversejustice.com/")]

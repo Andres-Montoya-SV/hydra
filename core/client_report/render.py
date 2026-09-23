@@ -24,11 +24,25 @@ def render_markdown(
     data: RunReportData,
     consolidated: list[ConsolidatedFinding],
     language: str = DEFAULT_LANGUAGE,
+    *,
+    branding: str | None = None,
 ) -> str:
+    """`branding`: an Ultra account's own configured consultancy name
+    (docs/PAID_API_DESIGN.md's white-label section) — `None` (the
+    default) renders byte-for-byte identical output to every prior
+    round; a real value adds one attribution line right under the
+    title, never replacing or removing anything else. The caller
+    (`api/routers/scans.py`) is responsible for resolving this from the
+    account's tier/configured name and for the 422 validation when
+    `white_label=true` was requested but nothing is configured — this
+    function only renders whatever it's given."""
     lines: list[str] = []
     target = ", ".join(data.targets) if data.targets else data.run_id
     lines.append(t(language, "report_title", target=target))
     lines.append("")
+    if branding:
+        lines.append(f"**{t(language, 'report_prepared_by_label')}:** {branding}")
+        lines.append("")
     lines.append(_summary_line(data, language))
     lines.append("")
 

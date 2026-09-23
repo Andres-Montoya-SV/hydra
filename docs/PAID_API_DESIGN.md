@@ -1012,13 +1012,10 @@ is recorded (Pro/Ultra: `True`) and surfaced via `GET
 /account/subscription`, but Round 1's scan execution is still a plain
 `asyncio.create_task` per scan with no real job queue to reorder
 (already a documented Round 1 limitation) — this field is a no-op today,
-present so a real scheduler landing later has something to read. The
-`white_label` flag on `POST /scans/{id}/client-report` is
-tier-validated (only Ultra can set it `true`) but does **not** yet
-change the generated report's content — `core/client_report/` has no
-white-label rendering mode, and building one was out of this round's
-tested scope (the task's six required tests don't exercise it). Flagged
-here rather than silently claimed.
+present so a real scheduler landing later has something to read. ~~The `white_label` flag on `POST /scans/{id}/client-report` is
+tier-validated (only Ultra can set it `true`) but does not yet
+change the generated report's content.~~ — **resolved**, see
+"White-label client report rendering" below.
 
 ### Task 2 — Wompi OAuth client: confirmed against real docs.wompi.sv
 
@@ -2449,6 +2446,130 @@ handler" safety.
   loops.** Stated above as a real, deliberate tradeoff, not an
   oversight.
 
+## White-label client report rendering — 2026-09-23
+
+Closes the gap this document itself already named twice: `white_label`
+on `POST /scans/{id}/client-report` was tier-validated (Ultra only,
+`api/subscriptions.py::check_report_options`) but did nothing —
+`core/client_report/` had no white-label rendering mode at all.
+
+**What the default report actually looked like before this task,
+confirmed by reading `render.py`/`render_docx.py` first, not assumed**:
+no company identity anywhere — the title is a generic "Informe de
+seguridad"/"Security Report", no "Hydra" branding, no attribution line
+of any kind. This task is additive (one new attribution line when
+requested), never a removal — there was nothing to strip out.
+
+### Configuring branding — account-level, Ultra tier only
+
+`PUT`/`GET /account/branding` (`{"company_name": "..."}`,
+`subscriptions.white_label_company_name` — a new nullable column,
+migrated the same way every other `subscriptions` column addition has
+been). **Account-level, not a per-request field on
+`POST /scans/{id}/client-report`** — a consultancy's own name doesn't
+change per report, so configuring it once and having every
+white-labeled report use it is the right shape; a per-request field
+would mean re-sending the same value on every single report call for
+no benefit. Gated to Ultra tier AT SET TIME (`limits.white_label_report`,
+the exact same field `check_report_options` already reads) — an
+account that can never request `white_label=true` has nothing useful to
+configure, and gating here avoids a confusing "saved successfully, does
+nothing" state for a non-Ultra account. `company_name: null` clears it,
+same "set to remove" shape `retention_days_override` already uses.
+
+**Logo support: explicitly deferred, not half-built.** Accepting an
+image upload, storing it, validating it's genuinely an image, and
+embedding it in `render_docx.py`'s python-docx pipeline is a materially
+bigger lift than a text field — a new upload endpoint, a storage
+location decision, size/format validation. Text-only branding ships
+now; logo support is a real, named non-goal for this pass, not an
+oversight.
+
+### What changes in the rendered output
+
+One new attribution line, immediately under the existing title —
+**never replacing or removing anything**, in both formats identically.
+Real rendered output, both formats, default vs. white-labeled
+(`branding="Acme Security Consulting"`, English, target `example.com`):
+
+**Markdown, default:**
+```
+Security Report — example.com
+
+*Generated: 2026-09-23 · Run duration: 25.5 minutes (1532 seconds)*
+
+## What You Need to Know
+```
+
+**Markdown, white-labeled:**
+```
+Security Report — example.com
+
+**Prepared by:** Acme Security Consulting
+
+*Generated: 2026-09-23 · Run duration: 25.5 minutes (1532 seconds)*
+```
+
+**Docx cover page paragraphs, default:**
+```
+'Security Report'
+'example.com'
+'Report date: 2026-09-23\nRun duration: 25.5 minutes (1532 seconds)'
+'DRAFT — for internal review before being shared with the client.'
+```
+
+**Docx cover page paragraphs, white-labeled:**
+```
+'Security Report'
+'example.com'
+'Prepared by: Acme Security Consulting'
+'Report date: 2026-09-23\nRun duration: 25.5 minutes (1532 seconds)'
+'DRAFT — for internal review before being shared with the client.'
+```
+
+`render_markdown`/`render_docx` both gained a `branding: str | None = None`
+keyword parameter — `None` (the default, and the only value every
+prior caller ever passes) renders byte-for-byte identical output to
+before this task, verified directly
+(`tests/test_client_report_render_markdown.py`,
+`tests/test_client_report_render_docx.py`). The new
+`report_prepared_by_label` i18n key ("Preparado por"/"Prepared by")
+follows the exact same `core.client_report.i18n` convention every other
+fixed string already uses — no literal sentence embedded in either
+renderer.
+
+### Validation — a clear 422, never a silent fallback
+
+`POST /scans/{id}/client-report {"white_label": true}` against an
+Ultra account that never configured a name returns `422`
+("white_label=true but no branding is configured for this account —
+set one first via PUT /account/branding"). A consultancy paying
+specifically for ITS OWN identity to appear would not want a silent
+fallback to unbranded output — that's a real, avoidable surprise a
+clear error prevents.
+
+### New endpoints (`api/routers/subscription.py`)
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/account/branding` | Any tier can read (returns `null` if never configured). |
+| `PUT` | `/account/branding` | Ultra tier only (`403` otherwise); `company_name: null` clears it. |
+
+### CLI (`app.py client-report`)
+
+`--company-name NAME` — no tier gating (the CLI operator IS the
+consultancy running it locally); omit for the default, unbranded report,
+unchanged from before this flag existed.
+
+### Explicit non-goals — deferred, not silently skipped
+
+- **Logo images.** Stated above — a real, bigger lift, deferred rather
+  than half-built.
+- **Any branding beyond a name** — colors, fonts, custom section
+  ordering.
+- **A branding preview endpoint** — generating the actual report is the
+  only way to see it, for now.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
@@ -2477,8 +2598,9 @@ handler" safety.
   round's own honesty requirement — both are implemented and tested
   against real local stand-ins, neither is observed-in-production-
   confirmed yet.
-- White-label report content rendering (`core/client_report/` itself) —
-  the tier gate exists; the actual branding-free output does not yet.
+- ~~White-label report content rendering (`core/client_report/`
+  itself).~~ — **resolved**, see "White-label client report rendering"
+  below.
 - One-off LLM-budget top-ups via Wompi tokenization (Part B/D.4's
   `POST /Tokenizacion` flow) — still not built, not required by this
   round's tests.

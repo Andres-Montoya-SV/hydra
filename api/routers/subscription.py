@@ -23,8 +23,10 @@ from api import subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB
 from api.schemas import (
+    BrandingResponse,
     CreateSubscriptionRequest,
     CreateSubscriptionResponse,
+    SetBrandingRequest,
     SubscriptionResponse,
     WompiReconcileRequest,
     WompiReconcileResponse,
@@ -127,6 +129,44 @@ def create_or_change_subscription(
         status=current.status,  # type: ignore[arg-type]
         payment_url=payment_url,
     )
+
+
+# --- White-label client-report branding (Ultra tier only) ---------------
+
+
+@router.get("/account/branding", response_model=BrandingResponse)
+def get_branding(
+    request: Request, auth: AuthContext = Depends(require_api_key)
+) -> BrandingResponse:
+    control_db = _control_db(request)
+    subscription = subscriptions.get_or_create_subscription(control_db, auth.account_id)
+    return BrandingResponse(company_name=subscription.white_label_company_name)
+
+
+@router.put("/account/branding", response_model=BrandingResponse)
+def set_branding(
+    body: SetBrandingRequest,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> BrandingResponse:
+    """Ultra tier only, gated HERE at configuration time — an account
+    that can never actually request `white_label=true`
+    (`api/subscriptions.py::check_report_options`) has nothing useful to
+    configure, and gating here avoids a confusing "saved successfully,
+    does nothing" state. Storing `company_name=None` clears it, the
+    same "set to remove" shape `retention_days_override` already uses —
+    no separate delete endpoint."""
+    control_db = _control_db(request)
+    subscription = subscriptions.get_or_create_subscription(control_db, auth.account_id)
+    limits = subscriptions.effective_limits(subscription)
+    if not limits.white_label_report:
+        raise HTTPException(
+            status_code=403,
+            detail=f"White-label branding is an Ultra-tier feature. The {limits.tier!r} "
+            "tier does not include it.",
+        )
+    control_db.set_white_label_branding(auth.account_id, body.company_name)
+    return BrandingResponse(company_name=body.company_name)
 
 
 # --- Wompi webhook -------------------------------------------------------

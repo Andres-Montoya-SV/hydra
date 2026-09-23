@@ -260,6 +260,32 @@ class TestDefaultOutputPath:
         assert (run_dir / "client_report.md").is_file()
 
 
+class TestCompanyNameBranding:
+    def test_company_name_flag_threads_through_to_the_written_markdown(
+        self, tmp_path: Path
+    ) -> None:
+        _, run_dir = _seed_pilot_run(tmp_path)
+        settings = _settings(tmp_path)
+        output_path = run_dir / "branded.md"
+        rc = cmd_client_report(
+            settings, RUN_ID, output_path=output_path, branding="Acme Security Consulting"
+        )
+        assert rc == 0
+        content = output_path.read_text(encoding="utf-8")
+        assert "Acme Security Consulting" in content
+
+    def test_no_company_name_is_byte_for_byte_identical_to_before(self, tmp_path: Path) -> None:
+        _, run_dir = _seed_pilot_run(tmp_path)
+        settings = _settings(tmp_path)
+        with_default = run_dir / "default.md"
+        with_explicit_none = run_dir / "explicit_none.md"
+        cmd_client_report(settings, RUN_ID, output_path=with_default)
+        cmd_client_report(settings, RUN_ID, output_path=with_explicit_none, branding=None)
+        assert with_default.read_text(encoding="utf-8") == with_explicit_none.read_text(
+            encoding="utf-8"
+        )
+
+
 class TestUnsupportedFormat:
     def test_unknown_format_is_rejected(self, tmp_path: Path) -> None:
         _seed_pilot_run(tmp_path)
