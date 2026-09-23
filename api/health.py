@@ -71,6 +71,7 @@ _MONITORED_LOOPS: tuple[tuple[str, str], ...] = (
     ("scan_worker", "scan_poll_interval_seconds"),
     ("reconciliation", "reconciliation_interval_seconds"),
     ("backup", "backup_interval_seconds"),
+    ("monitoring", "monitoring_poll_interval_seconds"),
 )
 
 

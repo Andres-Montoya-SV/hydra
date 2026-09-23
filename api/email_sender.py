@@ -16,11 +16,12 @@ decides its own subject/body/formatting — a generic
 CALLER instead, meaning `api/reconciliation_worker.py` would need to
 know how to write a suspension email itself, duplicating the same
 "one content-builder function per email kind" pattern
-(`_verification_email_content`/`_account_suspended_email_content`) this
-module already uses. Two typed methods sharing one Protocol keeps that
-consistent, at the cost of a new method per email kind added later —
-judged the right tradeoff while there are only two kinds of email
-total.
+(`_verification_email_content`/`_account_suspended_email_content`/
+`_monitoring_alert_email_content`) this module already uses. Typed
+methods sharing one Protocol keeps that consistent, at the cost of a new
+method per email kind added later — judged the right tradeoff while
+there are only a handful of kinds of email total (three, as of the
+continuous-monitoring task's `send_monitoring_alert`).
 
 **Two implementations now exist, selected automatically by
 `api/main.py`'s `lifespan` based on which environment variables are
@@ -117,6 +118,10 @@ class EmailSender(Protocol):
 
     def send_account_suspended_email(self, *, to: str, account_id: str) -> None: ...
 
+    def send_monitoring_alert(
+        self, *, to: str, account_id: str, summary_lines: list[str], truncated_count: int
+    ) -> None: ...
+
 
 class ConsoleEmailSender:
     """Logs the verification instructions instead of sending real email.
@@ -143,6 +148,18 @@ class ConsoleEmailSender:
             "(grace period expired with no successful payment).",
             to,
             account_id,
+        )
+
+    def send_monitoring_alert(
+        self, *, to: str, account_id: str, summary_lines: list[str], truncated_count: int
+    ) -> None:
+        logger.info(
+            "[DEV EMAIL — no real provider configured] To: %s | Monitoring alert for "
+            "account %s:\n%s%s",
+            to,
+            account_id,
+            "\n".join(summary_lines),
+            f"\n…and {truncated_count} more." if truncated_count else "",
         )
 
 
@@ -185,6 +202,30 @@ def _account_suspended_email_content(*, account_id: str) -> tuple[str, str]:
         f"Account reference: {account_id}\n"
     )
     return subject, body
+
+
+def _monitoring_alert_email_content(
+    *, summary_lines: list[str], truncated_count: int
+) -> tuple[str, str]:
+    """The continuous-monitoring task's capped/summarized notification —
+    `summary_lines` is already ordered and truncated by the caller
+    (`api/monitoring_worker.py`, using `api/monitoring.py::significance_rank`
+    and `APISettings.monitoring_max_domains_per_email`); this function only
+    ever renders what it's given, never re-sorts or re-truncates, so the
+    ordering/cap decision lives in exactly one place."""
+    subject = "Hydra monitoring: changes detected"
+    body_lines = [
+        "Your Hydra continuous monitoring detected changes across one or more "
+        "of your monitored domains:\n",
+    ]
+    body_lines.extend(summary_lines)
+    if truncated_count:
+        body_lines.append(f"\n…and {truncated_count} more domain(s) with changes this cycle.")
+    body_lines.append(
+        "\nSign in via the API (GET /domains/{domain}/monitoring) for the full detail "
+        "on any of these."
+    )
+    return subject, "\n".join(body_lines)
 
 
 class PostmarkEmailSender:
@@ -241,6 +282,24 @@ class PostmarkEmailSender:
             # email landed, and the next reconciliation cycle does not
             # re-suspend an already-suspended account (only 'past_due'
             # ones), so a failed send here is simply lost, not retried.
+            retry_hint="No automatic retry exists for this notice.",
+        )
+
+    def send_monitoring_alert(
+        self, *, to: str, account_id: str, summary_lines: list[str], truncated_count: int
+    ) -> None:
+        subject, text_body = _monitoring_alert_email_content(
+            summary_lines=summary_lines, truncated_count=truncated_count
+        )
+        self._send(
+            to=to,
+            account_id=account_id,
+            subject=subject,
+            text_body=text_body,
+            purpose="monitoring alert",
+            # Same reasoning as the suspension notice: the next
+            # monitoring cycle simply reports fresh changes on its own
+            # schedule — there is nothing here to "resend."
             retry_hint="No automatic retry exists for this notice.",
         )
 

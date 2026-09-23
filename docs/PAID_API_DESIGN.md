@@ -2570,6 +2570,244 @@ unchanged from before this flag existed.
 - **A branding preview endpoint** — generating the actual report is the
   only way to see it, for now.
 
+## Continuous monitoring for verified domains — 2026-09-23
+
+Opt-in, per-domain, two-speed background re-scanning of already-verified
+domains — the first task in this API's history to run scans the client
+never directly requested. Built on top of every earlier round unchanged:
+the same durable scan queue (`api/scan_worker.py`), the same domain-
+verification gate (Part A), the same tier/quota machinery (Part B), the
+same `asyncio.create_task` + shared `stop_event` periodic-loop shape
+`api/reconciliation_worker.py` and `api/backup_worker.py` already
+established. No new execution engine, no new scheduler, no new database.
+
+### The two-speed model
+
+- **Speed 1 (passive, daily, every tier)** — re-runs ONLY the plugins
+  this codebase already declares non-active
+  (`core.plugin_base.ReconPlugin.active_collection is False`:
+  `subfinder`, `amass`, `assetfinder`, `ctlogs`, `theharvester`,
+  `passive_dns`, `unfurl`, `anew`), computed live off the plugin
+  registry (`api/monitoring.py::passive_monitoring_plugin_names`), never
+  a hand-maintained list that could silently drift from what the plugins
+  themselves declare. Implemented by narrowing the account's own
+  `enable_*` settings flags for that one scan
+  (`api/monitoring.py::passive_monitoring_settings_overrides`,
+  applied in `api/scan_orchestrator.py::execute_scan`) — Speed 1 is not
+  a second pipeline, it's the same pipeline with fewer tools turned on.
+  Available to every tier the instant a domain is verified; never
+  tier-gated, never consumes the monthly scan quota (see "Quota
+  interaction" below).
+- **Speed 2 (active, weekly, Pro/Ultra only)** — the full, unmodified
+  pipeline, exactly what a manual `POST /scans` runs. Opt-in per domain
+  (`speed2` on `POST /domains/{domain}/monitoring`), gated by a new
+  `TierLimits.monitoring_speed2` field (`api/tiers.py`) — `False` for
+  Free/Medium, `True` for Pro/Ultra, the same split
+  `TierLimits.priority_queue` already draws between "casual" and
+  "paying for real usage" tiers. Consumes a real monthly scan-quota slot
+  per run, identically to a manual scan.
+
+Both speeds queue through the exact same `scans` table
+`ControlDB.create_scan` already writes to, tagged via a new
+`trigger_source` column (`'manual'` — the only value that existed before
+this task — `'scheduled_passive'`, `'scheduled_active'`) purely so
+`api/scan_orchestrator.py` knows which plugin subset to run and so a
+client's own scan history can tell why a scan exists. No second queue,
+no second worker.
+
+### Two-phase cycle: harvest before enqueue
+
+`api/monitoring_worker.py::run_monitoring_cycle`, one call per
+`monitoring_poll_interval_seconds` tick (default 1h — coarse relative to
+the daily/weekly cadences themselves, the same "poll interval
+independent of the thing being scheduled" relationship
+`scan_poll_interval_seconds` already has to a 25-minute scan):
+
+1. **Harvest** — every monitored domain with an in-flight scheduled scan
+   (a new `pending_passive_scan_id`/`pending_active_scan_id` column pair
+   on `monitored_domains`) is checked for completion. A finished scan's
+   hostnames (`core.store.AssetStore.get_host_domains`, a new lightweight
+   query added specifically so this never pays `get_hosts`' full port/
+   service hydration cost) are reduced to a single SHA-256 digest
+   (`api/monitoring.py::compute_asset_digest`) and compared to the
+   PREVIOUS digest — the full hostname diff (added/removed, for the
+   notification email) is only ever computed when the digest actually
+   changed, which is the optimization that keeps a cycle's cost
+   proportional to how much actually changed, not to the total hosts
+   across every monitored domain.
+2. **Enqueue** — every domain now due (keyset-paginated,
+   `monitoring_batch_size` rows per page, never OFFSET) with no scan
+   already in flight is re-checked against Part A's verification-
+   freshness gate and, for Speed 2, the tier/quota gates, then queued.
+
+Harvest runs first each cycle specifically so a scan that finished
+between polls can be re-enqueued in the SAME cycle instead of waiting a
+full extra poll interval.
+
+### Verification-freshness interaction
+
+Exactly as strict as a real `POST /scans`, re-checked at enqueue time,
+never assumed still valid from whenever the domain was first opted into
+monitoring: `api/domain_verification.py::classify_scan_gate` runs
+against the account's live verification records on every due check. A
+lapsed verification sets `monitored_domains.status =
+'paused_verification_lapsed'` and skips that cycle's scan — the domain
+is never removed from monitoring, and the very next poll (not the next
+daily/weekly cadence) notices a renewed verification and resumes
+automatically, since the freshness check itself is what runs on the
+poll interval, independent of the passive/active cadence.
+
+### Quota interaction
+
+Speed 1 never touches `monthly_usage.scans_used` — Part B's quota exists
+to bound Hydra's own tool-execution cost per account per month, and a
+passive-only run's cost (a handful of OSINF-source API calls) doesn't
+change the cost picture that quota was sized around. Charging it would
+also produce a perverse, explicitly-ruled-out outcome: an account
+running Speed 1 daily would exhaust an entire month's manual-scan quota
+in days doing nothing but the free background hygiene check the feature
+exists to provide. Speed 2 always consumes a slot
+(`api/subscriptions.check_scan_quota`, the identical function/gate
+`POST /scans` itself uses) — an exhausted quota silently skips that
+cycle's Speed 2 scan (logged, not erroring, not emailed per-cycle) while
+Speed 1 continues unaffected for the same domain. A mid-cycle tier
+downgrade that drops `monitoring_speed2` below what a domain's
+`speed2_enabled=true` row expects is handled the same way: skipped and
+logged, `speed2_enabled` left as the account's own recorded preference,
+resumed automatically on the next upgrade — never silently disabled,
+never erroring.
+
+### Asset-count sanity ceiling
+
+`HYDRA_API_MONITORING_ASSET_CEILING` (default 5,000, `api/settings.py`)
+— `api/monitoring.py::classify_asset_jump` flags `needs_review` only
+when a domain's host count jumps PAST the ceiling relative to its own
+PREVIOUS run (never on a domain's first-ever run, however large, since
+there's no baseline to jump from) AND the pipeline's own wildcard-DNS
+detector (`modules/wildcard_check.py`, read from the scan's
+`wildcard_check.jsonl` artifact) did NOT already flag wildcard DNS for
+that run — a real, already-explained cause of an inflated count is never
+double-counted as a second, contradictory kind of alarm. A flagged
+domain's `status` becomes `'needs_review'`; monitoring keeps running
+every cycle (a human clearing the review is not required for scanning
+to continue), but no further notification fires until the count changes
+again.
+
+### Notifications — capped, ordered, never per-domain
+
+One `EmailSender.send_monitoring_alert` call per account per cycle, never
+one email per changed domain. `api/monitoring.py::significance_rank`
+orders `needs_review` first, then domains with new hosts, then domains
+with hosts removed, tie-broken by domain name for stable output;
+`monitoring_max_domains_per_email` (default 20) caps the listed domains,
+with a "…and N more" summary line for the rest — an account with
+hundreds of monitored domains changing in one cycle (a plausible
+upstream-provider-wide event) gets one readable email, never a wall of
+text or a burst of hundreds of individual emails.
+
+### Scale — the ~300,000-row target, measured for real
+
+`tests/test_monitoring_scale.py` bulk-inserts 300,000
+`monitored_domains` rows directly via `sqlite3.executemany` (bypassing
+`ControlDB`'s per-row CRUD, which is correct but not how 300k rows would
+ever really accumulate — the real growth path is 300k separate opt-in
+calls over months) and exercises the actual read/write paths under test
+against a table already at that size. Real numbers from this machine,
+not estimates:
+
+- **Paginated read of the due subset** (30,000 of the 300,000 rows,
+  keyset-paginated in pages of 1,000): **0.15s total**, peak RSS
+  essentially flat (well under the 200MB regression bound the test
+  asserts) — proof the read path is O(page size), not O(table size).
+- **Keyset vs. OFFSET**: a page fetched near the END of the due set costs
+  the same (~5ms) as the FIRST page — the actual proof this is real
+  keyset pagination (`WHERE (due_at, id) > (?, ?)`) and not OFFSET in
+  disguise, which would instead get progressively slower with depth.
+- **Batched writes**: 30,000 rows' progress written in 60 chunked
+  `executemany` transactions of 500 rows each: **0.45s total**.
+- **Concurrent-write non-blocking**: a single 1,000-row batch write
+  running concurrently with a separate thread hammering small
+  `create_scan`-shaped inserts every 10ms measured a worst-case small-
+  write latency of **6ms** — proof that 500-1,000-row batches (not one
+  giant per-cycle transaction, and not one commit per row) keep any
+  single transaction's write-lock hold time short enough that the scan
+  queue's own writes are never meaningfully delayed.
+
+**Why 500 rows** (`monitoring_batch_size`, `api/settings.py`) — the same
+range `api/reconciliation_worker.py`'s own retention-purge batching
+precedent uses, for the identical reason: large enough that 300k rows
+finish in a bounded number of round trips (600 batches, well under a
+second of actual write time per the measurement above), small enough
+that no single transaction meaningfully contends with a concurrent scan-
+queue write. **Why a 5,000-host ceiling** — derived from this project's
+own real recon runs: a genuinely large but legitimate attack surface
+tends to land in the low thousands of distinct hosts, while a wildcard-
+DNS false-positive explosion or a scope misconfiguration tends to jump
+into the tens of thousands almost immediately; 5,000 sits between the
+two, erring toward "flag it" over either silently emailing a nonsense
+diff or silently dropping monitoring for a domain that legitimately
+grew. **Why a 300s (5 min) per-cycle time budget**
+(`monitoring_cycle_time_budget_seconds`) — bounds how long any single
+`run_monitoring_cycle` call can run before yielding back to the loop;
+safe to interrupt at any point because `next_*_due_at` (the only
+checkpoint that matters) only ever advances as the LAST step of a
+successfully-processed, already-batched-and-written row — a cycle killed
+mid-run, or one that hits its own budget, leaves not-yet-reached rows
+looking identical to "not due yet," picked up cleanly by the next cycle
+with no separate checkpoint/offset table and no risk of double
+processing.
+
+**Speed 2 at scale, stated honestly**: the scale numbers above are the
+MONITORING BOOKKEEPING layer (the `monitored_domains` table itself) at
+300k rows — they say nothing about 300k concurrent active pipeline runs,
+which was never the target. Speed 2 scans still go through
+`api/scan_worker.py`'s existing `max_concurrent_scans` ceiling exactly
+like a manual scan; the monitoring loop enqueuing many due Speed 2 scans
+in one cycle simply queues them (`status='queued'`) the same as a burst
+of manual `POST /scans` calls would, to be claimed and executed at the
+worker's own pace. Continuous monitoring does not, and is not intended
+to, change that separate, already-solved concurrency limit — see the
+durable-queue section above for that mechanism's own design.
+
+### New endpoints (`api/routers/monitoring.py`)
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/domains/{domain}/monitoring` | Opt in (idempotent — a second call updates `speed2`). `403` if the domain isn't currently verified, or if `speed2: true` on a tier without it. |
+| `GET` | `/domains/{domain}/monitoring` | Current status, schedule, last asset count. `404` if never opted in. |
+| `DELETE` | `/domains/{domain}/monitoring` | Opt out. `404` if never opted in. |
+
+### New settings (env-configurable, `api/settings.py`)
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HYDRA_API_MONITORING_POLL_INTERVAL_SECONDS` | `3600` | How often the loop checks for due domains. |
+| `HYDRA_API_MONITORING_PASSIVE_INTERVAL_HOURS` | `24` | Speed 1 cadence. |
+| `HYDRA_API_MONITORING_ACTIVE_INTERVAL_HOURS` | `168` | Speed 2 cadence. |
+| `HYDRA_API_MONITORING_BATCH_SIZE` | `500` | Read-page size and write-batch size. |
+| `HYDRA_API_MONITORING_ASSET_CEILING` | `5000` | Asset-count sanity ceiling. |
+| `HYDRA_API_MONITORING_CYCLE_TIME_BUDGET_SECONDS` | `300` | Per-cycle time/work budget. |
+| `HYDRA_API_MONITORING_MAX_DOMAINS_PER_EMAIL` | `20` | Notification email domain cap. |
+
+### Explicit non-goals — deferred, not silently skipped
+
+- **True mid-cycle checkpoint/resume beyond the row-level idempotency
+  described above** — there is no separate resumable-offset table; a
+  killed cycle's unprocessed rows are simply indistinguishable from "not
+  due yet," which is sufficient but is not the same thing as a formal
+  checkpoint record.
+- **Per-domain notification preferences** (digest frequency, channel
+  other than email) — one email shape, one cadence, for every account.
+- **A UI/endpoint for clearing `needs_review`** — the status is visible
+  via `GET /domains/{domain}/monitoring`, but nothing clears it
+  automatically except the count naturally coming back under the
+  ceiling on a later run; there is no explicit "acknowledge" action.
+- **Coordinating monitoring's own scan bursts with `TierLimits.
+  priority_queue`** — still a recorded-but-inert field (per the durable-
+  queue section above); a monitoring-triggered burst of Speed 2 scans
+  competes for `max_concurrent_scans` slots on the same FIFO
+  (`created_at`) basis as everything else.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
