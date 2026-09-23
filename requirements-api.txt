@@ -46,3 +46,11 @@ httpx==0.28.1
 # stays fully OPT-IN (no bucket configured = local-only backups, never
 # a hard failure).
 boto3==1.43.100
+# sentry-sdk: error tracking (docs/PAID_API_DESIGN.md's "Basic
+# observability" section, api/observability.py) — auto-detects the
+# installed `fastapi` package and enables its own FastAPI/Starlette
+# integration accordingly (confirmed against Sentry's current docs), no
+# separate `[fastapi]` extra needed. Entirely opt-in at runtime: unset
+# `SENTRY_DSN` means `init_sentry` never calls `sentry_sdk.init()` at
+# all.
+sentry-sdk==2.70.0

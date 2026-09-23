@@ -79,6 +79,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from api.health import LoopHeartbeats
+
 if TYPE_CHECKING:
     from api.control_db import ControlDB
     from api.settings import APISettings
@@ -262,6 +264,7 @@ async def run_backup_loop(
     api_settings: APISettings,
     control_db: ControlDB,
     stop_event: asyncio.Event,
+    heartbeats: LoopHeartbeats,
 ) -> None:
     """Runs `run_backup_job` once immediately at startup (so a
     just-deployed host doesn't wait a full day for its first backup),
@@ -272,6 +275,7 @@ async def run_backup_loop(
     few small SQL statements, so running it directly on the event loop
     could stall live request handling for longer than is acceptable."""
     while not stop_event.is_set():
+        heartbeats.mark_alive("backup")  # GET /health's liveness signal, api/health.py
         await asyncio.to_thread(run_backup_job, api_settings=api_settings, control_db=control_db)
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(stop_event.wait(), timeout=api_settings.backup_interval_seconds)

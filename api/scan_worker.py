@@ -78,6 +78,7 @@ import socket
 import uuid
 from typing import TYPE_CHECKING
 
+from api.health import LoopHeartbeats
 from api.scan_orchestrator import execute_scan
 
 if TYPE_CHECKING:
@@ -133,6 +134,7 @@ async def run_worker_loop(
     control_db: ControlDB,
     worker_id: str,
     stop_event: asyncio.Event,
+    heartbeats: LoopHeartbeats,
 ) -> None:
     """The loop itself: every `scan_poll_interval_seconds`, sweep for
     stale `running` scans (requeue-or-fail per the retry ceiling above),
@@ -152,6 +154,12 @@ async def run_worker_loop(
     active: set[asyncio.Task[None]] = set()
     try:
         while not stop_event.is_set():
+            # GET /health's real liveness signal (api/health.py) — marked
+            # at the TOP of each iteration, before any work, so a loop
+            # that's merely slow on one cycle's work still reports in
+            # promptly next time around, and a loop that crashed with an
+            # unhandled exception stops updating this the moment it dies.
+            heartbeats.mark_alive("scan_worker")
             requeued, failed = control_db.sweep_stale_running_scans(
                 stale_after_seconds=api_settings.scan_stale_after_seconds,
                 max_retries=api_settings.scan_max_retries,

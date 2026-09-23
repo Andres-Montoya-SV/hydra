@@ -189,6 +189,16 @@ class APISettings:
     backup_s3_endpoint_url: str | None = None
     backup_s3_region: str | None = None
 
+    # Basic observability (docs/PAID_API_DESIGN.md's "Basic
+    # observability" section). `sentry_dsn`: unset means error tracking
+    # is simply off — same "zero-config keeps working" discipline as
+    # Postmark/Wompi (api/settings.py's own existing convention), never
+    # a startup failure. `log_format`: "text" (default, unchanged from
+    # every prior round) or "json" — see api/observability.py for the
+    # formatter itself.
+    sentry_dsn: str | None = None
+    log_format: str = "text"
+
     @property
     def control_db_path(self) -> Path:
         return self.data_dir / "control.db"
@@ -287,6 +297,8 @@ def load_api_settings() -> APISettings:
     settings.backup_s3_prefix = os.getenv("HYDRA_API_BACKUP_S3_PREFIX") or "hydra-backups"
     settings.backup_s3_endpoint_url = os.getenv("HYDRA_API_BACKUP_S3_ENDPOINT_URL") or None
     settings.backup_s3_region = os.getenv("HYDRA_API_BACKUP_S3_REGION") or None
+    settings.sentry_dsn = os.getenv("SENTRY_DSN") or None
+    settings.log_format = os.getenv("HYDRA_API_LOG_FORMAT") or "text"
     return settings
 
 

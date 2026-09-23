@@ -2323,9 +2323,131 @@ future observability task's work.
 - **Choosing and provisioning the actual production host.** This task
   is the backup mechanism and the documentation, not standing up real
   infrastructure.
-- **A `GET /health` endpoint.** Real, deferred work for a follow-up
-  observability task — `docs/DEPLOYMENT.md` §6 documents the interim
-  authenticated-route check instead of inventing one here.
+- ~~A `GET /health` endpoint.~~ — **resolved**, see "Basic
+  observability" below.
+
+## Basic observability — 2026-09-23
+
+A deliberately SMALL task, per its own explicit instruction — no
+metrics/dashboard stack, no alerting rules, no per-request tracing.
+Three pieces: a real `GET /health`, error tracking (Sentry), and an
+optional JSON log format.
+
+### `GET /health` (`api/health.py`, `api/routers/health.py`)
+
+Unauthenticated (same reasoning as `POST /webhooks/wompi` — an uptime
+monitor can't send `X-API-Key`), and actually verifies the service can
+do its job rather than returning `200` from a route that does nothing:
+
+- **`control_db` reachability** — `ControlDB.ping()`, a real query
+  against `sqlite_master`. **Deliberately not `SELECT 1`** — found the
+  hard way, while writing this exact method's own test, that `SELECT 1`
+  is a pure constant expression SQLite evaluates without ever reading
+  the database file's header or schema, so it SUCCEEDS even against a
+  completely corrupted, non-SQLite file. Querying `sqlite_master`
+  forces a real read of the file's actual content.
+- **Each background loop's liveness** — `LoopHeartbeats`
+  (`app.state.loop_heartbeats`), a real per-loop timestamp updated once
+  per iteration by the scan worker, reconciliation, and backup loops
+  (`api/scan_worker.py`/`api/reconciliation_worker.py`/
+  `api/backup_worker.py`), compared against a per-loop threshold
+  (`max(interval_seconds * 2, 60.0)`) derived from that loop's own
+  configured interval. This is a REAL signal, not "the asyncio task
+  object hasn't been garbage collected" — a task whose coroutine died on
+  an unhandled exception stays a valid, non-garbage-collected Python
+  object forever, `task.done()` only tells you it finished at some
+  point, never that it's actually still iterating. (This exact
+  distinction is why the Python 3.10 `asyncio.TimeoutError` bug in
+  these same loops, fixed in an earlier round, went completely
+  undetected until a real CI failure — nothing was watching whether
+  those loops were still alive at all.)
+- **A real 503** with a per-check reason when anything above fails —
+  never a generic "unhealthy," since that's what an on-call human pages
+  on at 3am.
+
+**A real, honestly-stated tradeoff on the daily loops' detection
+window**: the reconciliation/backup loops only mark themselves alive
+once per full (daily) cycle, so their `interval * 2` threshold means a
+genuinely dead loop can go up to ~48 hours before `/health` notices.
+This is deliberately coarse, not an oversight — a same-day-precision
+liveness check for a once-a-day job would need a separate, faster
+internal heartbeat just for monitoring purposes, exactly the kind of
+complexity this task's own "don't build a metrics stack" instruction
+rules out.
+
+Tested against genuinely broken dependencies, not just the happy path
+(`tests/test_api_health.py`): a `control.db` actually corrupted on disk
+(including its `-wal`/`-shm` sidecars — corrupting only the main file
+is not enough to prove anything, since WAL mode can transparently
+recover real data from an intact `-wal` file even when the main `.db`
+file is garbage, found the same way as the `SELECT 1` gap above); a
+real backdated heartbeat timestamp; a loop that never reported in at
+all.
+
+### Error tracking (`api/observability.py`, Sentry)
+
+`SENTRY_DSN` unset (the default) means `init_sentry` never calls
+`sentry_sdk.init()` at all — same zero-config-stays-zero-config
+discipline as Postmark. FastAPI/Starlette integration is auto-detected
+by `sentry_sdk` itself once `fastapi` is importable (confirmed against
+Sentry's own current docs before writing this), no separate integration
+class needed.
+
+**Scrubbing — deliberate, not the SDK's own defaults left alone**:
+Sentry's `send_default_pii` defaults to `False` (confirmed against
+Sentry's docs) and already excludes some PII, but `X-API-Key` is a
+custom header name, not covered by that built-in behavior — exactly the
+gap the task called out. Two independent passes run in `before_send`:
+
+1. **Header-name scrubbing** — `X-API-Key`, `Authorization`, `Cookie`,
+   `wompi_hash` stripped from `event["request"]["headers"]`
+   unconditionally, handling both the dict and list-of-pairs shapes
+   Sentry's SDK can produce. Covers a value that isn't known ahead of
+   time (a real customer's actual API key).
+2. **Known-static-secret value scrubbing** — `POSTMARK_SERVER_TOKEN`/
+   `WOMPI_CLIENT_SECRET`'s real configured values are searched for and
+   redacted ANYWHERE in the serialized event (a serialize → string-
+   replace → deserialize sweep) — an exception message, a local
+   variable's repr, extra context, not just headers.
+
+**Proven with a real intercepted payload, not asserted from reading the
+code** (`tests/test_observability_sentry_scrubbing.py`): a real
+`sentry_sdk.transport.Transport` subclass (the actual, current
+transport interface in the pinned SDK version, confirmed directly
+against the installed package) intercepts `capture_envelope`; a real
+`sentry_sdk.capture_exception()` call carrying a realistic fake secret
+in its message, a local variable, and extra context is triggered; the
+transport's actually-received event is inspected and confirmed to never
+contain the secret anywhere.
+
+### Structured (JSON) logging (`api/observability.py`)
+
+`HYDRA_API_LOG_FORMAT=json` switches to `JsonFormatter`; unset (default)
+keeps the exact human-readable format every prior round already used.
+`api/main.py`'s old unconditional `logging.basicConfig` call — a fixed
+format string, which can't select a custom `Formatter` class — was
+replaced with `configure_logging(settings.log_format)`, called from
+inside `create_app()` (after `settings` resolves) instead of at module
+import time, keeping the same "no-op if the root logger already has a
+handler" safety.
+
+### New settings (env-configurable, `api/settings.py`)
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `SENTRY_DSN` | unset | Set to enable error tracking; unset = off. |
+| `HYDRA_API_LOG_FORMAT` | `text` | `json` switches to structured logs. |
+
+### Explicit non-goals — deferred, not silently skipped
+
+- **Prometheus/Grafana or any metrics time-series stack.** Not
+  warranted at Hydra's current scale.
+- **Alerting rules/on-call rotation tooling.** Sentry's own default
+  notification settings are enough for now.
+- **Per-request tracing/APM.** Out of scope.
+- **Same-day-precision liveness for the daily reconciliation/backup
+  loops.** Stated above as a real, deliberate tradeoff, not an
+  oversight.
 
 ## Explicitly deferred beyond Round 3
 

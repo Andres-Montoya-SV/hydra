@@ -454,6 +454,27 @@ class ControlDB:
     def _connect(self) -> sqlite3.Connection:
         return connect_sqlite(self.db_path)
 
+    def ping(self) -> None:
+        """`GET /health`'s (`api/health.py`) real reachability check —
+        a trivial but GENUINE query, not just "the `ControlDB` object
+        exists in memory." Raises whatever `sqlite3` itself raises if
+        the file is missing, corrupted, or otherwise unreadable; the
+        caller decides what that means for the response.
+
+        **Deliberately NOT `SELECT 1`** — found the hard way, while
+        writing this exact method's own test, that `SELECT 1` is a pure
+        constant expression SQLite evaluates without ever reading the
+        database file's header or schema, so it SUCCEEDS even against a
+        completely corrupted, non-SQLite file — exactly the "a route
+        that returns 200 without checking anything real" trap this
+        health check exists to avoid. Querying `sqlite_master` (SQLite's
+        own schema table) forces a real read of the file's actual
+        content, which genuinely fails
+        (`sqlite3.DatabaseError: file is not a database`) against a
+        corrupted file — confirmed directly, not assumed."""
+        with self._connect() as conn:
+            conn.execute("SELECT count(*) FROM sqlite_master")
+
     # --- accounts ---------------------------------------------------
 
     def create_account(

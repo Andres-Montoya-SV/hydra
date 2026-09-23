@@ -170,23 +170,38 @@ docker compose logs -f api caddy   # watch startup: worker/reconciliation/backup
 
 ## 6. How do I know it's actually up
 
-There is no dedicated `GET /health` endpoint yet — that's real,
-deliberately deferred work for a follow-up observability task, not
-something invented here to avoid duplicating it. For now, the honest
-"is this actually serving real traffic" check is hitting an existing
-authenticated route and confirming a real response, e.g.:
+`GET /health` (added by the "Basic observability" task,
+`api/health.py`/`api/routers/health.py`) — unauthenticated, so any
+uptime monitor can point straight at it:
 
 ```bash
-curl -s https://api.yourdomain.com/account/subscription \
-  -H "X-API-Key: <a real key from a real POST /accounts>"
+curl -s https://api.yourdomain.com/health
 ```
 
-A `200` with real subscription JSON (or a `401` for a bad/missing key,
-which still proves the process is up and routing requests correctly) means
-the service is genuinely running end to end, through Caddy's TLS
-termination, not just that the container hasn't crashed.
-`docker compose logs api` — the scan worker loop, the reconciliation
-loop, and the backup loop each log a real "started" line at
-`api/main.py`'s own `lifespan` startup — is the other half of "is this
-actually up," since a container can be running while one of its
-background loops silently failed to start.
+Point an external uptime monitor (UptimeRobot, Better Uptime, a simple
+cron+curl, whatever's already in use) at this URL, expecting `200`.
+Unlike a bare "the process is running" check, this genuinely verifies
+`control_db` is reachable (a real query, not just an in-memory object)
+and that the scan-worker, reconciliation, and backup loops are each
+still alive (a real per-loop heartbeat timestamp, not just "the asyncio
+task object hasn't been garbage collected" — see `api/health.py`'s own
+docstring for why that distinction matters). A `503` response body
+names exactly which check failed:
+
+```json
+{"status": "unhealthy", "checks": {"control_db": "ok", "scan_worker": "stale: last alive 245s ago (threshold 60s)", ...}}
+```
+
+`docker compose logs api` is still worth checking on first deploy too —
+each loop logs a real "started" line at `api/main.py`'s own `lifespan`
+startup, which `/health` alone can't tell you (a loop that never
+started at all vs. one that started and later went stale look
+identical to `/health` until enough time passes for the staleness
+threshold to trip).
+
+**Error tracking (Sentry)**: set `SENTRY_DSN` to get unhandled
+exceptions reported automatically — unset means it's simply off, no
+separate flag needed. See `docs/PAID_API_DESIGN.md`'s "Basic
+observability" section for exactly what gets scrubbed before anything
+is sent (API keys, the Postmark/Wompi secrets, never a raw webhook
+body).
