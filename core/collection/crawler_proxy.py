@@ -79,6 +79,16 @@ PROXY_VERIFIED_TOOLS = frozenset(
         "soft404_check",
         "param_fuzz",
         "cloud_bucket_enum",
+        # Confirmed by real testing during modules/ffuf.py's own development:
+        # ffuf's `-x <proxy_url>` (its own real flag name — NOT `-proxy`,
+        # unlike katana/hakrawler/nuclei) correctly routes every one of its
+        # requests through a real ScopeEnforcingProxy instance. Verified
+        # both directions: an in-scope target's requests all showed up in
+        # the proxy's own audit log (ALLOW/in_scope), and an out-of-scope
+        # target's requests never reached the real target at all (ffuf
+        # reported connection errors for all of them; the target's own
+        # access log recorded nothing).
+        "ffuf",
     }
 )
 

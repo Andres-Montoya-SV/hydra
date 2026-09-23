@@ -127,6 +127,7 @@ def test_only_live_verified_tools_are_treated_as_proxy_confined() -> None:
             "soft404_check",
             "param_fuzz",
             "cloud_bucket_enum",
+            "ffuf",
         }
     )
 
@@ -183,6 +184,37 @@ async def test_verified_tool_gets_no_untrusted_network_tool_warning(tmp_path) ->
         output_dir=output_dir,
         collection_scope=scope,
         run_id="trusted-tool",
+    )
+
+    async with plugin._crawler_confinement(context):
+        pass
+
+    assert not any("UNTRUSTED_NETWORK_TOOL" in w for w in context.warnings)
+
+
+@pytest.mark.asyncio
+async def test_ffuf_is_verified_and_gets_no_untrusted_network_tool_warning(tmp_path) -> None:
+    """`ffuf` joined `PROXY_VERIFIED_TOOLS` in modules/ffuf.py's own turn —
+    real, live-verified against an actual ffuf subprocess and a real
+    ScopeEnforcingProxy in tests/test_ffuf.py (both directions: an
+    in-scope target's requests all showed up in the proxy's own audit
+    log, and an out-of-scope target's requests never reached the real
+    target at all). Confirms it does not get flagged here, same as the
+    other verified tools above."""
+    from modules.ffuf import FfufPlugin
+
+    settings = Settings(project_root=tmp_path)
+    plugin = FfufPlugin(settings)
+    assert plugin.name in PROXY_VERIFIED_TOOLS
+
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    scope = CollectionScope.from_seeds(["seed.trusted-ffuf-test.internal"])
+    context = PipelineContext(
+        targets=[DomainTarget(domain="seed.trusted-ffuf-test.internal")],
+        output_dir=output_dir,
+        collection_scope=scope,
+        run_id="trusted-ffuf-tool",
     )
 
     async with plugin._crawler_confinement(context):

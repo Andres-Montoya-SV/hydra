@@ -195,6 +195,7 @@ class Settings:
     theharvester_path: Path = field(default_factory=lambda: Path("theHarvester"))
     sslyze_path: Path = field(default_factory=lambda: Path("sslyze"))
     wafw00f_path: Path = field(default_factory=lambda: Path("wafw00f"))
+    ffuf_path: Path = field(default_factory=lambda: Path("ffuf"))
 
     # Execution
     timeout: int = 300
@@ -312,6 +313,23 @@ class Settings:
     theharvester_timeout: int = 180
     sslyze_timeout: int = 120
     wafw00f_timeout: int = 60
+    # Hidden endpoint/content discovery (opt-in, disabled by default like
+    # param_fuzz — the most request-heavy active plugin Hydra has). ffuf's
+    # own -maxtime-job/-rate flags enforce the real per-host ceilings
+    # below (confirmed by real testing, not assumed to work); Hydra's
+    # subprocess-level ffuf_timeout is a coarser outer safety net.
+    enable_ffuf: bool = False
+    ffuf_timeout: int = 180
+    # None -> the vendored modules/data/ffuf_wordlist_quick.txt (181 real,
+    # curated entries — a deliberately small default, not SecLists'
+    # raft-large; see modules/ffuf.py for why). Set to opt into a larger
+    # wordlist for a deeper, slower scan.
+    ffuf_wordlist_path: Path | None = None
+    ffuf_extensions: str = ".bak,.old,.zip,.sql"
+    ffuf_rate_limit: int = 50
+    ffuf_threads: int = 20
+    ffuf_max_time_per_host: int = 120
+    ffuf_max_hosts: int = 10
     vuln_match_timeout: int = 15
     wpscan_api_token: str | None = None
     scope_file: Path | None = None
@@ -628,6 +646,16 @@ class Settings:
             ),
             sslyze_timeout=_int(os.getenv("SSLYZE_TIMEOUT"), 120, "SSLYZE_TIMEOUT"),
             wafw00f_timeout=_int(os.getenv("WAFW00F_TIMEOUT"), 60, "WAFW00F_TIMEOUT"),
+            enable_ffuf=_bool(os.getenv("ENABLE_FFUF")),
+            ffuf_timeout=_int(os.getenv("FFUF_TIMEOUT"), 180, "FFUF_TIMEOUT"),
+            ffuf_wordlist_path=_optional_scope_file(os.getenv("FFUF_WORDLIST_PATH", "").strip()),
+            ffuf_extensions=os.getenv("FFUF_EXTENSIONS", ".bak,.old,.zip,.sql").strip(),
+            ffuf_rate_limit=_int(os.getenv("FFUF_RATE_LIMIT"), 50, "FFUF_RATE_LIMIT", maximum=1000),
+            ffuf_threads=_int(os.getenv("FFUF_THREADS"), 20, "FFUF_THREADS", maximum=200),
+            ffuf_max_time_per_host=_int(
+                os.getenv("FFUF_MAX_TIME_PER_HOST"), 120, "FFUF_MAX_TIME_PER_HOST", maximum=3600
+            ),
+            ffuf_max_hosts=_int(os.getenv("FFUF_MAX_HOSTS"), 10, "FFUF_MAX_HOSTS", maximum=100),
             vuln_match_timeout=_int(os.getenv("VULN_MATCH_TIMEOUT"), 15, "VULN_MATCH_TIMEOUT"),
             wpscan_api_token=os.getenv("WPSCAN_API_TOKEN", "").strip() or None,
             scope_file=_optional_scope_file(os.getenv("SCOPE_FILE", "").strip()),
@@ -1024,6 +1052,7 @@ class Settings:
             "theharvester": self.theharvester_path,
             "sslyze": self.sslyze_path,
             "wafw00f": self.wafw00f_path,
+            "ffuf": self.ffuf_path,
         }
 
     def to_safe_dict(self) -> dict[str, Any]:
@@ -1071,6 +1100,7 @@ class Settings:
                     ("theharvester", self.enable_theharvester),
                     ("sslyze", self.enable_sslyze),
                     ("wafw00f", self.enable_wafw00f),
+                    ("ffuf", self.enable_ffuf),
                 ]
                 if enabled
             ],

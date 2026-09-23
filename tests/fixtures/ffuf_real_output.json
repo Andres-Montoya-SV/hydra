@@ -1,0 +1,60 @@
+{
+  "commandline": "ffuf -w modules/data/ffuf_wordlist_quick.txt -u http://127.0.0.1:18082/FUZZ -e .bak,.old,.zip,.sql -ac -rate 80 -t 30 -maxtime-job 30 -json -o /tmp/ffuf_real_capture2.json -of json -noninteractive -mc all",
+  "time": "2026-09-23T11:15:16-06:00",
+  "results": [
+    {
+      "input": {
+        "FFUFHASH": "3f5d210a",
+        "FUZZ": ".git/config"
+      },
+      "position": 266,
+      "status": 200,
+      "length": 7,
+      "words": 1,
+      "lines": 2,
+      "content-type": "application/octet-stream",
+      "redirectlocation": "",
+      "scraper": {},
+      "duration": 1218750,
+      "resultfile": "",
+      "url": "http://127.0.0.1:18082/.git/config",
+      "host": "127.0.0.1:18082"
+    },
+    {
+      "input": {
+        "FFUFHASH": "3f5d2137",
+        "FUZZ": ".env"
+      },
+      "position": 311,
+      "status": 200,
+      "length": 18,
+      "words": 1,
+      "lines": 2,
+      "content-type": "application/octet-stream",
+      "redirectlocation": "",
+      "scraper": {},
+      "duration": 775125,
+      "resultfile": "",
+      "url": "http://127.0.0.1:18082/.env",
+      "host": "127.0.0.1:18082"
+    },
+    {
+      "input": {
+        "FFUFHASH": "3f5d22f9",
+        "FUZZ": "README.md"
+      },
+      "position": 761,
+      "status": 200,
+      "length": 3,
+      "words": 1,
+      "lines": 2,
+      "content-type": "text/markdown",
+      "redirectlocation": "",
+      "scraper": {},
+      "duration": 734042,
+      "resultfile": "",
+      "url": "http://127.0.0.1:18082/README.md",
+      "host": "127.0.0.1:18082"
+    }
+  ]
+}

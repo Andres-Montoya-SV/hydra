@@ -1527,6 +1527,38 @@ class Wafw00fParser(ToolParser):
         return list(by_host.values()), []
 
 
+class FfufParser(ToolParser):
+    """Hidden endpoint/content discovery findings (modules/ffuf.py) — a
+    real finding on the target's own infrastructure (unlike
+    modules/dnstwist.py's typosquat candidates), so it lands in the
+    ordinary Host/Finding model like every other active-probe module."""
+
+    tool_name = "ffuf"
+
+    def parse(
+        self, output_dir: Path, *, artifact: Path | None = None, run_id: str = ""
+    ) -> tuple[list[Host], list[str]]:
+        path = artifact or output_dir / "ffuf_findings.jsonl"
+        by_host: dict[str, Host] = {}
+        for record in read_jsonl(path):
+            domain = normalize_domain(str(record.get("host", "")))
+            if not domain:
+                continue
+            host = by_host.setdefault(domain, Host(domain=domain))
+            finding = Finding(
+                host=domain,
+                template_id=str(record.get("template_id") or "hidden-endpoint-discovered"),
+                severity=str(record.get("severity") or "low"),
+                name=str(record.get("name") or ""),
+                source="ffuf",
+                url=record.get("url") if isinstance(record.get("url"), str) else None,
+                description=str(record.get("description") or ""),
+                confidence_score=int(record.get("confidence_score") or 50),
+            )
+            host.findings.append(finding)
+        return list(by_host.values()), []
+
+
 PARSER_REGISTRY: dict[str, ToolParser] = {
     p.tool_name: p
     for p in [
@@ -1557,6 +1589,7 @@ PARSER_REGISTRY: dict[str, ToolParser] = {
         TheHarvesterParser(),
         SslyzeParser(),
         Wafw00fParser(),
+        FfufParser(),
     ]
 }
 

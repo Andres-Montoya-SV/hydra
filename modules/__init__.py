@@ -12,6 +12,7 @@ from modules import (
     cloud_bucket_enum,
     ctlogs,
     dnsx,
+    ffuf,
     gau,
     hakrawler,
     httpx,
@@ -65,4 +66,5 @@ __all__ = [
     "theharvester",
     "sslyze",
     "wafw00f",
+    "ffuf",
 ]

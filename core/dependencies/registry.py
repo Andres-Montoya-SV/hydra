@@ -268,6 +268,18 @@ _register(
     )
 )
 
+_register(
+    ToolDefinition(
+        name="ffuf",
+        display_name="ffuf",
+        version_commands=(("-V",),),
+        health_commands=(("-h",),),
+        capabilities=frozenset({"content_discovery", "endpoint_fuzzing"}),
+        install_homebrew="ffuf",
+        install_go="github.com/ffuf/ffuf/v2@latest",
+    )
+)
+
 
 def get_tool_definition(name: str) -> ToolDefinition:
     """Return registry entry or synthesize a minimal definition."""
