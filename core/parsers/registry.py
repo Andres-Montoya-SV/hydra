@@ -1527,6 +1527,15 @@ class Wafw00fParser(ToolParser):
         return list(by_host.values()), []
 
 
+class GithubSecretsParser(ToolParser):
+    """Leaked-secret findings from public GitHub repos
+    (modules/github_secrets.py). The raw secret value is never present
+    anywhere in `github_secrets.jsonl` in the first place (see that
+    module's own docstring) — this parser only ever reads safe metadata
+    fields (rule id, file, line, commit, description) that were already
+    safe before reaching this file, not redacted here."""
+
+    tool_name = "github_secrets"
 class SubTakeoverParser(ToolParser):
     """Confirmed subdomain-takeover findings (modules/sub_takeover.py) —
     only Stage-2-confirmed records ever reach `sub_takeover.jsonl`; a
@@ -1537,6 +1546,7 @@ class SubTakeoverParser(ToolParser):
     def parse(
         self, output_dir: Path, *, artifact: Path | None = None, run_id: str = ""
     ) -> tuple[list[Host], list[str]]:
+        path = artifact or output_dir / "github_secrets.jsonl"
         path = artifact or output_dir / "sub_takeover.jsonl"
         by_host: dict[str, Host] = {}
         for record in read_jsonl(path):
@@ -1546,6 +1556,13 @@ class SubTakeoverParser(ToolParser):
             host = by_host.setdefault(domain, Host(domain=domain))
             finding = Finding(
                 host=domain,
+                template_id=str(record.get("template_id") or "leaked-secret"),
+                severity=str(record.get("severity") or "medium"),
+                name=str(record.get("name") or ""),
+                source="github_secrets",
+                url=record.get("url") if isinstance(record.get("url"), str) else None,
+                description=str(record.get("description_full") or record.get("description") or ""),
+                confidence_score=int(record.get("confidence_score") or 60),
                 template_id=str(record.get("template_id") or "subdomain-takeover"),
                 severity=str(record.get("severity") or "high"),
                 name=str(record.get("name") or ""),
@@ -1588,6 +1605,7 @@ PARSER_REGISTRY: dict[str, ToolParser] = {
         TheHarvesterParser(),
         SslyzeParser(),
         Wafw00fParser(),
+        GithubSecretsParser(),
         SubTakeoverParser(),
     ]
 }
