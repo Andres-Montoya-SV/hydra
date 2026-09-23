@@ -652,6 +652,37 @@ CREATE INDEX IF NOT EXISTS idx_intel_rel_type ON intel_relationships(run_id, rel
 CREATE INDEX IF NOT EXISTS idx_intel_ind_value ON intel_indicators(run_id, value);
 CREATE INDEX IF NOT EXISTS idx_runs_finished_started ON runs(finished_at, started_at DESC);
 
+-- Domain-permutation / typosquat monitoring (modules/dnstwist.py) —
+-- deliberately its OWN table, never the `hosts`/`findings` tables above.
+-- A registered typosquat is evidence of a distinct, separate risk
+-- (potential phishing infrastructure impersonating the target), not an
+-- asset OF the target — a report or downstream consumer must never be
+-- able to mistake "someone registered a lookalike of your domain" for
+-- "we found a new subdomain of yours." `candidate_domain` (deliberately
+-- NOT named `host`, unlike every table above) is a domain Hydra never
+-- resolved/probed itself in the target's own collection sense; the
+-- column name difference is intentional, not cosmetic.
+CREATE TABLE IF NOT EXISTS typosquat_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    target_domain TEXT NOT NULL,
+    candidate_domain TEXT NOT NULL,
+    fuzzer TEXT,
+    dns_a_json TEXT,
+    dns_mx_json TEXT,
+    has_mx INTEGER NOT NULL DEFAULT 0,
+    whois_created TEXT,
+    whois_registrar TEXT,
+    severity TEXT NOT NULL,
+    risk_reason TEXT,
+    confidence_score INTEGER DEFAULT 60,
+    discovered_at TEXT,
+    UNIQUE(run_id, candidate_domain),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_typosquat_run ON typosquat_candidates(run_id, severity);
+
 CREATE TABLE IF NOT EXISTS result_cache (
     cache_key TEXT PRIMARY KEY,
     tool TEXT NOT NULL,
@@ -1125,6 +1156,52 @@ class AssetStore:
                     "SELECT * FROM intel_network_requests WHERE run_id=? ORDER BY id",
                     (run_id,),
                 ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_typosquat_candidates(self, run_id: str, candidates: list[dict]) -> None:
+        """Persist registered domain-permutation candidates
+        (modules/dnstwist.py) — their OWN table, never `hosts`/`findings`.
+        See `typosquat_candidates`'s own schema comment for why. `INSERT
+        OR REPLACE` so a retried/partial finalize is idempotent."""
+        if not candidates:
+            return
+        import json as _json
+
+        with self._connect() as conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO typosquat_candidates
+                   (run_id, target_domain, candidate_domain, fuzzer, dns_a_json,
+                    dns_mx_json, has_mx, whois_created, whois_registrar, severity,
+                    risk_reason, confidence_score, discovered_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        str(c.get("target_domain") or ""),
+                        str(c.get("candidate_domain") or ""),
+                        str(c.get("fuzzer") or ""),
+                        _json.dumps(c.get("dns_a") or []),
+                        _json.dumps(c.get("dns_mx") or []),
+                        1 if c.get("has_mx") else 0,
+                        str(c.get("whois_created") or "") or None,
+                        str(c.get("whois_registrar") or "") or None,
+                        str(c.get("severity") or "low"),
+                        str(c.get("risk_reason") or ""),
+                        int(c.get("confidence_score") or 60),
+                        str(c.get("discovered_at") or ""),
+                    )
+                    for c in candidates
+                    if c.get("candidate_domain")
+                ],
+            )
+
+    def get_typosquat_candidates(self, run_id: str) -> list[dict[str, object]]:
+        """Read back registered typosquat candidates for a run."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM typosquat_candidates WHERE run_id=? ORDER BY id",
+                (run_id,),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def record_verification_findings(self, run_id: str, findings: list) -> None:

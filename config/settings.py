@@ -195,6 +195,7 @@ class Settings:
     theharvester_path: Path = field(default_factory=lambda: Path("theHarvester"))
     sslyze_path: Path = field(default_factory=lambda: Path("sslyze"))
     wafw00f_path: Path = field(default_factory=lambda: Path("wafw00f"))
+    dnstwist_path: Path = field(default_factory=lambda: Path("dnstwist"))
 
     # Execution
     timeout: int = 300
@@ -312,6 +313,16 @@ class Settings:
     theharvester_timeout: int = 180
     sslyze_timeout: int = 120
     wafw00f_timeout: int = 60
+    # Off by default. Passive with respect to the TARGET (never sends the
+    # target org's own domains any traffic) — see modules/dnstwist.py for
+    # why candidate DNS/WHOIS lookups are in scope but active content
+    # fetching of a candidate (dnstwist's own -b/-p/--lsh flags) is not.
+    enable_dnstwist: bool = False
+    dnstwist_timeout: int = 180
+    dnstwist_threads: int = 20
+    # A registered permutation younger than this is flagged as
+    # "freshly registered" — a real, if imperfect, phishing-setup signal.
+    dnstwist_fresh_registration_days: int = 90
     vuln_match_timeout: int = 15
     wpscan_api_token: str | None = None
     scope_file: Path | None = None
@@ -479,6 +490,7 @@ class Settings:
             theharvester_path=_safe_path(os.getenv("THEHARVESTER_PATH", ""), "theHarvester"),
             sslyze_path=_safe_path(os.getenv("SSLYZE_PATH", ""), "sslyze"),
             wafw00f_path=_safe_path(os.getenv("WAFW00F_PATH", ""), "wafw00f"),
+            dnstwist_path=_safe_path(os.getenv("DNSTWIST_PATH", ""), "dnstwist"),
             timeout=_int(os.getenv("TIMEOUT"), 300, "TIMEOUT"),
             threads=_int(os.getenv("THREADS"), 50, "THREADS"),
             rate_limit=_int(os.getenv("RATE_LIMIT"), 150, "RATE_LIMIT"),
@@ -628,6 +640,17 @@ class Settings:
             ),
             sslyze_timeout=_int(os.getenv("SSLYZE_TIMEOUT"), 120, "SSLYZE_TIMEOUT"),
             wafw00f_timeout=_int(os.getenv("WAFW00F_TIMEOUT"), 60, "WAFW00F_TIMEOUT"),
+            enable_dnstwist=_bool(os.getenv("ENABLE_DNSTWIST")),
+            dnstwist_timeout=_int(os.getenv("DNSTWIST_TIMEOUT"), 180, "DNSTWIST_TIMEOUT"),
+            dnstwist_threads=_int(
+                os.getenv("DNSTWIST_THREADS"), 20, "DNSTWIST_THREADS", maximum=100
+            ),
+            dnstwist_fresh_registration_days=_int(
+                os.getenv("DNSTWIST_FRESH_REGISTRATION_DAYS"),
+                90,
+                "DNSTWIST_FRESH_REGISTRATION_DAYS",
+                maximum=3650,
+            ),
             vuln_match_timeout=_int(os.getenv("VULN_MATCH_TIMEOUT"), 15, "VULN_MATCH_TIMEOUT"),
             wpscan_api_token=os.getenv("WPSCAN_API_TOKEN", "").strip() or None,
             scope_file=_optional_scope_file(os.getenv("SCOPE_FILE", "").strip()),
@@ -1024,6 +1047,7 @@ class Settings:
             "theharvester": self.theharvester_path,
             "sslyze": self.sslyze_path,
             "wafw00f": self.wafw00f_path,
+            "dnstwist": self.dnstwist_path,
         }
 
     def to_safe_dict(self) -> dict[str, Any]:
@@ -1071,6 +1095,7 @@ class Settings:
                     ("theharvester", self.enable_theharvester),
                     ("sslyze", self.enable_sslyze),
                     ("wafw00f", self.enable_wafw00f),
+                    ("dnstwist", self.enable_dnstwist),
                 ]
                 if enabled
             ],
