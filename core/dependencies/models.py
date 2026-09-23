@@ -22,6 +22,12 @@ class InstallKind(str, Enum):
     HOMEBREW = "homebrew"
     APT = "apt"
     GO = "go"
+    PIP = "pip"
+    # theHarvester (modules/theharvester.py) needs Python >=3.14 managed
+    # by `uv` — genuinely none of the categories above (see that module's
+    # own docstring); MANUAL carries a real, specific instruction string
+    # instead of a fabricated fit into an existing category.
+    MANUAL = "manual"
 
 
 @dataclass(frozen=True)
@@ -36,6 +42,10 @@ class InstallMethod:
             return f"brew install {self.package}"
         if self.kind == InstallKind.APT:
             return f"sudo apt install {self.package}"
+        if self.kind == InstallKind.PIP:
+            return f"pip install {self.package}"
+        if self.kind == InstallKind.MANUAL:
+            return self.package
         return f"go install -v {self.package}"
 
 
@@ -57,6 +67,8 @@ class ToolDefinition:
     install_homebrew: str | None = None
     install_apt: str | None = None
     install_go: str | None = None
+    install_pip: str | None = None
+    install_manual: str | None = None
     allow_smoke_test: bool = True
     path_denylist: tuple[str, ...] = ()
     identity_markers: tuple[str, ...] = ()
@@ -73,6 +85,10 @@ class ToolDefinition:
             methods.append(InstallMethod(InstallKind.APT, self.install_apt))
         if self.install_go:
             methods.append(InstallMethod(InstallKind.GO, self.install_go))
+        if self.install_pip:
+            methods.append(InstallMethod(InstallKind.PIP, self.install_pip))
+        if self.install_manual:
+            methods.append(InstallMethod(InstallKind.MANUAL, self.install_manual))
         return methods
 
 

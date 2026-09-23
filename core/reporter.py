@@ -784,6 +784,14 @@ class ReportGenerator:
             ("vuln_match.jsonl", "vuln-match"),
             ("security_headers.jsonl", "missing-security-header"),
             ("cloud_bucket_enum.jsonl", "cloud-bucket-public-listable"),
+            ("sslyze_findings.jsonl", "tls-heartbleed"),
+            ("sslyze_findings.jsonl", "tls-robot"),
+            ("sslyze_findings.jsonl", "tls-weak-protocol"),
+            ("sslyze_findings.jsonl", "tls-missing-hsts"),
+            ("sslyze_findings.jsonl", "tls-untrusted-certificate"),
+            ("sslyze_findings.jsonl", "tls-expired-certificate"),
+            ("theharvester_findings.jsonl", "email-exposure"),
+            ("theharvester_findings.jsonl", "personnel-exposure"),
         )
         for filename, template_id in mapping:
             path = output_dir / filename

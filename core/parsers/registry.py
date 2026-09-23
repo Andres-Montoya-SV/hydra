@@ -1427,6 +1427,106 @@ class SecurityHeadersParser(ToolParser):
         return list(by_host.values()), []
 
 
+class TheHarvesterParser(ToolParser):
+    """Organization-associated email/personnel OSINT findings
+    (modules/theharvester.py — the plugin itself already filters to
+    `email`/`person` records whose domain matches the target, so this
+    parser trusts what it's given rather than re-filtering)."""
+
+    tool_name = "theharvester"
+
+    def parse(
+        self, output_dir: Path, *, artifact: Path | None = None, run_id: str = ""
+    ) -> tuple[list[Host], list[str]]:
+        path = artifact or output_dir / "theharvester_findings.jsonl"
+        by_host: dict[str, Host] = {}
+        for record in read_jsonl(path):
+            domain = normalize_domain(str(record.get("host", "")))
+            if not domain:
+                continue
+            host = by_host.setdefault(domain, Host(domain=domain))
+            value = str(record.get("value") or "")
+            record_type = str(record.get("type") or "")
+            sources = record.get("sources") or []
+            source_note = f" (via {', '.join(str(s) for s in sources)})" if sources else ""
+            if record_type == "email":
+                name = f"Work email address discovered: {value}"
+                description = f"Publicly indexed work email address for {domain}{source_note}."
+            else:
+                name = f"Personnel name discovered: {value}"
+                description = (
+                    f"Publicly indexed personnel name associated with {domain}{source_note} — "
+                    "evidence of phishing-surface/social-engineering exposure, not itself "
+                    "a technical vulnerability."
+                )
+            finding = Finding(
+                host=domain,
+                template_id=str(record.get("template_id") or "email-exposure"),
+                severity=str(record.get("severity") or "info"),
+                name=name,
+                source="theharvester",
+                description=description,
+                confidence_score=60,
+            )
+            host.findings.append(finding)
+        return list(by_host.values()), []
+
+
+class SslyzeParser(ToolParser):
+    """TLS/certificate posture findings (modules/sslyze.py)."""
+
+    tool_name = "sslyze"
+
+    def parse(
+        self, output_dir: Path, *, artifact: Path | None = None, run_id: str = ""
+    ) -> tuple[list[Host], list[str]]:
+        path = artifact or output_dir / "sslyze_findings.jsonl"
+        by_host: dict[str, Host] = {}
+        for record in read_jsonl(path):
+            domain = normalize_domain(str(record.get("host", "")))
+            if not domain:
+                continue
+            host = by_host.setdefault(domain, Host(domain=domain))
+            finding = Finding(
+                host=domain,
+                template_id=str(record.get("template_id") or "tls-finding"),
+                severity=str(record.get("severity") or "info"),
+                name=str(record.get("name") or ""),
+                source="sslyze",
+                description=str(record.get("description") or ""),
+                confidence_score=85,
+            )
+            host.findings.append(finding)
+        return list(by_host.values()), []
+
+
+class Wafw00fParser(ToolParser):
+    """WAF/CDN confirmation (modules/wafw00f.py) — feeds the SAME
+    `Host.is_waf`/`.waf_provider` fields
+    `core.validation.engine.detect_cdn_waf`'s passive header heuristic
+    already populates via `HttpxParser`, never a new parallel data
+    shape. Real active detection is authoritative over that passive
+    heuristic for any host it actually confirms — genuinely useful
+    METADATA (per this task's own framing), never emitted as a
+    standalone Finding/vulnerability in its own right."""
+
+    tool_name = "wafw00f"
+
+    def parse(
+        self, output_dir: Path, *, artifact: Path | None = None, run_id: str = ""
+    ) -> tuple[list[Host], list[str]]:
+        path = artifact or output_dir / "wafw00f_findings.jsonl"
+        by_host: dict[str, Host] = {}
+        for record in read_jsonl(path):
+            domain = _extract_domain(str(record.get("url") or ""))
+            if not domain:
+                continue
+            host = by_host.setdefault(domain, Host(domain=domain))
+            host.is_waf = True
+            host.waf_provider = str(record.get("firewall") or host.waf_provider or "")
+        return list(by_host.values()), []
+
+
 PARSER_REGISTRY: dict[str, ToolParser] = {
     p.tool_name: p
     for p in [
@@ -1454,6 +1554,9 @@ PARSER_REGISTRY: dict[str, ToolParser] = {
         CloudBucketEnumParser(),
         VulnMatchParser(),
         SecurityHeadersParser(),
+        TheHarvesterParser(),
+        SslyzeParser(),
+        Wafw00fParser(),
     ]
 }
 

@@ -1,0 +1,3 @@
+{"action_executions":[],"artifacts":[],"completed_at":"2026-09-23T02:19:48.579511Z","counts":{"hostname":2},"evidence_status":"complete","result_count":2,"run_id":"430a26fd-c74d-4739-956e-c720e8106fa9","source_executions":[{"duration_ms":1596.9504580061766,"error_type":null,"result_count":2,"source":"rapiddns","status":"completed","stop_reason":null},{"duration_ms":42138.18354099931,"error_type":null,"result_count":1,"source":"crtsh","status":"completed","stop_reason":null}],"started_at":"2026-09-23T02:19:06.407493Z","target":"example.com","type":"summary"}
+{"sources":["rapiddns"],"type":"hostname","value":"20mail2.example.com"}
+{"sources":["crtsh","rapiddns"],"type":"hostname","value":"www.example.com"}

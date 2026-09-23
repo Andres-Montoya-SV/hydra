@@ -226,6 +226,48 @@ _register(
     )
 )
 
+_register(
+    ToolDefinition(
+        name="sslyze",
+        display_name="sslyze",
+        version_commands=(("--version",),),
+        health_commands=(("--help",),),
+        capabilities=frozenset({"tls_posture", "certificate_analysis"}),
+        install_pip="sslyze",
+    )
+)
+
+_register(
+    ToolDefinition(
+        name="wafw00f",
+        display_name="wafw00f",
+        version_commands=(("-V",), ("--version",)),
+        health_commands=(("--help",),),
+        capabilities=frozenset({"waf_detection"}),
+        install_pip="wafw00f",
+    )
+)
+
+_register(
+    ToolDefinition(
+        name="theharvester",
+        display_name="theHarvester",
+        health_commands=(("--help",), ("-h",)),
+        capabilities=frozenset({"email_personnel_osint"}),
+        # Genuinely none of HOMEBREW/APT/GO/PIP fit — theHarvester
+        # requires Python >=3.14, managed by `uv`, cloned from source
+        # (confirmed directly, not assumed: it is NOT published on
+        # PyPI). See modules/theharvester.py's own docstring and
+        # docs/DOCKER.md for the real, tested setup.
+        install_manual=(
+            "git clone https://github.com/laramies/theHarvester.git && "
+            "cd theHarvester && uv sync  (requires Python 3.14, managed by uv — "
+            "see docs/DOCKER.md)"
+        ),
+        allow_smoke_test=True,
+    )
+)
+
 
 def get_tool_definition(name: str) -> ToolDefinition:
     """Return registry entry or synthesize a minimal definition."""
@@ -301,4 +343,8 @@ def install_hint_for(defn: ToolDefinition, *, is_macos: bool, is_linux: bool) ->
         return f"brew install {defn.install_homebrew}"
     if defn.install_apt:
         return f"sudo apt install {defn.install_apt}"
+    if defn.install_pip:
+        return f"pip install {defn.install_pip}"
+    if defn.install_manual:
+        return defn.install_manual
     return "See tool documentation for installation"
