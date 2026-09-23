@@ -82,3 +82,100 @@ class TestReporter:
         )
         assert "Parameter Discovery Skipped" in md
         assert "example.com" in md
+
+
+class TestTyposquatBrandProtectionSection:
+    """modules/dnstwist.py's findings get their own, clearly-separated
+    report section — never mixed into the Assets/Hosts tables, which
+    would let a reader mistake a registered lookalike for a real
+    subdomain of the target."""
+
+    def _store_with_candidate(self, tmp_path: Path, run_id: str):
+        from core.assets import ScanRun
+        from core.store import AssetStore
+
+        store = AssetStore(tmp_path / "run.db")
+        store.create_run(ScanRun(run_id=run_id, started_at="2026-09-23T00:00:00Z"))
+        store.persist_registry(run_id, {}, clusters=[], graph=None, intel=None)
+        store.record_typosquat_candidates(
+            run_id,
+            [
+                {
+                    "target_domain": "example.com",
+                    "candidate_domain": "exampler.com",
+                    "fuzzer": "addition",
+                    "dns_a": ["203.0.113.5"],
+                    "dns_mx": ["mx.some-host.test"],
+                    "has_mx": True,
+                    "whois_created": "2020-01-01",
+                    "whois_registrar": "Namecheap",
+                    "severity": "high",
+                    "risk_reason": "MX record configured",
+                    "confidence_score": 80,
+                }
+            ],
+        )
+        store.finish_run(run_id, host_count=0, alive_count=0, warnings=[], errors=[])
+        return store
+
+    def test_markdown_report_labels_it_as_not_target_infrastructure(
+        self, settings: Settings, tmp_path: Path
+    ) -> None:
+        run_id = "test-typosquat-md"
+        store = self._store_with_candidate(tmp_path, run_id)
+        context = PipelineContext(
+            output_dir=tmp_path / "run",
+            targets=[DomainTarget("example.com")],
+            run_id=run_id,
+            started_at=datetime.utcnow(),
+        )
+        context.output_dir.mkdir(parents=True)
+        reporter = ReportGenerator(settings)
+        reporter._write_markdown_overview(context, reporter.build_summary(context), store=store)
+        overview = (settings.project_root / settings.reports_directory / "overview.md").read_text(
+            encoding="utf-8"
+        )
+        assert "Brand Protection" in overview
+        assert "NOT part of your own infrastructure" in overview
+        assert "exampler.com" in overview
+
+    def test_html_report_includes_the_section_with_the_disclaimer(
+        self, settings: Settings, tmp_path: Path
+    ) -> None:
+        run_id = "test-typosquat-html"
+        store = self._store_with_candidate(tmp_path, run_id)
+        context = PipelineContext(
+            output_dir=tmp_path / "run",
+            targets=[DomainTarget("example.com")],
+            run_id=run_id,
+            started_at=datetime.utcnow(),
+        )
+        context.output_dir.mkdir(parents=True)
+        reporter = ReportGenerator(settings)
+        reporter._write_html_summary(context, reporter.build_summary(context), store=store)
+        html = (context.output_dir / "summary.html").read_text(encoding="utf-8")
+        assert "Brand Protection" in html
+        assert "NOT a vulnerability in your systems" in html
+        assert "exampler.com" in html
+
+    def test_summary_json_keeps_it_in_its_own_key_not_mixed_with_hosts(
+        self, settings: Settings, tmp_path: Path
+    ) -> None:
+        run_id = "test-typosquat-json"
+        store = self._store_with_candidate(tmp_path, run_id)
+        context = PipelineContext(
+            output_dir=tmp_path / "run",
+            targets=[DomainTarget("example.com")],
+            run_id=run_id,
+            started_at=datetime.utcnow(),
+        )
+        context.output_dir.mkdir(parents=True)
+        reporter = ReportGenerator(settings)
+        reporter.generate(context, store=store)
+        import json
+
+        summary_data = json.loads((context.output_dir / "summary.json").read_text(encoding="utf-8"))
+        assert "typosquat_candidates" in summary_data
+        assert summary_data["typosquat_candidates"][0]["candidate_domain"] == "exampler.com"
+        high_priority_domains = {h["domain"] for h in summary_data.get("high_priority", [])}
+        assert "exampler.com" not in high_priority_domains

@@ -11,6 +11,7 @@ from modules import (
     browser_probe,
     cloud_bucket_enum,
     ctlogs,
+    dnstwist,
     dnsx,
     gau,
     github_secrets,
@@ -67,6 +68,7 @@ __all__ = [
     "theharvester",
     "sslyze",
     "wafw00f",
+    "dnstwist",
     "github_secrets",
     "sub_takeover",
 ]

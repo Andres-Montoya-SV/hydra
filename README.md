@@ -99,6 +99,7 @@ flowchart TD
     Wildcard --> Dnsx["dnsx: resolve subdomains -> resolved.txt"]
     Dnsx --> AsnNaabu["asn_lookup, naabu -> port_verify"]
     AsnNaabu --> Httpx["httpx: probe resolved hosts\n(each redirect hop re-authorized)"]
+    Httpx --> Optional["Optional/enrichment stage, concurrent:\nctlogs, katana, hakrawler, gau, waybackurls, unfurl,\nnuclei, soft404_check, param_fuzz, cloud_bucket_enum,\nthreat_intel, vuln_match, security_headers,\ntheharvester, sslyze, wafw00f, dnstwist"]
     Httpx --> Optional["Optional/enrichment stage, concurrent:\nctlogs, katana, hakrawler, gau, waybackurls, unfurl,\nnuclei, soft404_check, param_fuzz, cloud_bucket_enum,\nthreat_intel, vuln_match, security_headers,\ntheharvester, sslyze, wafw00f, github_secrets, sub_takeover"]
     Optional --> Gateway{{"CollectionGateway / ScopeEnforcingProxy\nevery tool-issued connection re-authorized\nat the socket, not just the input file"}}
     Gateway --> Followup["Bounded follow-up collection\n(re-authorizes every discovered indicator)"]
@@ -319,6 +320,8 @@ Hydra can run, as a "head"):
 │ ctlogs            │ yes    │ yes    │ ctlogs — certificate-transparency discovery head           │
 │ theharvester      │ no     │ yes    │ theharvester — email/personnel OSINT head                  │
 │ assetfinder       │ yes    │ yes    │ assetfinder — related-hostname discovery head              │
+│ amass             │ no     │ yes    │ amass — deep OSINT enumeration head                        │
+│ dnstwist          │ no     │ yes    │ dnstwist — domain permutation / typosquat monitoring head  │
 │ github_secrets    │ no     │ yes    │ github_secrets — leaked-secrets (public GitHub repos) head │
 │ amass             │ no     │ yes    │ amass — deep OSINT enumeration head                        │
 │ gau               │ yes    │ yes    │ gau — archived-URL harvest head                            │
@@ -384,6 +387,27 @@ Hydra can run, as a "head"):
 Note: `amass` shows `Active: no` here too — this environment simply
 doesn't have it installed, unrelated to this task.
 
+`dnstwist` (`modules/dnstwist.py`, `ENABLE_DNSTWIST`) is a **brand-
+protection signal, not a target-infrastructure vulnerability** — worth
+stating plainly here, not just in a docstring. It generates typosquat/
+homoglyph/bit-flip permutations of your own domain and checks which are
+actually registered by a third party (via `dnstwist`, never
+reimplementing its permutation algorithms). A registered lookalike is
+evidence of a *separate* risk — potential phishing/brand-impersonation
+infrastructure — and is **never merged into your own discovered hosts**:
+it lives in its own dedicated `typosquat_candidates` database table and
+its own clearly-labeled report section, so it can never be mistaken for
+a new subdomain of yours. Confirmed against dnstwist's real, current CLI
+(no `--proxy` flag exists at all, unlike `katana`/`hakrawler`/`nuclei`):
+its own optional active-fetch flags (HTTP/SMTP banner grabs, page-
+similarity scoring, active MX-interception checks) are never enabled,
+since Hydra has no way to apply its own SSRF/confinement discipline to a
+raw connection dnstwist itself would make to an unrelated, attacker-
+influenceable third party. Only passive DNS/WHOIS lookups run. A
+candidate with an MX record configured is the strongest available
+phishing signal (`severity=high`); a freshly-registered candidate with
+no MX is `medium`; everything else registered is `low` — not every
+lookalike is a threat, and this avoids dumping an undifferentiated list.
 `github_secrets` (`modules/github_secrets.py`, `ENABLE_GITHUB_SECRETS`)
 finds leaked secrets in public GitHub repositories plausibly tied to the
 target, by wrapping `gitleaks` — never reimplementing its detection

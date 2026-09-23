@@ -270,6 +270,13 @@ _register(
 
 _register(
     ToolDefinition(
+        name="dnstwist",
+        display_name="dnstwist",
+        version_commands=(("--version",),),
+        health_commands=(("--help",),),
+        capabilities=frozenset({"typosquat_detection"}),
+        install_homebrew="dnstwist",
+        install_pip="dnstwist",
         name="gitleaks",
         display_name="gitleaks",
         version_commands=(("version",),),

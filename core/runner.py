@@ -1136,6 +1136,19 @@ class PipelineRunner:
         if isinstance(network_requests, list) and network_requests:
             store.record_network_requests(context.run_id, network_requests)
 
+        # Deliberately NOT routed through PARSER_REGISTRY/HostRegistry above
+        # — a registered typosquat is evidence about a distinct third party,
+        # never an asset of the target, and PARSER_REGISTRY's whole contract
+        # is "produces Host objects merged into the target's own graph."
+        # See core/store.py's typosquat_candidates table comment.
+        from utils.files import read_jsonl
+
+        dnstwist_path = context.output_dir / "dnstwist_findings.jsonl"
+        if dnstwist_path.exists():
+            candidates = read_jsonl(dnstwist_path)
+            if candidates:
+                store.record_typosquat_candidates(context.run_id, candidates)
+
         store.finish_run(
             context.run_id,
             host_count=len(hosts),
