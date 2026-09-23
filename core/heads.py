@@ -72,6 +72,7 @@ HEAD_BLURBS: dict[str, str] = {
     "sslyze": "TLS/certificate posture head",
     "wafw00f": "WAF/CDN fingerprinting head",
     "github_secrets": "leaked-secrets (public GitHub repos) head",
+    "sub_takeover": "subdomain takeover detection head",
 }
 
 

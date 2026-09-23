@@ -793,6 +793,7 @@ class ReportGenerator:
             ("theharvester_findings.jsonl", "email-exposure"),
             ("theharvester_findings.jsonl", "personnel-exposure"),
             ("github_secrets.jsonl", "leaked-secret"),
+            ("sub_takeover.jsonl", "subdomain-takeover"),
         )
         for filename, template_id in mapping:
             path = output_dir / filename

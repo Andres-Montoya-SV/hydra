@@ -140,6 +140,26 @@ class VerifyDomainResponse(BaseModel):
     expires_at: str
 
 
+class SetMonitoringRequest(BaseModel):
+    speed2: bool = Field(
+        default=False,
+        description="Opt into the weekly ACTIVE deep-scan (Speed 2, Pro/Ultra only). Speed 1 "
+        "(daily passive re-scan) is implied by monitoring simply being enabled.",
+    )
+
+
+class MonitoringStatusResponse(BaseModel):
+    domain: str
+    status: Literal["active", "paused_verification_lapsed", "needs_review"]
+    speed2_enabled: bool
+    last_passive_run_at: str | None
+    last_active_run_at: str | None
+    next_passive_due_at: str
+    next_active_due_at: str | None
+    last_asset_count: int | None
+    needs_review: bool
+
+
 # --- Part B/D: tiers, subscription management, Wompi (Round 3) --------
 
 

@@ -71,6 +71,17 @@ FINDING_GLOSSARY: dict[str, dict[str, str]] = {
             "rotated but still confirms real exposure. The secret value "
             "itself is never stored by Hydra — only enough metadata (rule, "
             "file, line, commit) to locate and act on it."
+    "subdomain-takeover": {
+        "what": (
+            "A subdomain's DNS record points at a third-party service the "
+            "target no longer controls, and the dangling state was confirmed "
+            "live (or, for services whose target cannot resolve at all, via "
+            "Hydra's own DNS data)."
+        ),
+        "why": (
+            "Anyone can claim the dangling name on that service and serve "
+            "content under the target's own subdomain — a well-understood, "
+            "frequently-paid bug class. Hydra never claims it for you."
         ),
     },
 }

@@ -199,6 +199,67 @@ class APISettings:
     sentry_dsn: str | None = None
     log_format: str = "text"
 
+    # Continuous monitoring ("Hydra API — Continuous Monitoring for
+    # Verified Domains" task) — see `api/monitoring_worker.py`'s own
+    # module docstring and docs/PAID_API_DESIGN.md's dated monitoring
+    # section for the full reasoning behind every value below.
+    #
+    # How often the monitoring loop wakes up to check for due domains —
+    # hourly, not daily/weekly like the cadences themselves: Speed 1's
+    # 24h cadence and Speed 2's 168h cadence are both MUCH coarser than
+    # this poll interval on purpose (the same "poll interval independent
+    # of the thing being scheduled" shape scan_poll_interval_seconds
+    # already uses relative to a 25-minute scan) — an hourly poll means a
+    # domain becomes due within an hour of its actual cadence deadline,
+    # not up to a full extra day/week late, while still being cheap
+    # (one indexed range query) to run 24x/day against even a
+    # 300k-row table.
+    monitoring_poll_interval_seconds: float = 3600.0
+    # Speed 1 (passive) cadence — daily, per the task's own name for it.
+    monitoring_passive_interval_hours: int = 24
+    # Speed 2 (active) cadence — weekly.
+    monitoring_active_interval_hours: int = 24 * 7
+    # Read-page size (keyset pagination) AND write-batch size (chunked
+    # `executemany` transactions) — the same 500-1000 range
+    # `api/reconciliation_worker.py`'s retention-purge batching precedent
+    # uses, for the same reason: large enough that a 300k-row table
+    # finishes in a bounded number of round trips, small enough that no
+    # single transaction holds SQLite's write lock long enough to
+    # meaningfully delay a concurrent scan-queue write.
+    monitoring_batch_size: int = 500
+    # Part B's asset-count sanity ceiling
+    # (`api/monitoring.py::classify_asset_jump`) — chosen from this
+    # project's own real recon runs: a genuinely large but legitimate
+    # attack surface (a big enterprise's full external footprint) tends
+    # to land in the low thousands of distinct hosts; a wildcard-DNS
+    # false-positive explosion or a scope misconfiguration tends to jump
+    # into the tens of thousands almost immediately. 5,000 sits above the
+    # former and below the latter, erring toward "flag it and let a human
+    # look" rather than either silently emailing a client a nonsense
+    # 50,000-host diff or silently dropping monitoring for a domain that
+    # legitimately grew.
+    monitoring_asset_count_ceiling: int = 5000
+    # Real per-cycle time/work budget — a SINGLE call to
+    # `run_monitoring_cycle` stops claiming new pages of due domains once
+    # this many seconds have elapsed since it started (already-started
+    # batches still finish and get written), rather than running
+    # unbounded. This is deliberately separate from, and much larger
+    # than, `monitoring_poll_interval_seconds`: the budget bounds how
+    # long ANY SINGLE cycle can run before yielding back to the loop
+    # (which then immediately starts another cycle if there's still due
+    # work, rather than waiting a full poll interval) — it does not
+    # change how often cycles start. At 300k rows this is what keeps one
+    # slow cycle from starving `stop_event` checks / graceful shutdown.
+    monitoring_cycle_time_budget_seconds: float = 300.0
+    # How many changed/needs-review domains one notification email lists
+    # by name before switching to a "…and N more" summary line — an
+    # account with hundreds of monitored domains changing in one cycle
+    # (a plausible upstream-provider-wide event) should get one readable
+    # email, never one email per domain or one email listing hundreds of
+    # lines. `api/monitoring.py::significance_rank` decides which ones
+    # make the cut.
+    monitoring_max_domains_per_email: int = 20
+
     @property
     def control_db_path(self) -> Path:
         return self.data_dir / "control.db"
@@ -299,6 +360,27 @@ def load_api_settings() -> APISettings:
     settings.backup_s3_region = os.getenv("HYDRA_API_BACKUP_S3_REGION") or None
     settings.sentry_dsn = os.getenv("SENTRY_DSN") or None
     settings.log_format = os.getenv("HYDRA_API_LOG_FORMAT") or "text"
+    monitoring_poll_interval = os.getenv("HYDRA_API_MONITORING_POLL_INTERVAL_SECONDS")
+    if monitoring_poll_interval:
+        settings.monitoring_poll_interval_seconds = float(monitoring_poll_interval)
+    monitoring_passive_hours = os.getenv("HYDRA_API_MONITORING_PASSIVE_INTERVAL_HOURS")
+    if monitoring_passive_hours:
+        settings.monitoring_passive_interval_hours = int(monitoring_passive_hours)
+    monitoring_active_hours = os.getenv("HYDRA_API_MONITORING_ACTIVE_INTERVAL_HOURS")
+    if monitoring_active_hours:
+        settings.monitoring_active_interval_hours = int(monitoring_active_hours)
+    monitoring_batch_size = os.getenv("HYDRA_API_MONITORING_BATCH_SIZE")
+    if monitoring_batch_size:
+        settings.monitoring_batch_size = int(monitoring_batch_size)
+    monitoring_ceiling = os.getenv("HYDRA_API_MONITORING_ASSET_CEILING")
+    if monitoring_ceiling:
+        settings.monitoring_asset_count_ceiling = int(monitoring_ceiling)
+    monitoring_budget = os.getenv("HYDRA_API_MONITORING_CYCLE_TIME_BUDGET_SECONDS")
+    if monitoring_budget:
+        settings.monitoring_cycle_time_budget_seconds = float(monitoring_budget)
+    monitoring_email_cap = os.getenv("HYDRA_API_MONITORING_MAX_DOMAINS_PER_EMAIL")
+    if monitoring_email_cap:
+        settings.monitoring_max_domains_per_email = int(monitoring_email_cap)
     return settings
 
 
