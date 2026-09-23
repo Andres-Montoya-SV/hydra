@@ -15,6 +15,7 @@ than looking like a missed dependency.
 from __future__ import annotations
 
 import json
+import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
@@ -31,6 +32,8 @@ from api.schemas import (
 from api.settings import APISettings
 from api.tiers import retention_days_for
 from api.wompi_client import WompiClient, tier_for_product_name, verify_webhook_signature
+
+logger = logging.getLogger("hydra.api.wompi_webhook")
 
 router = APIRouter(tags=["subscription"])
 
@@ -141,27 +144,63 @@ async def wompi_webhook(
     wompi_client = _wompi_client(request)
 
     raw_body = await request.body()
+    source_ip = request.client.host if request.client else "unknown"
+    # Logged BEFORE any verification, deliberately: this is the one
+    # thing that would have told us, in the previous round's real
+    # sandbox attempt, whether Wompi ever actually reached this
+    # endpoint at all — an empty `wompi_webhook_events` table alone
+    # can't distinguish "nothing was ever delivered" from "something
+    # was delivered and rejected," and that ambiguity is exactly what
+    # made the last round's silence undiagnosable. Metadata only —
+    # never the raw body, which is unverified at this point and must
+    # never be treated as trustworthy content.
+    logger.info(
+        "Wompi webhook received: source_ip=%s, content_length=%d, signature_header_present=%s",
+        source_ip,
+        len(raw_body),
+        wompi_hash is not None,
+    )
 
     if not api_settings.wompi_client_secret:
+        logger.error(
+            "Wompi webhook received from %s but WOMPI_CLIENT_SECRET is not configured — "
+            "cannot verify it, refusing to act on it.",
+            source_ip,
+        )
         raise HTTPException(status_code=503, detail="Webhook verification is not configured.")
     if not verify_webhook_signature(raw_body, wompi_hash, api_settings.wompi_client_secret):
         # Never persisted to wompi_webhook_events — that table's
         # dedup/audit guarantee only makes sense for requests already
-        # confirmed to genuinely be from Wompi (module docstring).
+        # confirmed to genuinely be from Wompi (module docstring). Still
+        # logged (metadata only, never the body or the secret) so a
+        # real signature mismatch — e.g. the HMAC-key inference in
+        # api/wompi_client.py's own module docstring turning out wrong —
+        # is visible somewhere, rather than indistinguishable from "no
+        # request arrived at all."
+        logger.warning(
+            "Wompi webhook signature verification FAILED: source_ip=%s, content_length=%d. "
+            "Never acted on — if this keeps happening, verify WOMPI_CLIENT_SECRET is the "
+            "same value Wompi's dashboard shows as this webhook's signing secret.",
+            source_ip,
+            len(raw_body),
+        )
         raise HTTPException(status_code=401, detail="Invalid or missing webhook signature.")
 
     try:
         payload = json.loads(raw_body)
     except json.JSONDecodeError as exc:
+        logger.warning("Wompi webhook signature verified but body is not valid JSON.")
         raise HTTPException(status_code=400, detail="Malformed webhook body.") from exc
 
     transaction_id = str(payload.get("IdTransaccion", ""))
     if not transaction_id:
+        logger.warning("Wompi webhook signature verified but has no IdTransaccion.")
         raise HTTPException(status_code=400, detail="Missing IdTransaccion.")
 
     if control_db.webhook_event_already_processed(transaction_id):
         # Wompi's own retry behavior (or a replay) — already handled,
         # tell it so without doing anything a second time.
+        logger.info("Wompi webhook for transaction %s already processed; no-op.", transaction_id)
         return {"status": "already_processed"}
 
     # Part D.2's belt-and-suspenders second check: independently confirm
@@ -170,10 +209,17 @@ async def wompi_webhook(
     try:
         transaction = await wompi_client.get_transaction(transaction_id)
     except Exception as exc:  # noqa: BLE001 - any Wompi-side failure is treated the same: don't act
+        logger.error("Independent TransaccionCompra lookup for %s failed: %s", transaction_id, exc)
         raise HTTPException(
             status_code=502, detail=f"Could not independently confirm this transaction: {exc}"
         ) from exc
     if not transaction.get("esAprobada"):
+        logger.warning(
+            "Transaction %s: signature verified but independent lookup does not confirm "
+            "approval — refusing to act on it. This is the fake-transaction defense actually "
+            "firing, not a bug.",
+            transaction_id,
+        )
         control_db.record_webhook_event(
             transaction_id=transaction_id,
             outcome="rejected_transaction_check_failed",
@@ -207,12 +253,22 @@ async def wompi_webhook(
                 matched_account_id=account_id,
                 raw_body=raw_body.decode("utf-8", errors="replace"),
             )
+            logger.warning(
+                "Transaction %s: payment failure for account %s — grace period started.",
+                transaction_id,
+                account_id,
+            )
             return {"status": "grace_period_started"}
         control_db.record_webhook_event(
             transaction_id=transaction_id,
             outcome="payment_failure_unmatched",
             matched_account_id=None,
             raw_body=raw_body.decode("utf-8", errors="replace"),
+        )
+        logger.warning(
+            "Transaction %s: payment failure reported but no account matched by billing "
+            "email — logged, nothing to act on.",
+            transaction_id,
         )
         return {"status": "unmatched_failure_logged"}
 
@@ -234,6 +290,12 @@ async def wompi_webhook(
             matched_account_id=enrollment.account_id,
             raw_body=raw_body.decode("utf-8", errors="replace"),
         )
+        logger.info(
+            "Transaction %s: activated account %s to tier %s.",
+            transaction_id,
+            enrollment.account_id,
+            enrollment.tier,
+        )
         return {"status": "activated"}
 
     existing_account_id = control_db.find_account_id_by_billing_email(email) if email else None
@@ -244,6 +306,11 @@ async def wompi_webhook(
             outcome="renewal_confirmed",
             matched_account_id=existing_account_id,
             raw_body=raw_body.decode("utf-8", errors="replace"),
+        )
+        logger.info(
+            "Transaction %s: renewal confirmed for account %s.",
+            transaction_id,
+            existing_account_id,
         )
         return {"status": "renewal_confirmed"}
 
@@ -261,6 +328,12 @@ async def wompi_webhook(
         outcome="unmatched",
         matched_account_id=None,
         raw_body=raw_body.decode("utf-8", errors="replace"),
+    )
+    logger.warning(
+        "Transaction %s: signature verified and independently confirmed approved, but no "
+        "account matched — filed to the manual-reconciliation backstop "
+        "(GET /admin/wompi/unmatched), never guessed.",
+        transaction_id,
     )
     return {"status": "unmatched_pending_manual_reconciliation"}
 

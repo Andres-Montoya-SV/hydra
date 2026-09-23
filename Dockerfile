@@ -115,11 +115,22 @@ RUN python -m venv "$VENV_PATH"
 ENV PATH="$VENV_PATH/bin:$PATH"
 
 # Dependencies before source so `docker build` cache survives source edits.
-COPY --chown=hydra:hydra requirements.txt requirements-dev.txt requirements-optional.txt ./
+# requirements-api.txt (fastapi/uvicorn/argon2-cffi/dnspython) was
+# missing here — a real, previously-unnoticed gap: neither this image
+# nor CI's own `check` job (.github/workflows/ci.yml) ever installed
+# it, so every api/*-dependent test (anything gated by
+# `pytest.importorskip("fastapi")`, plus tests/test_scan_queue_
+# durability.py's real-subprocess kill+relaunch test, which needs
+# `uvicorn` specifically) was silently never exercised in ANY CI path —
+# only ever run locally, wherever a dev's own venv happened to have the
+# API extras installed. Found via a real CI failure
+# (`ModuleNotFoundError: No module named 'uvicorn'`), not by inspection.
+COPY --chown=hydra:hydra requirements.txt requirements-dev.txt requirements-api.txt requirements-optional.txt ./
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir \
          -r requirements.txt \
          -r requirements-dev.txt \
+         -r requirements-api.txt \
          -r requirements-optional.txt \
     && playwright install webkit
 

@@ -1,10 +1,26 @@
-"""Email-verification delivery (Hallazgo 1: `POST /accounts` must not
-create an immediately-usable account without proving the client controls
-a real, distinct email address). `EmailSender` is a `Protocol`, not a
+"""Transactional email delivery — account-email verification (Hallazgo 1:
+`POST /accounts` must not create an immediately-usable account without
+proving the client controls a real, distinct email address) and, since
+the "Automatic billing enforcement and data retention purge" task,
+account-suspension notices too. `EmailSender` is a `Protocol`, not a
 concrete dependency — the same "structural interface, no shared base
 class" choice `core/reportability/provider.py::ReportabilityProvider`
-already made, since every implementation shares nothing but this one
-method's shape.
+already made.
+
+**Why a second Protocol method (`send_account_suspended_email`) instead
+of one generic "send this content" method**: every other typed method
+here (`send_verification_email`) takes structured, purpose-specific
+arguments (`token`, not a pre-rendered body) so each implementation
+decides its own subject/body/formatting — a generic
+`send(subject, body)` method would push that decision onto every
+CALLER instead, meaning `api/reconciliation_worker.py` would need to
+know how to write a suspension email itself, duplicating the same
+"one content-builder function per email kind" pattern
+(`_verification_email_content`/`_account_suspended_email_content`) this
+module already uses. Two typed methods sharing one Protocol keeps that
+consistent, at the cost of a new method per email kind added later —
+judged the right tradeoff while there are only two kinds of email
+total.
 
 **Two implementations now exist, selected automatically by
 `api/main.py`'s `lifespan` based on which environment variables are
@@ -68,12 +84,12 @@ request itself (which contains the token in its headers).
 
 **Explicit non-goals for this pass** (deferred, not silently skipped):
 bounce/complaint/suppression webhook handling from Postmark; any email
-besides this one verification message (scan-complete, billing, password
-reset — none of that exists yet); a clickable link (no frontend base
-URL exists to build one against); choosing between Postmark's
-transactional/broadcast message streams (only one kind of email is sent
-today, so there is nothing to choose between yet — the default stream
-is used, unconfigured).
+besides the two built so far (verification, suspension — scan-complete
+and password reset still don't exist); a clickable link (no frontend
+base URL exists to build one against); choosing between Postmark's
+transactional/broadcast message streams (both emails sent today are
+transactional in nature, so there is still nothing to choose between —
+the default stream is used, unconfigured).
 """
 
 from __future__ import annotations
@@ -99,6 +115,8 @@ _POSTMARK_TIMEOUT_SECONDS = 10.0
 class EmailSender(Protocol):
     def send_verification_email(self, *, to: str, account_id: str, token: str) -> None: ...
 
+    def send_account_suspended_email(self, *, to: str, account_id: str) -> None: ...
+
 
 class ConsoleEmailSender:
     """Logs the verification instructions instead of sending real email.
@@ -119,6 +137,14 @@ class ConsoleEmailSender:
             token,
         )
 
+    def send_account_suspended_email(self, *, to: str, account_id: str) -> None:
+        logger.info(
+            "[DEV EMAIL — no real provider configured] To: %s | Account %s was suspended "
+            "(grace period expired with no successful payment).",
+            to,
+            account_id,
+        )
+
 
 def _verification_email_content(*, token: str) -> tuple[str, str]:
     """Returns (subject, text_body) — factored out on its own so a
@@ -135,6 +161,28 @@ def _verification_email_content(*, token: str) -> tuple[str, str]:
         "If you're using the Hydra API directly, confirm by calling:\n"
         f'    POST /accounts/verify-email  {{"token": "{token}"}}\n\n'
         "If you didn't create a Hydra account, you can safely ignore this email.\n"
+    )
+    return subject, body
+
+
+def _account_suspended_email_content(*, account_id: str) -> tuple[str, str]:
+    """The grace-period-enforcement job's suspension notice
+    (docs/PAID_API_DESIGN.md's "Automatic billing enforcement and data
+    retention purge" section) — the real self-service UX gap this task
+    closed: without this, a customer whose card failed silently loses
+    `POST /scans` access (`402`) with no explanation anywhere but an API
+    error response they may never see until they try to run a scan."""
+    subject = "Your Hydra account has been suspended"
+    body = (
+        "Your Hydra account has been suspended because a payment could not be "
+        "completed and the 3-day grace period has now expired.\n\n"
+        "While suspended, new scans cannot be started (POST /scans returns 402). "
+        "Reports you already have keep working normally — nothing already "
+        "delivered to you is affected.\n\n"
+        "To restore access, complete payment for your subscription tier; your "
+        "account is reactivated automatically as soon as a successful payment "
+        "is confirmed.\n\n"
+        f"Account reference: {account_id}\n"
     )
     return subject, body
 
@@ -170,9 +218,49 @@ class PostmarkEmailSender:
         self._timeout_seconds = timeout_seconds or _POSTMARK_TIMEOUT_SECONDS
 
     def send_verification_email(self, *, to: str, account_id: str, token: str) -> None:
+        subject, text_body = _verification_email_content(token=token)
+        self._send(
+            to=to,
+            account_id=account_id,
+            subject=subject,
+            text_body=text_body,
+            purpose="verification email",
+            retry_hint="POST /accounts/resend-verification will retry once this is resolved.",
+        )
+
+    def send_account_suspended_email(self, *, to: str, account_id: str) -> None:
+        subject, text_body = _account_suspended_email_content(account_id=account_id)
+        self._send(
+            to=to,
+            account_id=account_id,
+            subject=subject,
+            text_body=text_body,
+            purpose="suspension notice",
+            # There is no equivalent resend endpoint for this one — the
+            # account is already suspended regardless of whether the
+            # email landed, and the next reconciliation cycle does not
+            # re-suspend an already-suspended account (only 'past_due'
+            # ones), so a failed send here is simply lost, not retried.
+            retry_hint="No automatic retry exists for this notice.",
+        )
+
+    def _send(
+        self,
+        *,
+        to: str,
+        account_id: str,
+        subject: str,
+        text_body: str,
+        purpose: str,
+        retry_hint: str,
+    ) -> None:
+        """Shared by both `EmailSender` methods — the request shape,
+        failure handling (never raise, log at ERROR, never leak the
+        server token), and success-vs-Postmark-level-error checks are
+        identical regardless of which email is being sent; only the
+        subject/body and the log wording differ."""
         import httpx as _httpx
 
-        subject, text_body = _verification_email_content(token=token)
         try:
             response = _httpx.post(
                 self._send_url,
@@ -195,11 +283,11 @@ class PostmarkEmailSender:
             # could ever echo request internals; log only the exception
             # TYPE, which carries no header/token content.
             logger.error(
-                "Failed to send verification email for account %s via Postmark: "
-                "network error (%s). The account was still created; "
-                "POST /accounts/resend-verification will retry once this is resolved.",
+                "Failed to send %s for account %s via Postmark: network error (%s). %s",
+                purpose,
                 account_id,
                 type(exc).__name__,
+                retry_hint,
             )
             return
 
@@ -207,14 +295,16 @@ class PostmarkEmailSender:
             # Built entirely from POSTMARK'S OWN response body/status —
             # never from the request we sent, which carried the server
             # token in its headers.
-            self._log_postmark_error(account_id, response)
+            self._log_postmark_error(account_id, response, purpose=purpose, retry_hint=retry_hint)
             return
 
         body = response.json()
         if body.get("ErrorCode", 0) != 0:
-            self._log_postmark_error(account_id, response)
+            self._log_postmark_error(account_id, response, purpose=purpose, retry_hint=retry_hint)
 
-    def _log_postmark_error(self, account_id: str, response: httpx.Response) -> None:
+    def _log_postmark_error(
+        self, account_id: str, response: httpx.Response, *, purpose: str, retry_hint: str
+    ) -> None:
         try:
             body = response.json()
             error_code = body.get("ErrorCode")
@@ -222,11 +312,12 @@ class PostmarkEmailSender:
         except ValueError:
             error_code, message = None, response.text[:200]
         logger.error(
-            "Failed to send verification email for account %s via Postmark: "
-            "HTTP %s, ErrorCode=%s, Message=%s. The account was still created; "
-            "POST /accounts/resend-verification will retry once this is resolved.",
+            "Failed to send %s for account %s via Postmark: HTTP %s, ErrorCode=%s, "
+            "Message=%s. %s",
+            purpose,
             account_id,
             response.status_code,
             error_code,
             message,
+            retry_hint,
         )

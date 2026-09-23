@@ -31,13 +31,19 @@ responsibility in Round 2.
    which of these now apply, so `POST /account/subscription` can surface
    it to the client instead of the client discovering it via a later,
    unexplained 403.
-3. **Retention-window changes are recorded, not enforced by a purge job**
-   — no scheduled retention-purge job exists in this codebase yet (Part
-   B's original draft already described this as a *future* scheduled
-   job, and Round 3's task list does not ask for one). A downgrade to a
-   shorter retention window changes what `TierLimits.retention_days`
-   *would* keep going forward; it does not retroactively delete
-   anything. Flagged here rather than silently assumed built.
+3. **Retention-window changes are recorded, not enforced immediately** —
+   `api/reconciliation_worker.py::run_retention_purge_job` (added by
+   "Automatic billing enforcement and data retention purge") now runs
+   daily and reads each account's CURRENT effective retention window
+   (`api/tiers.py::retention_days_for`, which already reflects
+   `retention_days_override`/tier at read time) fresh on every cycle. A
+   downgrade to a shorter window is not retroactive in the sense of an
+   immediate one-time purge the moment `apply_tier_change` runs — it
+   simply means the next scheduled purge cycle (within
+   `reconciliation_interval_seconds`, default 24h) starts using the new,
+   shorter window for that account, same as it would for any other
+   account. Nothing about the purge job itself is aware of *why* a scan
+   is now old enough to purge, only that it is.
 4. **Payment-failure grace period: 3 days** (`GRACE_PERIOD_DAYS`,
    Part D.3) — during grace (`status == "past_due"`), scans and
    already-issued API keys keep working exactly as `"active"` does;

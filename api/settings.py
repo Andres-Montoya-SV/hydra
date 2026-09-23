@@ -131,6 +131,31 @@ class APISettings:
     # an outage (the same slot never frees up for other work).
     scan_max_retries: int = 3
 
+    # Automatic billing enforcement and data retention purge
+    # (docs/PAID_API_DESIGN.md's "Automatic billing enforcement and
+    # data retention purge" section) — see `api/reconciliation_worker.py`'s
+    # own module docstring for the full reasoning behind each value
+    # below.
+    #
+    # How often the grace-period-suspension and retention-purge jobs
+    # run, in the SAME cycle. Daily is the right granularity for both:
+    # grace periods are measured in days (GRACE_PERIOD_DAYS = 3,
+    # api/subscriptions.py) and retention windows in months
+    # (api/tiers.py) — polling either one every few seconds like the
+    # scan queue does would just be wasted work for no operational
+    # benefit.
+    reconciliation_interval_seconds: float = 86400.0
+    # How many scans (per account, per cycle) the retention-purge job
+    # deletes in one pass — bounded so a large backlog never becomes one
+    # long-held transaction that could stall other traffic; the rest of
+    # the backlog simply finishes over the next scheduled cycle(s).
+    retention_purge_batch_size: int = 200
+    # OFF by default (real deletion happens): an operator has to opt
+    # into a rehearsal explicitly, never opt into the actually-
+    # destructive behavior by omission. When True, the purge job only
+    # logs what it WOULD delete.
+    retention_purge_dry_run: bool = False
+
     @property
     def control_db_path(self) -> Path:
         return self.data_dir / "control.db"
@@ -206,6 +231,15 @@ def load_api_settings() -> APISettings:
     max_retries = os.getenv("HYDRA_API_SCAN_MAX_RETRIES")
     if max_retries:
         settings.scan_max_retries = int(max_retries)
+    reconciliation_interval = os.getenv("HYDRA_API_RECONCILIATION_INTERVAL_SECONDS")
+    if reconciliation_interval:
+        settings.reconciliation_interval_seconds = float(reconciliation_interval)
+    purge_batch_size = os.getenv("HYDRA_API_RETENTION_PURGE_BATCH_SIZE")
+    if purge_batch_size:
+        settings.retention_purge_batch_size = int(purge_batch_size)
+    settings.retention_purge_dry_run = os.getenv(
+        "HYDRA_API_RETENTION_PURGE_DRY_RUN", ""
+    ).strip().lower() in ("1", "true", "yes")
     return settings
 
 

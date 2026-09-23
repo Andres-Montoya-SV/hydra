@@ -82,6 +82,35 @@ class TestSuccessfulSend:
         assert "/accounts/verify-email" in body["TextBody"]
 
 
+class TestAccountSuspendedEmail:
+    """The second email kind (`api/reconciliation_worker.py`'s
+    grace-period job) — same request shape/failure handling as
+    verification email (shared via `PostmarkEmailSender._send`), a
+    different subject/body."""
+
+    def test_sends_the_correct_request_shape(self, postmark_server: str) -> None:
+        sender = _sender(postmark_server)
+        sender.send_account_suspended_email(to="user@example.com", account_id="acct-9")
+
+        assert len(FakePostmarkHandler.requests) == 1
+        request = FakePostmarkHandler.requests[0]
+        body = request["body"]
+        assert body["To"] == "user@example.com"
+        assert "acct-9" in body["TextBody"]
+        assert "suspend" in body["Subject"].lower()
+
+    def test_a_failure_does_not_raise_and_never_leaks_the_token(
+        self, postmark_server: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reset_fake_postmark_state(status=422, body={"ErrorCode": 300, "Message": "bad"})
+        sender = _sender(postmark_server)
+        with caplog.at_level("ERROR"):
+            sender.send_account_suspended_email(to="user@example.com", account_id="acct-10")
+        full_log = "\n".join(record.message for record in caplog.records)
+        assert "acct-10" in full_log
+        assert FAKE_SERVER_TOKEN not in full_log
+
+
 class TestFailureNeverBreaksAccountCreation:
     """The documented decision: a send failure is logged, never raised —
     POST /accounts must always succeed regardless."""

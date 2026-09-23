@@ -218,7 +218,16 @@ CREATE INDEX IF NOT EXISTS idx_cost_estimates_account ON cost_estimates(account_
 -- mechanism (docs/PAID_API_DESIGN.md's "Round 3 implemented" section
 -- documents this honestly as unconfirmed against a real Wompi sandbox):
 -- match an incoming webhook's `cliente.Email` against a still-'pending'
--- row's `billing_email` for the same tier/product.
+-- row's `billing_email` for the same tier/product. `status` is one of
+-- 'pending' (no matching webhook yet), 'matched' (activated a real
+-- account), or 'superseded' (this account requested another upgrade
+-- before this one was ever matched — `create_pending_enrollment`
+-- superseded it so at most one 'pending' row per account ever exists,
+-- closing a real ambiguity a live sandbox attempt surfaced: more than
+-- one 'pending' row for the same email/tier makes
+-- `find_pending_enrollment_by_email` correctly refuse to guess,
+-- silently sending a later genuinely-successful webhook to
+-- `wompi_unmatched_payments` instead of activating anything).
 CREATE TABLE IF NOT EXISTS wompi_pending_enrollments (
     enrollment_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(account_id),
@@ -1000,6 +1009,81 @@ class ControlDB:
                 (status, grace_period_started_at, _now_iso(), account_id),
             )
 
+    # --- scheduled reconciliation (grace-period enforcement, Part D.3) --
+
+    def list_past_due_account_ids(self) -> list[str]:
+        """The candidate list `api/reconciliation_worker.py`'s grace-
+        period job starts from — deliberately just account_ids, not
+        full `SubscriptionRecord`s: the job re-reads each one fresh
+        (`get_subscription`) right before acting on it, so a row this
+        query saw as `'past_due'` a moment ago but that has since been
+        resolved (a payment landed, `restore_active_status`) is never
+        acted on based on this now-stale snapshot."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT account_id FROM subscriptions WHERE status = 'past_due'"
+            ).fetchall()
+        return [row["account_id"] for row in rows]
+
+    def suspend_if_still_past_due(self, account_id: str) -> bool:
+        """Atomically suspends `account_id` ONLY if its subscription is
+        STILL `'past_due'` at the exact moment this statement executes
+        — the same single-statement, conditional-UPDATE discipline
+        `claim_next_queued_scan` uses to close a claim race, applied
+        here to close the analogous race against a payment webhook
+        restoring the account to `'active'` in a different worker
+        process between this job's fresh re-read and its write. Returns
+        whether a row was actually changed (i.e., whether this call is
+        the one that suspended it) — `False` means something else
+        already moved the account off `'past_due'` first, and this call
+        correctly did nothing."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE subscriptions SET status = 'suspended', updated_at = ? "
+                "WHERE account_id = ? AND status = 'past_due'",
+                (_now_iso(), account_id),
+            )
+        return cursor.rowcount > 0
+
+    # --- scheduled reconciliation (retention purge, Part B) --------------
+
+    def list_account_ids(self) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT account_id FROM accounts").fetchall()
+        return [row["account_id"] for row in rows]
+
+    def list_purgeable_scans_for_account(
+        self, account_id: str, *, cutoff: str, limit: int
+    ) -> list[ScanRecord]:
+        """Every scan of this account old enough (`created_at < cutoff`,
+        the account's own effective retention window) to purge —
+        `status IN ('completed', 'failed')` is enforced HERE, in the
+        query itself, not as a filter the caller has to remember to
+        apply: a `'running'` or `'queued'` scan can never be a
+        candidate no matter how old its `created_at` is, regardless of
+        how long an unusually slow scan has been executing."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scans WHERE account_id = ? "
+                "AND status IN ('completed', 'failed') AND created_at < ? "
+                "ORDER BY created_at ASC LIMIT ?",
+                (account_id, cutoff, limit),
+            ).fetchall()
+        return [_scan_record_from_row(row) for row in rows]
+
+    def delete_scan(self, scan_id: str, account_id: str) -> None:
+        """Deletes the control-plane `scans` row only — the caller
+        (`api/reconciliation_worker.py`) is responsible for removing
+        the corresponding `output/<scan_id>/` directory on disk itself,
+        since that's filesystem, not database, state. Idempotent:
+        deleting a `scan_id` that's already gone affects zero rows and
+        raises nothing, so running the purge job twice in a row is a
+        safe no-op the second time."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM scans WHERE scan_id = ? AND account_id = ?", (scan_id, account_id)
+            )
+
     def set_retention_override(self, account_id: str, retention_days: int | None) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -1144,9 +1228,31 @@ class ControlDB:
     def create_pending_enrollment(
         self, *, account_id: str, tier: str, billing_email: str
     ) -> WompiPendingEnrollmentRecord:
+        """A real gap a live sandbox attempt surfaced: a client that
+        calls `POST /account/subscription` more than once before ever
+        completing payment (retrying because nothing seemed to happen,
+        changing their mind on tier, or simply double-clicking) used to
+        accumulate multiple `'pending'` rows for the same account.
+        `find_pending_enrollment_by_email` correctly refuses to guess
+        between more than one match — but that means a LATER, genuinely
+        successful webhook would silently fall through to
+        `wompi_unmatched_payments` instead of activating anything,
+        indistinguishable from a real correlation failure. Superseding
+        this account's own other still-`'pending'` rows first (same
+        pattern `supersede_other_verifications` already uses for domain
+        verification) means only the MOST RECENT upgrade attempt is ever
+        a live candidate — exactly matching what a real user actually
+        wants ("I asked to upgrade again, that's the one that should
+        count"), and it can never be forgotten by a future caller since
+        it happens here, not at each call site."""
         enrollment_id = secrets.token_hex(16)
         now = _now_iso()
         with self._connect() as conn:
+            conn.execute(
+                "UPDATE wompi_pending_enrollments SET status = 'superseded' "
+                "WHERE account_id = ? AND status = 'pending'",
+                (account_id,),
+            )
             conn.execute(
                 "INSERT INTO wompi_pending_enrollments "
                 "(enrollment_id, account_id, tier, billing_email, status, created_at) "

@@ -19,8 +19,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from api.control_db import ControlDB
-from api.email_sender import ConsoleEmailSender, PostmarkEmailSender
+from api.email_sender import ConsoleEmailSender, EmailSender, PostmarkEmailSender
 from api.rate_limit import PersistentTokenBucketLimiter
+from api.reconciliation_worker import run_reconciliation_loop
 from api.routers import accounts, domains, hypotheses, keys, reportability, scans, subscription
 from api.scan_worker import generate_worker_id, run_worker_loop
 from api.settings import APISettings, load_api_settings, validate_email_provider_config
@@ -75,8 +76,14 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
         # (log-only) remains the unconditional zero-config default.
         # Logged once, in plain words, so it's never ambiguous from the
         # logs alone which mode a running deployment is in.
+        # A typed local (not just `app.state.email_sender` directly) so
+        # the reconciliation loop below can be passed a real `EmailSender`
+        # — reading it back off `app.state` after this if/else would
+        # type-check as `object` (mypy joins the two unrelated concrete
+        # classes assigned across the two branches), not `EmailSender`.
+        email_sender: EmailSender
         if settings.postmark_server_token and settings.email_from_address:
-            app.state.email_sender = PostmarkEmailSender(
+            email_sender = PostmarkEmailSender(
                 server_token=settings.postmark_server_token,
                 from_address=settings.email_from_address,
                 from_name=settings.email_from_name,
@@ -84,10 +91,11 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             )
             logger.info("Postmark configured — sending real verification emails.")
         else:
-            app.state.email_sender = ConsoleEmailSender()
+            email_sender = ConsoleEmailSender()
             logger.info(
                 "No email provider configured — verification emails are only logged, " "not sent."
             )
+        app.state.email_sender = email_sender
 
         # Durable-queue fix: supersedes Hallazgo 2's old one-time
         # startup-only `fail_orphaned_scans` — a `'running'` scan whose
@@ -108,9 +116,31 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
         )
         logger.info("Scan worker loop started (worker_id=%s).", worker_id)
 
+        # Automatic billing enforcement and data retention purge fix:
+        # its own periodic loop, sharing `stop_event` with the scan
+        # worker (both simply stop being scheduled once shutdown
+        # begins) but NOT its interval — see
+        # api/reconciliation_worker.py's own module docstring for why a
+        # day-granularity job needs a separate loop from a sub-second
+        # scan-claim one, rather than being folded into it.
+        reconciliation_task = asyncio.create_task(
+            run_reconciliation_loop(
+                api_settings=settings,
+                control_db=app.state.control_db,
+                email_sender=email_sender,
+                stop_event=stop_event,
+            )
+        )
+        logger.info(
+            "Billing/retention reconciliation loop started (interval=%.0fs, " "dry_run=%s).",
+            settings.reconciliation_interval_seconds,
+            settings.retention_purge_dry_run,
+        )
+
         yield
         stop_event.set()
         await worker_task
+        await reconciliation_task
 
     app = FastAPI(
         title="Hydra EASM API",
@@ -130,7 +160,11 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             "backed queue (api/scan_worker.py) — a scan interrupted by "
             "a worker crash or restart is automatically requeued and "
             "re-executed, up to a bounded retry ceiling, rather than "
-            "silently abandoned — see docs/PAID_API_DESIGN.md."
+            "silently abandoned. A daily reconciliation loop "
+            "(api/reconciliation_worker.py) suspends accounts whose "
+            "payment-failure grace period expired (emailing them when "
+            "it does) and purges scans/artifacts past each account's "
+            "tier retention window — see docs/PAID_API_DESIGN.md."
         ),
         lifespan=lifespan,
     )

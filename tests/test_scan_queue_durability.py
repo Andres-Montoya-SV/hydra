@@ -10,6 +10,7 @@ simulated restart).
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
@@ -23,6 +24,26 @@ import pytest
 
 from api.control_db import ControlDB
 from api.rate_limit import PersistentTokenBucketLimiter, RateLimitExceededError
+
+# Every other test in this file only needs api/control_db.py and
+# api/rate_limit.py, neither of which import fastapi — so this file
+# deliberately has no module-level importorskip, unlike most other
+# api/*-dependent test files (would needlessly skip real, dependency-
+# free coverage). Only the kill+relaunch class below spawns a real
+# `uvicorn` subprocess (tests/_scan_worker_subprocess_helper.py), which
+# needs both `fastapi` and `uvicorn` genuinely installed — found the
+# hard way via a real CI failure (`ModuleNotFoundError: No module named
+# 'uvicorn'`) when requirements-api.txt turned out to never be
+# installed in CI at all (now fixed: .github/workflows/ci.yml,
+# Dockerfile). Guarded here too, narrowly, so this one class degrades
+# to a clear skip rather than a hard failure in any environment that
+# still lacks the API extras — the same "skip, never hard-fail over a
+# missing optional dependency" convention every tool-gated test in this
+# project already follows.
+_HAS_API_RUNTIME_DEPS = (
+    importlib.util.find_spec("fastapi") is not None
+    and importlib.util.find_spec("uvicorn") is not None
+)
 
 
 @pytest.fixture
@@ -293,6 +314,11 @@ class TestPersistedRateLimiterCrossProcess:
         assert allowed_count == 5
 
 
+@pytest.mark.skipif(
+    not _HAS_API_RUNTIME_DEPS,
+    reason="fastapi/uvicorn not installed (pip install -r requirements-api.txt) — this "
+    "test spawns a real uvicorn subprocess serving the actual FastAPI app.",
+)
 class TestKillAndRelaunchAgainstARealSeparateProcess:
     """Task's own explicit requirement: verified the same way Hallazgo 2
     was verified live — a real process kill+relaunch against the same
