@@ -1,0 +1,198 @@
+[
+  {
+    "dns_a": [
+      "104.20.23.154",
+      "172.66.147.243"
+    ],
+    "dns_aaaa": [
+      "2606:4700:10::6814:179a",
+      "2606:4700:10::ac42:93f3"
+    ],
+    "dns_mx": [
+      ""
+    ],
+    "dns_ns": [
+      "elliott.ns.cloudflare.com",
+      "hera.ns.cloudflare.com"
+    ],
+    "domain": "example.com",
+    "fuzzer": "*original",
+    "whois_created": "1995-08-14",
+    "whois_registrar": "RESERVED-Internet Assigned Numbers Authority"
+  },
+  {
+    "dns_a": [
+      "103.168.172.37",
+      "103.168.172.52"
+    ],
+    "dns_mx": [
+      "us1-smtp.messagingengine.com",
+      "us2-smtp.messagingengine.com"
+    ],
+    "dns_ns": [
+      "ns1.messagingengine.com",
+      "ns2.messagingengine.com"
+    ],
+    "domain": "exampler.com",
+    "fuzzer": "addition",
+    "whois_created": "2004-06-15",
+    "whois_registrar": "Gandi SAS"
+  },
+  {
+    "dns_a": [
+      "104.21.44.49",
+      "172.67.195.22"
+    ],
+    "dns_aaaa": [
+      "2606:4700:3032::6815:2c31",
+      "2606:4700:3037::ac43:c316"
+    ],
+    "dns_mx": [
+      "mx1-hosting.jellyfish.systems",
+      "mx2-hosting.jellyfish.systems",
+      "mx3-hosting.jellyfish.systems"
+    ],
+    "dns_ns": [
+      "dimitris.ns.cloudflare.com",
+      "karina.ns.cloudflare.com"
+    ],
+    "domain": "example2.com",
+    "fuzzer": "addition",
+    "whois_created": "2001-11-09",
+    "whois_registrar": "NameCheap, Inc."
+  },
+  {
+    "dns_a": [
+      "15.197.148.33",
+      "3.33.130.190"
+    ],
+    "dns_mx": [
+      "mailstore1.secureserver.net",
+      "smtp.secureserver.net"
+    ],
+    "dns_ns": [
+      "ns23.domaincontrol.com",
+      "ns24.domaincontrol.com"
+    ],
+    "domain": "examplet.com",
+    "fuzzer": "addition",
+    "whois_created": "1999-10-19",
+    "whois_registrar": "GoDaddy.com, LLC"
+  },
+  {
+    "dns_a": [
+      "188.40.59.208"
+    ],
+    "dns_aaaa": [
+      "2a01:4f8:172:35ec::2"
+    ],
+    "dns_mx": [
+      "mail.examplel.com"
+    ],
+    "dns_ns": [
+      "b.ns14.net",
+      "c.ns14.net",
+      "d.ns14.net"
+    ],
+    "domain": "examplel.com",
+    "fuzzer": "addition",
+    "whois_created": "2014-10-20",
+    "whois_registrar": "InterNetX GmbH"
+  },
+  {
+    "dns_a": [
+      "3.166.135.116",
+      "3.166.135.13",
+      "3.166.135.56",
+      "3.166.135.71"
+    ],
+    "dns_aaaa": [
+      "2600:9000:279e:7c00:1c:ff28:e5c0:93a1",
+      "2600:9000:279e:8000:1c:ff28:e5c0:93a1",
+      "2600:9000:279e:8600:1c:ff28:e5c0:93a1",
+      "2600:9000:279e:8a00:1c:ff28:e5c0:93a1",
+      "2600:9000:279e:a800:1c:ff28:e5c0:93a1",
+      "2600:9000:279e:b200:1c:ff28:e5c0:93a1",
+      "2600:9000:279e:c00:1c:ff28:e5c0:93a1",
+      "2600:9000:279e:fe00:1c:ff28:e5c0:93a1"
+    ],
+    "domain": "examplu.com",
+    "fuzzer": "bitsquatting",
+    "whois_created": "2026-06-25",
+    "whois_registrar": "Amazon Registrar, Inc."
+  },
+  {
+    "dns_a": [
+      "104.21.23.31",
+      "172.67.208.120"
+    ],
+    "dns_aaaa": [
+      "2606:4700:3030::6815:171f",
+      "2606:4700:3030::ac43:d078"
+    ],
+    "dns_ns": [
+      "irena.ns.cloudflare.com",
+      "kevin.ns.cloudflare.com"
+    ],
+    "domain": "example8.com",
+    "fuzzer": "addition",
+    "whois_created": "2012-03-12",
+    "whois_registrar": "GoDaddy.com, LLC"
+  },
+  {
+    "dns_a": [
+      "104.21.59.130",
+      "172.67.177.133"
+    ],
+    "dns_aaaa": [
+      "2606:4700:3032::6815:3b82",
+      "2606:4700:3036::ac43:b185"
+    ],
+    "dns_ns": [
+      "keira.ns.cloudflare.com",
+      "roman.ns.cloudflare.com"
+    ],
+    "domain": "example6.com",
+    "fuzzer": "addition",
+    "whois_created": "2017-07-29",
+    "whois_registrar": "Cloudflare, Inc."
+  },
+  {
+    "dns_a": [
+      "104.26.14.194",
+      "104.26.15.194",
+      "172.67.72.248"
+    ],
+    "dns_aaaa": [
+      "2606:4700:20::681a:ec2",
+      "2606:4700:20::681a:fc2",
+      "2606:4700:20::ac43:48f8"
+    ],
+    "dns_ns": [
+      "dan.ns.cloudflare.com",
+      "kim.ns.cloudflare.com"
+    ],
+    "domain": "example3.com",
+    "fuzzer": "addition",
+    "whois_created": "2018-10-27",
+    "whois_registrar": "Cloudflare, Inc."
+  },
+  {
+    "dns_a": [
+      "13.223.25.84",
+      "54.243.117.197"
+    ],
+    "dns_aaaa": [
+      "2600:1f18:4ae:c605:dd5d:b838:5816:d7fb",
+      "2600:1f18:4ae:c606:78d4:4260:db4e:aeee"
+    ],
+    "dns_ns": [
+      "nsg1.namebrightdns.com",
+      "nsg2.namebrightdns.com"
+    ],
+    "domain": "example5.com",
+    "fuzzer": "addition",
+    "whois_created": "2019-06-07",
+    "whois_registrar": "TurnCommerce, Inc. DBA NameBright.com"
+  }
+]

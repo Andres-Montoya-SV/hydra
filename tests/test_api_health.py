@@ -36,6 +36,7 @@ class TestHealthEndpointHappyPath:
         assert body["checks"]["scan_worker"] == "ok"
         assert body["checks"]["reconciliation"] == "ok"
         assert body["checks"]["backup"] == "ok"
+        assert body["checks"]["monitoring"] == "ok"
 
     def test_health_requires_no_api_key(self, api_settings: APISettings) -> None:
         with TestClient(create_app(api_settings)) as client:
@@ -71,6 +72,7 @@ class TestHealthCheckPureFunction:
         heartbeats.mark_alive("scan_worker")
         heartbeats.mark_alive("reconciliation")
         heartbeats.mark_alive("backup")
+        heartbeats.mark_alive("monitoring")
 
         healthy, checks = check_health(
             control_db=control_db, heartbeats=heartbeats, api_settings=api_settings
@@ -84,6 +86,7 @@ class TestHealthCheckPureFunction:
         heartbeats = LoopHeartbeats()
         heartbeats.mark_alive("reconciliation")
         heartbeats.mark_alive("backup")
+        heartbeats.mark_alive("monitoring")
         # scan_worker: backdated far past its threshold
         # (max(scan_poll_interval_seconds * 2, 60) — default settings
         # give a 60s floor) — a real elapsed-time comparison, not a
@@ -98,6 +101,7 @@ class TestHealthCheckPureFunction:
         assert "stale" in checks["scan_worker"]
         assert checks["reconciliation"] == "ok"
         assert checks["backup"] == "ok"
+        assert checks["monitoring"] == "ok"
 
     def test_a_loop_that_never_reported_in_is_never_treated_as_healthy_by_default(
         self, api_settings: APISettings
@@ -113,11 +117,12 @@ class TestHealthCheckPureFunction:
         assert checks["scan_worker"] == "never reported alive"
         assert checks["reconciliation"] == "never reported alive"
         assert checks["backup"] == "never reported alive"
+        assert checks["monitoring"] == "never reported alive"
 
     def test_everything_alive_and_recent_is_healthy(self, api_settings: APISettings) -> None:
         control_db = ControlDB(api_settings.control_db_path)
         heartbeats = LoopHeartbeats()
-        for name in ("scan_worker", "reconciliation", "backup"):
+        for name in ("scan_worker", "reconciliation", "backup", "monitoring"):
             heartbeats.mark_alive(name)
 
         healthy, checks = check_health(

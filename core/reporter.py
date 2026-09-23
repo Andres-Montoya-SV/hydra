@@ -174,6 +174,13 @@ class ReportGenerator:
                     for h in soft404_hosts
                 ]
 
+            # Brand-protection signal, deliberately its OWN summary key —
+            # never merged into "hosts"/"high_priority" above. See
+            # core/store.py's typosquat_candidates table comment.
+            typosquat_candidates = store.get_typosquat_candidates(context.run_id)
+            if typosquat_candidates:
+                summary_data["typosquat_candidates"] = typosquat_candidates
+
         invalid_param_hosts = context.metadata.get("param_fuzz_baseline_invalid_hosts") or []
         if invalid_param_hosts:
             summary_data["param_fuzz_baseline_invalid_hosts"] = invalid_param_hosts
@@ -391,6 +398,36 @@ class ReportGenerator:
                         )
                 lines.append("")
 
+            typosquats = store.get_typosquat_candidates(context.run_id)
+            if typosquats:
+                lines.extend(
+                    [
+                        "## 🎭 Brand Protection — Registered Lookalike Domains",
+                        "",
+                        "**These are NOT part of your own infrastructure and are NOT a "
+                        "vulnerability in your systems.** Each row below is a separate, "
+                        "third-party domain — a typosquat/homoglyph/lookalike of your own "
+                        "domain that someone else has registered. Most registered "
+                        "lookalikes are unrelated, harmless businesses; the signals below "
+                        "(an email server configured, a very recent registration) flag "
+                        "which ones are worth a closer look for phishing/brand-"
+                        "impersonation risk — not target-infrastructure findings.",
+                        "",
+                        "| Lookalike Domain | Risk | Why | Registrar | Registered |",
+                        "|-------------------|------|-----|-----------|-------------|",
+                    ]
+                )
+                for t in sorted(
+                    typosquats,
+                    key=lambda t: {"high": 0, "medium": 1, "low": 2}.get(str(t.get("severity")), 3),
+                )[:30]:
+                    lines.append(
+                        f"| `{t.get('candidate_domain')}` | {t.get('severity')} | "
+                        f"{t.get('risk_reason', '')} | {t.get('whois_registrar') or '—'} | "
+                        f"{t.get('whois_created') or '—'} |"
+                    )
+                lines.append("")
+
         elif context.httpx_results:
             lines.extend(
                 [
@@ -513,6 +550,7 @@ class ReportGenerator:
         html_parts.extend(self._executive_summary_html(context, summary, store))
         html_parts.extend(self._intel_correlation_html(context, store, invalidated_hosts))
         html_parts.extend(self._host_projection_clusters_html(context, store))
+        html_parts.extend(self._typosquat_candidates_html(context, store))
         html_parts.extend(
             [
                 "  <h2>Assets</h2>",
@@ -793,6 +831,8 @@ class ReportGenerator:
             ("theharvester_findings.jsonl", "email-exposure"),
             ("theharvester_findings.jsonl", "personnel-exposure"),
             ("ffuf_findings.jsonl", "hidden-endpoint-discovered"),
+            ("github_secrets.jsonl", "leaked-secret"),
+            ("sub_takeover.jsonl", "subdomain-takeover"),
         )
         for filename, template_id in mapping:
             path = output_dir / filename
@@ -1049,6 +1089,46 @@ class ReportGenerator:
         for cluster in sorted(clusters, key=lambda c: -len(c.members))[:15]:
             parts.append(f"    <li>{escape_html(_format_cluster(cluster))}</li>")
         parts.append("  </ul>")
+        return parts
+
+    def _typosquat_candidates_html(
+        self, context: PipelineContext, store: AssetStore | None
+    ) -> list[str]:
+        if not (store and context.run_id):
+            return []
+        getter = getattr(store, "get_typosquat_candidates", None)
+        if not callable(getter):
+            return []
+        candidates = getter(context.run_id)
+        if not candidates:
+            return []
+        parts = [
+            "  <h2>🎭 Brand Protection — Registered Lookalike Domains</h2>",
+            "  <p class='muted'><strong>These are NOT part of your own infrastructure "
+            "and are NOT a vulnerability in your systems.</strong> Each row is a "
+            "separate, third-party domain — a typosquat/homoglyph/lookalike of your "
+            "own domain someone else has registered. Most are unrelated, harmless "
+            "businesses; the risk column flags which ones show real phishing/brand-"
+            "impersonation signals (an email server configured, a very recent "
+            "registration) — never a target-infrastructure finding.</p>",
+            "  <table>",
+            "    <tr><th>Lookalike Domain</th><th>Risk</th><th>Why</th>"
+            "<th>Registrar</th><th>Registered</th></tr>",
+        ]
+        severity_order = {"high": 0, "medium": 1, "low": 2}
+        for c in sorted(candidates, key=lambda c: severity_order.get(str(c.get("severity")), 3))[
+            :50
+        ]:
+            parts.append(
+                f"    <tr data-risk='{escape_html(str(c.get('severity') or ''))}'>"
+                f"<td>{escape_html(str(c.get('candidate_domain') or ''))}</td>"
+                f"<td>{escape_html(str(c.get('severity') or ''))}</td>"
+                f"<td>{escape_html(str(c.get('risk_reason') or ''))}</td>"
+                f"<td>{escape_html(str(c.get('whois_registrar') or '—'))}</td>"
+                f"<td>{escape_html(str(c.get('whois_created') or '—'))}</td>"
+                "</tr>"
+            )
+        parts.append("  </table>")
         return parts
 
 

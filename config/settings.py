@@ -196,6 +196,8 @@ class Settings:
     sslyze_path: Path = field(default_factory=lambda: Path("sslyze"))
     wafw00f_path: Path = field(default_factory=lambda: Path("wafw00f"))
     ffuf_path: Path = field(default_factory=lambda: Path("ffuf"))
+    dnstwist_path: Path = field(default_factory=lambda: Path("dnstwist"))
+    gitleaks_path: Path = field(default_factory=lambda: Path("gitleaks"))
 
     # Execution
     timeout: int = 300
@@ -273,6 +275,9 @@ class Settings:
     # Active cloud bucket enumeration (opt-in).
     cloud_bucket_enum_timeout: int = 10
     cloud_bucket_enum_delay_ms: int = 150
+    # Active subdomain takeover confirmation (opt-in). Only fingerprint-type
+    # signatures ever make a request; see modules/sub_takeover.py.
+    sub_takeover_timeout: int = 10
     strict_opsec: bool = False
     outbound_proxy_url: str | None = None
 
@@ -310,6 +315,12 @@ class Settings:
     enable_theharvester: bool = False
     enable_sslyze: bool = False
     enable_wafw00f: bool = False
+    # Off by default. Passive with respect to the TARGET (never connects to
+    # the target's own infrastructure), but a real third-party API/clone/
+    # scan integration — see modules/github_secrets.py.
+    enable_github_secrets: bool = False
+    # Off by default like every other active opt-in probe above.
+    enable_sub_takeover: bool = False
     theharvester_timeout: int = 180
     sslyze_timeout: int = 120
     wafw00f_timeout: int = 60
@@ -330,6 +341,33 @@ class Settings:
     ffuf_threads: int = 20
     ffuf_max_time_per_host: int = 120
     ffuf_max_hosts: int = 10
+    # Off by default. Passive with respect to the TARGET (never sends the
+    # target org's own domains any traffic) — see modules/dnstwist.py for
+    # why candidate DNS/WHOIS lookups are in scope but active content
+    # fetching of a candidate (dnstwist's own -b/-p/--lsh flags) is not.
+    enable_dnstwist: bool = False
+    dnstwist_timeout: int = 180
+    dnstwist_threads: int = 20
+    # A registered permutation younger than this is flagged as
+    # "freshly registered" — a real, if imperfect, phishing-setup signal.
+    dnstwist_fresh_registration_days: int = 90
+    gitleaks_timeout: int = 120
+    # GitHub org/repo discovery + secret scanning (modules/github_secrets.py).
+    # github_org, when set, is ALWAYS preferred over automatic discovery —
+    # see that module's own docstring for why automatic discovery is
+    # inherently best-effort. github_token unlocks GitHub's code-search API
+    # (required by GitHub for that endpoint even for public code — confirmed
+    # against GitHub's own current REST API docs) for the fallback
+    # discovery path; without it, only an explicitly supplied github_org can
+    # be used (its public repos are listable unauthenticated).
+    github_org: str | None = None
+    github_token: str | None = None
+    # A full, unbounded clone of every discovered repo's entire history
+    # could be arbitrarily expensive — bounded by default, a real, stated
+    # tradeoff against historical-commit coverage, not a hidden limitation.
+    github_secrets_clone_depth: int = 50
+    github_secrets_max_repos: int = 5
+    github_secrets_include_forks: bool = False
     vuln_match_timeout: int = 15
     wpscan_api_token: str | None = None
     scope_file: Path | None = None
@@ -497,6 +535,8 @@ class Settings:
             theharvester_path=_safe_path(os.getenv("THEHARVESTER_PATH", ""), "theHarvester"),
             sslyze_path=_safe_path(os.getenv("SSLYZE_PATH", ""), "sslyze"),
             wafw00f_path=_safe_path(os.getenv("WAFW00F_PATH", ""), "wafw00f"),
+            dnstwist_path=_safe_path(os.getenv("DNSTWIST_PATH", ""), "dnstwist"),
+            gitleaks_path=_safe_path(os.getenv("GITLEAKS_PATH", ""), "gitleaks"),
             timeout=_int(os.getenv("TIMEOUT"), 300, "TIMEOUT"),
             threads=_int(os.getenv("THREADS"), 50, "THREADS"),
             rate_limit=_int(os.getenv("RATE_LIMIT"), 150, "RATE_LIMIT"),
@@ -612,6 +652,9 @@ class Settings:
                 "CLOUD_BUCKET_ENUM_DELAY_MS",
                 maximum=5000,
             ),
+            sub_takeover_timeout=_int(
+                os.getenv("SUB_TAKEOVER_TIMEOUT"), 10, "SUB_TAKEOVER_TIMEOUT"
+            ),
             strict_opsec=_bool(os.getenv("STRICT_OPSEC")),
             outbound_proxy_url=_optional_proxy_url(os.getenv("OUTBOUND_PROXY_URL", "").strip()),
             enable_amass=_bool(os.getenv("ENABLE_AMASS")),
@@ -641,6 +684,8 @@ class Settings:
             enable_theharvester=_bool(os.getenv("ENABLE_THEHARVESTER")),
             enable_sslyze=_bool(os.getenv("ENABLE_SSLYZE")),
             enable_wafw00f=_bool(os.getenv("ENABLE_WAFW00F")),
+            enable_github_secrets=_bool(os.getenv("ENABLE_GITHUB_SECRETS")),
+            enable_sub_takeover=_bool(os.getenv("ENABLE_SUB_TAKEOVER")),
             theharvester_timeout=_int(
                 os.getenv("THEHARVESTER_TIMEOUT"), 180, "THEHARVESTER_TIMEOUT"
             ),
@@ -656,6 +701,30 @@ class Settings:
                 os.getenv("FFUF_MAX_TIME_PER_HOST"), 120, "FFUF_MAX_TIME_PER_HOST", maximum=3600
             ),
             ffuf_max_hosts=_int(os.getenv("FFUF_MAX_HOSTS"), 10, "FFUF_MAX_HOSTS", maximum=100),
+            enable_dnstwist=_bool(os.getenv("ENABLE_DNSTWIST")),
+            dnstwist_timeout=_int(os.getenv("DNSTWIST_TIMEOUT"), 180, "DNSTWIST_TIMEOUT"),
+            dnstwist_threads=_int(
+                os.getenv("DNSTWIST_THREADS"), 20, "DNSTWIST_THREADS", maximum=100
+            ),
+            dnstwist_fresh_registration_days=_int(
+                os.getenv("DNSTWIST_FRESH_REGISTRATION_DAYS"),
+                90,
+                "DNSTWIST_FRESH_REGISTRATION_DAYS",
+                maximum=3650,
+            ),
+            gitleaks_timeout=_int(os.getenv("GITLEAKS_TIMEOUT"), 120, "GITLEAKS_TIMEOUT"),
+            github_org=os.getenv("GITHUB_ORG", "").strip() or None,
+            github_token=os.getenv("GITHUB_TOKEN", "").strip() or None,
+            github_secrets_clone_depth=_int(
+                os.getenv("GITHUB_SECRETS_CLONE_DEPTH"),
+                50,
+                "GITHUB_SECRETS_CLONE_DEPTH",
+                maximum=10_000,
+            ),
+            github_secrets_max_repos=_int(
+                os.getenv("GITHUB_SECRETS_MAX_REPOS"), 5, "GITHUB_SECRETS_MAX_REPOS", maximum=50
+            ),
+            github_secrets_include_forks=_bool(os.getenv("GITHUB_SECRETS_INCLUDE_FORKS")),
             vuln_match_timeout=_int(os.getenv("VULN_MATCH_TIMEOUT"), 15, "VULN_MATCH_TIMEOUT"),
             wpscan_api_token=os.getenv("WPSCAN_API_TOKEN", "").strip() or None,
             scope_file=_optional_scope_file(os.getenv("SCOPE_FILE", "").strip()),
@@ -1053,6 +1122,8 @@ class Settings:
             "sslyze": self.sslyze_path,
             "wafw00f": self.wafw00f_path,
             "ffuf": self.ffuf_path,
+            "dnstwist": self.dnstwist_path,
+            "gitleaks": self.gitleaks_path,
         }
 
     def to_safe_dict(self) -> dict[str, Any]:
@@ -1101,6 +1172,9 @@ class Settings:
                     ("sslyze", self.enable_sslyze),
                     ("wafw00f", self.enable_wafw00f),
                     ("ffuf", self.enable_ffuf),
+                    ("dnstwist", self.enable_dnstwist),
+                    ("github_secrets", self.enable_github_secrets),
+                    ("sub_takeover", self.enable_sub_takeover),
                 ]
                 if enabled
             ],
@@ -1115,6 +1189,8 @@ class Settings:
             "has_webhook": self.webhook_url is not None,
             "has_scope_file": self.scope_file is not None,
             "has_wpscan_token": self.wpscan_api_token is not None,
+            "has_github_token": self.github_token is not None,
+            "github_org": self.github_org,
             "has_securitytrails_key": self.securitytrails_api_key is not None,
             "has_anthropic_key": self.anthropic_api_key is not None,
             "anthropic_model": self.anthropic_model,
