@@ -22,6 +22,7 @@ from api.backup_worker import run_backup_loop
 from api.control_db import ControlDB
 from api.email_sender import ConsoleEmailSender, EmailSender, PostmarkEmailSender
 from api.health import LoopHeartbeats
+from api.monitoring_worker import run_monitoring_loop
 from api.observability import configure_logging, init_sentry
 from api.rate_limit import PersistentTokenBucketLimiter
 from api.reconciliation_worker import run_reconciliation_loop
@@ -31,6 +32,7 @@ from api.routers import (
     health,
     hypotheses,
     keys,
+    monitoring,
     reportability,
     scans,
     subscription,
@@ -176,11 +178,34 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             "on" if settings.backup_s3_bucket else "off",
         )
 
+        # Continuous monitoring's own periodic loop — same shared-
+        # stop_event, independent-interval shape as reconciliation/backup
+        # above. See api/monitoring_worker.py's own module docstring for
+        # the full two-speed/harvest-then-enqueue design.
+        monitoring_task = asyncio.create_task(
+            run_monitoring_loop(
+                api_settings=settings,
+                control_db=app.state.control_db,
+                email_sender=email_sender,
+                stop_event=stop_event,
+                heartbeats=app.state.loop_heartbeats,
+            )
+        )
+        logger.info(
+            "Continuous monitoring loop started (poll_interval=%.0fs, passive_cadence=%dh, "
+            "active_cadence=%dh, asset_ceiling=%d).",
+            settings.monitoring_poll_interval_seconds,
+            settings.monitoring_passive_interval_hours,
+            settings.monitoring_active_interval_hours,
+            settings.monitoring_asset_count_ceiling,
+        )
+
         yield
         stop_event.set()
         await worker_task
         await reconciliation_task
         await backup_task
+        await monitoring_task
 
     app = FastAPI(
         title="Hydra EASM API",
@@ -219,6 +244,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(accounts.router)
     app.include_router(keys.router)
     app.include_router(domains.router)
+    app.include_router(monitoring.router)
     app.include_router(scans.router)
     app.include_router(reportability.router)
     app.include_router(hypotheses.router)
