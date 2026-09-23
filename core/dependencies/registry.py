@@ -270,6 +270,13 @@ _register(
 
 _register(
     ToolDefinition(
+        name="ffuf",
+        display_name="ffuf",
+        version_commands=(("-V",),),
+        health_commands=(("-h",),),
+        capabilities=frozenset({"content_discovery", "endpoint_fuzzing"}),
+        install_homebrew="ffuf",
+        install_go="github.com/ffuf/ffuf/v2@latest",
         name="dnstwist",
         display_name="dnstwist",
         version_commands=(("--version",),),

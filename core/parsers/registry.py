@@ -1527,6 +1527,13 @@ class Wafw00fParser(ToolParser):
         return list(by_host.values()), []
 
 
+class FfufParser(ToolParser):
+    """Hidden endpoint/content discovery findings (modules/ffuf.py) — a
+    real finding on the target's own infrastructure (unlike
+    modules/dnstwist.py's typosquat candidates), so it lands in the
+    ordinary Host/Finding model like every other active-probe module."""
+
+    tool_name = "ffuf"
 class GithubSecretsParser(ToolParser):
     """Leaked-secret findings from public GitHub repos
     (modules/github_secrets.py). The raw secret value is never present
@@ -1546,6 +1553,7 @@ class SubTakeoverParser(ToolParser):
     def parse(
         self, output_dir: Path, *, artifact: Path | None = None, run_id: str = ""
     ) -> tuple[list[Host], list[str]]:
+        path = artifact or output_dir / "ffuf_findings.jsonl"
         path = artifact or output_dir / "github_secrets.jsonl"
         path = artifact or output_dir / "sub_takeover.jsonl"
         by_host: dict[str, Host] = {}
@@ -1556,6 +1564,13 @@ class SubTakeoverParser(ToolParser):
             host = by_host.setdefault(domain, Host(domain=domain))
             finding = Finding(
                 host=domain,
+                template_id=str(record.get("template_id") or "hidden-endpoint-discovered"),
+                severity=str(record.get("severity") or "low"),
+                name=str(record.get("name") or ""),
+                source="ffuf",
+                url=record.get("url") if isinstance(record.get("url"), str) else None,
+                description=str(record.get("description") or ""),
+                confidence_score=int(record.get("confidence_score") or 50),
                 template_id=str(record.get("template_id") or "leaked-secret"),
                 severity=str(record.get("severity") or "medium"),
                 name=str(record.get("name") or ""),
@@ -1605,6 +1620,7 @@ PARSER_REGISTRY: dict[str, ToolParser] = {
         TheHarvesterParser(),
         SslyzeParser(),
         Wafw00fParser(),
+        FfufParser(),
         GithubSecretsParser(),
         SubTakeoverParser(),
     ]

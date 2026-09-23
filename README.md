@@ -99,6 +99,7 @@ flowchart TD
     Wildcard --> Dnsx["dnsx: resolve subdomains -> resolved.txt"]
     Dnsx --> AsnNaabu["asn_lookup, naabu -> port_verify"]
     AsnNaabu --> Httpx["httpx: probe resolved hosts\n(each redirect hop re-authorized)"]
+    Httpx --> Optional["Optional/enrichment stage, concurrent:\nctlogs, katana, hakrawler, gau, waybackurls, unfurl,\nnuclei, soft404_check, param_fuzz, cloud_bucket_enum,\nthreat_intel, vuln_match, security_headers,\ntheharvester, sslyze, wafw00f, ffuf"]
     Httpx --> Optional["Optional/enrichment stage, concurrent:\nctlogs, katana, hakrawler, gau, waybackurls, unfurl,\nnuclei, soft404_check, param_fuzz, cloud_bucket_enum,\nthreat_intel, vuln_match, security_headers,\ntheharvester, sslyze, wafw00f, dnstwist"]
     Httpx --> Optional["Optional/enrichment stage, concurrent:\nctlogs, katana, hakrawler, gau, waybackurls, unfurl,\nnuclei, soft404_check, param_fuzz, cloud_bucket_enum,\nthreat_intel, vuln_match, security_headers,\ntheharvester, sslyze, wafw00f, github_secrets, sub_takeover"]
     Optional --> Gateway{{"CollectionGateway / ScopeEnforcingProxy\nevery tool-issued connection re-authorized\nat the socket, not just the input file"}}
@@ -387,6 +388,32 @@ Hydra can run, as a "head"):
 Note: `amass` shows `Active: no` here too — this environment simply
 doesn't have it installed, unrelated to this task.
 
+`ffuf` (`modules/ffuf.py`, `ENABLE_FFUF`) is hidden endpoint/content
+discovery — the same authorization posture as `param_fuzz.py`
+(disabled by default), but for **paths**, not parameters. `katana`
+crawls links a real page contains; `gau`/`waybackurls` pull from
+historical archives; a path that was never linked and never archived —
+an old admin panel, a `.git/` left behind by a deploy, a stray backup
+file — is invisible to both. This closes that gap with a deliberately
+small, hand-curated ~180-entry wordlist (`modules/data/
+ffuf_wordlist_quick.txt`, not SecLists' `raft-large`;
+`FFUF_WORDLIST_PATH` opts into a bigger one), combined with `-e
+.bak,.old,.zip,.sql` for ~900 real requests per host. False-positive
+handling is layered, not reinvented: `ffuf`'s own `-ac` auto-
+calibration (confirmed by real testing to correctly zero out a genuine
+catch-all server while keeping a real hit on a normal one) runs on
+every host, and any host `modules/soft404_check.py` already flagged as
+returning HTTP 200 for nonexistent paths is skipped entirely rather
+than re-testing the same fact. Real, enforced ceilings, not just
+configured ones: `ffuf`'s own `-rate`/`-maxtime-job` flags (confirmed
+by testing that a run genuinely stops early, not merely accepts the
+flag) cap each host at 120 seconds by default, and `FFUF_MAX_HOSTS`
+(default 10) bounds the whole run. A `.git`/`.env`/credential-shaped hit
+is `critical`; an admin/management panel is `high`; a merely-genuine
+but unremarkable 200 is `low`; universally-expected files like
+`robots.txt` are excluded entirely — the task's own example, made
+structural rather than left as an undifferentiated list of "things ffuf
+found."
 `dnstwist` (`modules/dnstwist.py`, `ENABLE_DNSTWIST`) is a **brand-
 protection signal, not a target-infrastructure vulnerability** — worth
 stating plainly here, not just in a docstring. It generates typosquat/

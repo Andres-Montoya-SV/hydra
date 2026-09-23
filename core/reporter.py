@@ -830,6 +830,7 @@ class ReportGenerator:
             ("sslyze_findings.jsonl", "tls-expired-certificate"),
             ("theharvester_findings.jsonl", "email-exposure"),
             ("theharvester_findings.jsonl", "personnel-exposure"),
+            ("ffuf_findings.jsonl", "hidden-endpoint-discovered"),
             ("github_secrets.jsonl", "leaked-secret"),
             ("sub_takeover.jsonl", "subdomain-takeover"),
         )

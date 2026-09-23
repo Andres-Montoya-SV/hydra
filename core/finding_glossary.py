@@ -59,6 +59,16 @@ FINDING_GLOSSARY: dict[str, dict[str, str]] = {
         "what": "A brand-derived cloud bucket returned a public object listing.",
         "why": "Public listings often leak sensitive files; treat as high priority.",
     },
+    "hidden-endpoint-discovered": {
+        "what": (
+            "A wordlist-brute-forced path responded live — never surfaced by "
+            "crawling or historical archives, so nothing links to it."
+        ),
+        "why": (
+            "Forgotten admin panels, backup files, and version-control "
+            "directories are frequently left behind after a deploy; severity "
+            "depends on what was found (a .git/.env leak is critical, a "
+            "generic 200 on an obscure path is lower priority)."
     "leaked-secret": {
         "what": (
             "gitleaks matched a credential pattern in a public GitHub "
