@@ -277,6 +277,21 @@ _register(
         capabilities=frozenset({"typosquat_detection"}),
         install_homebrew="dnstwist",
         install_pip="dnstwist",
+        name="gitleaks",
+        display_name="gitleaks",
+        version_commands=(("version",),),
+        health_commands=(("--help",),),
+        capabilities=frozenset({"secret_scanning"}),
+        install_homebrew="gitleaks",
+        # Real, verified gotcha (confirmed by actually running `go install`,
+        # not assumed): the project moved from zricethezav/gitleaks to the
+        # gitleaks org on GitHub, but its go.mod still declares the module
+        # path under the OLD owner — `go install
+        # github.com/gitleaks/gitleaks/v8@...` fails with a "version
+        # constraints conflict" error; the real, current working path is
+        # still `github.com/zricethezav/gitleaks/v8@...`. See
+        # modules/github_secrets.py's own docstring.
+        install_go="github.com/zricethezav/gitleaks/v8@latest",
     )
 )
 

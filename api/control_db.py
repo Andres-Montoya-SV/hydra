@@ -24,6 +24,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Literal
 
 from core.store import connect_sqlite
 
@@ -76,6 +77,15 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_account_id ON api_keys(account_id);
 -- and reasoning. A fresh DB gets these columns directly from this
 -- CREATE TABLE; an existing `control.db` from an earlier round gets
 -- them via `_migrate_table_columns` below.
+-- `trigger_source` (continuous-monitoring task): 'manual' (a real
+-- `POST /scans` call — the default, and the only value that ever existed
+-- before this column) vs 'scheduled_passive'/'scheduled_active' (the
+-- monitoring loop auto-queued this one). Every scan goes through this
+-- SAME table/queue/worker regardless of trigger — monitoring invents no
+-- second execution path — this column only records WHY a row exists, so
+-- `api/scan_orchestrator.py::execute_scan` knows whether to run the full
+-- pipeline or the passive-only plugin subset, and so a client listing its
+-- own scan history can tell which ones it asked for.
 CREATE TABLE IF NOT EXISTS scans (
     scan_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(account_id),
@@ -87,7 +97,8 @@ CREATE TABLE IF NOT EXISTS scans (
     updated_at TEXT NOT NULL,
     retry_count INTEGER NOT NULL DEFAULT 0,
     worker_id TEXT,
-    heartbeat_at TEXT
+    heartbeat_at TEXT,
+    trigger_source TEXT NOT NULL DEFAULT 'manual'
 );
 CREATE INDEX IF NOT EXISTS idx_scans_account_id ON scans(account_id);
 CREATE INDEX IF NOT EXISTS idx_scans_status ON scans(status);
@@ -151,6 +162,84 @@ CREATE TABLE IF NOT EXISTS domain_verifications (
 CREATE INDEX IF NOT EXISTS idx_domain_verifications_domain ON domain_verifications(domain);
 CREATE INDEX IF NOT EXISTS idx_domain_verifications_account
     ON domain_verifications(account_id, domain);
+
+-- Continuous monitoring ("Hydra API — Continuous Monitoring for Verified
+-- Domains" task). One row per (account, domain) the account has opted
+-- into monitoring for — never created implicitly by verifying a domain,
+-- always an explicit `POST /domains/{domain}/monitoring`. `speed2_enabled`
+-- is the separate, tier-gated opt-in for the weekly ACTIVE deep-scan;
+-- Speed 1 (daily passive re-scan) is implied by the row's mere existence
+-- and is never tier-gated (see docs/PAID_API_DESIGN.md's dated monitoring
+-- section for why: it reuses only genuinely-passive-source plugins, so
+-- its marginal cost/risk per account is small enough not to need a
+-- ceiling of its own beyond the account's overall scan quota, which
+-- Speed 2 scans DO consume).
+--
+-- `next_passive_due_at`/`next_active_due_at` are this table's own
+-- checkpoint: the monitoring loop only ever selects rows whose due
+-- timestamp has passed, and advances it (to "now + cadence") as the
+-- LAST step of successfully processing that row — so a cycle interrupted
+-- partway through (crash, restart, time-budget exhausted) simply leaves
+-- not-yet-processed rows' due timestamps unchanged, and the same or next
+-- cycle picks them up again, identically to a domain that was never
+-- attempted this cycle at all. No separate checkpoint/offset table is
+-- needed for this idempotency.
+--
+-- `last_asset_digest`/`last_asset_count` are the lightweight diff key
+-- (a hash of the sorted hostname set from the domain's last scan, not
+-- the full Host/Finding rows) — cheap enough to hold for every monitored
+-- domain even at real scale, so "did anything change" never requires
+-- re-reading a large account's entire recon.db on every cycle.
+-- `needs_review` is Part B's asset-count sanity ceiling
+-- (HYDRA_API_MONITORING_ASSET_CEILING): set when a scan's host count
+-- jumps past the ceiling without wildcard DNS explaining it — skips
+-- auto-diff/notify for that domain until an operator/account clears it,
+-- rather than either silently notifying on (likely-garbage) wildcard
+-- noise or silently dropping the domain from monitoring altogether.
+-- `status` is one of 'active' (normal), 'paused_verification_lapsed'
+-- (Part A verification expired — monitoring pauses, not deletes, and
+-- resumes automatically once re-verified), 'needs_review' (asset-count
+-- ceiling tripped).
+-- `pending_passive_scan_id`/`pending_active_scan_id`: set the moment the
+-- monitoring loop enqueues a scheduled scan for this domain (Phase 1,
+-- "enqueue"), cleared the moment that scan's result is harvested back
+-- into this row (Phase 2, "harvest" — `next_*_due_at` only advances at
+-- harvest time, never at enqueue time). This two-phase split, and the
+-- pending marker that makes it possible, is what keeps a domain whose
+-- scan takes hours from being re-enqueued every single poll cycle while
+-- it's still in flight: `list_due_*_monitoring_page` only ever selects
+-- rows where the relevant pending column is NULL.
+CREATE TABLE IF NOT EXISTS monitored_domains (
+    monitoring_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(account_id),
+    domain TEXT NOT NULL,
+    speed2_enabled INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    last_passive_scan_id TEXT,
+    last_active_scan_id TEXT,
+    last_passive_run_at TEXT,
+    last_active_run_at TEXT,
+    next_passive_due_at TEXT NOT NULL,
+    next_active_due_at TEXT,
+    pending_passive_scan_id TEXT,
+    pending_active_scan_id TEXT,
+    last_asset_digest TEXT,
+    last_asset_count INTEGER,
+    needs_review INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (account_id, domain)
+);
+-- The monitoring loop's own read pattern is always "rows due now,
+-- oldest-due first" — this composite index (due timestamp leading) is
+-- what keeps `list_due_passive_monitoring_page`/
+-- `list_due_active_monitoring_page`'s keyset pagination a real index
+-- range scan at 300k+ rows, never a full-table scan with a sort step.
+CREATE INDEX IF NOT EXISTS idx_monitored_domains_passive_due
+    ON monitored_domains(next_passive_due_at, monitoring_id);
+CREATE INDEX IF NOT EXISTS idx_monitored_domains_active_due
+    ON monitored_domains(next_active_due_at, monitoring_id);
+CREATE INDEX IF NOT EXISTS idx_monitored_domains_account ON monitored_domains(account_id);
 
 -- Part B (docs/PAID_API_DESIGN.md, Round 3) tier/subscription state. One
 -- row per account, created at account-creation time defaulting to
@@ -327,6 +416,7 @@ class ScanRecord:
     retry_count: int
     worker_id: str | None
     heartbeat_at: str | None
+    trigger_source: str
 
 
 @dataclass(frozen=True)
@@ -365,6 +455,28 @@ class CostEstimateRecord:
     created_at: str
     expires_at: str
     consumed_at: str | None
+
+
+@dataclass(frozen=True)
+class MonitoredDomainRecord:
+    monitoring_id: str
+    account_id: str
+    domain: str
+    speed2_enabled: bool
+    status: str
+    last_passive_scan_id: str | None
+    last_active_scan_id: str | None
+    last_passive_run_at: str | None
+    last_active_run_at: str | None
+    next_passive_due_at: str
+    next_active_due_at: str | None
+    pending_passive_scan_id: str | None
+    pending_active_scan_id: str | None
+    last_asset_digest: str | None
+    last_asset_count: int | None
+    needs_review: bool
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -407,6 +519,7 @@ _SCANS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ("worker_id", "TEXT"),
     ("heartbeat_at", "TEXT"),
+    ("trigger_source", "TEXT NOT NULL DEFAULT 'manual'"),
 )
 
 # White-label client report fix: an existing `subscriptions` table
@@ -714,14 +827,23 @@ class ControlDB:
 
     # --- scans ----------------------------------------------------------
 
-    def create_scan(self, *, scan_id: str, account_id: str, domain: str, db_path: str) -> None:
+    def create_scan(
+        self,
+        *,
+        scan_id: str,
+        account_id: str,
+        domain: str,
+        db_path: str,
+        trigger_source: str = "manual",
+    ) -> None:
         now = _now_iso()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO scans "
-                "(scan_id, account_id, domain, db_path, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, 'queued', ?, ?)",
-                (scan_id, account_id, domain, db_path, now, now),
+                "(scan_id, account_id, domain, db_path, status, created_at, updated_at, "
+                "trigger_source) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
+                (scan_id, account_id, domain, db_path, now, now, trigger_source),
             )
 
     def update_scan_status(
@@ -973,6 +1095,300 @@ class ControlDB:
                 "AND status IN ('pending', 'verified')",
                 (account_id, domain, keep_verification_id),
             )
+
+    # --- continuous monitoring -------------------------------------------
+
+    def create_or_update_monitored_domain(
+        self,
+        *,
+        account_id: str,
+        domain: str,
+        speed2_enabled: bool,
+        passive_interval_hours: int,
+        active_interval_hours: int,
+    ) -> MonitoredDomainRecord:
+        """Idempotent opt-in/settings-change entry point for
+        `POST /domains/{domain}/monitoring` — a second call for the same
+        (account, domain) updates `speed2_enabled` in place rather than
+        erroring or creating a duplicate row (the table's own UNIQUE
+        constraint would reject a duplicate insert anyway; this makes the
+        common "toggle speed2 on/off" case a normal, expected call rather
+        than a delete-then-recreate dance). Re-enabling `speed2_enabled`
+        after it was off schedules the next active scan a full cadence
+        out from now, not immediately — the client just asked to start
+        monitoring, not to force an immediate scan (POST /scans already
+        exists for that)."""
+        now = _now_iso()
+        next_passive_due_at = (
+            datetime.now(timezone.utc) + timedelta(hours=passive_interval_hours)
+        ).isoformat()
+        next_active_due_at = (
+            (datetime.now(timezone.utc) + timedelta(hours=active_interval_hours)).isoformat()
+            if speed2_enabled
+            else None
+        )
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM monitored_domains WHERE account_id = ? AND domain = ?",
+                (account_id, domain),
+            ).fetchone()
+            if existing is None:
+                monitoring_id = secrets.token_hex(16)
+                conn.execute(
+                    "INSERT INTO monitored_domains "
+                    "(monitoring_id, account_id, domain, speed2_enabled, status, "
+                    "next_passive_due_at, next_active_due_at, needs_review, created_at, "
+                    "updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?, 0, ?, ?)",
+                    (
+                        monitoring_id,
+                        account_id,
+                        domain,
+                        int(speed2_enabled),
+                        next_passive_due_at,
+                        next_active_due_at,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                monitoring_id = existing["monitoring_id"]
+                # Only `next_active_due_at` is (re)armed here, and only
+                # when speed2 was OFF and is now being turned ON — a
+                # domain already being actively monitored keeps its
+                # existing schedule rather than getting pushed back out
+                # every time the client re-POSTs the same settings.
+                set_next_active = speed2_enabled and not existing["speed2_enabled"]
+                conn.execute(
+                    "UPDATE monitored_domains SET speed2_enabled = ?, "
+                    "next_active_due_at = CASE WHEN ? THEN ? ELSE next_active_due_at END, "
+                    "updated_at = ? WHERE monitoring_id = ?",
+                    (
+                        int(speed2_enabled),
+                        int(set_next_active),
+                        next_active_due_at,
+                        now,
+                        monitoring_id,
+                    ),
+                )
+            row = conn.execute(
+                "SELECT * FROM monitored_domains WHERE monitoring_id = ?", (monitoring_id,)
+            ).fetchone()
+        return _monitored_domain_record_from_row(row)
+
+    def get_monitored_domain(self, account_id: str, domain: str) -> MonitoredDomainRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM monitored_domains WHERE account_id = ? AND domain = ?",
+                (account_id, domain),
+            ).fetchone()
+        return None if row is None else _monitored_domain_record_from_row(row)
+
+    def list_monitored_domains_for_account(self, account_id: str) -> list[MonitoredDomainRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM monitored_domains WHERE account_id = ? ORDER BY domain",
+                (account_id,),
+            ).fetchall()
+        return [_monitored_domain_record_from_row(row) for row in rows]
+
+    def delete_monitored_domain(self, account_id: str, domain: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM monitored_domains WHERE account_id = ? AND domain = ?",
+                (account_id, domain),
+            )
+        return cursor.rowcount > 0
+
+    def set_monitoring_status(
+        self, monitoring_id: str, status: str, *, needs_review: bool | None = None
+    ) -> None:
+        with self._connect() as conn:
+            if needs_review is None:
+                conn.execute(
+                    "UPDATE monitored_domains SET status = ?, updated_at = ? "
+                    "WHERE monitoring_id = ?",
+                    (status, _now_iso(), monitoring_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE monitored_domains SET status = ?, needs_review = ?, updated_at = ? "
+                    "WHERE monitoring_id = ?",
+                    (status, int(needs_review), _now_iso(), monitoring_id),
+                )
+
+    def list_due_passive_monitoring_page(
+        self, *, due_before: str, cursor: tuple[str, str] | None, limit: int
+    ) -> list[MonitoredDomainRecord]:
+        """Keyset pagination (never OFFSET) over every row whose
+        `next_passive_due_at` has already passed — `cursor` is the
+        `(next_passive_due_at, monitoring_id)` of the last row the
+        PREVIOUS page returned; passing it again re-scans the same
+        `idx_monitored_domains_passive_due` index range starting just
+        past that row, an O(page size) operation regardless of how many
+        pages came before it or how large the table has grown (an OFFSET
+        of 250,000 would instead force SQLite to walk and discard a
+        quarter-million rows on every single page). `None` starts from
+        the beginning of the due set. This is a READ ONLY operation — a
+        row is not "claimed" by being returned here, unlike
+        `claim_next_queued_scan`'s scan-queue equivalent; the caller
+        advances `next_passive_due_at` itself, per-row, only after that
+        row's work actually succeeds (see `batch_record_monitoring_progress`)."""
+        with self._connect() as conn:
+            if cursor is None:
+                rows = conn.execute(
+                    "SELECT * FROM monitored_domains WHERE "
+                    "pending_passive_scan_id IS NULL AND next_passive_due_at <= ? "
+                    "ORDER BY next_passive_due_at, monitoring_id LIMIT ?",
+                    (due_before, limit),
+                ).fetchall()
+            else:
+                cursor_due_at, cursor_id = cursor
+                rows = conn.execute(
+                    "SELECT * FROM monitored_domains WHERE "
+                    "pending_passive_scan_id IS NULL AND next_passive_due_at <= ? "
+                    "AND (next_passive_due_at, monitoring_id) > (?, ?) "
+                    "ORDER BY next_passive_due_at, monitoring_id LIMIT ?",
+                    (due_before, cursor_due_at, cursor_id, limit),
+                ).fetchall()
+        return [_monitored_domain_record_from_row(row) for row in rows]
+
+    def list_due_active_monitoring_page(
+        self, *, due_before: str, cursor: tuple[str, str] | None, limit: int
+    ) -> list[MonitoredDomainRecord]:
+        """Speed 2's equivalent of `list_due_passive_monitoring_page` —
+        same keyset-pagination shape, scoped to `speed2_enabled` rows
+        whose `next_active_due_at` (never NULL for those rows) has
+        passed."""
+        with self._connect() as conn:
+            if cursor is None:
+                rows = conn.execute(
+                    "SELECT * FROM monitored_domains WHERE speed2_enabled = 1 "
+                    "AND pending_active_scan_id IS NULL "
+                    "AND next_active_due_at IS NOT NULL AND next_active_due_at <= ? "
+                    "ORDER BY next_active_due_at, monitoring_id LIMIT ?",
+                    (due_before, limit),
+                ).fetchall()
+            else:
+                cursor_due_at, cursor_id = cursor
+                rows = conn.execute(
+                    "SELECT * FROM monitored_domains WHERE speed2_enabled = 1 "
+                    "AND pending_active_scan_id IS NULL "
+                    "AND next_active_due_at IS NOT NULL AND next_active_due_at <= ? "
+                    "AND (next_active_due_at, monitoring_id) > (?, ?) "
+                    "ORDER BY next_active_due_at, monitoring_id LIMIT ?",
+                    (due_before, cursor_due_at, cursor_id, limit),
+                ).fetchall()
+        return [_monitored_domain_record_from_row(row) for row in rows]
+
+    def mark_monitoring_scan_enqueued(
+        self, monitoring_id: str, *, speed: Literal["passive", "active"], scan_id: str
+    ) -> None:
+        """Phase 1 ("enqueue") — sets the pending marker so this row
+        drops out of `list_due_*_monitoring_page` until the scan is
+        harvested, without touching `next_*_due_at` (that only advances
+        at harvest time, in `batch_record_monitoring_progress`)."""
+        column = "pending_passive_scan_id" if speed == "passive" else "pending_active_scan_id"
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE monitored_domains SET {column} = ?, updated_at = ? "  # noqa: S608  # nosec B608
+                "WHERE monitoring_id = ?",
+                (scan_id, _now_iso(), monitoring_id),
+            )
+
+    def list_pending_monitoring_harvest(
+        self, *, speed: Literal["passive", "active"]
+    ) -> list[MonitoredDomainRecord]:
+        """Phase 2's candidate list — every row with an in-flight
+        scheduled scan of this speed. Deliberately not keyset-paginated:
+        at any given moment this is bounded by how many scans can
+        possibly be `queued`/`running` at once (`max_concurrent_scans`
+        globally, or a small multiple of it across accounts), never by
+        the total monitored-domain count — a fundamentally different,
+        much smaller set than the "due to enqueue" scan `list_due_*`
+        methods above have to handle at 300k-row scale."""
+        column = "pending_passive_scan_id" if speed == "passive" else "pending_active_scan_id"
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM monitored_domains WHERE {column} IS NOT NULL"  # noqa: S608  # nosec B608
+            ).fetchall()
+        return [_monitored_domain_record_from_row(row) for row in rows]
+
+    def batch_record_monitoring_progress(self, updates: list[dict]) -> None:
+        """The batched-write half of the scale requirement: one
+        transaction per call (never one commit per row, and never one
+        giant unbounded transaction for an entire cycle) — the caller
+        (`api/monitoring_worker.py`) chunks `updates` into
+        `api_settings.monitoring_batch_size`-sized lists (500-1000 rows,
+        the same range `api/reconciliation_worker.py`'s own retention-
+        purge batching precedent uses) before calling this, so a single
+        call's transaction never holds SQLite's write lock long enough to
+        meaningfully delay a concurrent `claim_next_queued_scan`/
+        `create_scan` write from the scan queue.
+
+        Each dict: monitoring_id, speed(str, 'passive'|'active'), scan_id,
+        ran_at (iso), next_due_at (iso), asset_digest, asset_count,
+        needs_review (bool), status. Uses `executemany` — one prepared
+        statement, N bindings — rather than N separate `execute` calls,
+        which is what actually makes a 500-1000 row batch fast rather
+        than just fewer-transactions-but-still-row-at-a-time."""
+        if not updates:
+            return
+        now = _now_iso()
+        passive_rows = [
+            (
+                u["scan_id"],
+                u["ran_at"],
+                u["next_due_at"],
+                u["asset_digest"],
+                u["asset_count"],
+                int(u["needs_review"]),
+                u["status"],
+                now,
+                u["monitoring_id"],
+            )
+            for u in updates
+            if u["speed"] == "passive"
+        ]
+        active_rows = [
+            (
+                u["scan_id"],
+                u["ran_at"],
+                u["next_due_at"],
+                u["asset_digest"],
+                u["asset_count"],
+                int(u["needs_review"]),
+                u["status"],
+                now,
+                u["monitoring_id"],
+            )
+            for u in updates
+            if u["speed"] == "active"
+        ]
+        with self._connect() as conn:
+            if passive_rows:
+                conn.executemany(
+                    "UPDATE monitored_domains SET last_passive_scan_id = ?, "
+                    "last_passive_run_at = ?, next_passive_due_at = ?, last_asset_digest = ?, "
+                    "last_asset_count = ?, needs_review = ?, status = ?, updated_at = ?, "
+                    "pending_passive_scan_id = NULL "
+                    "WHERE monitoring_id = ?",
+                    passive_rows,
+                )
+            if active_rows:
+                conn.executemany(
+                    "UPDATE monitored_domains SET last_active_scan_id = ?, "
+                    "last_active_run_at = ?, next_active_due_at = ?, last_asset_digest = ?, "
+                    "last_asset_count = ?, needs_review = ?, status = ?, updated_at = ?, "
+                    "pending_active_scan_id = NULL "
+                    "WHERE monitoring_id = ?",
+                    active_rows,
+                )
+
+    def count_monitored_domains(self) -> int:
+        """Test/observability helper — not on any hot path."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM monitored_domains").fetchone()
+        return int(row["c"])
 
     # --- subscriptions / tiers (Part B, Round 3) ------------------------
 
@@ -1509,6 +1925,30 @@ def _scan_record_from_row(row: sqlite3.Row) -> ScanRecord:
         retry_count=row["retry_count"],
         worker_id=row["worker_id"],
         heartbeat_at=row["heartbeat_at"],
+        trigger_source=row["trigger_source"],
+    )
+
+
+def _monitored_domain_record_from_row(row: sqlite3.Row) -> MonitoredDomainRecord:
+    return MonitoredDomainRecord(
+        monitoring_id=row["monitoring_id"],
+        account_id=row["account_id"],
+        domain=row["domain"],
+        speed2_enabled=bool(row["speed2_enabled"]),
+        status=row["status"],
+        last_passive_scan_id=row["last_passive_scan_id"],
+        last_active_scan_id=row["last_active_scan_id"],
+        last_passive_run_at=row["last_passive_run_at"],
+        last_active_run_at=row["last_active_run_at"],
+        next_passive_due_at=row["next_passive_due_at"],
+        next_active_due_at=row["next_active_due_at"],
+        pending_passive_scan_id=row["pending_passive_scan_id"],
+        pending_active_scan_id=row["pending_active_scan_id"],
+        last_asset_digest=row["last_asset_digest"],
+        last_asset_count=row["last_asset_count"],
+        needs_review=bool(row["needs_review"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 

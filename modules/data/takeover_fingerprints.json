@@ -1,0 +1,350 @@
+{
+  "_meta": {
+    "description": "Vendored subdomain-takeover fingerprint snapshot for modules/sub_takeover.py. Entries with source=can-i-take-over-xyz are a filtered snapshot of the upstream_url below (entries kept: vulnerable == true AND at least one non-IP-literal cname pattern -- SmartJobBoard was dropped entirely, its only pattern was a bare IP; the IP literal was dropped from Worksites but its hostname pattern was kept). Entries with source=hydra-supplementary are added by this project where the upstream list itself has gone stale/empty for a well-known pattern -- see each entry own source_discussion.",
+    "snapshot_fetched_at": "2026-09-23",
+    "upstream_url": "https://raw.githubusercontent.com/EdOverflow/can-i-take-over-xyz/master/fingerprints.json",
+    "refresh_instructions": "curl -sL <upstream_url> -o /tmp/fingerprints.json, then re-run the filter (vulnerable == true, cname non-empty after dropping bare-IP entries) and regenerate this file, preserving the hydra-supplementary entries below the regenerated upstream ones. Re-check whether Github/Heroku (or any other Edge case/empty-cname entry) have gained a real cname pattern upstream before assuming the supplementary entries below are still needed."
+  },
+  "signatures": [
+    {
+      "service": "AWS/Elastic Beanstalk",
+      "cname_patterns": [
+        "elasticbeanstalk.com"
+      ],
+      "fingerprint": "NXDOMAIN",
+      "http_status": null,
+      "nxdomain": true,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #194](https://github.com/EdOverflow/can-i-take-over-xyz/issues/194)"
+    },
+    {
+      "service": "AWS/S3",
+      "cname_patterns": [
+        "s3.amazonaws.com"
+      ],
+      "fingerprint": "The specified bucket does not exist",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #36](https://github.com/EdOverflow/can-i-take-over-xyz/issues/36)"
+    },
+    {
+      "service": "Agile CRM",
+      "cname_patterns": [
+        "agilecrm.com"
+      ],
+      "fingerprint": "Sorry, this page is no longer available.",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #145](https://github.com/EdOverflow/can-i-take-over-xyz/issues/145)"
+    },
+    {
+      "service": "Airee.ru",
+      "cname_patterns": [
+        "airee.ru"
+      ],
+      "fingerprint": "Ошибка 402. Сервис Айри.рф не оплачен",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #104](https://github.com/EdOverflow/can-i-take-over-xyz/issues/104)"
+    },
+    {
+      "service": "Anima",
+      "cname_patterns": [
+        "animaapp.io"
+      ],
+      "fingerprint": "The page you were looking for does not exist.",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #126](https://github.com/EdOverflow/can-i-take-over-xyz/issues/126)"
+    },
+    {
+      "service": "Bitbucket",
+      "cname_patterns": [
+        "bitbucket.io"
+      ],
+      "fingerprint": "Repository not found",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #97](https://github.com/EdOverflow/can-i-take-over-xyz/issues/97)"
+    },
+    {
+      "service": "Discourse",
+      "cname_patterns": [
+        "trydiscourse.com"
+      ],
+      "fingerprint": "NXDOMAIN",
+      "http_status": null,
+      "nxdomain": true,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #49](https://github.com/EdOverflow/can-i-take-over-xyz/issues/49)"
+    },
+    {
+      "service": "Gemfury",
+      "cname_patterns": [
+        "furyns.com"
+      ],
+      "fingerprint": "404: This page could not be found.",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #154](https://github.com/EdOverflow/can-i-take-over-xyz/issues/154)"
+    },
+    {
+      "service": "Ghost",
+      "cname_patterns": [
+        "ghost.io"
+      ],
+      "fingerprint": "Site unavailable\\.&#124;Failed to resolve DNS path for this host",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #89](https://github.com/EdOverflow/can-i-take-over-xyz/issues/89)"
+    },
+    {
+      "service": "HatenaBlog",
+      "cname_patterns": [
+        "hatenablog.com"
+      ],
+      "fingerprint": "404 Blog is not found",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": null
+    },
+    {
+      "service": "Help Juice",
+      "cname_patterns": [
+        "helpjuice.com"
+      ],
+      "fingerprint": "We could not find what you're looking for.",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": null
+    },
+    {
+      "service": "Help Scout",
+      "cname_patterns": [
+        "helpscoutdocs.com"
+      ],
+      "fingerprint": "No settings were found for this company:",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": null
+    },
+    {
+      "service": "Helprace",
+      "cname_patterns": [
+        "helprace.com"
+      ],
+      "fingerprint": "HTTP_STATUS=301",
+      "http_status": 301,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #115](https://github.com/EdOverflow/can-i-take-over-xyz/issues/115)"
+    },
+    {
+      "service": "JetBrains",
+      "cname_patterns": [
+        "youtrack.cloud"
+      ],
+      "fingerprint": "is not a registered InCloud YouTrack",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[PR #107](https://github.com/EdOverflow/can-i-take-over-xyz/pull/107)"
+    },
+    {
+      "service": "LaunchRock",
+      "cname_patterns": [
+        "launchrock.com"
+      ],
+      "fingerprint": "HTTP_STATUS=500",
+      "http_status": 500,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #74](https://github.com/EdOverflow/can-i-take-over-xyz/issues/74)"
+    },
+    {
+      "service": "Microsoft Azure",
+      "cname_patterns": [
+        "cloudapp.net",
+        "cloudapp.azure.com",
+        "azurewebsites.net",
+        "blob.core.windows.net",
+        "cloudapp.azure.com",
+        "azure-api.net",
+        "azurehdinsight.net",
+        "azureedge.net",
+        "azurecontainer.io",
+        "database.windows.net",
+        "azuredatalakestore.net",
+        "search.windows.net",
+        "azurecr.io",
+        "redis.cache.windows.net",
+        "azurehdinsight.net",
+        "servicebus.windows.net",
+        "visualstudio.com"
+      ],
+      "fingerprint": "NXDOMAIN",
+      "http_status": null,
+      "nxdomain": true,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #35](https://github.com/EdOverflow/can-i-take-over-xyz/issues/35)"
+    },
+    {
+      "service": "Ngrok",
+      "cname_patterns": [
+        "ngrok.io"
+      ],
+      "fingerprint": "Tunnel .*.ngrok.io not found",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #92](https://github.com/EdOverflow/can-i-take-over-xyz/issues/92)"
+    },
+    {
+      "service": "Readme.io",
+      "cname_patterns": [
+        "readme.io"
+      ],
+      "fingerprint": "The creators of this project are still working on making everything perfect!",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #41](https://github.com/EdOverflow/can-i-take-over-xyz/issues/41)"
+    },
+    {
+      "service": "Strikingly",
+      "cname_patterns": [
+        "s.strikinglydns.com"
+      ],
+      "fingerprint": "PAGE NOT FOUND.",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #58](https://github.com/EdOverflow/can-i-take-over-xyz/issues/58)"
+    },
+    {
+      "service": "Surge.sh",
+      "cname_patterns": [
+        "na-west1.surge.sh"
+      ],
+      "fingerprint": "project not found",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #198](https://github.com/EdOverflow/can-i-take-over-xyz/issues/198)"
+    },
+    {
+      "service": "SurveySparrow",
+      "cname_patterns": [
+        "surveysparrow.com"
+      ],
+      "fingerprint": "Account not found.",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #281](https://github.com/EdOverflow/can-i-take-over-xyz/issues/281)"
+    },
+    {
+      "service": "Uberflip",
+      "cname_patterns": [
+        "read.uberflip.com"
+      ],
+      "fingerprint": "The URL you've accessed does not provide a hub.",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #150](https://github.com/EdOverflow/can-i-take-over-xyz/issues/150)"
+    },
+    {
+      "service": "Uptimerobot",
+      "cname_patterns": [
+        "stats.uptimerobot.com"
+      ],
+      "fingerprint": "page not found",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #45](https://github.com/EdOverflow/can-i-take-over-xyz/issues/45)"
+    },
+    {
+      "service": "Wordpress",
+      "cname_patterns": [
+        "wordpress.com"
+      ],
+      "fingerprint": "Do you want to register .*.wordpress.com?",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[PR #176](https://github.com/EdOverflow/can-i-take-over-xyz/pull/176)"
+    },
+    {
+      "service": "Worksites",
+      "cname_patterns": [
+        "worksites.net"
+      ],
+      "fingerprint": "Hello! Sorry, but the website you&rsquo;re looking for doesn&rsquo;t exist.",
+      "http_status": null,
+      "nxdomain": false,
+      "status": "Vulnerable",
+      "source": "can-i-take-over-xyz",
+      "source_discussion": "[Issue #142](https://github.com/EdOverflow/can-i-take-over-xyz/issues/142)"
+    },
+    {
+      "service": "GitHub Pages",
+      "cname_patterns": [
+        "github.io"
+      ],
+      "fingerprint": "There isn't a GitHub Pages site here.",
+      "http_status": 404,
+      "nxdomain": false,
+      "status": "Edge case",
+      "source": "hydra-supplementary",
+      "source_discussion": "can-i-take-over-xyz classifies Github as Edge case with an empty cname list (fetched 2026-09-23) -- no reliable current CNAME pattern is published upstream. github.io is added here as a well-known, real-world pattern; treat a Stage-2 match as a strong signal, not a guaranteed-claimable state."
+    },
+    {
+      "service": "Heroku",
+      "cname_patterns": [
+        "herokuapp.com"
+      ],
+      "fingerprint": "No such app",
+      "http_status": 404,
+      "nxdomain": false,
+      "status": "Edge case",
+      "source": "hydra-supplementary",
+      "source_discussion": "can-i-take-over-xyz classifies Heroku as Edge case with an empty cname list (fetched 2026-09-23) -- no reliable current CNAME pattern is published upstream. herokuapp.com is added here as a well-known, real-world pattern; treat a Stage-2 match as a strong signal, not a guaranteed-claimable state."
+    }
+  ]
+}

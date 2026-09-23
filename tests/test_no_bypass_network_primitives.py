@@ -59,6 +59,15 @@ ALLOWED_DIRECT_NETWORK_IMPORTS: dict[str, str] = {
         "never the connection destination — Hydra's own socket only ever "
         "connects to the passive-DNS provider, never the sibling itself"
     ),
+    "github_secrets.py": (
+        "fixed api.github.com endpoint (urllib.request) for org/search "
+        "lookups; the target domain and operator-supplied org name are "
+        "query parameters, never the connection destination. Repository "
+        "content itself is fetched by the `git`/`gitleaks` binaries via "
+        "subprocess (modules/_base.py's run_command pattern, not a raw "
+        "Python socket), to a GitHub-hosted clone_url discovered through "
+        "that same fixed API — never the target's own infrastructure."
+    ),
 }
 
 # Infrastructure modules this guard doesn't apply to at all — they ARE the

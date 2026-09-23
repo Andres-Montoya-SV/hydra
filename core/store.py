@@ -1550,6 +1550,19 @@ class AssetStore:
             ).fetchone()
         return row["c"] if row else 0
 
+    def get_host_domains(self, run_id: str) -> list[str]:
+        """Just the `domain` column, sorted — for callers that only need
+        a cheap identity/diff key for a run's host set (e.g.
+        `api/monitoring.py`'s asset-digest computation) and would
+        otherwise pay `get_hosts`'s full port/service/finding hydration
+        cost for every single monitored domain on every scheduled scan,
+        including ones with tens of thousands of hosts."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT domain FROM hosts WHERE run_id=? ORDER BY domain", (run_id,)
+            ).fetchall()
+        return [row["domain"] for row in rows]
+
     def get_clusters(self, run_id: str) -> list[InfrastructureCluster]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM clusters WHERE run_id=?", (run_id,)).fetchall()

@@ -1,0 +1,42 @@
+[
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 1,
+  "EndLine": 1,
+  "StartColumn": 1,
+  "EndColumn": 32,
+  "Match": "AWS_KEY = 'REDACTED'",
+  "Secret": "REDACTED",
+  "File": "config.py",
+  "SymlinkFile": "",
+  "Commit": "bedd45b2b9e33bf0a4c699747a5ef824bd11b30d",
+  "Entropy": 4.0219283,
+  "Author": "Test User",
+  "Email": "test@example.com",
+  "Date": "2026-09-23T13:25:04Z",
+  "Message": "initial config with key",
+  "Tags": [],
+  "Fingerprint": "bedd45b2b9e33bf0a4c699747a5ef824bd11b30d:config.py:generic-api-key:1"
+ },
+ {
+  "RuleID": "stripe-access-token",
+  "Description": "Found a Stripe Access Token, posing a risk to payment processing services and sensitive financial data.",
+  "StartLine": 2,
+  "EndLine": 2,
+  "StartColumn": 15,
+  "EndColumn": 88,
+  "Match": "REDACTED'",
+  "Secret": "REDACTED",
+  "File": "config.py",
+  "SymlinkFile": "",
+  "Commit": "58dd9c9f672e90991431b7998d213020e7fa3fae",
+  "Entropy": 2.3531368,
+  "Author": "Test User",
+  "Email": "test@example.com",
+  "Date": "2026-09-23T13:25:04Z",
+  "Message": "add stripe key",
+  "Tags": [],
+  "Fingerprint": "58dd9c9f672e90991431b7998d213020e7fa3fae:config.py:stripe-access-token:2"
+ }
+]

@@ -14,6 +14,7 @@ from modules import (
     dnstwist,
     dnsx,
     gau,
+    github_secrets,
     hakrawler,
     httpx,
     katana,
@@ -25,6 +26,7 @@ from modules import (
     security_headers,
     soft404_check,
     sslyze,
+    sub_takeover,
     subfinder,
     theharvester,
     threat_intel,
@@ -67,4 +69,6 @@ __all__ = [
     "sslyze",
     "wafw00f",
     "dnstwist",
+    "github_secrets",
+    "sub_takeover",
 ]

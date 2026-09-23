@@ -54,6 +54,18 @@ class TierLimits:
     white_label_report: bool
     retention_days: int | None  # None = configurable per account (Ultra)
     priority_queue: bool
+    # "Hydra API — Continuous Monitoring" task's own tier decision: Speed 1
+    # (daily passive re-scan) is available to every tier the moment a
+    # domain is verified — it only ever runs the genuinely-passive-source
+    # plugin subset (api/monitoring.py::PASSIVE_MONITORING_PLUGINS), so its
+    # marginal cost/risk is small and it consumes no scan-quota at all
+    # (see docs/PAID_API_DESIGN.md's dated monitoring section). Speed 2
+    # (weekly ACTIVE deep-scan) runs the full pipeline and DOES consume a
+    # real monthly scan-quota slot per run, so it's gated the same way
+    # `assess-reportability` is: not reachable at all below Pro, matching
+    # Pro/Ultra's existing "the paying-for-active-usage" tiers
+    # (`priority_queue=True` uses the identical Pro/Ultra split already).
+    monitoring_speed2: bool
 
 
 TIERS: dict[Tier, TierLimits] = {
@@ -68,6 +80,7 @@ TIERS: dict[Tier, TierLimits] = {
         white_label_report=False,
         retention_days=7,
         priority_queue=False,
+        monitoring_speed2=False,
     ),
     "medium": TierLimits(
         tier="medium",
@@ -85,6 +98,7 @@ TIERS: dict[Tier, TierLimits] = {
         white_label_report=False,
         retention_days=90,
         priority_queue=False,
+        monitoring_speed2=False,
     ),
     "pro": TierLimits(
         tier="pro",
@@ -108,6 +122,7 @@ TIERS: dict[Tier, TierLimits] = {
         white_label_report=False,
         retention_days=365,
         priority_queue=True,
+        monitoring_speed2=True,
     ),
     "ultra": TierLimits(
         tier="ultra",
@@ -130,6 +145,7 @@ TIERS: dict[Tier, TierLimits] = {
         # window just because nobody configured it yet.
         retention_days=None,
         priority_queue=True,
+        monitoring_speed2=True,
     ),
 }
 

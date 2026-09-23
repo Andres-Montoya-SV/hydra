@@ -18,6 +18,18 @@ Durable execution (surviving a worker crash mid-scan, bounded automatic
 retries) is `api/scan_worker.py`'s concern, not this module's — see that
 module's own docstring for the full design (heartbeat liveness, the
 retry ceiling, what "durable" does and does not mean here).
+
+**Continuous monitoring's Speed 1** (`trigger_source == "scheduled_passive"`,
+`api/monitoring_worker.py`) runs through this EXACT same function, not a
+second execution path — the only difference is that the account's
+`Settings` object has its active-tool `enable_*` flags narrowed to the
+genuinely-passive-source subset
+(`api/monitoring.py::passive_monitoring_settings_overrides`) before the
+pipeline runs. `account_settings()` already constructs a fresh,
+throwaway `Settings` instance per call (see `api/tenancy.py`), so
+mutating it here never touches the account's own persisted
+configuration — there is nothing to restore afterward. `"manual"` and
+`"scheduled_active"` (Speed 2) both run the full pipeline unchanged.
 """
 
 from __future__ import annotations
@@ -39,12 +51,21 @@ async def execute_scan(
     account_id: str,
     scan_id: str,
     domain: str,
+    trigger_source: str = "manual",
 ) -> None:
     import app as hydra_app  # deferred: heavy import graph (ToolManager, plugins, …)
 
     try:
         settings = account_settings(api_settings, account_id)
         settings.validate_or_raise()
+
+        if trigger_source == "scheduled_passive":
+            from api.monitoring import passive_monitoring_settings_overrides
+
+            enable_flags = {k: v for k, v in vars(settings).items() if k.startswith("enable_")}
+            overrides = passive_monitoring_settings_overrides(enable_flags)
+            for attr, value in overrides.items():
+                setattr(settings, attr, value)
 
         preflight_args = argparse.Namespace(domain=domain, targets_file=None, external=False)
         hydra_app._external_mode_preflight(preflight_args, settings)
