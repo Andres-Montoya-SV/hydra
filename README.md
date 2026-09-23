@@ -99,7 +99,7 @@ flowchart TD
     Wildcard --> Dnsx["dnsx: resolve subdomains -> resolved.txt"]
     Dnsx --> AsnNaabu["asn_lookup, naabu -> port_verify"]
     AsnNaabu --> Httpx["httpx: probe resolved hosts\n(each redirect hop re-authorized)"]
-    Httpx --> Optional["Optional/enrichment stage, concurrent:\nctlogs, katana, hakrawler, gau, waybackurls, unfurl,\nnuclei, soft404_check, param_fuzz, cloud_bucket_enum,\nthreat_intel, vuln_match, security_headers,\ntheharvester, sslyze, wafw00f"]
+    Httpx --> Optional["Optional/enrichment stage, concurrent:\nctlogs, katana, hakrawler, gau, waybackurls, unfurl,\nnuclei, soft404_check, param_fuzz, cloud_bucket_enum,\nthreat_intel, vuln_match, security_headers,\ntheharvester, sslyze, wafw00f, sub_takeover"]
     Optional --> Gateway{{"CollectionGateway / ScopeEnforcingProxy\nevery tool-issued connection re-authorized\nat the socket, not just the input file"}}
     Gateway --> Followup["Bounded follow-up collection\n(re-authorizes every discovered indicator)"]
     Followup --> Browser["browser_probe\n(Playwright/WebKit, proxy-confined)"]
@@ -306,7 +306,7 @@ The startup banner (captured directly from `core.heads.HYDRA_BANNER`,
 
 <!-- TODO: replace with a real terminal screenshot of `python app.py heads` -->
 
-`python app.py heads` (real output, captured 2026-09-22 — every plugin
+`python app.py heads` (real output, captured 2026-09-23 — every plugin
 Hydra can run, as a "head"):
 
 ```
@@ -332,6 +332,7 @@ Hydra can run, as a "head"):
 │ sslyze            │ no     │ yes    │ sslyze — TLS/certificate posture head               │
 │ soft404_check     │ yes    │ yes    │ soft404_check — soft-404 / catch-all detection head │
 │ wafw00f           │ no     │ yes    │ wafw00f — WAF/CDN fingerprinting head               │
+│ sub_takeover      │ no     │ yes    │ sub_takeover — subdomain takeover detection head    │
 │ threat_intel      │ yes    │ yes    │ threat_intel — host-reputation (URLhaus) head       │
 │ passive_dns       │ yes    │ yes    │ passive_dns — Passive DNS (certificate siblings)    │
 │ katana            │ yes    │ yes    │ katana — active crawler head                        │
@@ -348,6 +349,23 @@ Hydra can run, as a "head"):
 
 Note: `amass` shows `Active: no` here too — this environment simply
 doesn't have it installed, unrelated to this task.
+
+`sub_takeover` (`modules/sub_takeover.py`, `ENABLE_SUB_TAKEOVER`) detects
+dangling CNAMEs (subdomain takeover) in two stages: a cheap passive check
+of whether a resolved subdomain's CNAME matches a known-vulnerable-
+service pattern, then a live confirmation — either one safe, read-only
+GET to the subdomain itself checked against that service's real
+unclaimed-state fingerprint, or (for services whose dangling CNAME
+target can't resolve at all, e.g. AWS Elastic Beanstalk/Azure) Hydra's
+own already-collected DNS data, never a second network request. Only a
+Stage-2-confirmed match ever becomes a finding. The fingerprint database
+is a vendored, filtered snapshot of the community-maintained
+[`can-i-take-over-xyz`](https://github.com/EdOverflow/can-i-take-over-xyz)
+project at `modules/data/takeover_fingerprints.json` — see that file's
+own `_meta.refresh_instructions` for how to pull a fresh copy, and
+`modules/sub_takeover.py`'s module docstring for a real, current gotcha
+that refresh turned up (the upstream project itself no longer lists a
+reliable CNAME pattern for GitHub Pages or Heroku).
 
 <!-- TODO: replace with a real terminal screenshot of the "Reconnaissance Complete" summary at the end of a live `python app.py run` -->
 

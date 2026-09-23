@@ -1527,6 +1527,37 @@ class Wafw00fParser(ToolParser):
         return list(by_host.values()), []
 
 
+class SubTakeoverParser(ToolParser):
+    """Confirmed subdomain-takeover findings (modules/sub_takeover.py) —
+    only Stage-2-confirmed records ever reach `sub_takeover.jsonl`; a
+    Stage-1-only CNAME-pattern match is never parsed into a Finding."""
+
+    tool_name = "sub_takeover"
+
+    def parse(
+        self, output_dir: Path, *, artifact: Path | None = None, run_id: str = ""
+    ) -> tuple[list[Host], list[str]]:
+        path = artifact or output_dir / "sub_takeover.jsonl"
+        by_host: dict[str, Host] = {}
+        for record in read_jsonl(path):
+            domain = normalize_domain(str(record.get("host", "")))
+            if not domain:
+                continue
+            host = by_host.setdefault(domain, Host(domain=domain))
+            finding = Finding(
+                host=domain,
+                template_id=str(record.get("template_id") or "subdomain-takeover"),
+                severity=str(record.get("severity") or "high"),
+                name=str(record.get("name") or ""),
+                source="sub_takeover",
+                url=record.get("url") if isinstance(record.get("url"), str) else None,
+                description=str(record.get("description") or ""),
+                confidence_score=int(record.get("confidence_score") or 65),
+            )
+            host.findings.append(finding)
+        return list(by_host.values()), []
+
+
 PARSER_REGISTRY: dict[str, ToolParser] = {
     p.tool_name: p
     for p in [
@@ -1557,6 +1588,7 @@ PARSER_REGISTRY: dict[str, ToolParser] = {
         TheHarvesterParser(),
         SslyzeParser(),
         Wafw00fParser(),
+        SubTakeoverParser(),
     ]
 }
 
