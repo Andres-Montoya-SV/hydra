@@ -59,6 +59,20 @@ FINDING_GLOSSARY: dict[str, dict[str, str]] = {
         "what": "A brand-derived cloud bucket returned a public object listing.",
         "why": "Public listings often leak sensitive files; treat as high priority.",
     },
+    "leaked-secret": {
+        "what": (
+            "gitleaks matched a credential pattern in a public GitHub "
+            "repository plausibly tied to this target — in the current "
+            "default branch, or only in historical commit content."
+        ),
+        "why": (
+            "A secret still present in the current codebase should be "
+            "rotated immediately; one found only in history may already be "
+            "rotated but still confirms real exposure. The secret value "
+            "itself is never stored by Hydra — only enough metadata (rule, "
+            "file, line, commit) to locate and act on it."
+        ),
+    },
 }
 
 

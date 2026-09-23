@@ -13,6 +13,7 @@ from modules import (
     ctlogs,
     dnsx,
     gau,
+    github_secrets,
     hakrawler,
     httpx,
     katana,
@@ -65,4 +66,5 @@ __all__ = [
     "theharvester",
     "sslyze",
     "wafw00f",
+    "github_secrets",
 ]

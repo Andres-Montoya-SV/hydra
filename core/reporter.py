@@ -792,6 +792,7 @@ class ReportGenerator:
             ("sslyze_findings.jsonl", "tls-expired-certificate"),
             ("theharvester_findings.jsonl", "email-exposure"),
             ("theharvester_findings.jsonl", "personnel-exposure"),
+            ("github_secrets.jsonl", "leaked-secret"),
         )
         for filename, template_id in mapping:
             path = output_dir / filename
