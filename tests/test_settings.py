@@ -53,6 +53,23 @@ class TestSettings:
         with pytest.raises(ConfigurationError):
             Settings.from_env(project_root=project_root)
 
+    def test_from_env_parses_the_three_new_recon_module_flags(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ENABLE_THEHARVESTER", "true")
+        monkeypatch.setenv("ENABLE_SSLYZE", "true")
+        monkeypatch.setenv("ENABLE_WAFW00F", "true")
+        settings = Settings.from_env(project_root=project_root)
+        assert settings.enable_theharvester is True
+        assert settings.enable_sslyze is True
+        assert settings.enable_wafw00f is True
+
+    def test_the_three_new_recon_modules_are_off_by_default(self, project_root: Path) -> None:
+        settings = Settings(project_root=project_root)
+        assert settings.enable_theharvester is False
+        assert settings.enable_sslyze is False
+        assert settings.enable_wafw00f is False
+
     def test_from_env_parses_headers_json(
         self, project_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

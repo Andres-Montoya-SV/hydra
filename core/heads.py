@@ -68,6 +68,9 @@ HEAD_BLURBS: dict[str, str] = {
     "browser_probe": "browser cloaking-detection head",
     "vuln_match": "CVE correlation head",
     "security_headers": "HTTP security-header audit head",
+    "theharvester": "email/personnel OSINT head",
+    "sslyze": "TLS/certificate posture head",
+    "wafw00f": "WAF/CDN fingerprinting head",
 }
 
 

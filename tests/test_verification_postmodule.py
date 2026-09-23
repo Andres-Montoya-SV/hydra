@@ -20,6 +20,9 @@ from core.verification.postmodule import (
     _check_dnsx,
     _check_port_verify,
     _check_security_headers,
+    _check_sslyze,
+    _check_theharvester,
+    _check_wafw00f,
     _check_whois,
     _extract_domain_whois_section,
     run_post_module_checks,
@@ -528,3 +531,127 @@ class TestRunPostModuleChecksWiredIntoFinalize:
         runner._finalize_to_store(context, store)
 
         assert store.get_verification_flags("run1") == []
+
+
+class TestCheckSslyze:
+    def test_not_scheduled_command_whose_result_was_used_is_flagged(self, tmp_path: Path) -> None:
+        (tmp_path / "sslyze.json").write_text(
+            json.dumps(
+                {
+                    "server_scan_results": [
+                        {
+                            "server_location": {"hostname": "example.com"},
+                            "scan_result": {
+                                "http_headers": {"status": "NOT_SCHEDULED", "result": None}
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        _write_jsonl(
+            tmp_path / "sslyze_findings.jsonl",
+            [{"host": "example.com", "template_id": "tls-missing-hsts"}],
+        )
+
+        findings = _check_sslyze(tmp_path)
+
+        assert len(findings) == 1
+        assert findings[0].host == "example.com"
+        assert findings[0].severity is ContradictionSeverity.INVALIDATES
+
+    def test_completed_command_is_never_flagged(self, tmp_path: Path) -> None:
+        (tmp_path / "sslyze.json").write_text(
+            json.dumps(
+                {
+                    "server_scan_results": [
+                        {
+                            "server_location": {"hostname": "example.com"},
+                            "scan_result": {"http_headers": {"status": "COMPLETED", "result": {}}},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        _write_jsonl(
+            tmp_path / "sslyze_findings.jsonl",
+            [{"host": "example.com", "template_id": "tls-missing-hsts"}],
+        )
+        assert _check_sslyze(tmp_path) == []
+
+    def test_missing_artifact_skips_cleanly(self, tmp_path: Path) -> None:
+        assert _check_sslyze(tmp_path) == []
+
+
+class TestCheckWafw00f:
+    def test_real_example_com_shape_is_not_flagged_since_the_plugin_already_filters_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The plugin's own JSONL (sslyze_findings.jsonl-equivalent) never
+        sees the trailing false — this check reads the RAW unfiltered
+        wafw00f.json instead, exactly reproducing the real captured
+        contradiction shape."""
+        (tmp_path / "wafw00f.json").write_text(
+            json.dumps(
+                [
+                    {"detected": True, "firewall": "Cloudflare", "url": "https://example.com"},
+                    {"detected": False, "firewall": "None", "url": "https://example.com"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        findings = _check_wafw00f(tmp_path)
+        assert len(findings) == 1
+        assert findings[0].severity is ContradictionSeverity.INVALIDATES
+
+    def test_genuinely_no_waf_is_not_flagged(self, tmp_path: Path) -> None:
+        (tmp_path / "wafw00f.json").write_text(
+            json.dumps([{"detected": False, "firewall": "None", "url": "https://x.example"}]),
+            encoding="utf-8",
+        )
+        assert _check_wafw00f(tmp_path) == []
+
+    def test_missing_artifact_skips_cleanly(self, tmp_path: Path) -> None:
+        assert _check_wafw00f(tmp_path) == []
+
+
+class TestCheckTheharvester:
+    def test_an_off_domain_email_that_somehow_got_counted_is_flagged(self, tmp_path: Path) -> None:
+        _write_jsonl(
+            tmp_path / "theharvester.jsonl",
+            [
+                {"type": "summary", "target": "example.com"},
+                {"type": "email", "value": "someone@gmail.com", "sources": []},
+            ],
+        )
+        _write_jsonl(
+            tmp_path / "theharvester_findings.jsonl",
+            [
+                {
+                    "host": "example.com",
+                    "type": "email",
+                    "value": "someone@gmail.com",
+                }
+            ],
+        )
+
+        findings = _check_theharvester(tmp_path)
+
+        assert len(findings) == 1
+        assert findings[0].severity is ContradictionSeverity.INVALIDATES
+
+    def test_a_correctly_filtered_off_domain_email_is_not_flagged(self, tmp_path: Path) -> None:
+        _write_jsonl(
+            tmp_path / "theharvester.jsonl",
+            [
+                {"type": "summary", "target": "example.com"},
+                {"type": "email", "value": "someone@gmail.com", "sources": []},
+            ],
+        )
+        _write_jsonl(tmp_path / "theharvester_findings.jsonl", [])
+        assert _check_theharvester(tmp_path) == []
+
+    def test_missing_artifact_skips_cleanly(self, tmp_path: Path) -> None:
+        assert _check_theharvester(tmp_path) == []

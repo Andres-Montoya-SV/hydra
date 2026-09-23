@@ -192,6 +192,9 @@ class Settings:
     anew_path: Path = field(default_factory=lambda: Path("anew"))
     jq_path: Path = field(default_factory=lambda: Path("jq"))
     nmap_path: Path = field(default_factory=lambda: Path("nmap"))
+    theharvester_path: Path = field(default_factory=lambda: Path("theHarvester"))
+    sslyze_path: Path = field(default_factory=lambda: Path("sslyze"))
+    wafw00f_path: Path = field(default_factory=lambda: Path("wafw00f"))
 
     # Execution
     timeout: int = 300
@@ -299,6 +302,16 @@ class Settings:
     enable_cloud_bucket_enum: bool = False
     enable_vuln_match: bool = True
     enable_security_headers: bool = True
+    # Three new recon modules — off by default like every other optional
+    # active/external tool above (amass, naabu, ...); theharvester is
+    # passive but still off by default since it's a heavier, separately-
+    # environmented external dependency (docs/DOCKER.md).
+    enable_theharvester: bool = False
+    enable_sslyze: bool = False
+    enable_wafw00f: bool = False
+    theharvester_timeout: int = 180
+    sslyze_timeout: int = 120
+    wafw00f_timeout: int = 60
     vuln_match_timeout: int = 15
     wpscan_api_token: str | None = None
     scope_file: Path | None = None
@@ -463,6 +476,9 @@ class Settings:
             anew_path=_safe_path(os.getenv("ANEW_PATH", ""), "anew"),
             jq_path=_safe_path(os.getenv("JQ_PATH", ""), "jq"),
             nmap_path=_safe_path(os.getenv("NMAP_PATH", ""), "nmap"),
+            theharvester_path=_safe_path(os.getenv("THEHARVESTER_PATH", ""), "theHarvester"),
+            sslyze_path=_safe_path(os.getenv("SSLYZE_PATH", ""), "sslyze"),
+            wafw00f_path=_safe_path(os.getenv("WAFW00F_PATH", ""), "wafw00f"),
             timeout=_int(os.getenv("TIMEOUT"), 300, "TIMEOUT"),
             threads=_int(os.getenv("THREADS"), 50, "THREADS"),
             rate_limit=_int(os.getenv("RATE_LIMIT"), 150, "RATE_LIMIT"),
@@ -604,6 +620,14 @@ class Settings:
             enable_cloud_bucket_enum=_bool(os.getenv("ENABLE_CLOUD_BUCKET_ENUM")),
             enable_vuln_match=_bool(os.getenv("ENABLE_VULN_MATCH"), True),
             enable_security_headers=_bool(os.getenv("ENABLE_SECURITY_HEADERS"), True),
+            enable_theharvester=_bool(os.getenv("ENABLE_THEHARVESTER")),
+            enable_sslyze=_bool(os.getenv("ENABLE_SSLYZE")),
+            enable_wafw00f=_bool(os.getenv("ENABLE_WAFW00F")),
+            theharvester_timeout=_int(
+                os.getenv("THEHARVESTER_TIMEOUT"), 180, "THEHARVESTER_TIMEOUT"
+            ),
+            sslyze_timeout=_int(os.getenv("SSLYZE_TIMEOUT"), 120, "SSLYZE_TIMEOUT"),
+            wafw00f_timeout=_int(os.getenv("WAFW00F_TIMEOUT"), 60, "WAFW00F_TIMEOUT"),
             vuln_match_timeout=_int(os.getenv("VULN_MATCH_TIMEOUT"), 15, "VULN_MATCH_TIMEOUT"),
             wpscan_api_token=os.getenv("WPSCAN_API_TOKEN", "").strip() or None,
             scope_file=_optional_scope_file(os.getenv("SCOPE_FILE", "").strip()),
@@ -997,6 +1021,9 @@ class Settings:
             "anew": self.anew_path,
             "jq": self.jq_path,
             "port_verify": self.nmap_path,
+            "theharvester": self.theharvester_path,
+            "sslyze": self.sslyze_path,
+            "wafw00f": self.wafw00f_path,
         }
 
     def to_safe_dict(self) -> dict[str, Any]:
@@ -1041,6 +1068,9 @@ class Settings:
                     ("cloud_bucket_enum", self.enable_cloud_bucket_enum),
                     ("vuln_match", self.enable_vuln_match),
                     ("security_headers", self.enable_security_headers),
+                    ("theharvester", self.enable_theharvester),
+                    ("sslyze", self.enable_sslyze),
+                    ("wafw00f", self.enable_wafw00f),
                 ]
                 if enabled
             ],

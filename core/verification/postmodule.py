@@ -16,6 +16,9 @@ from core.verification.detectors import (
     detect_dnsx_nodata_as_resolved,
     detect_naabu_nmap_port_disagreement,
     detect_security_headers_key_mismatch,
+    detect_sslyze_result_used_despite_not_completed,
+    detect_theharvester_off_domain_email_counted,
+    detect_wafw00f_generic_negative_overwrites_earlier_detection,
     detect_whois_block_specificity,
 )
 from core.verification.model import VerificationFinding
@@ -140,6 +143,134 @@ def _check_port_verify(output_dir: Path) -> list[VerificationFinding]:
     return findings
 
 
+_SSLYZE_COMMAND_TEMPLATE = {
+    "heartbleed": "tls-heartbleed",
+    "http_headers": "tls-missing-hsts",
+}
+
+
+def _check_sslyze(output_dir: Path) -> list[VerificationFinding]:
+    """Independently re-derives, from the RAW `sslyze.json`, whether a
+    finding was produced from a scan command that never actually
+    completed — see `detect_sslyze_result_used_despite_not_completed`'s
+    own docstring for the real gap this covers. Only the two scan
+    commands with an unambiguous one-to-one finding template are checked
+    here (`heartbleed`, `http_headers`) — `certificate_info` and the
+    four cipher-suite commands all feed more than one possible template
+    and are left to `tests/test_client_report_render_docx.py`-style
+    direct unit tests on the parser instead of a raw-artifact re-check.
+    """
+    sslyze_path = output_dir / "sslyze.json"
+    findings_path = output_dir / "sslyze_findings.jsonl"
+    if not sslyze_path.exists():
+        return []
+    try:
+        import json
+
+        data = json.loads(sslyze_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+
+    produced_templates_by_host: dict[str, set[str]] = {}
+    for row in read_jsonl(findings_path):
+        host = str(row.get("host") or "")
+        produced_templates_by_host.setdefault(host, set()).add(str(row.get("template_id") or ""))
+
+    findings: list[VerificationFinding] = []
+    for server_result in data.get("server_scan_results") or []:
+        host = str((server_result.get("server_location") or {}).get("hostname") or "")
+        scan_result = server_result.get("scan_result") or {}
+        for command, template_id in _SSLYZE_COMMAND_TEMPLATE.items():
+            node = scan_result.get(command) or {}
+            status = str(node.get("status") or "")
+            was_used = template_id in produced_templates_by_host.get(host, set())
+            finding = detect_sslyze_result_used_despite_not_completed(
+                status,
+                was_result_used=was_used,
+                scan_command=command,
+                host=host,
+                raw_artifact="sslyze.json",
+            )
+            if finding:
+                findings.append(finding)
+    return findings
+
+
+def _check_wafw00f(output_dir: Path) -> list[VerificationFinding]:
+    """Independently re-derives, from the RAW (unfiltered) `wafw00f.json`
+    — every entry `-a`/findall produced, not just the plugin's own
+    `detected: true`-filtered output — whether a trailing generic-method
+    negative for a URL could be misread as "no WAF" despite an earlier
+    real detection for that same URL. See that detector's own docstring
+    for the real, observed shape this covers.
+    """
+    path = output_dir / "wafw00f.json"
+    if not path.exists():
+        return []
+    try:
+        import json
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+
+    by_url: dict[str, list[bool]] = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url") or "")
+        by_url.setdefault(url, []).append(bool(entry.get("detected")))
+
+    findings: list[VerificationFinding] = []
+    for url, detections in by_url.items():
+        finding = detect_wafw00f_generic_negative_overwrites_earlier_detection(
+            detections, host=url, raw_artifact="wafw00f.json"
+        )
+        if finding:
+            findings.append(finding)
+    return findings
+
+
+def _check_theharvester(output_dir: Path) -> list[VerificationFinding]:
+    """Independently re-derives, from the RAW (unfiltered)
+    `theharvester.jsonl` — every `email`/`person` record theHarvester
+    itself returned, before the plugin's own domain-match filter ran —
+    whether an off-domain email nonetheless made it into
+    `theharvester_findings.jsonl`. See that detector's own docstring for
+    the hard boundary this independently re-checks.
+    """
+    raw_path = output_dir / "theharvester.jsonl"
+    findings_path = output_dir / "theharvester_findings.jsonl"
+    if not raw_path.exists():
+        return []
+
+    target_domain = ""
+    counted_emails: set[str] = set()
+    for row in read_jsonl(findings_path):
+        if row.get("type") == "email":
+            counted_emails.add(str(row.get("value") or ""))
+        host = str(row.get("host") or "")
+        if host:
+            target_domain = host
+
+    findings: list[VerificationFinding] = []
+    for record in read_jsonl(raw_path):
+        if record.get("type") != "email" or not target_domain:
+            continue
+        email = str(record.get("value") or "")
+        finding = detect_theharvester_off_domain_email_counted(
+            email,
+            target_domain,
+            was_counted=email in counted_emails,
+            raw_artifact="theharvester.jsonl",
+        )
+        if finding:
+            findings.append(finding)
+    return findings
+
+
 def run_post_module_checks(output_dir: Path) -> list[VerificationFinding]:
     """Every B.2 detector this run's artifacts make possible, run once,
     right before persistence — see this module's docstring.
@@ -149,4 +280,7 @@ def run_post_module_checks(output_dir: Path) -> list[VerificationFinding]:
     findings.extend(_check_security_headers(output_dir))
     findings.extend(_check_whois(output_dir))
     findings.extend(_check_port_verify(output_dir))
+    findings.extend(_check_sslyze(output_dir))
+    findings.extend(_check_wafw00f(output_dir))
+    findings.extend(_check_theharvester(output_dir))
     return findings

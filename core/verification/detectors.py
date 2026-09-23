@@ -220,3 +220,117 @@ def detect_naabu_nmap_port_disagreement(
         detector="detect_naabu_nmap_port_disagreement",
         host=host,
     )
+
+
+# ---------------------------------------------------------------------------
+# New recon modules (email/OSINT, TLS posture, WAF detection) — each
+# detector below traces to a real contradiction risk found while actually
+# running the real tool during development (modules/sslyze.py,
+# modules/wafw00f.py, modules/theharvester.py's own docstrings have the
+# full story), not a hypothetical.
+# ---------------------------------------------------------------------------
+
+
+def detect_sslyze_result_used_despite_not_completed(
+    scan_status: str,
+    *,
+    was_result_used: bool,
+    scan_command: str = "",
+    host: str | None = None,
+    raw_artifact: str | None = None,
+) -> VerificationFinding | None:
+    """sslyze's own JSON shape (confirmed live, `modules/sslyze.py`'s
+    docstring): `scan_result.<command>` is always
+    `{"status", "error_reason", "error_trace", "result"}`, and `result`
+    is only meaningful when `status == "COMPLETED"` — a real, observed
+    case (`http_headers` when that scan command wasn't explicitly
+    requested) has `status: "NOT_SCHEDULED"` and `result: null`. A caller
+    that reads `result` without checking `status` first could
+    misinterpret a `null`/absent field as "checked, nothing found"
+    (e.g. "no HSTS header" from a scan that never actually ran) rather
+    than "not checked at all" — this detector catches exactly that
+    conflation.
+    """
+    if scan_status == "COMPLETED" or not was_result_used:
+        return None
+    where = f"{host} " if host else ""
+    return VerificationFinding(
+        claim=f"{where}{scan_command}: checked, result used".strip(),
+        evidence=f"sslyze scan_status={scan_status!r} — this scan command did not complete, "
+        "so its result field cannot be trusted as a real finding either way",
+        raw_artifact=raw_artifact,
+        severity=ContradictionSeverity.INVALIDATES,
+        detector="detect_sslyze_result_used_despite_not_completed",
+        host=host,
+    )
+
+
+def detect_wafw00f_generic_negative_overwrites_earlier_detection(
+    detections_for_url: list[bool],
+    *,
+    host: str | None = None,
+    raw_artifact: str | None = None,
+) -> VerificationFinding | None:
+    """`-a`/findall (confirmed live, `modules/wafw00f.py`'s docstring)
+    makes wafw00f emit one entry per matched WAF signature PLUS a
+    trailing generic-detection entry that is `detected: false` whenever
+    the generic method found nothing NEW — a real, observed shape: a
+    genuine Cloudflare detection immediately followed by a
+    `detected: false` entry for the exact same URL. `detections_for_url`
+    is every `detected` value for one URL, in the tool's own output
+    order; a parser that only reads the LAST entry would wrongly
+    conclude "no WAF" despite an earlier TRUE in the same list.
+    """
+    if not detections_for_url:
+        return None
+    if detections_for_url[-1] or not any(detections_for_url):
+        return None
+    return VerificationFinding(
+        claim=f"{host or '(unknown host)'}: no WAF detected (last entry)",
+        evidence=(
+            f"wafw00f's own output for this URL has {sum(detections_for_url)} earlier "
+            "detected=true entr(y/ies) before a trailing detected=false generic-detection "
+            "entry — reading only the last entry would wrongly report no WAF"
+        ),
+        raw_artifact=raw_artifact,
+        severity=ContradictionSeverity.INVALIDATES,
+        detector="detect_wafw00f_generic_negative_overwrites_earlier_detection",
+        host=host,
+    )
+
+
+def detect_theharvester_off_domain_email_counted(
+    email: str,
+    target_domain: str,
+    *,
+    was_counted: bool,
+    raw_artifact: str | None = None,
+) -> VerificationFinding | None:
+    """`modules/theharvester.py`'s own hard boundary: only an email whose
+    domain part is the target domain (or a subdomain of it) may ever be
+    treated as organization-associated evidence. This detector
+    independently re-derives that same domain-match check rather than
+    calling the plugin's own filter function, so a future regression in
+    the filter itself (the exact class of bug
+    `detect_security_headers_key_mismatch`'s own docstring describes for
+    a different fix) would still be caught here.
+    """
+    if not was_counted:
+        return None
+    if "@" not in email:
+        return None
+    _, _, domain_part = email.rpartition("@")
+    domain_part = domain_part.strip().lower().rstrip(".")
+    target = target_domain.strip().lower().rstrip(".")
+    if domain_part == target or domain_part.endswith(f".{target}"):
+        return None
+    return VerificationFinding(
+        claim=f"{email}: organization-associated work email for {target_domain}",
+        evidence=f"the email's domain ({domain_part!r}) does not match the target domain "
+        f"({target!r}) or any of its subdomains — this is not organization-associated "
+        "evidence, regardless of what page it was found on",
+        raw_artifact=raw_artifact,
+        severity=ContradictionSeverity.INVALIDATES,
+        detector="detect_theharvester_off_domain_email_counted",
+        host=target_domain,
+    )

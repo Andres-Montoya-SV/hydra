@@ -8,6 +8,9 @@ from core.verification.detectors import (
     detect_dnsx_nodata_as_resolved,
     detect_naabu_nmap_port_disagreement,
     detect_security_headers_key_mismatch,
+    detect_sslyze_result_used_despite_not_completed,
+    detect_theharvester_off_domain_email_counted,
+    detect_wafw00f_generic_negative_overwrites_earlier_detection,
     detect_whois_block_specificity,
 )
 from core.verification.model import ContradictionSeverity
@@ -232,4 +235,98 @@ class TestDetectNaabuNmapPortDisagreement:
 
     def test_naabu_not_open_is_not_this_detectors_pattern(self) -> None:
         finding = detect_naabu_nmap_port_disagreement("closed", "filtered")
+        assert finding is None
+
+
+# ---------------------------------------------------------------------------
+# New recon modules — each detector traces to a real contradiction risk
+# found while actually running the real tool (modules/sslyze.py,
+# modules/wafw00f.py, modules/theharvester.py's own docstrings have the
+# full story).
+# ---------------------------------------------------------------------------
+
+
+class TestDetectSslyzeResultUsedDespiteNotCompleted:
+    def test_not_completed_status_with_result_used_is_flagged(self) -> None:
+        finding = detect_sslyze_result_used_despite_not_completed(
+            "NOT_SCHEDULED",
+            was_result_used=True,
+            scan_command="http_headers",
+            host="example.com",
+            raw_artifact="sslyze.json",
+        )
+        assert finding is not None
+        assert finding.severity is ContradictionSeverity.INVALIDATES
+        assert finding.host == "example.com"
+
+    def test_completed_status_is_never_flagged_even_if_used(self) -> None:
+        finding = detect_sslyze_result_used_despite_not_completed(
+            "COMPLETED", was_result_used=True, scan_command="heartbleed"
+        )
+        assert finding is None
+
+    def test_not_completed_but_never_used_is_not_flagged(self) -> None:
+        """The common, healthy case: a scan command legitimately didn't
+        complete (a real connection error) and nothing downstream tried
+        to use its result — not a contradiction, just an incomplete
+        scan."""
+        finding = detect_sslyze_result_used_despite_not_completed(
+            "ERROR", was_result_used=False, scan_command="robot"
+        )
+        assert finding is None
+
+
+class TestDetectWafw00fGenericNegativeOverwritesEarlierDetection:
+    def test_a_trailing_false_after_a_real_detection_is_flagged(self) -> None:
+        """The exact real shape captured against example.com: a real
+        Cloudflare detection followed by a trailing generic-method
+        detected=false entry for the same URL."""
+        finding = detect_wafw00f_generic_negative_overwrites_earlier_detection(
+            [True, False], host="https://example.com", raw_artifact="wafw00f.json"
+        )
+        assert finding is not None
+        assert finding.severity is ContradictionSeverity.INVALIDATES
+
+    def test_genuinely_no_detection_anywhere_is_not_flagged(self) -> None:
+        finding = detect_wafw00f_generic_negative_overwrites_earlier_detection([False, False])
+        assert finding is None
+
+    def test_a_true_as_the_last_entry_is_not_flagged(self) -> None:
+        finding = detect_wafw00f_generic_negative_overwrites_earlier_detection([False, True])
+        assert finding is None
+
+    def test_empty_list_is_not_flagged(self) -> None:
+        assert detect_wafw00f_generic_negative_overwrites_earlier_detection([]) is None
+
+
+class TestDetectTheharvesterOffDomainEmailCounted:
+    def test_an_off_domain_email_counted_as_organization_associated_is_flagged(self) -> None:
+        finding = detect_theharvester_off_domain_email_counted(
+            "someone@gmail.com",
+            "example.com",
+            was_counted=True,
+            raw_artifact="theharvester.jsonl",
+        )
+        assert finding is not None
+        assert finding.severity is ContradictionSeverity.INVALIDATES
+        assert finding.host == "example.com"
+
+    def test_a_real_work_email_is_never_flagged(self) -> None:
+        finding = detect_theharvester_off_domain_email_counted(
+            "julia@example.com", "example.com", was_counted=True
+        )
+        assert finding is None
+
+    def test_a_subdomain_email_is_never_flagged(self) -> None:
+        finding = detect_theharvester_off_domain_email_counted(
+            "julia@mail.example.com", "example.com", was_counted=True
+        )
+        assert finding is None
+
+    def test_an_off_domain_email_never_counted_is_not_flagged(self) -> None:
+        """The healthy case: the plugin's own filter already dropped it —
+        nothing downstream ever treated it as organization-associated."""
+        finding = detect_theharvester_off_domain_email_counted(
+            "someone@gmail.com", "example.com", was_counted=False
+        )
         assert finding is None
