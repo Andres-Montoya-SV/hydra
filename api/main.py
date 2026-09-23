@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from api.backup_worker import run_backup_loop
 from api.control_db import ControlDB
 from api.email_sender import ConsoleEmailSender, EmailSender, PostmarkEmailSender
 from api.rate_limit import PersistentTokenBucketLimiter
@@ -137,10 +138,28 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             settings.retention_purge_dry_run,
         )
 
+        # Automated backups fix: same "own periodic loop, shared
+        # stop_event, independent interval" shape as the reconciliation
+        # loop above — see api/backup_worker.py's own module docstring
+        # for the full design.
+        backup_task = asyncio.create_task(
+            run_backup_loop(
+                api_settings=settings,
+                control_db=app.state.control_db,
+                stop_event=stop_event,
+            )
+        )
+        logger.info(
+            "Backup loop started (interval=%.0fs, remote_upload=%s).",
+            settings.backup_interval_seconds,
+            "on" if settings.backup_s3_bucket else "off",
+        )
+
         yield
         stop_event.set()
         await worker_task
         await reconciliation_task
+        await backup_task
 
     app = FastAPI(
         title="Hydra EASM API",
@@ -164,7 +183,11 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             "(api/reconciliation_worker.py) suspends accounts whose "
             "payment-failure grace period expired (emailing them when "
             "it does) and purges scans/artifacts past each account's "
-            "tier retention window — see docs/PAID_API_DESIGN.md."
+            "tier retention window. A daily backup loop "
+            "(api/backup_worker.py) snapshots control.db and every "
+            "account's recon.db via SQLite's own online backup API, "
+            "optionally pushing them to S3-compatible storage — see "
+            "docs/PAID_API_DESIGN.md."
         ),
         lifespan=lifespan,
     )

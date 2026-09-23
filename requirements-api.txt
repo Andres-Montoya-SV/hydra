@@ -34,3 +34,15 @@ dnspython==2.8.0
 # with the ProjectDiscovery `httpx` recon binary — already defended
 # against (core/dependencies/), not a new concern introduced here.
 httpx==0.28.1
+# boto3: optional remote backup upload (docs/PAID_API_DESIGN.md's
+# "Automated backups and a real deployment target" section,
+# api/backup_worker.py) — S3-compatible, not locked to AWS: any
+# provider that speaks the S3 API (DigitalOcean Spaces, Backblaze B2,
+# Cloudflare R2) works via `HYDRA_API_BACKUP_S3_ENDPOINT_URL`.
+# Installed unconditionally here (small, pure-Python-plus-botocore, no
+# C extensions) so the remote-upload code path is genuinely exercised
+# in CI rather than skipped — but importing it is still wrapped in a
+# runtime check in api/backup_worker.py, since remote upload itself
+# stays fully OPT-IN (no bucket configured = local-only backups, never
+# a hard failure).
+boto3==1.43.100

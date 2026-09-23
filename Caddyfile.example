@@ -1,0 +1,9 @@
+# Copy this to `Caddyfile` (referenced as-is by docker-compose.yml's
+# `caddy` service) and replace api.yourdomain.com with your real,
+# DNS-pointed-at-this-host domain. See docs/DEPLOYMENT.md for the full
+# walkthrough — this file alone is enough for automatic HTTPS via
+# Let's Encrypt with zero other configuration.
+
+api.yourdomain.com {
+	reverse_proxy api:8000
+}

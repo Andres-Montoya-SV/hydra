@@ -2211,6 +2211,122 @@ established.
 - **Purging the account's own `recon.db`/`AssetStore`.** Stated above,
   repeated here: out of scope by design, not an oversight.
 
+## Automated backups and a real deployment target — 2026-09-23
+
+Closes two real, previously-unaddressed gaps: every piece of durable
+state in this service lives in SQLite (`control.db` plus one
+`recon.db` per account, `api/tenancy.py`), and until this task nothing
+backed any of it up; and this service had never run anywhere but a
+developer's own machine — no domain, no TLS, no host.
+
+### Backups (`api/backup_worker.py`)
+
+**Mechanism — SQLite's own online backup API, never a raw file copy**:
+`sqlite3.Connection.backup()`, confirmed directly against Python's own
+current docs before relying on it: "Works even if the database is
+being accessed by other clients or concurrently by the same
+connection." A raw `shutil.copy()` of a live WAL-mode file (every DB
+this service touches uses WAL, `core.store.connect_sqlite`) has no
+such guarantee.
+
+**What gets backed up**: `control.db`, and every account's `recon.db`
+discovered via `ControlDB.list_account_ids()` — never a hardcoded glob.
+An account with no `recon.db` yet (never scanned) is skipped, not an
+error.
+
+**Where backups go**: local disk first, always
+(`<data_dir>/backups/<timestamp>/`, mirroring each account's real
+relative layout so restore is a straight structural copy back). Remote
+upload to S3-compatible storage is layered on top and entirely
+OPT-IN — `None`/unset `HYDRA_API_BACKUP_S3_BUCKET` means local-only,
+loudly logged as such, never a hard failure. Deliberately not locked to
+AWS: `HYDRA_API_BACKUP_S3_ENDPOINT_URL` + path-style addressing (only
+applied when a custom endpoint is actually configured) makes this work
+unmodified against DigitalOcean Spaces, Backblaze B2, or Cloudflare
+R2 — verified for real against a local fake S3-compatible HTTP server
+(`tests/_fake_s3_server.py`, the same "real server as arbiter" pattern
+Postmark/Wompi/DNS testing already established in this project), not
+mocked.
+
+**Retention**: `HYDRA_API_BACKUP_RETENTION_COUNT` (default 7 — one
+week of daily snapshots) most recent LOCAL snapshots are kept;
+`rotate_backups` always keeps at least the single most recent one
+regardless of misconfiguration (`0`, or a negative number) — tested
+directly. Remote objects are never deleted by this job; S3-compatible
+providers' own lifecycle rules are the right tool for that, not
+duplicated custom code.
+
+**Schedule**: its own daily `asyncio` loop, the exact same
+`asyncio.create_task` + shared `stop_event` shape
+`api/scan_worker.py`/`api/reconciliation_worker.py` already
+established — no third scheduler invented. Unlike the reconciliation
+loop, the actual work runs via `asyncio.to_thread` rather than directly
+on the event loop: real disk I/O across every account plus an optional
+real network upload is genuinely blocking, and could otherwise stall
+live request handling longer than is acceptable.
+
+**Restore, tested for real — the part that matters most**: a
+standalone module, never imported by the running service,
+`python -m api.restore_backup <backup-dir> <target-data-dir>`
+(`--force` to overwrite an existing target). The real integration test
+(`tests/test_backup_and_restore.py`) does exactly what the task
+demanded: seeds real rows, backs up, genuinely deletes the original
+`control.db` (and its `-wal`/`-shm` files) from disk, restores from the
+backup into a fresh directory, and asserts the restored `ControlDB`
+rows are equal to the pre-deletion originals — not "the file exists."
+Same for a `recon.db`: a real marker row, deleted, restored, re-read.
+
+**Concurrent-writer safety, verified not assumed**: a real background
+thread continuously inserts/updates rows in `control.db` while a backup
+runs concurrently; the resulting backup file's `PRAGMA integrity_check`
+returns `"ok"` and is genuinely queryable — `sqlite3.Connection.backup()`'s
+own documented concurrent-access guarantee holds under a real
+concurrent writer, not just in isolation.
+
+### New settings (env-configurable, `api/settings.py`)
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HYDRA_API_BACKUP_INTERVAL_SECONDS` | `86400` | How often a backup runs. |
+| `HYDRA_API_BACKUP_RETENTION_COUNT` | `7` | Local snapshots kept (floor of 1, always). |
+| `HYDRA_API_BACKUP_S3_BUCKET` | unset | Set to enable remote upload; unset = local-only. |
+| `HYDRA_API_BACKUP_S3_PREFIX` | `hydra-backups` | Remote key prefix. |
+| `HYDRA_API_BACKUP_S3_ENDPOINT_URL` | unset (real AWS) | Set for a non-AWS S3-compatible provider. |
+| `HYDRA_API_BACKUP_S3_REGION` | unset | The bucket's region, if required. |
+
+Credentials (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) are read by
+`boto3` itself from the process environment — never a Hydra-specific
+setting, never logged.
+
+### Deployment (`docs/DEPLOYMENT.md`, new)
+
+The full walkthrough for a real host lives there, not duplicated here:
+host sizing (honestly flagged as unbenchmarked, with what to measure
+before committing to an instance size), a real domain + TLS via Caddy
+(automatic Let's Encrypt, exact `Caddyfile` steps — added,
+`Caddyfile.example`), `docker-compose.yml`'s new `api`/`caddy` services
+(the API had zero Docker representation before this task — confirmed
+by reading `docker-compose.yml`, not assumed), the backup destination
+confirmed to already live on the same mounted volume as the data it
+backs up (no separate volume needed), and an honest "there is no
+`/health` endpoint yet" note pointing at a real authenticated route as
+the interim up-check, rather than inventing one that would duplicate a
+future observability task's work.
+
+### Explicit non-goals — deferred, not silently skipped
+
+- **Multi-region/high-availability database replication.** A single
+  host with real backups is the right target for Hydra's actual
+  current scale.
+- **Point-in-time recovery beyond "restore the most recent daily
+  snapshot."** Good enough for now, stated explicitly as the limit.
+- **Choosing and provisioning the actual production host.** This task
+  is the backup mechanism and the documentation, not standing up real
+  infrastructure.
+- **A `GET /health` endpoint.** Real, deferred work for a follow-up
+  observability task — `docs/DEPLOYMENT.md` §6 documents the interim
+  authenticated-route check instead of inventing one here.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —

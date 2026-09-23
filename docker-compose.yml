@@ -24,3 +24,64 @@ services:
     # No command by default — `docker compose run hydra ...` supplies one.
     # `docker compose up` alone would just print --help and exit, which is
     # intentional: Hydra is not a long-running daemon.
+
+  # The paid EASM API (docs/PAID_API_DESIGN.md) — a genuinely separate,
+  # long-running service from the `hydra` CLI service above, sharing the
+  # same image (api/ is already part of it — see requirements-api.txt)
+  # but never the same command or volumes. See docs/DEPLOYMENT.md for
+  # the full real-deployment walkthrough (domain, TLS, backups); this
+  # file only wires the container itself correctly.
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hydra:local
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      # api_data/ holds control.db, every account's own recon.db
+      # (api/tenancy.py), AND api/backup_worker.py's own backup
+      # snapshots (api_data/backups/) — all under this ONE mounted
+      # volume, never the container's own writable layer, for the same
+      # reason output/logs/reports are mounted above: recreating the
+      # container must never silently discard real account/billing data
+      # or the backups meant to protect it. `APISettings.data_dir`
+      # defaults to `<repo_root>/api_data`, which resolves to
+      # `/app/api_data` inside this image (WORKDIR /app) — no extra env
+      # var needed for this mount to be exactly where the app already
+      # looks.
+      - ./docker-data/api_data:/app/api_data
+    # Bound to localhost only — Caddy (below) is the one thing that
+    # should ever reach this port from outside the host; the API itself
+    # has no TLS of its own; api key auth ≠ transport encryption. Real
+    # public exposure goes through the Caddy service instead, never
+    # this port directly.
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+
+  # A reverse proxy purely for automatic HTTPS (docs/DEPLOYMENT.md
+  # explains why Caddy specifically) — this container never sees
+  # application logic, only forwards to `api` over the compose network.
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  # Caddy's own state (its automatically-obtained Let's Encrypt
+  # certificates and account key) — MUST persist across container
+  # recreation, or a redeploy would re-request a fresh certificate from
+  # Let's Encrypt every time, risking their real rate limits.
+  caddy_data:
+  caddy_config:
