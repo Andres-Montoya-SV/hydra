@@ -220,3 +220,155 @@ class TestClientReportMatchesCli:
             # only a 409 is invalid to assert unconditionally here, so
             # confirm the endpoint never 500s regardless of timing.
             assert resp.status_code in (200, 409)
+
+
+class TestWhiteLabelBranding:
+    """docs/PAID_API_DESIGN.md's white-label client report section — an
+    Ultra account's own configured name appearing on the report cover/
+    title, gated by real branding configuration, not a silent
+    fallback."""
+
+    def _ultra_account_with_completed_scan(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[str, str, str]:
+        _install_pipeline_stubs(monkeypatch)
+        account = client.post("/accounts", json={"email": unique_email()}).json()
+        client.app.state.control_db.mark_email_verified(account["account_id"])
+        api_key = account["api_key"]
+        account_id = account["account_id"]
+        seed_verified_domain(client, account_id, SEED)
+        client.app.state.control_db.set_tier(account_id, "ultra")
+        scan_id = client.post(
+            "/scans", json={"domain": SEED}, headers={"X-API-Key": api_key}
+        ).json()["scan_id"]
+        _wait_for_terminal_status(client, api_key, scan_id)
+        return api_key, account_id, scan_id
+
+    def test_branding_endpoints_round_trip(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api_data"))) as client:
+            account = client.post("/accounts", json={"email": unique_email()}).json()
+            client.app.state.control_db.mark_email_verified(account["account_id"])
+            api_key = account["api_key"]
+            client.app.state.control_db.set_tier(account["account_id"], "ultra")
+
+            initial = client.get("/account/branding", headers={"X-API-Key": api_key})
+            assert initial.status_code == 200
+            assert initial.json() == {"company_name": None}
+
+            set_resp = client.put(
+                "/account/branding",
+                json={"company_name": "Acme Security Consulting"},
+                headers={"X-API-Key": api_key},
+            )
+            assert set_resp.status_code == 200
+            assert set_resp.json() == {"company_name": "Acme Security Consulting"}
+
+            get_resp = client.get("/account/branding", headers={"X-API-Key": api_key})
+            assert get_resp.json() == {"company_name": "Acme Security Consulting"}
+
+    def test_a_non_ultra_account_cannot_set_branding(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api_data"))) as client:
+            account = client.post("/accounts", json={"email": unique_email()}).json()
+            client.app.state.control_db.mark_email_verified(account["account_id"])
+            api_key = account["api_key"]
+            # Free tier — never touched set_tier, default from account creation.
+
+            resp = client.put(
+                "/account/branding",
+                json={"company_name": "Should Not Be Allowed"},
+                headers={"X-API-Key": api_key},
+            )
+            assert resp.status_code == 403
+
+    def test_white_label_with_branding_configured_appears_in_markdown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api_data"))) as client:
+            api_key, account_id, scan_id = self._ultra_account_with_completed_scan(
+                client, monkeypatch
+            )
+            client.put(
+                "/account/branding",
+                json={"company_name": "Acme Security Consulting"},
+                headers={"X-API-Key": api_key},
+            )
+
+            resp = client.post(
+                f"/scans/{scan_id}/client-report",
+                json={"format": "markdown", "language": "en", "white_label": True},
+                headers={"X-API-Key": api_key},
+            )
+            assert resp.status_code == 200
+            assert "Acme Security Consulting" in resp.text
+            assert "**Prepared by:** Acme Security Consulting" in resp.text
+
+    def test_white_label_with_branding_configured_appears_in_docx(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("docx")
+        import io
+
+        import docx
+
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api_data"))) as client:
+            api_key, account_id, scan_id = self._ultra_account_with_completed_scan(
+                client, monkeypatch
+            )
+            client.put(
+                "/account/branding",
+                json={"company_name": "Acme Security Consulting"},
+                headers={"X-API-Key": api_key},
+            )
+
+            resp = client.post(
+                f"/scans/{scan_id}/client-report",
+                json={"format": "docx", "language": "en", "white_label": True},
+                headers={"X-API-Key": api_key},
+            )
+            assert resp.status_code == 200
+            document = docx.Document(io.BytesIO(resp.content))
+            full_text = "\n".join(p.text for p in document.paragraphs)
+            assert "Acme Security Consulting" in full_text
+
+    def test_white_label_without_branding_configured_is_422_not_a_silent_fallback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api_data"))) as client:
+            api_key, account_id, scan_id = self._ultra_account_with_completed_scan(
+                client, monkeypatch
+            )
+            # Deliberately never called PUT /account/branding.
+
+            resp = client.post(
+                f"/scans/{scan_id}/client-report",
+                json={"format": "markdown", "language": "en", "white_label": True},
+                headers={"X-API-Key": api_key},
+            )
+            assert resp.status_code == 422
+            assert "branding" in resp.json()["detail"].lower()
+
+    def test_white_label_off_is_byte_for_byte_identical_to_no_branding_configured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No regression for the default path — an Ultra account that
+        configured branding but did NOT ask for white_label=true on this
+        particular request must get the exact same unbranded output as
+        before this task existed."""
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api_data"))) as client:
+            api_key, account_id, scan_id = self._ultra_account_with_completed_scan(
+                client, monkeypatch
+            )
+            client.put(
+                "/account/branding",
+                json={"company_name": "Acme Security Consulting"},
+                headers={"X-API-Key": api_key},
+            )
+
+            resp = client.post(
+                f"/scans/{scan_id}/client-report",
+                json={"format": "markdown", "language": "en", "white_label": False},
+                headers={"X-API-Key": api_key},
+            )
+            assert resp.status_code == 200
+            assert "Acme Security Consulting" not in resp.text
+            assert "Prepared by" not in resp.text

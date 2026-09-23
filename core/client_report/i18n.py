@@ -32,6 +32,7 @@ DEFAULT_LANGUAGE = "es"
 _ES: dict[str, object] = {
     # --- Markdown/docx shared structure ---
     "report_title": "Informe de seguridad — {target}",
+    "report_prepared_by_label": "Preparado por",
     "generated_line": "*Generado: {date} · Duración de la corrida: {duration}*",
     "duration_known": "{minutes:.1f} minutos ({seconds:.0f} segundos)",
     "duration_unknown": "no disponible",
@@ -381,6 +382,7 @@ _ES: dict[str, object] = {
 
 _EN: dict[str, object] = {
     "report_title": "Security Report — {target}",
+    "report_prepared_by_label": "Prepared by",
     "generated_line": "*Generated: {date} · Run duration: {duration}*",
     "duration_known": "{minutes:.1f} minutes ({seconds:.0f} seconds)",
     "duration_unknown": "not available",

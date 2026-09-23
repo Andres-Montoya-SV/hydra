@@ -291,6 +291,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Real findings/hosts/domains are never translated either way."
         ),
     )
+    client_report_p.add_argument(
+        "--company-name",
+        dest="company_name",
+        default=None,
+        help=(
+            "White-label the report with this name (an attribution line under the "
+            "title/cover, both formats) instead of no branding at all. Omit for the "
+            "default, unbranded report — unchanged from before this flag existed."
+        ),
+    )
 
     engagement_p = subparsers.add_parser(
         "engagement",
@@ -964,6 +974,7 @@ def main() -> int:
                 output_path=args.output,
                 output_format=args.report_format,
                 language=args.language,
+                branding=args.company_name,
             )
         return 1
 

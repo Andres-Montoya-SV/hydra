@@ -75,9 +75,14 @@ def render_docx(
     data: RunReportData,
     consolidated: list[ConsolidatedFinding],
     language: str = DEFAULT_LANGUAGE,
+    *,
+    branding: str | None = None,
 ) -> bytes:
     """Returns the finished .docx file as bytes — the caller decides
-    where (or whether) to write it to disk."""
+    where (or whether) to write it to disk. `branding`: see
+    `render.py::render_markdown`'s identical parameter — `None` (the
+    default) renders byte-for-byte identical output to every prior
+    round."""
     try:
         import docx
         from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -89,7 +94,7 @@ def render_docx(
         ) from exc
 
     document = docx.Document()
-    _add_cover_page(document, data, language, WD_ALIGN_PARAGRAPH, Pt, RGBColor)
+    _add_cover_page(document, data, language, WD_ALIGN_PARAGRAPH, Pt, RGBColor, branding)
     document.add_page_break()
 
     vulns = [f for f in consolidated if f.category is FindingCategory.VULNERABILIDAD_CONFIRMADA]
@@ -121,7 +126,7 @@ def render_docx(
     return buffer.getvalue()
 
 
-def _add_cover_page(document, data: RunReportData, language: str, align, pt, rgb) -> None:  # type: ignore[no-untyped-def]
+def _add_cover_page(document, data: RunReportData, language: str, align, pt, rgb, branding: str | None = None) -> None:  # type: ignore[no-untyped-def]
     target = ", ".join(data.targets) if data.targets else data.run_id
 
     title = document.add_paragraph()
@@ -137,6 +142,18 @@ def _add_cover_page(document, data: RunReportData, language: str, align, pt, rgb
     run = subtitle.add_run(target)
     run.font.size = pt(18)
     run.font.color.rgb = rgb(0x40, 0x40, 0x40)
+
+    if branding:
+        # White-label (docs/PAID_API_DESIGN.md) — one attribution line,
+        # never replacing the title/subtitle above. Logo images are an
+        # explicitly deferred non-goal for this pass (see that doc
+        # section for why); text-only branding only.
+        prepared = document.add_paragraph()
+        prepared.alignment = align.CENTER
+        prepared.paragraph_format.space_before = pt(16)
+        prepared_run = prepared.add_run(f"{t(language, 'report_prepared_by_label')}: {branding}")
+        prepared_run.bold = True
+        prepared_run.font.size = pt(14)
 
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     duration = _format_duration(data.duration_seconds, language)

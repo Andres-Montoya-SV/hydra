@@ -92,7 +92,12 @@ class ClientReportRequest(BaseModel):
     format: Literal["markdown", "docx"] = "markdown"
     language: Literal["en", "es"] = "es"
     white_label: bool = Field(
-        default=False, description="Ultra-tier only — omits Hydra's own branding from the report."
+        default=False,
+        description=(
+            "Ultra-tier only — shows the account's own configured branding "
+            "(PUT /account/branding) on the report's cover/title instead of no "
+            "branding at all. Requires branding to already be configured; 422 otherwise."
+        ),
     )
 
 
@@ -170,6 +175,22 @@ class CreateSubscriptionResponse(BaseModel):
     previous_tier: str | None = None
     exceeds_domain_limit: bool = False
     exceeds_scan_limit: bool = False
+
+
+class SetBrandingRequest(BaseModel):
+    company_name: str | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "The name shown on white-labeled client reports (PUT /scans/{id}/"
+            "client-report with white_label=true). null clears any previously "
+            "configured branding."
+        ),
+    )
+
+
+class BrandingResponse(BaseModel):
+    company_name: str | None = None
 
 
 class WompiReconcileRequest(BaseModel):

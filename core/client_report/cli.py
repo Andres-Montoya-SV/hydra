@@ -32,6 +32,7 @@ def cmd_client_report(
     output_path: Path | None = None,
     output_format: str = "markdown",
     language: str = DEFAULT_LANGUAGE,
+    branding: str | None = None,
 ) -> int:
     sanitize_run_id(run_id)
 
@@ -78,14 +79,14 @@ def cmd_client_report(
         from core.client_report.render_docx import DocxRenderError, render_docx
 
         try:
-            content: str | bytes = render_docx(data, consolidated, language)
+            content: str | bytes = render_docx(data, consolidated, language, branding=branding)
         except DocxRenderError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         default_name = "client_report.docx"
         write_mode = "wb"
     else:
-        content = render_markdown(data, consolidated, language)
+        content = render_markdown(data, consolidated, language, branding=branding)
         default_name = "client_report.md"
         write_mode = "w"
 

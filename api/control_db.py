@@ -165,6 +165,14 @@ CREATE INDEX IF NOT EXISTS idx_domain_verifications_account
 -- correlated back to this account even after the original
 -- `wompi_pending_enrollments` row has done its one job and been marked
 -- 'matched'. NULL for an account that has never had a paid tier.
+-- `white_label_company_name`: the "Build the white-label client report
+-- rendering" task — an Ultra account's own consultancy name, shown on
+-- the client-report cover/title in place of no branding at all when
+-- `white_label=true` is requested (api/routers/subscription.py's
+-- `PUT /account/branding`). NULL means "never configured" — checked
+-- explicitly by the client-report route before honoring
+-- `white_label=true`, never silently falling back to an unbranded
+-- report a paying reseller didn't ask for.
 CREATE TABLE IF NOT EXISTS subscriptions (
     account_id TEXT PRIMARY KEY REFERENCES accounts(account_id),
     tier TEXT NOT NULL,
@@ -172,6 +180,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     billing_email TEXT,
     grace_period_started_at TEXT,
     retention_days_override INTEGER,
+    white_label_company_name TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -328,6 +337,7 @@ class SubscriptionRecord:
     billing_email: str | None
     grace_period_started_at: str | None
     retention_days_override: int | None
+    white_label_company_name: str | None
     created_at: str
     updated_at: str
 
@@ -399,6 +409,13 @@ _SCANS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("heartbeat_at", "TEXT"),
 )
 
+# White-label client report fix: an existing `subscriptions` table
+# (every account created before this task) needs this column added the
+# same way.
+_SUBSCRIPTIONS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("white_label_company_name", "TEXT"),
+)
+
 
 def _migrate_table_columns(
     conn: sqlite3.Connection, table: str, columns: tuple[tuple[str, str], ...]
@@ -442,6 +459,7 @@ class ControlDB:
         with self._connect() as conn:
             _migrate_table_columns(conn, "accounts", _ACCOUNTS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "scans", _SCANS_MIGRATION_COLUMNS)
+            _migrate_table_columns(conn, "subscriptions", _SUBSCRIPTIONS_MIGRATION_COLUMNS)
             conn.executescript(_SCHEMA)
         for suffix in ("", "-wal", "-shm"):
             path = Path(f"{self.db_path}{suffix}")
@@ -1113,6 +1131,18 @@ class ControlDB:
                 (retention_days, _now_iso(), account_id),
             )
 
+    def set_white_label_branding(self, account_id: str, company_name: str | None) -> None:
+        """`company_name=None` clears the account's configured branding
+        (`PUT /account/branding {"company_name": null}` — same "set to
+        remove" convention `set_retention_override` already uses, no
+        separate delete endpoint needed)."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE subscriptions SET white_label_company_name = ?, updated_at = ? "
+                "WHERE account_id = ?",
+                (company_name, _now_iso(), account_id),
+            )
+
     # --- monthly usage (Part B) -----------------------------------------
 
     def get_monthly_usage(self, account_id: str, period_key: str) -> MonthlyUsageRecord:
@@ -1403,6 +1433,7 @@ def _subscription_record_from_row(row: sqlite3.Row) -> SubscriptionRecord:
         billing_email=row["billing_email"],
         grace_period_started_at=row["grace_period_started_at"],
         retention_days_override=row["retention_days_override"],
+        white_label_company_name=row["white_label_company_name"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
