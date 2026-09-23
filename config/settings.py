@@ -272,6 +272,9 @@ class Settings:
     # Active cloud bucket enumeration (opt-in).
     cloud_bucket_enum_timeout: int = 10
     cloud_bucket_enum_delay_ms: int = 150
+    # Active subdomain takeover confirmation (opt-in). Only fingerprint-type
+    # signatures ever make a request; see modules/sub_takeover.py.
+    sub_takeover_timeout: int = 10
     strict_opsec: bool = False
     outbound_proxy_url: str | None = None
 
@@ -309,6 +312,8 @@ class Settings:
     enable_theharvester: bool = False
     enable_sslyze: bool = False
     enable_wafw00f: bool = False
+    # Off by default like every other active opt-in probe above.
+    enable_sub_takeover: bool = False
     theharvester_timeout: int = 180
     sslyze_timeout: int = 120
     wafw00f_timeout: int = 60
@@ -594,6 +599,9 @@ class Settings:
                 "CLOUD_BUCKET_ENUM_DELAY_MS",
                 maximum=5000,
             ),
+            sub_takeover_timeout=_int(
+                os.getenv("SUB_TAKEOVER_TIMEOUT"), 10, "SUB_TAKEOVER_TIMEOUT"
+            ),
             strict_opsec=_bool(os.getenv("STRICT_OPSEC")),
             outbound_proxy_url=_optional_proxy_url(os.getenv("OUTBOUND_PROXY_URL", "").strip()),
             enable_amass=_bool(os.getenv("ENABLE_AMASS")),
@@ -623,6 +631,7 @@ class Settings:
             enable_theharvester=_bool(os.getenv("ENABLE_THEHARVESTER")),
             enable_sslyze=_bool(os.getenv("ENABLE_SSLYZE")),
             enable_wafw00f=_bool(os.getenv("ENABLE_WAFW00F")),
+            enable_sub_takeover=_bool(os.getenv("ENABLE_SUB_TAKEOVER")),
             theharvester_timeout=_int(
                 os.getenv("THEHARVESTER_TIMEOUT"), 180, "THEHARVESTER_TIMEOUT"
             ),
@@ -1071,6 +1080,7 @@ class Settings:
                     ("theharvester", self.enable_theharvester),
                     ("sslyze", self.enable_sslyze),
                     ("wafw00f", self.enable_wafw00f),
+                    ("sub_takeover", self.enable_sub_takeover),
                 ]
                 if enabled
             ],
