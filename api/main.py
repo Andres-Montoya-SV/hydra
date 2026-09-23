@@ -18,33 +18,46 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from api.backup_worker import run_backup_loop
 from api.control_db import ControlDB
 from api.email_sender import ConsoleEmailSender, EmailSender, PostmarkEmailSender
+from api.health import LoopHeartbeats
+from api.observability import configure_logging, init_sentry
 from api.rate_limit import PersistentTokenBucketLimiter
 from api.reconciliation_worker import run_reconciliation_loop
-from api.routers import accounts, domains, hypotheses, keys, reportability, scans, subscription
+from api.routers import (
+    accounts,
+    domains,
+    health,
+    hypotheses,
+    keys,
+    reportability,
+    scans,
+    subscription,
+)
 from api.scan_worker import generate_worker_id, run_worker_loop
 from api.settings import APISettings, load_api_settings, validate_email_provider_config
 from api.wompi_client import WompiClient
-
-# A real gap this task's own "never ambiguous from the logs alone"
-# requirement surfaced: nothing in this service ever configured Python
-# logging. Without a handler, the stdlib's "handler of last resort"
-# (stderr, WARNING+) is all that's active — an INFO-level line (this
-# module's own email-provider-selection log, and the pre-existing
-# Hallazgo 2 orphaned-scan reconciliation log) is silently dropped by
-# default, never actually visible in a real `uvicorn` process's console
-# output. `basicConfig` is a no-op if the root logger already has a
-# handler (a real deployment's own explicit logging config, set up
-# before this module imports, always wins) — safe to call
-# unconditionally as a sensible zero-config default otherwise.
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 logger = logging.getLogger("hydra.api")
 
 
 def create_app(api_settings: APISettings | None = None) -> FastAPI:
     settings = api_settings or load_api_settings()
+    # A real gap this task's own "never ambiguous from the logs alone"
+    # requirement surfaced: nothing in this service ever configured
+    # Python logging. Without a handler, the stdlib's "handler of last
+    # resort" (stderr, WARNING+) is all that's active — an INFO-level
+    # line is silently dropped by default, never actually visible in a
+    # real `uvicorn` process's console output. `configure_logging` is a
+    # no-op if the root logger already has a handler (a real
+    # deployment's own explicit logging config, set up before this
+    # module imports, always wins). Moved here (from a module-level
+    # call) so `settings.log_format` — read from the SAME `APISettings`
+    # every other per-instance choice already comes from — can select
+    # `JsonFormatter` (api/observability.py) instead of a fixed format
+    # string.
+    configure_logging(settings.log_format)
     # Fails loudly HERE, synchronously, at app-construction time — never
     # a silent half-configured boot that only breaks on the first real
     # POST /accounts (api/settings.py::validate_email_provider_config's
@@ -52,11 +65,17 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     # regardless of whether it came from load_api_settings() (a real
     # deployment) or was constructed directly (tests).
     validate_email_provider_config(settings)
+    sentry_active = init_sentry(settings)
+    logger.info("Sentry error tracking: %s.", "on" if sentry_active else "off (SENTRY_DSN not set)")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.api_settings = settings
         app.state.control_db = ControlDB(settings.control_db_path)
+        # GET /health's liveness signal for the three loops below
+        # (api/health.py) — one instance, shared by every loop and read
+        # by the health route.
+        app.state.loop_heartbeats = LoopHeartbeats()
         # Durable-queue fix: persisted, cross-process-safe — see
         # api/rate_limit.py's own module docstring for why this replaced
         # the old in-memory TokenBucketLimiter as what the real app
@@ -112,6 +131,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
                 control_db=app.state.control_db,
                 worker_id=worker_id,
                 stop_event=stop_event,
+                heartbeats=app.state.loop_heartbeats,
             )
         )
         logger.info("Scan worker loop started (worker_id=%s).", worker_id)
@@ -129,6 +149,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
                 control_db=app.state.control_db,
                 email_sender=email_sender,
                 stop_event=stop_event,
+                heartbeats=app.state.loop_heartbeats,
             )
         )
         logger.info(
@@ -137,10 +158,29 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             settings.retention_purge_dry_run,
         )
 
+        # Automated backups fix: same "own periodic loop, shared
+        # stop_event, independent interval" shape as the reconciliation
+        # loop above — see api/backup_worker.py's own module docstring
+        # for the full design.
+        backup_task = asyncio.create_task(
+            run_backup_loop(
+                api_settings=settings,
+                control_db=app.state.control_db,
+                stop_event=stop_event,
+                heartbeats=app.state.loop_heartbeats,
+            )
+        )
+        logger.info(
+            "Backup loop started (interval=%.0fs, remote_upload=%s).",
+            settings.backup_interval_seconds,
+            "on" if settings.backup_s3_bucket else "off",
+        )
+
         yield
         stop_event.set()
         await worker_task
         await reconciliation_task
+        await backup_task
 
     app = FastAPI(
         title="Hydra EASM API",
@@ -164,10 +204,18 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             "(api/reconciliation_worker.py) suspends accounts whose "
             "payment-failure grace period expired (emailing them when "
             "it does) and purges scans/artifacts past each account's "
-            "tier retention window — see docs/PAID_API_DESIGN.md."
+            "tier retention window. A daily backup loop "
+            "(api/backup_worker.py) snapshots control.db and every "
+            "account's recon.db via SQLite's own online backup API, "
+            "optionally pushing them to S3-compatible storage. "
+            "GET /health (unauthenticated) reports control_db "
+            "reachability and whether each background loop is still "
+            "alive; error tracking (Sentry) and JSON logs are optional, "
+            "env-configured — see docs/PAID_API_DESIGN.md."
         ),
         lifespan=lifespan,
     )
+    app.include_router(health.router)
     app.include_router(accounts.router)
     app.include_router(keys.router)
     app.include_router(domains.router)

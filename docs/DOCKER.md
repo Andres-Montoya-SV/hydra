@@ -272,13 +272,22 @@ docker compose run hydra ruff check .
 docker compose run hydra bash          # interactive shell for debugging
 ```
 
-One service, not two: `docker compose run <service> <anything>` already
-overrides the command per invocation, so a real scan and the test suite
-share one image and one set of volume mounts — a second service definition
-would just duplicate the same `build:`/`volumes:` block for no benefit.
-`docker compose up` alone (no command) is intentionally not the normal way
-to use this — Hydra is not a long-running daemon, and the plain `up` path
-exists mainly for the `--build` cache-warming case.
+Just the one `hydra` service for the CLI: `docker compose run <service>
+<anything>` already overrides the command per invocation, so a real scan
+and the test suite share one image and one set of volume mounts — a
+second service definition would just duplicate the same
+`build:`/`volumes:` block for no benefit. `docker compose up` alone (no
+command) is intentionally not the normal way to use this service — Hydra
+is not a long-running daemon, and the plain `up` path exists mainly for
+the `--build` cache-warming case.
+
+`docker-compose.yml` also defines `api` and `caddy` — the paid API
+(`api/`) and its TLS reverse proxy, a genuinely different, long-running
+service from the CLI above, sharing the same image but never the same
+command or volumes. Covered in `docs/DEPLOYMENT.md`, not here — this
+document's own stated scope is containerization only, and running the API
+persistently on a real host with a real domain is a deployment concern,
+not a container-build one.
 
 ## Network confinement — verified, not assumed
 

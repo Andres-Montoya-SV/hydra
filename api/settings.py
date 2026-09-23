@@ -156,9 +156,56 @@ class APISettings:
     # logs what it WOULD delete.
     retention_purge_dry_run: bool = False
 
+    # Automated backups (docs/PAID_API_DESIGN.md's "Automated backups
+    # and a real deployment target" section) — see
+    # `api/backup_worker.py`'s own module docstring for the full
+    # reasoning. Daily, like the reconciliation loop — a database this
+    # size doesn't need finer-grained snapshots, and every account's
+    # `recon.db` gets backed up in the same cycle as `control.db`.
+    backup_interval_seconds: float = 86400.0
+    # How many of the most recent local snapshot directories to keep —
+    # one week of daily backups by default, a real, bounded retention
+    # policy rather than "keep everything forever" (which would grow
+    # without limit) or "keep nothing" (which defeats the purpose the
+    # first time a restore is actually needed a few days after a bad
+    # deploy, not the same day). `rotate_backups` always keeps AT LEAST
+    # the single most recent snapshot even if this is misconfigured to
+    # 0 or a negative number — a backup system that could delete its
+    # only copy through a config typo is worse than having no retention
+    # limit at all.
+    backup_retention_count: int = 7
+    # Remote (S3-compatible) upload is entirely OPT-IN — `None` means
+    # backups stay local-only, logged loudly (never a silent gap) but
+    # never a hard failure, since a fresh deployment that hasn't
+    # provisioned a bucket yet should still get local backups working.
+    # Deliberately not locked to AWS: `backup_s3_endpoint_url` lets this
+    # point at any S3-compatible provider (DigitalOcean Spaces, Backblaze
+    # B2, Cloudflare R2) — credentials themselves are never a field here,
+    # read via boto3's own standard `AWS_ACCESS_KEY_ID`/
+    # `AWS_SECRET_ACCESS_KEY` environment variables instead, the same
+    # convention every S3-compatible provider's own docs recommend.
+    backup_s3_bucket: str | None = None
+    backup_s3_prefix: str = "hydra-backups"
+    backup_s3_endpoint_url: str | None = None
+    backup_s3_region: str | None = None
+
+    # Basic observability (docs/PAID_API_DESIGN.md's "Basic
+    # observability" section). `sentry_dsn`: unset means error tracking
+    # is simply off — same "zero-config keeps working" discipline as
+    # Postmark/Wompi (api/settings.py's own existing convention), never
+    # a startup failure. `log_format`: "text" (default, unchanged from
+    # every prior round) or "json" — see api/observability.py for the
+    # formatter itself.
+    sentry_dsn: str | None = None
+    log_format: str = "text"
+
     @property
     def control_db_path(self) -> Path:
         return self.data_dir / "control.db"
+
+    @property
+    def backup_root(self) -> Path:
+        return self.data_dir / "backups"
 
     def account_root(self, account_id: str) -> Path:
         """Every account's pipeline data lives under its own directory —
@@ -240,6 +287,18 @@ def load_api_settings() -> APISettings:
     settings.retention_purge_dry_run = os.getenv(
         "HYDRA_API_RETENTION_PURGE_DRY_RUN", ""
     ).strip().lower() in ("1", "true", "yes")
+    backup_interval = os.getenv("HYDRA_API_BACKUP_INTERVAL_SECONDS")
+    if backup_interval:
+        settings.backup_interval_seconds = float(backup_interval)
+    backup_retention = os.getenv("HYDRA_API_BACKUP_RETENTION_COUNT")
+    if backup_retention:
+        settings.backup_retention_count = int(backup_retention)
+    settings.backup_s3_bucket = os.getenv("HYDRA_API_BACKUP_S3_BUCKET") or None
+    settings.backup_s3_prefix = os.getenv("HYDRA_API_BACKUP_S3_PREFIX") or "hydra-backups"
+    settings.backup_s3_endpoint_url = os.getenv("HYDRA_API_BACKUP_S3_ENDPOINT_URL") or None
+    settings.backup_s3_region = os.getenv("HYDRA_API_BACKUP_S3_REGION") or None
+    settings.sentry_dsn = os.getenv("SENTRY_DSN") or None
+    settings.log_format = os.getenv("HYDRA_API_LOG_FORMAT") or "text"
     return settings
 
 

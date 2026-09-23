@@ -2,6 +2,9 @@
 .env
 config/.env
 /scope.txt
+# The real, domain-specific reverse-proxy config (docs/DEPLOYMENT.md) —
+# Caddyfile.example is the committed template.
+/Caddyfile
 
 # Python
 __pycache__/

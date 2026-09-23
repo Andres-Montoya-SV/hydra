@@ -2211,6 +2211,244 @@ established.
 - **Purging the account's own `recon.db`/`AssetStore`.** Stated above,
   repeated here: out of scope by design, not an oversight.
 
+## Automated backups and a real deployment target — 2026-09-23
+
+Closes two real, previously-unaddressed gaps: every piece of durable
+state in this service lives in SQLite (`control.db` plus one
+`recon.db` per account, `api/tenancy.py`), and until this task nothing
+backed any of it up; and this service had never run anywhere but a
+developer's own machine — no domain, no TLS, no host.
+
+### Backups (`api/backup_worker.py`)
+
+**Mechanism — SQLite's own online backup API, never a raw file copy**:
+`sqlite3.Connection.backup()`, confirmed directly against Python's own
+current docs before relying on it: "Works even if the database is
+being accessed by other clients or concurrently by the same
+connection." A raw `shutil.copy()` of a live WAL-mode file (every DB
+this service touches uses WAL, `core.store.connect_sqlite`) has no
+such guarantee.
+
+**What gets backed up**: `control.db`, and every account's `recon.db`
+discovered via `ControlDB.list_account_ids()` — never a hardcoded glob.
+An account with no `recon.db` yet (never scanned) is skipped, not an
+error.
+
+**Where backups go**: local disk first, always
+(`<data_dir>/backups/<timestamp>/`, mirroring each account's real
+relative layout so restore is a straight structural copy back). Remote
+upload to S3-compatible storage is layered on top and entirely
+OPT-IN — `None`/unset `HYDRA_API_BACKUP_S3_BUCKET` means local-only,
+loudly logged as such, never a hard failure. Deliberately not locked to
+AWS: `HYDRA_API_BACKUP_S3_ENDPOINT_URL` + path-style addressing (only
+applied when a custom endpoint is actually configured) makes this work
+unmodified against DigitalOcean Spaces, Backblaze B2, or Cloudflare
+R2 — verified for real against a local fake S3-compatible HTTP server
+(`tests/_fake_s3_server.py`, the same "real server as arbiter" pattern
+Postmark/Wompi/DNS testing already established in this project), not
+mocked.
+
+**Retention**: `HYDRA_API_BACKUP_RETENTION_COUNT` (default 7 — one
+week of daily snapshots) most recent LOCAL snapshots are kept;
+`rotate_backups` always keeps at least the single most recent one
+regardless of misconfiguration (`0`, or a negative number) — tested
+directly. Remote objects are never deleted by this job; S3-compatible
+providers' own lifecycle rules are the right tool for that, not
+duplicated custom code.
+
+**Schedule**: its own daily `asyncio` loop, the exact same
+`asyncio.create_task` + shared `stop_event` shape
+`api/scan_worker.py`/`api/reconciliation_worker.py` already
+established — no third scheduler invented. Unlike the reconciliation
+loop, the actual work runs via `asyncio.to_thread` rather than directly
+on the event loop: real disk I/O across every account plus an optional
+real network upload is genuinely blocking, and could otherwise stall
+live request handling longer than is acceptable.
+
+**Restore, tested for real — the part that matters most**: a
+standalone module, never imported by the running service,
+`python -m api.restore_backup <backup-dir> <target-data-dir>`
+(`--force` to overwrite an existing target). The real integration test
+(`tests/test_backup_and_restore.py`) does exactly what the task
+demanded: seeds real rows, backs up, genuinely deletes the original
+`control.db` (and its `-wal`/`-shm` files) from disk, restores from the
+backup into a fresh directory, and asserts the restored `ControlDB`
+rows are equal to the pre-deletion originals — not "the file exists."
+Same for a `recon.db`: a real marker row, deleted, restored, re-read.
+
+**Concurrent-writer safety, verified not assumed**: a real background
+thread continuously inserts/updates rows in `control.db` while a backup
+runs concurrently; the resulting backup file's `PRAGMA integrity_check`
+returns `"ok"` and is genuinely queryable — `sqlite3.Connection.backup()`'s
+own documented concurrent-access guarantee holds under a real
+concurrent writer, not just in isolation.
+
+### New settings (env-configurable, `api/settings.py`)
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HYDRA_API_BACKUP_INTERVAL_SECONDS` | `86400` | How often a backup runs. |
+| `HYDRA_API_BACKUP_RETENTION_COUNT` | `7` | Local snapshots kept (floor of 1, always). |
+| `HYDRA_API_BACKUP_S3_BUCKET` | unset | Set to enable remote upload; unset = local-only. |
+| `HYDRA_API_BACKUP_S3_PREFIX` | `hydra-backups` | Remote key prefix. |
+| `HYDRA_API_BACKUP_S3_ENDPOINT_URL` | unset (real AWS) | Set for a non-AWS S3-compatible provider. |
+| `HYDRA_API_BACKUP_S3_REGION` | unset | The bucket's region, if required. |
+
+Credentials (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) are read by
+`boto3` itself from the process environment — never a Hydra-specific
+setting, never logged.
+
+### Deployment (`docs/DEPLOYMENT.md`, new)
+
+The full walkthrough for a real host lives there, not duplicated here:
+host sizing (honestly flagged as unbenchmarked, with what to measure
+before committing to an instance size), a real domain + TLS via Caddy
+(automatic Let's Encrypt, exact `Caddyfile` steps — added,
+`Caddyfile.example`), `docker-compose.yml`'s new `api`/`caddy` services
+(the API had zero Docker representation before this task — confirmed
+by reading `docker-compose.yml`, not assumed), the backup destination
+confirmed to already live on the same mounted volume as the data it
+backs up (no separate volume needed), and an honest "there is no
+`/health` endpoint yet" note pointing at a real authenticated route as
+the interim up-check, rather than inventing one that would duplicate a
+future observability task's work.
+
+### Explicit non-goals — deferred, not silently skipped
+
+- **Multi-region/high-availability database replication.** A single
+  host with real backups is the right target for Hydra's actual
+  current scale.
+- **Point-in-time recovery beyond "restore the most recent daily
+  snapshot."** Good enough for now, stated explicitly as the limit.
+- **Choosing and provisioning the actual production host.** This task
+  is the backup mechanism and the documentation, not standing up real
+  infrastructure.
+- ~~A `GET /health` endpoint.~~ — **resolved**, see "Basic
+  observability" below.
+
+## Basic observability — 2026-09-23
+
+A deliberately SMALL task, per its own explicit instruction — no
+metrics/dashboard stack, no alerting rules, no per-request tracing.
+Three pieces: a real `GET /health`, error tracking (Sentry), and an
+optional JSON log format.
+
+### `GET /health` (`api/health.py`, `api/routers/health.py`)
+
+Unauthenticated (same reasoning as `POST /webhooks/wompi` — an uptime
+monitor can't send `X-API-Key`), and actually verifies the service can
+do its job rather than returning `200` from a route that does nothing:
+
+- **`control_db` reachability** — `ControlDB.ping()`, a real query
+  against `sqlite_master`. **Deliberately not `SELECT 1`** — found the
+  hard way, while writing this exact method's own test, that `SELECT 1`
+  is a pure constant expression SQLite evaluates without ever reading
+  the database file's header or schema, so it SUCCEEDS even against a
+  completely corrupted, non-SQLite file. Querying `sqlite_master`
+  forces a real read of the file's actual content.
+- **Each background loop's liveness** — `LoopHeartbeats`
+  (`app.state.loop_heartbeats`), a real per-loop timestamp updated once
+  per iteration by the scan worker, reconciliation, and backup loops
+  (`api/scan_worker.py`/`api/reconciliation_worker.py`/
+  `api/backup_worker.py`), compared against a per-loop threshold
+  (`max(interval_seconds * 2, 60.0)`) derived from that loop's own
+  configured interval. This is a REAL signal, not "the asyncio task
+  object hasn't been garbage collected" — a task whose coroutine died on
+  an unhandled exception stays a valid, non-garbage-collected Python
+  object forever, `task.done()` only tells you it finished at some
+  point, never that it's actually still iterating. (This exact
+  distinction is why the Python 3.10 `asyncio.TimeoutError` bug in
+  these same loops, fixed in an earlier round, went completely
+  undetected until a real CI failure — nothing was watching whether
+  those loops were still alive at all.)
+- **A real 503** with a per-check reason when anything above fails —
+  never a generic "unhealthy," since that's what an on-call human pages
+  on at 3am.
+
+**A real, honestly-stated tradeoff on the daily loops' detection
+window**: the reconciliation/backup loops only mark themselves alive
+once per full (daily) cycle, so their `interval * 2` threshold means a
+genuinely dead loop can go up to ~48 hours before `/health` notices.
+This is deliberately coarse, not an oversight — a same-day-precision
+liveness check for a once-a-day job would need a separate, faster
+internal heartbeat just for monitoring purposes, exactly the kind of
+complexity this task's own "don't build a metrics stack" instruction
+rules out.
+
+Tested against genuinely broken dependencies, not just the happy path
+(`tests/test_api_health.py`): a `control.db` actually corrupted on disk
+(including its `-wal`/`-shm` sidecars — corrupting only the main file
+is not enough to prove anything, since WAL mode can transparently
+recover real data from an intact `-wal` file even when the main `.db`
+file is garbage, found the same way as the `SELECT 1` gap above); a
+real backdated heartbeat timestamp; a loop that never reported in at
+all.
+
+### Error tracking (`api/observability.py`, Sentry)
+
+`SENTRY_DSN` unset (the default) means `init_sentry` never calls
+`sentry_sdk.init()` at all — same zero-config-stays-zero-config
+discipline as Postmark. FastAPI/Starlette integration is auto-detected
+by `sentry_sdk` itself once `fastapi` is importable (confirmed against
+Sentry's own current docs before writing this), no separate integration
+class needed.
+
+**Scrubbing — deliberate, not the SDK's own defaults left alone**:
+Sentry's `send_default_pii` defaults to `False` (confirmed against
+Sentry's docs) and already excludes some PII, but `X-API-Key` is a
+custom header name, not covered by that built-in behavior — exactly the
+gap the task called out. Two independent passes run in `before_send`:
+
+1. **Header-name scrubbing** — `X-API-Key`, `Authorization`, `Cookie`,
+   `wompi_hash` stripped from `event["request"]["headers"]`
+   unconditionally, handling both the dict and list-of-pairs shapes
+   Sentry's SDK can produce. Covers a value that isn't known ahead of
+   time (a real customer's actual API key).
+2. **Known-static-secret value scrubbing** — `POSTMARK_SERVER_TOKEN`/
+   `WOMPI_CLIENT_SECRET`'s real configured values are searched for and
+   redacted ANYWHERE in the serialized event (a serialize → string-
+   replace → deserialize sweep) — an exception message, a local
+   variable's repr, extra context, not just headers.
+
+**Proven with a real intercepted payload, not asserted from reading the
+code** (`tests/test_observability_sentry_scrubbing.py`): a real
+`sentry_sdk.transport.Transport` subclass (the actual, current
+transport interface in the pinned SDK version, confirmed directly
+against the installed package) intercepts `capture_envelope`; a real
+`sentry_sdk.capture_exception()` call carrying a realistic fake secret
+in its message, a local variable, and extra context is triggered; the
+transport's actually-received event is inspected and confirmed to never
+contain the secret anywhere.
+
+### Structured (JSON) logging (`api/observability.py`)
+
+`HYDRA_API_LOG_FORMAT=json` switches to `JsonFormatter`; unset (default)
+keeps the exact human-readable format every prior round already used.
+`api/main.py`'s old unconditional `logging.basicConfig` call — a fixed
+format string, which can't select a custom `Formatter` class — was
+replaced with `configure_logging(settings.log_format)`, called from
+inside `create_app()` (after `settings` resolves) instead of at module
+import time, keeping the same "no-op if the root logger already has a
+handler" safety.
+
+### New settings (env-configurable, `api/settings.py`)
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `SENTRY_DSN` | unset | Set to enable error tracking; unset = off. |
+| `HYDRA_API_LOG_FORMAT` | `text` | `json` switches to structured logs. |
+
+### Explicit non-goals — deferred, not silently skipped
+
+- **Prometheus/Grafana or any metrics time-series stack.** Not
+  warranted at Hydra's current scale.
+- **Alerting rules/on-call rotation tooling.** Sentry's own default
+  notification settings are enough for now.
+- **Per-request tracing/APM.** Out of scope.
+- **Same-day-precision liveness for the daily reconciliation/backup
+  loops.** Stated above as a real, deliberate tradeoff, not an
+  oversight.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —

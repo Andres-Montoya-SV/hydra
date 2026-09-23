@@ -35,6 +35,7 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
+from api.health import LoopHeartbeats
 from api.subscriptions import get_or_create_subscription, grace_period_expired
 from api.tiers import retention_days_for, tier_limits
 
@@ -204,6 +205,7 @@ async def run_reconciliation_loop(
     control_db: ControlDB,
     email_sender: EmailSender,
     stop_event: asyncio.Event,
+    heartbeats: LoopHeartbeats,
 ) -> None:
     """Runs both jobs, logs one count-bearing summary line, then waits
     `api_settings.reconciliation_interval_seconds` (or until
@@ -220,6 +222,7 @@ async def run_reconciliation_loop(
     here ever runs long enough for prompt-shutdown latency to matter
     the way an in-flight 25-minute scan does."""
     while not stop_event.is_set():
+        heartbeats.mark_alive("reconciliation")  # GET /health's liveness signal, api/health.py
         suspended_count = run_grace_period_job(control_db=control_db, email_sender=email_sender)
         purged_count = run_retention_purge_job(api_settings=api_settings, control_db=control_db)
         logger.info(
