@@ -1534,28 +1534,11 @@ class FfufParser(ToolParser):
     ordinary Host/Finding model like every other active-probe module."""
 
     tool_name = "ffuf"
-class GithubSecretsParser(ToolParser):
-    """Leaked-secret findings from public GitHub repos
-    (modules/github_secrets.py). The raw secret value is never present
-    anywhere in `github_secrets.jsonl` in the first place (see that
-    module's own docstring) — this parser only ever reads safe metadata
-    fields (rule id, file, line, commit, description) that were already
-    safe before reaching this file, not redacted here."""
-
-    tool_name = "github_secrets"
-class SubTakeoverParser(ToolParser):
-    """Confirmed subdomain-takeover findings (modules/sub_takeover.py) —
-    only Stage-2-confirmed records ever reach `sub_takeover.jsonl`; a
-    Stage-1-only CNAME-pattern match is never parsed into a Finding."""
-
-    tool_name = "sub_takeover"
 
     def parse(
         self, output_dir: Path, *, artifact: Path | None = None, run_id: str = ""
     ) -> tuple[list[Host], list[str]]:
         path = artifact or output_dir / "ffuf_findings.jsonl"
-        path = artifact or output_dir / "github_secrets.jsonl"
-        path = artifact or output_dir / "sub_takeover.jsonl"
         by_host: dict[str, Host] = {}
         for record in read_jsonl(path):
             domain = normalize_domain(str(record.get("host", "")))
@@ -1571,6 +1554,33 @@ class SubTakeoverParser(ToolParser):
                 url=record.get("url") if isinstance(record.get("url"), str) else None,
                 description=str(record.get("description") or ""),
                 confidence_score=int(record.get("confidence_score") or 50),
+            )
+            host.findings.append(finding)
+        return list(by_host.values()), []
+
+
+class GithubSecretsParser(ToolParser):
+    """Leaked-secret findings from public GitHub repos
+    (modules/github_secrets.py). The raw secret value is never present
+    anywhere in `github_secrets.jsonl` in the first place (see that
+    module's own docstring) — this parser only ever reads safe metadata
+    fields (rule id, file, line, commit, description) that were already
+    safe before reaching this file, not redacted here."""
+
+    tool_name = "github_secrets"
+
+    def parse(
+        self, output_dir: Path, *, artifact: Path | None = None, run_id: str = ""
+    ) -> tuple[list[Host], list[str]]:
+        path = artifact or output_dir / "github_secrets.jsonl"
+        by_host: dict[str, Host] = {}
+        for record in read_jsonl(path):
+            domain = normalize_domain(str(record.get("host", "")))
+            if not domain:
+                continue
+            host = by_host.setdefault(domain, Host(domain=domain))
+            finding = Finding(
+                host=domain,
                 template_id=str(record.get("template_id") or "leaked-secret"),
                 severity=str(record.get("severity") or "medium"),
                 name=str(record.get("name") or ""),
@@ -1578,6 +1588,30 @@ class SubTakeoverParser(ToolParser):
                 url=record.get("url") if isinstance(record.get("url"), str) else None,
                 description=str(record.get("description_full") or record.get("description") or ""),
                 confidence_score=int(record.get("confidence_score") or 60),
+            )
+            host.findings.append(finding)
+        return list(by_host.values()), []
+
+
+class SubTakeoverParser(ToolParser):
+    """Confirmed subdomain-takeover findings (modules/sub_takeover.py) —
+    only Stage-2-confirmed records ever reach `sub_takeover.jsonl`; a
+    Stage-1-only CNAME-pattern match is never parsed into a Finding."""
+
+    tool_name = "sub_takeover"
+
+    def parse(
+        self, output_dir: Path, *, artifact: Path | None = None, run_id: str = ""
+    ) -> tuple[list[Host], list[str]]:
+        path = artifact or output_dir / "sub_takeover.jsonl"
+        by_host: dict[str, Host] = {}
+        for record in read_jsonl(path):
+            domain = normalize_domain(str(record.get("host", "")))
+            if not domain:
+                continue
+            host = by_host.setdefault(domain, Host(domain=domain))
+            finding = Finding(
+                host=domain,
                 template_id=str(record.get("template_id") or "subdomain-takeover"),
                 severity=str(record.get("severity") or "high"),
                 name=str(record.get("name") or ""),
