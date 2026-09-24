@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import secrets
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+import api.monitoring_worker as monitoring_worker_module
 from api.control_db import ControlDB
 from api.monitoring_worker import run_monitoring_cycle
 from api.settings import APISettings
@@ -417,3 +419,220 @@ class TestOptOut:
 
         assert stats["enqueued"] == 0
         assert control_db.get_monitored_domain(account_id, "example.com") is None
+
+
+class TestCycleIsSafeToInterruptMidWay:
+    """`run_monitoring_cycle`'s own module docstring claims the cycle is
+    "safe to interrupt at any point" — proven here for real, not just
+    asserted in prose. The enqueue phase's own page loop
+    (`while not budget.exhausted(): page = list_due_..._page(...)`) is
+    the exact mechanism under test: the budget is only re-checked BETWEEN
+    pages, so a real, deterministic per-row delay (added to a genuine
+    dependency `_try_enqueue_one` calls, `classify_scan_gate` — never the
+    function under test itself) combined with a small `monitoring_batch_size`
+    reliably stops the cycle after some pages but not all, without faking
+    `time.monotonic()` or mocking away any monitoring logic."""
+
+    def _slow_down_classify_scan_gate(self, monkeypatch: pytest.MonkeyPatch, delay: float) -> None:
+        real = monitoring_worker_module.classify_scan_gate
+
+        def slow(*args, **kwargs):
+            time.sleep(delay)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(monitoring_worker_module, "classify_scan_gate", slow)
+
+    def _seed_domains(
+        self, control_db: ControlDB, api_settings: APISettings, account_id: str, count: int
+    ) -> list[str]:
+        domains = [f"host{i}.interrupt-test.example" for i in range(count)]
+        for domain in domains:
+            _verify_domain(control_db, account_id, domain)
+            record = _monitor(control_db, api_settings, account_id, domain)
+            _make_due(control_db, record.monitoring_id)
+        return domains
+
+    def test_a_budget_exhausted_partway_through_enqueue_resumes_and_matches_one_clean_run(
+        self, api_settings: APISettings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Scenario A: interrupted then resumed, against its OWN control_db.
+        interrupted_settings = APISettings(
+            data_dir=api_settings.data_dir,
+            monitoring_batch_size=2,  # 6 domains -> 3 pages
+            monitoring_asset_count_ceiling=api_settings.monitoring_asset_count_ceiling,
+            monitoring_cycle_time_budget_seconds=0.08,  # ~1 page's worth of delay below
+        )
+        interrupted_db = ControlDB(interrupted_settings.data_dir / "control.db")
+        account_a = _account(interrupted_db, tier="pro")
+        domains = self._seed_domains(interrupted_db, interrupted_settings, account_a, 6)
+
+        self._slow_down_classify_scan_gate(monkeypatch, delay=0.05)
+        stats1 = run_monitoring_cycle(
+            api_settings=interrupted_settings,
+            control_db=interrupted_db,
+            email_sender=_RecordingEmailSender(),
+        )
+        monkeypatch.undo()  # remove the slowdown before resuming
+
+        mid_state = {
+            d: interrupted_db.get_monitored_domain(account_a, d).pending_passive_scan_id
+            for d in domains
+        }
+        touched_after_first_call = [d for d, scan_id in mid_state.items() if scan_id is not None]
+        untouched_after_first_call = [d for d, scan_id in mid_state.items() if scan_id is None]
+        assert 0 < len(touched_after_first_call) < 6, (
+            "the tiny budget should have stopped the cycle after some pages but not all — "
+            f"got {stats1}"
+        )
+        assert stats1["enqueued"] == len(touched_after_first_call)
+
+        # The untouched rows must be completely UNCHANGED — no partial
+        # write, still cleanly "due," never half-processed.
+        for d in untouched_after_first_call:
+            record = interrupted_db.get_monitored_domain(account_a, d)
+            assert record.pending_passive_scan_id is None
+            assert record.last_asset_count is None
+
+        # Resume with a real, generous budget — must finish exactly the
+        # rows the first call didn't reach, and never touch the
+        # already-enqueued ones a second time (their scan_id must be
+        # byte-identical before and after).
+        stats2 = run_monitoring_cycle(
+            api_settings=api_settings,  # generous default budget, no slowdown
+            control_db=interrupted_db,
+            email_sender=_RecordingEmailSender(),
+        )
+        assert stats2["enqueued"] == len(untouched_after_first_call)
+        assert stats1["enqueued"] + stats2["enqueued"] == 6
+
+        final_scan_ids = {
+            d: interrupted_db.get_monitored_domain(account_a, d).pending_passive_scan_id
+            for d in domains
+        }
+        assert all(scan_id is not None for scan_id in final_scan_ids.values())
+        for d in touched_after_first_call:
+            assert final_scan_ids[d] == mid_state[d], (
+                f"{d} was already enqueued before the resume — its scan_id must not change "
+                "(proof it was never re-enqueued/double-processed)"
+            )
+
+        # Scenario B: one single, uninterrupted cycle over an IDENTICAL
+        # fresh seed (same domain names, same account shape), no
+        # slowdown. The end state must match Scenario A's: every domain
+        # gets exactly one real queued scan, tagged the same way.
+        clean_db = ControlDB(Path(str(api_settings.data_dir) + "-clean") / "control.db")
+        account_b = _account(clean_db, tier="pro")
+        self._seed_domains(clean_db, api_settings, account_b, 6)
+        stats_clean = run_monitoring_cycle(
+            api_settings=api_settings, control_db=clean_db, email_sender=_RecordingEmailSender()
+        )
+        assert stats_clean["enqueued"] == 6
+
+        for d in domains:
+            interrupted_scan = interrupted_db.get_owned_scan(final_scan_ids[d], account_a)
+            clean_record = clean_db.get_monitored_domain(account_b, d)
+            clean_scan = clean_db.get_owned_scan(clean_record.pending_passive_scan_id, account_b)
+            # Real timestamps differ between the two runs by construction
+            # (two separate wall-clock cycles) — what "identical end
+            # state" actually means here is the MEANINGFUL, observable
+            # shape: exactly one real queued scan per domain, same
+            # trigger source, same domain, never zero, never two.
+            assert interrupted_scan.status == clean_scan.status == "queued"
+            assert interrupted_scan.trigger_source == clean_scan.trigger_source
+            assert interrupted_scan.domain == clean_scan.domain == d
+
+
+class TestNoLostOrDuplicateNotificationAcrossAnInterruption:
+    """Proves the durable-notification-outbox fix
+    (`monitoring_pending_notifications`, `api/control_db.py`) with a REAL
+    interruption, not a mock standing in for internal logic: a real
+    `EmailSender` implementation whose `send_monitoring_alert` genuinely
+    raises is passed into a real `run_monitoring_cycle` call. Since the
+    harvest phase's DB write (`batch_record_monitoring_progress`, which
+    durably records BOTH the row's new baseline AND the pending
+    notification in one transaction) has already committed by the time
+    `_flush_pending_notifications` reaches the send step, this raising
+    sender interrupts EXACTLY at the real boundary the task asked for —
+    after the write, at the send — not somewhere nothing could have gone
+    wrong."""
+
+    class _RaisingEmailSender(_RecordingEmailSender):
+        def send_monitoring_alert(self, **kwargs) -> None:
+            self.monitoring_alerts.append(
+                (
+                    kwargs["to"],
+                    kwargs["account_id"],
+                    kwargs["summary_lines"],
+                    kwargs["truncated_count"],
+                )
+            )
+            raise RuntimeError("simulated crash exactly at the send step")
+
+    def test_a_crash_between_the_db_write_and_the_send_never_loses_the_notification(
+        self, control_db: ControlDB, api_settings: APISettings
+    ) -> None:
+        account_id = _account(control_db, tier="pro")
+        _verify_domain(control_db, account_id, "example.com")
+        record = _monitor(control_db, api_settings, account_id, "example.com")
+
+        # First cycle: establish the baseline — never notification-worthy.
+        _make_due(control_db, record.monitoring_id)
+        run_monitoring_cycle(
+            api_settings=api_settings, control_db=control_db, email_sender=_RecordingEmailSender()
+        )
+        baseline_scan_id = control_db.get_monitored_domain(
+            account_id, "example.com"
+        ).pending_passive_scan_id
+        _write_hosts(api_settings, account_id, baseline_scan_id, ["a.example.com"])
+        control_db.update_scan_status(baseline_scan_id, "completed")
+        run_monitoring_cycle(
+            api_settings=api_settings, control_db=control_db, email_sender=_RecordingEmailSender()
+        )
+
+        # Second cycle: a new host appears -> a real, notification-worthy
+        # change. The email sender for THIS cycle genuinely raises, right
+        # after the harvest's own DB write already committed.
+        _make_due(control_db, record.monitoring_id)
+        run_monitoring_cycle(
+            api_settings=api_settings, control_db=control_db, email_sender=_RecordingEmailSender()
+        )
+        scan_id = control_db.get_monitored_domain(account_id, "example.com").pending_passive_scan_id
+        _write_hosts(api_settings, account_id, scan_id, ["a.example.com", "b.example.com"])
+        control_db.update_scan_status(scan_id, "completed")
+
+        crashing_sender = self._RaisingEmailSender()
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            run_monitoring_cycle(
+                api_settings=api_settings, control_db=control_db, email_sender=crashing_sender
+            )
+        # The raising sender WAS invoked (an attempt was genuinely made)
+        # but the notification must not be considered delivered — proven
+        # below by it still being found and sent on the next cycle.
+        assert len(crashing_sender.monitoring_alerts) == 1
+
+        # The row's own baseline update DID survive (the DB write commits
+        # before the raising send is ever reached).
+        updated = control_db.get_monitored_domain(account_id, "example.com")
+        assert updated.last_asset_count == 2
+
+        # Resume: a working sender, nothing newly due. The durable outbox
+        # (not this cycle's own harvest, which finds nothing new) is what
+        # delivers the previously-interrupted notification — never lost.
+        working_sender = _RecordingEmailSender()
+        stats_resume = run_monitoring_cycle(
+            api_settings=api_settings, control_db=control_db, email_sender=working_sender
+        )
+        assert stats_resume["notified_accounts"] == 1
+        assert len(working_sender.monitoring_alerts) == 1
+        _, _, lines, _ = working_sender.monitoring_alerts[0]
+        assert any("1 new host" in line for line in lines)
+
+        # A THIRD cycle, still nothing newly due: the same change must
+        # NEVER be reported again — proves "at most once delivered
+        # successfully," not just "eventually delivered."
+        third_sender = _RecordingEmailSender()
+        stats_third = run_monitoring_cycle(
+            api_settings=api_settings, control_db=control_db, email_sender=third_sender
+        )
+        assert stats_third["notified_accounts"] == 0
+        assert third_sender.monitoring_alerts == []

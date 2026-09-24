@@ -19,6 +19,7 @@ identically to "not found").
 
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -240,6 +241,50 @@ CREATE INDEX IF NOT EXISTS idx_monitored_domains_passive_due
 CREATE INDEX IF NOT EXISTS idx_monitored_domains_active_due
     ON monitored_domains(next_active_due_at, monitoring_id);
 CREATE INDEX IF NOT EXISTS idx_monitored_domains_account ON monitored_domains(account_id);
+
+-- A durable outbox for continuous-monitoring notifications — closes a
+-- real gap found while proving `run_monitoring_cycle`'s own "safe to
+-- interrupt at any point" claim with an actual test: before this table
+-- existed, a harvested outcome worth emailing lived ONLY in an
+-- in-memory dict for the rest of that one `run_monitoring_cycle` call,
+-- sent (if at all) as that function's very last step. A crash between
+-- `batch_record_monitoring_progress`'s row update (which already
+-- advances `next_*_due_at` and overwrites `last_asset_digest` — the
+-- only place the PREVIOUS baseline needed to reconstruct the diff was
+-- available) and that final send permanently lost the notification:
+-- the next cycle's own digest comparison would see no change at all,
+-- because the row already reflected the new state. Writing the
+-- notification's full content into this table in the EXACT SAME
+-- transaction as the row update (`batch_record_monitoring_progress`)
+-- makes the two changes atomic — a crash can no longer separate "this
+-- domain's progress was recorded" from "there is something to tell the
+-- account about it." `sent_at IS NULL` is what makes a row due for
+-- delivery; `run_monitoring_cycle` flushes every unsent row (from ANY
+-- past cycle, not just its own) at the end of each cycle, so a
+-- notification stranded by an interrupted earlier cycle is picked up
+-- and delivered by the very next one — at-least-once, never
+-- lost. (The narrow remaining window — a crash between the email
+-- actually sending and `mark_notifications_sent` committing — can
+-- produce at most one duplicate email; accepted as the safe direction
+-- to err in for a security-relevant change notification, unlike silent
+-- loss.)
+CREATE TABLE IF NOT EXISTS monitoring_pending_notifications (
+    notification_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(account_id),
+    domain TEXT NOT NULL,
+    speed TEXT NOT NULL,
+    scan_id TEXT NOT NULL,
+    hosts_added_json TEXT NOT NULL,
+    hosts_removed_json TEXT NOT NULL,
+    asset_count INTEGER NOT NULL,
+    asset_digest TEXT NOT NULL,
+    needs_review INTEGER NOT NULL,
+    review_reason TEXT,
+    created_at TEXT NOT NULL,
+    sent_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_monitoring_pending_notifications_unsent
+    ON monitoring_pending_notifications(sent_at);
 
 -- Part B (docs/PAID_API_DESIGN.md, Round 3) tier/subscription state. One
 -- row per account, created at account-creation time defaulting to
@@ -1313,7 +1358,9 @@ class ControlDB:
             ).fetchall()
         return [_monitored_domain_record_from_row(row) for row in rows]
 
-    def batch_record_monitoring_progress(self, updates: list[dict]) -> None:
+    def batch_record_monitoring_progress(
+        self, updates: list[dict], *, notifications: list[dict] | None = None
+    ) -> None:
         """The batched-write half of the scale requirement: one
         transaction per call (never one commit per row, and never one
         giant unbounded transaction for an entire cycle) — the caller
@@ -1330,8 +1377,15 @@ class ControlDB:
         needs_review (bool), status. Uses `executemany` — one prepared
         statement, N bindings — rather than N separate `execute` calls,
         which is what actually makes a 500-1000 row batch fast rather
-        than just fewer-transactions-but-still-row-at-a-time."""
-        if not updates:
+        than just fewer-transactions-but-still-row-at-a-time.
+
+        `notifications` (optional): the `MonitoringRunOutcome`-shaped
+        dicts worth emailing, inserted into the durable
+        `monitoring_pending_notifications` outbox IN THE SAME TRANSACTION
+        as the row updates above — see that table's own schema comment
+        for why this atomicity is the actual fix for a real lost-
+        notification bug, not just tidiness."""
+        if not updates and not notifications:
             return
         now = _now_iso()
         passive_rows = [
@@ -1383,6 +1437,79 @@ class ControlDB:
                     "WHERE monitoring_id = ?",
                     active_rows,
                 )
+            if notifications:
+                conn.executemany(
+                    "INSERT INTO monitoring_pending_notifications "
+                    "(notification_id, account_id, domain, speed, scan_id, hosts_added_json, "
+                    "hosts_removed_json, asset_count, asset_digest, needs_review, "
+                    "review_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            secrets.token_hex(16),
+                            n["account_id"],
+                            n["domain"],
+                            n["speed"],
+                            n["scan_id"],
+                            json.dumps(n["hosts_added"]),
+                            json.dumps(n["hosts_removed"]),
+                            n["asset_count"],
+                            n["asset_digest"],
+                            int(n["needs_review"]),
+                            n["review_reason"],
+                            now,
+                        )
+                        for n in notifications
+                    ],
+                )
+
+    def list_unsent_notifications(self) -> list[dict]:
+        """Every row still `sent_at IS NULL`, from ANY past cycle — not
+        scoped to "this cycle's own outcomes" the way the old in-memory
+        `outcomes_by_account` dict was, which is exactly what makes this
+        durable: a notification stranded by a cycle that crashed before
+        reaching its own send step is still here, waiting, for the very
+        next cycle (this process or another) to pick up. Returns plain
+        dicts (already `json.loads`-ed) rather than a dataclass — the
+        caller reconstructs `MonitoringRunOutcome` objects from these to
+        reuse the existing ordering/rendering logic unchanged."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM monitoring_pending_notifications WHERE sent_at IS NULL "
+                "ORDER BY created_at"
+            ).fetchall()
+        return [
+            {
+                "notification_id": row["notification_id"],
+                "account_id": row["account_id"],
+                "domain": row["domain"],
+                "speed": row["speed"],
+                "scan_id": row["scan_id"],
+                "hosts_added": json.loads(row["hosts_added_json"]),
+                "hosts_removed": json.loads(row["hosts_removed_json"]),
+                "asset_count": row["asset_count"],
+                "asset_digest": row["asset_digest"],
+                "needs_review": bool(row["needs_review"]),
+                "review_reason": row["review_reason"],
+            }
+            for row in rows
+        ]
+
+    def mark_notifications_sent(self, notification_ids: list[str]) -> None:
+        """Called only AFTER `EmailSender.send_monitoring_alert` has
+        actually returned successfully for the account those ids belong
+        to — the deliberate ordering (send, then mark) that makes "at
+        most one duplicate on a crash" the failure mode instead of
+        silent loss: a crash between the send and this call means the
+        next cycle's `list_unsent_notifications` finds the row again and
+        re-sends it, never drops it."""
+        if not notification_ids:
+            return
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.executemany(
+                "UPDATE monitoring_pending_notifications SET sent_at = ? WHERE notification_id = ?",
+                [(now, nid) for nid in notification_ids],
+            )
 
     def count_monitored_domains(self) -> int:
         """Test/observability helper — not on any hot path."""
