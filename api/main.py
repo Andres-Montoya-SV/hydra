@@ -36,6 +36,7 @@ from api.routers import (
     reportability,
     scans,
     subscription,
+    webhooks,
 )
 from api.scan_worker import generate_worker_id, run_worker_loop
 from api.settings import APISettings, load_api_settings, validate_email_provider_config
@@ -249,6 +250,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(reportability.router)
     app.include_router(hypotheses.router)
     app.include_router(subscription.router)
+    app.include_router(webhooks.router)
     return app
 
 

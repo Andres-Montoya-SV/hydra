@@ -10,6 +10,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -44,12 +45,43 @@ def control_db(api_settings: APISettings) -> ControlDB:
 
 
 def _seed_real_rows(control_db: ControlDB) -> str:
+    """Covers every kind of durable, account-scoped row a real
+    deployment accumulates — including the two the original version of
+    this fixture predated (`api_keys`, `monitored_domains`) — so the
+    backup/restore round trip is proven against the CURRENT schema, not
+    just the one that existed when this test was first written."""
     account_id = control_db.create_account(email="backup-test@example.com")
     control_db.create_default_subscription(account_id, tier="pro")
+    control_db.insert_api_key(
+        key_id="backup-key-1",
+        account_id=account_id,
+        lookup_hash="backup-lookup-hash",
+        verify_hash="backup-verify-hash",
+        prefix="hydra_live_",
+    )
     control_db.create_scan(
         scan_id="backup-scan-1", account_id=account_id, domain="backup.example", db_path="/tmp/x"
     )
     control_db.update_scan_status("backup-scan-1", "completed")
+    verification = control_db.create_domain_verification(
+        account_id=account_id,
+        domain="backup.example",
+        token="backup-verify-token",  # noqa: S106 - test fixture data, not a real secret
+    )
+    now = datetime.now(timezone.utc)
+    control_db.mark_verification_succeeded(
+        verification.verification_id,
+        method="dns_txt",
+        verified_at=now.isoformat(),
+        expires_at=(now + timedelta(days=90)).isoformat(),
+    )
+    control_db.create_or_update_monitored_domain(
+        account_id=account_id,
+        domain="backup.example",
+        speed2_enabled=True,
+        passive_interval_hours=24,
+        active_interval_hours=168,
+    )
     return account_id
 
 
@@ -70,6 +102,8 @@ class TestBackupAndRestoreRoundTrip:
         original_account = control_db.get_account(account_id)
         original_subscription = control_db.get_subscription(account_id)
         original_scan = control_db.get_owned_scan("backup-scan-1", account_id)
+        original_key = control_db.get_key("backup-key-1", account_id)
+        original_monitored = control_db.get_monitored_domain(account_id, "backup.example")
 
         snapshot_dir = run_backup_job(api_settings=api_settings, control_db=control_db)
 
@@ -87,7 +121,11 @@ class TestBackupAndRestoreRoundTrip:
         restored_account = restored_db.get_account(account_id)
         restored_subscription = restored_db.get_subscription(account_id)
         restored_scan = restored_db.get_owned_scan("backup-scan-1", account_id)
+        restored_key = restored_db.get_key("backup-key-1", account_id)
+        restored_monitored = restored_db.get_monitored_domain(account_id, "backup.example")
 
+        assert restored_key == original_key
+        assert restored_monitored == original_monitored
         assert restored_account == original_account
         assert restored_subscription == original_subscription
         assert restored_scan == original_scan
@@ -341,3 +379,36 @@ class TestBackupSqliteFileDirectly:
         row = dest_conn.execute("SELECT v FROM t").fetchone()
         dest_conn.close()
         assert row == (42,)
+
+
+class TestBackupFilePermissions:
+    """A real, confirmed gap found while verifying the backup/restore
+    path for this task: `control.db` itself is created with `0o600`
+    (`ControlDB.__init__`), but a fresh `sqlite3.connect()` on a
+    brand-new backup destination file inherits the process's ordinary
+    umask instead — `0o644` (world-readable) was the actually-observed
+    result before this was fixed. A backup snapshot contains the exact
+    same sensitive rows as the original (API-key hashes, account
+    emails, billing state) and must never be less protected."""
+
+    def test_a_fresh_backup_file_is_not_world_or_group_readable(self, tmp_path: Path) -> None:
+        source = tmp_path / "source.db"
+        conn = sqlite3.connect(source)
+        conn.execute("CREATE TABLE t (v INTEGER)")
+        conn.commit()
+        conn.close()
+
+        dest = tmp_path / "backup" / "dest.db"
+        backup_sqlite_file(source, dest)
+
+        mode = dest.stat().st_mode & 0o777
+        assert mode == 0o600, f"backup file permissions were {oct(mode)}, expected 0o600"
+
+    def test_run_backup_job_produces_a_locked_down_control_db_copy(
+        self, api_settings: APISettings, control_db: ControlDB
+    ) -> None:
+        _seed_real_rows(control_db)
+        snapshot_dir = run_backup_job(api_settings=api_settings, control_db=control_db)
+
+        mode = (snapshot_dir / "control.db").stat().st_mode & 0o777
+        assert mode == 0o600

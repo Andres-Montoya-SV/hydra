@@ -331,3 +331,61 @@ class TestRetentionPurgeJob:
         assert control_db_2.get_owned_scan("dry-run-scan", account) is not None
         assert output_dir.exists()
         assert any("DRY RUN" in record.message for record in caplog.records)
+
+    def test_a_real_backup_snapshot_is_never_touched_by_a_retention_purge_cycle(
+        self, tmp_path: Path
+    ) -> None:
+        """Explicit scope confirmation the task called for: retention
+        purge (`api_settings.account_root(account_id) / "output" /
+        scan.scan_id`) and backups (`api_settings.backup_root`, i.e.
+        `<data_dir>/backups/<timestamp>/`) are different directory
+        trees entirely — but "different code paths" is a claim worth
+        proving against a REAL backup snapshot, not just reading the
+        two path-construction functions and trusting they never
+        collide.
+
+        Deliberately builds its own `api_settings`/`control_db` pair
+        (never this file's own `control_db`/`api_settings` fixtures,
+        which point at two DIFFERENT files — `tmp_path/control.db` vs.
+        `tmp_path/api_data/control.db` — a pre-existing mismatch that
+        happens not to matter for the other tests in this class, since
+        none of them ever call `run_backup_job`, which is the first
+        thing here to actually read `api_settings.control_db_path` off
+        disk instead of taking `control_db` as a given in-memory
+        object)."""
+        from api.backup_worker import run_backup_job
+
+        api_settings = APISettings(data_dir=tmp_path / "api_data")
+        control_db = ControlDB(api_settings.control_db_path)
+        account_id = control_db.create_account(email=f"test-{secrets.token_hex(8)}@example.com")
+        control_db.create_default_subscription(account_id, tier="free")
+
+        control_db.create_scan(
+            scan_id="old-scan-near-backup",
+            account_id=account_id,
+            domain="old.example",
+            db_path="/tmp/x",
+        )
+        control_db.update_scan_status("old-scan-near-backup", "completed")
+        old_created_at = _iso(datetime.now(timezone.utc) - timedelta(days=10))
+        _set_scan_created_at(control_db, "old-scan-near-backup", old_created_at)
+        output_dir = api_settings.account_root(account_id) / "output" / "old-scan-near-backup"
+        output_dir.mkdir(parents=True)
+        (output_dir / "subdomains.txt").write_text("old.example\n")
+
+        # A real backup snapshot, taken before the purge, containing
+        # this same account's (about to be purged) control-plane row.
+        snapshot_dir = run_backup_job(api_settings=api_settings, control_db=control_db)
+        assert (snapshot_dir / "control.db").is_file()
+
+        purged = run_retention_purge_job(api_settings=api_settings, control_db=control_db)
+
+        assert purged == 1  # the old scan itself really was purged
+        assert not output_dir.exists()
+        # The backup snapshot — a completely separate directory tree —
+        # is untouched: still present, still a valid, queryable SQLite
+        # file with the pre-purge row still in it.
+        assert snapshot_dir.is_dir()
+        assert (snapshot_dir / "control.db").is_file()
+        backup_db = ControlDB(snapshot_dir / "control.db")
+        assert backup_db.get_owned_scan("old-scan-near-backup", account_id) is not None

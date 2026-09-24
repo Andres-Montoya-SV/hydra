@@ -9,16 +9,21 @@ dependencies = [
     "rich==13.9.4",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "bandit==1.8.3",
-    "black==25.1.0",
-    "isort==6.0.1",
-    "mypy==1.15.0",
-    "pytest==8.3.5",
-    "pytest-asyncio==0.25.3",
-    "ruff==0.11.2",
-]
+# Dev-tool versions are pinned in EXACTLY ONE place: `requirements-dev.txt`
+# — the file `.github/workflows/ci.yml`'s `check` job actually installs
+# from (`pip install -r requirements-dev.txt -r requirements-api.txt`)
+# and the file `docs/DOCKER.md`/`docs/PAID_API_DESIGN.md` document as the
+# real local-dev install path. There used to be a SECOND, hand-maintained
+# copy of the same pins here as a `[project.optional-dependencies]` `dev`
+# extra — confirmed dead: this project has no `[build-system]` table, so
+# `pip install .[dev]`/`pip install -e .[dev]` was never actually a
+# supported install path for anyone, CI included. A duplicate pin nobody
+# installs from is pure drift risk with no corresponding benefit, so it's
+# removed rather than kept in sync by hand — see
+# `tests/test_dev_toolchain_pins_agree.py` for the guard against the
+# remaining real duplication (`.pre-commit-config.yaml`'s hook `rev`s,
+# which DO need to match `requirements-dev.txt` exactly for a
+# contributor's local `pre-commit run` to be the same toolchain CI runs).
 
 [tool.black]
 line-length = 100

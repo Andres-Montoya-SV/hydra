@@ -1,0 +1,56 @@
+# Local pre-commit hooks — pinned to the EXACT SAME versions
+# `requirements-dev.txt` pins (the file CI actually installs from,
+# `.github/workflows/ci.yml`'s `check` job). A contributor running
+# `pre-commit run --all-files` locally is running the identical tool
+# version CI runs, not whatever happens to be latest on PyPI the day they
+# set up their machine — see `tests/test_dev_toolchain_pins_agree.py`
+# for the guard that fails CI if these two files' versions ever drift
+# apart again.
+#
+# Deliberately does NOT invoke each tool via `repo: local` /
+# `language: system` (which would just shell out to whatever's on PATH,
+# reintroducing the exact "whichever version happened to be installed"
+# problem this file exists to close) — each hook below pins its own
+# isolated version via `rev`, resolved from PyPI by pre-commit itself,
+# independent of anything already installed in the developer's own venv.
+repos:
+  - repo: https://github.com/psf/black
+    rev: 25.1.0
+    hooks:
+      - id: black
+
+  - repo: https://github.com/PyCQA/isort
+    rev: 6.0.1
+    hooks:
+      - id: isort
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.2
+    hooks:
+      - id: ruff
+        args: ["--exit-non-zero-on-fix"]
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.15.0
+    hooks:
+      - id: mypy
+        # mypy's pre-commit hook runs in its own isolated environment by
+        # default, separate from this repo's dependencies — pass the
+        # project's own pyproject.toml config through explicitly so the
+        # per-module overrides (docs/HARDENING_ROUND2_P1.md's
+        # incremental opt-in list) are honored the same way a plain
+        # `mypy .` invocation already honors them. `pass_filenames:
+        # false` + the literal "." target (found the hard way — mypy's
+        # pre-commit hook otherwise only ever type-checks the files that
+        # changed, silently missing the module-level `import` chain
+        # errors a real `mypy .` catches project-wide) makes this hook
+        # exactly equivalent to CI's own `mypy .` invocation.
+        args: ["--config-file=pyproject.toml", "."]
+        pass_filenames: false
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: "1.8.3"
+    hooks:
+      - id: bandit
+        args: ["-c", "pyproject.toml", "-r", "."]
+        pass_filenames: false

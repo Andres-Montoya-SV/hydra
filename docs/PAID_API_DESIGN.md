@@ -1166,6 +1166,175 @@ anything is activated. A forged or fabricated transaction cannot pass
 both checks. What changed today is visibility into this working (or a
 real webhook being rejected), not the mechanism's correctness itself.
 
+### Wompi webhook — confirmed against current official docs, sandbox capture still pending — 2026-09-24
+
+This re-checks the "documentation-terminology-confirmed, not observed-
+in-production-confirmed" inference above, this time by fetching Wompi's
+CURRENT live documentation (not from training memory) and comparing it
+field-by-field against what `api/wompi_client.py`/
+`api/routers/subscription.py` assume. **Note the correct doc host is
+`docs.wompi.sv` (El Salvador) — `docs.wompi.co` is a different product
+(Colombia) and was not consulted.**
+
+**Signature scheme** — [`docs.wompi.sv/webhook/validar-webhook.md`](https://docs.wompi.sv/webhook/validar-webhook.md):
+
+| | Assumed (code, before this check) | Documented (fetched live) | Match? |
+|---|---|---|---|
+| Header name | `wompi_hash` | "Todo webhook enviado por Wompi incluirá el header `wompi_hash`" | ✅ exact |
+| String-to-sign | the raw request body, byte-for-byte, unmodified | "Leer el 'body' completo del webhook. Asegurarse leerlo tal cual es enviado sin agregar ningún espacio o salto de linea" (read the full body exactly as sent, without adding any space or line break) | ✅ exact — confirms `raw_body: bytes` must never be re-serialized from parsed JSON before hashing, which `api/routers/subscription.py` already does correctly (it hashes the literal request bytes, parses JSON only afterward) |
+| Algorithm | HMAC-SHA256 | HMAC-SHA256 | ✅ exact |
+| Key | the OAuth `client_secret` ("API Secret") | "utilizando el API Secret de su aplicativo de Wompi como llave del HMAC" (using the API Secret of your Wompi application as the HMAC key) | ✅ exact wording — see below for what "confirmed" does and does not mean here |
+| Comparison | constant-time (`hmac.compare_digest`) | not specified either way by the doc (expected — this is an implementation detail, not a protocol detail) | not a doc claim to confirm; already correct in `api/wompi_client.py::verify_webhook_signature` regardless |
+
+**Is the webhook secret really the same value as the OAuth client secret?**
+[`docs.wompi.sv/autenticacion/autenticacion.md`](https://docs.wompi.sv/autenticacion/autenticacion.md)
+independently confirms the OAuth `client_secret` is *also* labeled "API
+Secret" in the Wompi dashboard (panel.wompi.sv): "el App ID corresponde
+a `client_id` y API Secret a `client_secret`." That page does not
+mention or link to any separate, webhook-specific secret, and the
+webhook doc names its HMAC key with the identical term ("API Secret").
+Two independent doc pages using the same term for what appears to be
+the same credential is stronger evidence than before, but it is still
+**terminology matching across two doc pages, not a byte-for-byte
+observed signature from a real webhook** — Wompi could in principle
+mint a distinct secret under the same label and this documentation
+search would not surface that. **This one specific point remains
+"must confirm against a live sandbox capture"** — see the runbook
+below; nothing else in this table does.
+
+**Payload envelope** — [`docs.wompi.sv/webhook/definicion-webhook.md`](https://docs.wompi.sv/webhook/definicion-webhook.md),
+full documented example fetched live:
+
+```json
+{
+  "IdCuenta": "980b36e6-15ab-463f-4444-ada3e396fe48",
+  "FechaTransaccion": "2020-07-07T21:27:03.3403497-06:00",
+  "Monto": 1,
+  "ModuloUtilizado": "BotonPago",
+  "FormaPagoUtilizada": "PagoNormal",
+  "IdTransaccion": "2bedafea-0924-49f0-927d-8c638e193990",
+  "ResultadoTransaccion": "ExitosaAprobada",
+  "CodigoAutorizacion": "ba7dbfd3-50d1-403c-bbfd-d3be5dc766f8",
+  "IdIntentoPago": "c6e10505-cada-4ae7-9892-d8786b7f455f",
+  "Cantidad": 1,
+  "EsProductiva": false,
+  "Aplicativo": {"Nombre": "Sitio Web Bitworks", "Url": "https://www.bitworks.com.sv/", "Id": "d432aef2-3333-4a75-4444-22e20789834a"},
+  "EnlacePago": {"Id": 66, "IdentificadorEnlaceComercio": "OC1234", "NombreProducto": "Camisa Azula"},
+  "cliente": {"Nombre": "string", "Email": "string", "additionalProp1": "string", "additionalProp2": "string"}
+}
+```
+
+Every field `api/routers/subscription.py::wompi_webhook` reads
+(`IdTransaccion`, `ResultadoTransaccion`, `cliente.Email`,
+`EnlacePago.NombreProducto`, `Monto`) is present with the exact spelling
+and nesting the handler already assumes — **zero discrepancies found,
+zero code changes needed** in either `api/wompi_client.py` or
+`api/routers/subscription.py`.
+
+**One deliberate non-issue, written down rather than silently
+ignored**: the documented example includes `EsProductiva: false` (a
+sandbox/test-mode flag on the transaction itself), which the handler
+does not read. This is intentional, not an oversight — Hydra's own
+sandbox/live separation is which `WOMPI_CLIENT_ID`/`WOMPI_CLIENT_SECRET`
+an operator has configured, not a per-transaction flag Wompi happens to
+echo back; branching handler behavior on a payload field would be
+redundant with (and could disagree with) which credentials are actually
+configured.
+
+**Statuses meaning paid/pending/failed**: the fetched doc page only
+shows one concrete value, `"ExitosaAprobada"`, in its example — it does
+not publish a comprehensive enum of every failure/pending status
+string. The handler's existing design does not need one: it treats
+`"ExitosaAprobada"` as the sole success case and **everything else** as
+a non-success (routed to grace-period-start-if-known-billing-email,
+Part D.3), which is the correct posture given Wompi's own docs never
+promise a closed, stable set of failure strings to match against
+individually — matching on the one documented success string and
+treating all else as "not a confirmed success" is more robust to
+undocumented status values than trying to enumerate failure states.
+**This remains implicitly "must confirm against live sandbox
+capture"** in the sense that only a real declined/pending transaction
+would show what other status strings actually look like in practice —
+but no code change follows from that uncertainty either way, since the
+handler already treats "not the one known success string" as the safe
+default.
+
+**`scripts/capture_wompi_webhook.py`: extended or not, stated
+explicitly**. It was NOT extended. It already captures exactly what a
+future replay test needs — raw headers (preserving `wompi_hash` and its
+casing), the exact raw body bytes as sent (`raw_body_text`), and the
+parsed JSON for convenience (`parsed_json_body`) — and deliberately does
+zero verification/interpretation of its own, which is correct: it's a
+capture tool, not a second implementation of the checks under test.
+Extending it would only be justified if the replay test needed some
+piece of wire data the script doesn't already save, and it does not.
+
+**The replay test**: `tests/test_wompi_real_capture_replay.py` is
+skipped (not xfail, not deleted) with a clear, actionable reason until a
+real capture exists at `tests/fixtures/wompi_real_capture.json`
+(gitignored) and `WOMPI_REAL_CAPTURE_SECRET` is set. Once both are
+present it: (1) verifies the REAL captured signature against the REAL
+secret using `verify_webhook_signature` — the one concrete confirmation
+this whole section is building toward; (2) asserts the real captured
+payload has every field the handler reads; (3) replays the real raw
+bytes through the actual `POST /webhooks/wompi` endpoint end-to-end,
+dynamically seeding a matching pending enrollment from whatever
+email/tier the real capture happens to contain (unpredictable ahead of
+time), and asserts a sane, non-crashing outcome. A fourth, optional env
+var `WOMPI_REAL_CAPTURE_CLIENT_ID` additionally exercises the handler's
+independent `api.wompi.sv` re-confirmation call for real; without it,
+that step correctly fails for lack of credentials and the handler
+correctly refuses to act (`502`), which the test treats as an expected,
+passing outcome, not a failure.
+
+**Operator runbook for Andrés — the exact steps to produce the one
+remaining confirmation**:
+
+1. Create (or reuse) a Wompi merchant account and switch it to
+   development/sandbox mode at [panel.wompi.sv](https://panel.wompi.sv).
+2. In that dashboard, find the app's **App ID** (`client_id`) and **API
+   Secret** (`client_secret` — per the doc excerpt above, this is the
+   same value the webhook signature is keyed with). Export them locally
+   as `WOMPI_CLIENT_ID`/`WOMPI_CLIENT_SECRET` — never commit them.
+3. Start the capture server: `python3 scripts/capture_wompi_webhook.py`
+   (see its own `--help`/docstring for `--out-dir`/`--port`). Expose it
+   to the internet with a tunnel (e.g. `ngrok http 8787`, matching
+   whatever port you started it on) — Wompi's servers must be able to
+   reach this URL directly; localhost is not enough.
+4. In the Wompi dashboard, configure that tunnel's public HTTPS URL as
+   the app's webhook URL.
+5. Run one real test transaction: either complete a real sandbox
+   payment on the app's `EnlacePagoRecurrente` link, or use whatever
+   test-transaction trigger the Wompi dev-mode dashboard offers.
+6. The capture server writes one timestamped JSON file per received
+   request under its `--out-dir` (default `/tmp/wompi_captures`). Pick
+   the one real webhook delivery, confirm it looks like a genuine Wompi
+   payload (has `wompi_hash`, `IdTransaccion`, etc.), then **redact
+   nothing except verify it's the one file you mean to use** and copy
+   it to `tests/fixtures/wompi_real_capture.json` (already gitignored —
+   double-check `git status` shows nothing new before ever running `git
+   add` near it, since it contains a real customer's own email/name).
+7. Export `WOMPI_REAL_CAPTURE_SECRET` to the same `API Secret` from step
+   2 (never commit it), and run
+   `pytest tests/test_wompi_real_capture_replay.py -v` — it should go
+   from 3 skipped to 3 passed. If the signature test fails, that is a
+   genuine, high-priority finding: it would mean the documented scheme
+   above does not match what Wompi's real sandbox actually sends, and
+   `api/wompi_client.py::verify_webhook_signature` needs to change to
+   match reality, not the other way around.
+8. Optionally also export `WOMPI_REAL_CAPTURE_CLIENT_ID` (the App ID
+   from step 2) to additionally exercise the handler's independent
+   `api.wompi.sv` re-confirmation call for real.
+
+**What this section does NOT claim**: the Wompi webhook is not
+"confirmed working against Wompi" — every dimension checked against
+Wompi's current published documentation matches the code exactly, and
+the code is now ready for the one remaining live confirmation above.
+The single specific thing still unconfirmed is whether the OAuth
+`client_secret` and the webhook HMAC key are truly the same live value
+in production, not just the same documented term — that, and only that,
+needs the sandbox runbook above to close out.
+
 ### Task 3.2 — Payment failure / grace period (Part D.3, confirmed as drafted)
 
 3-day grace period (`GRACE_PERIOD_DAYS`, `api/subscriptions.py`): a
@@ -2688,10 +2857,39 @@ detector (`modules/wildcard_check.py`, read from the scan's
 `wildcard_check.jsonl` artifact) did NOT already flag wildcard DNS for
 that run — a real, already-explained cause of an inflated count is never
 double-counted as a second, contradictory kind of alarm. A flagged
-domain's `status` becomes `'needs_review'`; monitoring keeps running
-every cycle (a human clearing the review is not required for scanning
-to continue), but no further notification fires until the count changes
-again.
+domain's `status` becomes `'needs_review'`.
+
+**Updated 2026-09-24 — Speed 2 pauses on `needs_review`, Speed 1 does
+not**: the original text above (and this round's own first pass) let a
+`needs_review` domain keep accruing full active pipeline runs every
+cadence indefinitely — exactly the scale/cost risk the ceiling exists to
+catch, now made worse by continuing to auto-scan it. Fixed:
+
+- **Speed 2 (active) is excluded from `list_due_active_monitoring_page`
+  at the query level** the moment `status = 'needs_review'` — a
+  deliberately DIFFERENT mechanism from how `'paused_verification_lapsed'`
+  is handled (that state is re-checked every cycle in Python,
+  `_try_enqueue_one`, so a verification that quietly becomes fresh again
+  resumes on the very next poll). `needs_review` has no equivalent
+  "became fresh again" condition to poll for — only a human clearing it
+  changes anything — so excluding it from the due set entirely, rather
+  than re-deriving the same "skip" decision from Python on every single
+  cycle, is both simpler and correct for that semantics.
+- **Speed 1 (passive) keeps running** — cheap, generates no active
+  target traffic, and lets the operator watch whether the count settles
+  back down before deciding what to do. A later passive cycle's smaller
+  count IS recorded (`last_asset_count`, visible via `GET
+  /domains/{domain}/monitoring`) but never silently flips `status` back
+  to `'active'` on its own — `_harvest_one` treats `needs_review` as
+  sticky (`row.status == "needs_review" or jump.needs_review`) precisely
+  so a domain that spikes and later happens to dip back under the
+  ceiling on an ordinary cycle doesn't self-heal the flag; only the
+  explicit acknowledge endpoint below does.
+- **`POST /domains/{domain}/monitoring/acknowledge`** clears
+  `status`/`needs_review` back to `'active'`/`false`. No separate
+  "resume" step is needed: `next_active_due_at` was never advanced while
+  the row was excluded from the due set, so it's already due again the
+  moment `status` changes — Speed 2 resumes on the very next cycle.
 
 ### Notifications — capped, ordered, never per-domain
 
@@ -2819,6 +3017,7 @@ durable-queue section above for that mechanism's own design.
 |---|---|---|
 | `POST` | `/domains/{domain}/monitoring` | Opt in (idempotent — a second call updates `speed2`). `403` if the domain isn't currently verified, or if `speed2: true` on a tier without it. |
 | `GET` | `/domains/{domain}/monitoring` | Current status, schedule, last asset count. `404` if never opted in. |
+| `POST` | `/domains/{domain}/monitoring/acknowledge` | Clears a `needs_review` flag and resumes Speed 2. `404` if never opted in, `409` if not currently flagged. |
 | `DELETE` | `/domains/{domain}/monitoring` | Opt out. `404` if never opted in. |
 
 ### New settings (env-configurable, `api/settings.py`)
@@ -2842,15 +3041,195 @@ durable-queue section above for that mechanism's own design.
   checkpoint record.
 - **Per-domain notification preferences** (digest frequency, channel
   other than email) — one email shape, one cadence, for every account.
-- **A UI/endpoint for clearing `needs_review`** — the status is visible
-  via `GET /domains/{domain}/monitoring`, but nothing clears it
-  automatically except the count naturally coming back under the
-  ceiling on a later run; there is no explicit "acknowledge" action.
+- ~~A UI/endpoint for clearing `needs_review`.~~ — **resolved 2026-09-24**,
+  see "Speed 2 pauses on `needs_review`" above:
+  `POST /domains/{domain}/monitoring/acknowledge`.
+- **Any smarter auto-resolution of a `needs_review` domain** (sampling,
+  auto-scoping to bring the count back down) — an explicit human
+  acknowledge is the accepted answer for now; a genuinely huge but
+  legitimate attack surface still needs a person to decide, not a
+  heuristic.
 - **Coordinating monitoring's own scan bursts with `TierLimits.
   priority_queue`** — still a recorded-but-inert field (per the durable-
   queue section above); a monitoring-triggered burst of Speed 2 scans
   competes for `max_concurrent_scans` slots on the same FIFO
   (`created_at`) basis as everything else.
+
+## Outbound webhooks — 2026-09-24
+
+A single generic, signed outbound webhook — a customer pastes their own
+Slack/Teams incoming-webhook URL (or any HTTPS endpoint they control,
+including a Zapier/n8n bridge into Jira or anything else) and Hydra
+POSTs a JSON event to it — gets most of the value of a native
+Slack/Teams/Jira integration for a fraction of the surface area. Reuses,
+never reinvents, two things this codebase already has real answers for:
+"is this notification-worthy" (the exact same significance decision
+`api/monitoring_worker.py` already makes for the email path) and
+SSRF/private-network defense (`core/collection/ssrf.py`'s real, tested
+resolve-then-classify-every-IP policy, used everywhere else this project
+makes an outbound connection to a caller-influenced hostname).
+
+### Event types
+
+| Event | Fires when |
+|---|---|
+| `monitoring.changed` | A monitored domain's asset set changed (hosts added/removed), per the continuous-monitoring section above. |
+| `monitoring.needs_review` | A monitored domain tripped the asset-count sanity ceiling. |
+| `finding.high_severity` | A completed scan produced one or more `critical`/`high` severity findings. |
+
+A fixed, closed set (`api/webhooks.py::EVENT_TYPES`) — registering for an
+unknown event type is a `422`, never a silently-ignored typo.
+
+### Payload schema
+
+```json
+{
+  "event": "monitoring.changed",
+  "domain": "example.com",
+  "speed": "passive",
+  "asset_count": 42,
+  "hosts_added": ["new.example.com"],
+  "hosts_removed": [],
+  "needs_review": false
+}
+```
+
+`monitoring.needs_review` adds a `"review_reason"` string field.
+`finding.high_severity`'s shape:
+
+```json
+{
+  "event": "finding.high_severity",
+  "domain": "example.com",
+  "scan_id": "a1b2c3...",
+  "finding_count": 3,
+  "findings": [
+    {"host": "app.example.com", "template_id": "leaked-secret", "severity": "critical", "name": "..."}
+  ]
+}
+```
+
+`findings` is capped at 20 entries per delivery (`_MAX_FINDINGS_PER_WEBHOOK`,
+`api/scan_orchestrator.py`) — the same "one bounded, readable payload,
+never an unbounded one" reasoning the monitoring email's own domain cap
+uses. Each finding entry contains ONLY `host`/`template_id`/`severity`/
+`name` — never a raw secret value (never present in a `Finding` object
+to begin with, per `modules/github_secrets.py`'s own redaction
+guarantee) and never any other account's data.
+
+### Signature scheme — so a customer can verify delivery is real
+
+Every delivery carries two headers:
+
+- `X-Hydra-Event`: the event type (e.g. `monitoring.changed`).
+- `X-Hydra-Signature`: `sha256=<hex HMAC-SHA256 digest>` of the exact raw
+  request body, keyed by the webhook's own secret (shown exactly once,
+  at registration — the same "never re-displayed" shape API keys already
+  use). The same `sha256=` prefix convention GitHub's own outbound
+  webhooks use.
+
+A receiver verifies by computing the same HMAC over the raw body with
+their own copy of the secret and comparing (constant-time) against the
+header — `api/webhooks.py::verify_signature` is the reference
+implementation this project's own tests use to prove a tampered body
+fails verification.
+
+### SSRF policy — stated plainly
+
+- **`https://` only.** No `http`, `file`, `gopher`, or any other scheme.
+- **Real DNS resolution, then every resolved IP is checked** against
+  `core/collection/ssrf.py`'s existing blocklist (RFC1918, loopback,
+  link-local including the `169.254.169.254` cloud-metadata address,
+  carrier-grade NAT, multicast, reserved, `::1`, `fc00::/7`, `fe80::/10`)
+  — the SAME policy, not a second hand-rolled one, already used
+  everywhere else this project makes an outbound connection to a
+  caller-influenced hostname.
+- **Checked at registration AND at every single delivery attempt**
+  (including every retry) — never once and cached. This is the real
+  DNS-rebinding defense: a URL that resolves to a public address at
+  registration time but rebinds to a private/metadata address by the
+  time an event actually fires is still refused, because the check
+  re-resolves fresh every time, not from a stored IP.
+- **Connects to the resolved (pinned) IP directly** — never lets the
+  HTTP client re-resolve the hostname itself at connect time, which
+  would reopen exactly the TOCTOU window a rebinding attack needs. The
+  original hostname is still sent via the `Host` header (virtual-hosting)
+  and via `httpx`'s `extensions={"sni_hostname": ...}` (so TLS
+  certificate verification still checks the real hostname, not the IP
+  literal) — confirmed working for real against a live HTTPS site before
+  relying on it, not assumed from reading `httpx`'s docs alone.
+- **`CollectionGateway`/`ScopeEnforcingProxy` (the OTHER egress-control
+  layer this project has) is deliberately NOT used here** — that
+  machinery authorizes a hostname against a *target's* `CollectionScope`;
+  a webhook URL is the opposite kind of destination (an account's own
+  third-party endpoint, never inside any scan's scope). Reusing it would
+  be a category error — either reject every real webhook destination, or
+  require inventing a permissive fake scope that would then leak into
+  the same object real recon collection is authorized against. See
+  `api/webhooks.py`'s own module docstring for the full reasoning.
+
+### Retries, backoff, and disable-after-failure
+
+- Up to 3 attempts per event delivery (`MAX_DELIVERY_ATTEMPTS`), with a
+  1s then 5s backoff between attempts (`RETRY_BACKOFF_SECONDS`) — bounded
+  so a slow/unreachable receiver never ties up the triggering account's
+  own notification path (composes with the monitoring loop's existing
+  per-account error isolation: one account's webhook delivery is wrapped
+  in its own `try`/`except`, same as every other per-domain operation
+  there).
+- After 5 CONSECUTIVE events that each exhausted their own retries and
+  still failed (`DISABLE_AFTER_CONSECUTIVE_FAILURES`), the webhook is
+  automatically disabled (`status: "disabled"`) and never attempted
+  again automatically — a dead endpoint stops being retried forever.
+  Re-enabling requires deleting and re-registering (the simplest correct
+  behavior for this pass; a dedicated "re-enable" endpoint is a real,
+  deferred non-goal, not an oversight).
+- A successful delivery resets the consecutive-failure counter to 0.
+
+### Per-account cap
+
+10 webhooks per account (`MAX_WEBHOOKS_PER_ACCOUNT`) — an account cannot
+use webhook registration to fan out an unbounded number of outbound
+requests from Hydra's own infrastructure. Checked before the (slower)
+real DNS/SSRF validation, so the cheapest rejection happens first.
+
+### New endpoints (`api/routers/webhooks.py`)
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/webhooks` | Register. `422` for a non-https URL, an unknown event type, or a private/loopback/metadata destination. `403` past the per-account cap. Returns the raw secret ONCE. |
+| `GET` | `/webhooks` | List this account's webhooks (never includes `secret`). |
+| `DELETE` | `/webhooks/{webhook_id}` | Opt out. `404` for an unknown id or another account's webhook (never `403`, which would confirm its existence). |
+
+### How to point this at Slack or Teams
+
+Both Slack's and Microsoft Teams' "incoming webhook" features give you a
+plain HTTPS URL that already accepts a JSON `POST` — register that exact
+URL here with the event types you want. Hydra's own JSON body isn't in
+either platform's native "attachment" format, so a receiving Slack/Teams
+workflow typically needs one small transform step (a Zapier/n8n/Power
+Automate step, or a few lines in whatever already receives the webhook)
+to reshape `{"event": ..., "domain": ..., ...}` into a chat message —
+this project deliberately does not build that transform itself (a native
+Slack/Teams app is exactly the bespoke-integration scope this task
+avoided; see Non-goals below).
+
+### Explicit non-goals — deferred, not silently skipped
+
+- **A native Slack app, Jira app, or Teams app.** The generic signed
+  webhook is deliberately the whole scope for this pass.
+- **Re-enabling a disabled webhook without deleting and re-registering.**
+- **Inbound webhooks, or any control-plane action triggered from
+  outside.** This is outbound notification only.
+- **A durable, persisted delivery queue surviving a process restart
+  mid-delivery.** Delivery is synchronous-to-the-triggering-event
+  (scheduled as a background `asyncio` task when the real monitoring
+  loop is running, or run to completion immediately when called
+  directly, e.g. by tests) — a process crash mid-retry loses that one
+  in-flight delivery attempt, the same durability level the monitoring
+  email path already has and never claimed to exceed.
+- **Per-webhook event-type editing after registration.** Delete and
+  re-register with the new set.
 
 ## Explicitly deferred beyond Round 3
 

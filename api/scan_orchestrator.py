@@ -35,13 +35,59 @@ configuration — there is nothing to restore afterward. `"manual"` and
 from __future__ import annotations
 
 import argparse
+import logging
 from typing import TYPE_CHECKING
 
 from api.control_db import ControlDB
-from api.tenancy import account_settings
+from api.tenancy import account_db_path, account_settings
 
 if TYPE_CHECKING:
     from api.settings import APISettings
+
+# Matches this codebase's own existing severity vocabulary
+# (core/assets.py::RiskLevel; every parser in core/parsers/registry.py
+# already writes Finding.severity as one of these lowercase strings) —
+# never a second severity scale invented for the webhook path.
+_HIGH_SEVERITY_LEVELS = frozenset({"critical", "high"})
+# Capped for the same reason api/monitoring.py's own notification email
+# caps the domain list — a scan with hundreds of high-severity findings
+# (a plausible worst case, e.g. a leaked-secrets sweep) gets one bounded,
+# readable webhook payload, never an unbounded one.
+_MAX_FINDINGS_PER_WEBHOOK = 20
+
+
+async def _deliver_high_severity_findings_webhook(
+    *, api_settings: APISettings, control_db: ControlDB, account_id: str, domain: str, scan_id: str
+) -> None:
+    """`finding.high_severity` — the one webhook event type this task
+    added that isn't already computed elsewhere (unlike the monitoring
+    events, which reuse `api/monitoring_worker.py`'s own significance
+    decision). The severity filter itself
+    (`severity in _HIGH_SEVERITY_LEVELS`) is the ONLY place that answers
+    "is this finding severe" for this event — `api/webhooks.py::
+    event_for_high_severity_findings` only shapes the already-filtered
+    list into a payload, it never re-derives severity itself."""
+    from api.webhooks import deliver_event_to_subscribers, event_for_high_severity_findings
+    from core.store import AssetStore
+
+    store = AssetStore(account_db_path(api_settings, account_id))
+    hosts = store.get_hosts(scan_id)
+    findings = [
+        {
+            "host": host.domain,
+            "template_id": finding.template_id,
+            "severity": finding.severity,
+            "name": finding.name,
+        }
+        for host in hosts
+        for finding in host.findings
+        if finding.severity in _HIGH_SEVERITY_LEVELS
+    ][:_MAX_FINDINGS_PER_WEBHOOK]
+
+    if not findings:
+        return
+    event = event_for_high_severity_findings(domain=domain, scan_id=scan_id, findings=findings)
+    await deliver_event_to_subscribers(control_db=control_db, account_id=account_id, event=event)
 
 
 async def execute_scan(
@@ -79,6 +125,25 @@ async def execute_scan(
             )
         else:
             control_db.update_scan_status(scan_id, "completed")
+            # Deliberately its OWN try/except, never inside the same
+            # scope as the scan's own status transition above: a bug or
+            # a slow/unreachable webhook receiver here must never
+            # retroactively turn an already-successfully-completed scan
+            # into a "failed" one from the client's point of view.
+            try:
+                await _deliver_high_severity_findings_webhook(
+                    api_settings=api_settings,
+                    control_db=control_db,
+                    account_id=account_id,
+                    domain=domain,
+                    scan_id=scan_id,
+                )
+            except Exception:
+                logging.getLogger("hydra.api.webhooks").exception(
+                    "Error delivering finding.high_severity webhook for account %s scan %s",
+                    account_id,
+                    scan_id,
+                )
     except Exception as exc:
         # A background asyncio task's exception would otherwise vanish
         # silently (asyncio logs it to stderr at best) — recording it on

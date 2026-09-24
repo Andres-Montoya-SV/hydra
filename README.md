@@ -576,6 +576,33 @@ is generated unless the operator invokes that command by name.
 
 ---
 
+## Development
+
+Dev-tool versions (`ruff`, `black`, `isort`, `mypy`, `bandit`, `pytest`)
+are pinned to exact versions in `requirements-dev.txt` — the same file
+CI installs from (`.github/workflows/ci.yml`). Set up a local dev
+environment against those exact pins:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt -r requirements-api.txt
+```
+
+**`pre-commit` is the supported way to run lint/format/type/security
+checks locally**, using the identical pinned versions CI runs (never
+whatever happens to be latest on PyPI):
+
+```bash
+pip install pre-commit
+pre-commit install            # runs the checks automatically on every commit
+pre-commit run --all-files    # or run them on demand, against the whole tree
+```
+
+`.pre-commit-config.yaml`'s hook versions are kept in sync with
+`requirements-dev.txt` by `tests/test_dev_toolchain_pins_agree.py` — that
+test fails if the two ever disagree, so a version bump in one without the
+other is caught immediately rather than silently drifting.
+
 ## License
 
 For authorized security research only. Use responsibly and within program

@@ -235,6 +235,19 @@ def _harvest_one(
                 review_reason=jump.reason,
             )
 
+    # Sticky by design, per the task's own explicit requirement: once a
+    # domain is in `needs_review`, NOTHING harvested here ever clears it
+    # again — not a smaller count next cycle, not the digest going back
+    # to its old value, nothing short of the explicit human acknowledge
+    # (`ControlDB.clear_needs_review`, `POST
+    # /domains/{domain}/monitoring/acknowledge`). Without this, a count
+    # that spikes past the ceiling and later happens to dip back under
+    # it on an ordinary later cycle would silently self-heal
+    # `classify_asset_jump`'s verdict (it only ever compares against the
+    # IMMEDIATELY PRECEDING count, which this same function already
+    # overwrites with `new_count` below) — exactly the "fully-automatic
+    # resolution of a flagged domain" the ceiling exists to prevent.
+    still_needs_review = row.status == "needs_review" or jump.needs_review
     update = {
         "monitoring_id": row.monitoring_id,
         "speed": speed,
@@ -243,8 +256,8 @@ def _harvest_one(
         "next_due_at": next_at,
         "asset_digest": new_digest,
         "asset_count": new_count,
-        "needs_review": jump.needs_review,
-        "status": "needs_review" if jump.needs_review else "active",
+        "needs_review": still_needs_review,
+        "status": "needs_review" if still_needs_review else "active",
     }
     return update, outcome
 
@@ -362,6 +375,65 @@ def _flush_pending_notifications(
 
     notified_accounts = 0
     for account_id, rows in by_account.items():
+_background_webhook_tasks: set[asyncio.Task] = set()
+
+
+def _deliver_webhooks_for_outcome(control_db: ControlDB, outcome: MonitoringRunOutcome) -> None:
+    """The exact same significance decision that just put `outcome` in
+    `outcomes_by_account` (i.e. it was worth an email) is reused here,
+    verbatim — `api/webhooks.py::event_for_monitoring_outcome` derives
+    its event type from `outcome.needs_review`, never a second
+    "is this worth alerting" computation.
+
+    Bridges this module's own synchronous call shape (`run_monitoring_cycle`
+    is a plain sync function, called both directly by tests and from
+    inside `run_monitoring_loop`'s real `asyncio` loop) to webhook
+    delivery's genuinely async HTTP calls: when a real event loop IS
+    running (production), delivery is scheduled as a background task —
+    never blocking the rest of this cycle's own per-account processing
+    on a slow/unreachable webhook receiver, which is exactly the "one
+    account's failing webhook never blocks another account's delivery"
+    requirement. When no loop is running (every existing synchronous
+    test), it runs to completion immediately via `asyncio.run` — the
+    same deterministic, awaited-for-real behavior those tests already
+    rely on for the email path."""
+    from api.webhooks import deliver_event_to_subscribers, event_for_monitoring_outcome
+
+    event = event_for_monitoring_outcome(outcome)
+    coro = deliver_event_to_subscribers(
+        control_db=control_db, account_id=outcome.account_id, event=event
+    )
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(coro)
+        return
+    task = loop.create_task(coro)
+    _background_webhook_tasks.add(task)
+    task.add_done_callback(_background_webhook_tasks.discard)
+
+
+def _send_notifications(
+    *,
+    control_db: ControlDB,
+    email_sender: EmailSender,
+    api_settings: APISettings,
+    outcomes_by_account: dict[str, list[MonitoringRunOutcome]],
+) -> None:
+    for account_id, outcomes in outcomes_by_account.items():
+        for outcome in outcomes:
+            try:
+                _deliver_webhooks_for_outcome(control_db, outcome)
+            except Exception:
+                # Per-account isolation extends to webhook delivery
+                # scheduling itself — a bug here must never prevent this
+                # same account's (or any other account's) email below.
+                logger.exception(
+                    "Error scheduling webhook delivery for account %s domain %s",
+                    account_id,
+                    outcome.domain,
+                )
+
         account = control_db.get_account(account_id)
         if account is None or account.email is None:
             logger.warning(
