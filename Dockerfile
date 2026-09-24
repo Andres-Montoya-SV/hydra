@@ -45,7 +45,7 @@ RUN go install -v github.com/hakluke/hakrawler@2.1
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime
 # ---------------------------------------------------------------------------
-FROM python:3.11-slim-bookworm AS final
+FROM python:3.15.0rc1-slim-bookworm AS final
 
 LABEL org.opencontainers.image.title="hydra" \
       org.opencontainers.image.description="Evidence-backed, scope-aware Attack Surface Intelligence control plane" \
