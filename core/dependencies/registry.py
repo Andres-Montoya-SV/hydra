@@ -277,6 +277,11 @@ _register(
         capabilities=frozenset({"content_discovery", "endpoint_fuzzing"}),
         install_homebrew="ffuf",
         install_go="github.com/ffuf/ffuf/v2@latest",
+    )
+)
+
+_register(
+    ToolDefinition(
         name="dnstwist",
         display_name="dnstwist",
         version_commands=(("--version",),),
@@ -284,6 +289,11 @@ _register(
         capabilities=frozenset({"typosquat_detection"}),
         install_homebrew="dnstwist",
         install_pip="dnstwist",
+    )
+)
+
+_register(
+    ToolDefinition(
         name="gitleaks",
         display_name="gitleaks",
         version_commands=(("version",),),
