@@ -349,6 +349,32 @@ def _try_enqueue_one(
     control_db.mark_monitoring_scan_enqueued(row.monitoring_id, speed=speed, scan_id=scan_id)
 
 
+def _flush_pending_notifications(
+    *, control_db: ControlDB, email_sender: EmailSender, api_settings: APISettings
+) -> int:
+    """Reads the DURABLE outbox (`monitoring_pending_notifications`),
+    never an in-memory dict scoped to this one call — a row written by
+    an EARLIER cycle that crashed before reaching this same step is
+    still `sent_at IS NULL` and gets flushed here exactly the same as
+    one this very cycle's own harvest phase just wrote. This is the
+    real fix for the lost-notification bug described in that table's own
+    schema comment; see it for the full reasoning.
+
+    Ordering per account is deliberately send-THEN-mark: if the process
+    dies between the two, the next flush (this cycle's caller running
+    again, or a fresh process entirely) finds the row still unsent and
+    re-sends it — at most one duplicate, never a silent loss. Returns
+    the number of accounts actually notified, for the caller's stats."""
+    pending = control_db.list_unsent_notifications()
+    if not pending:
+        return 0
+
+    by_account: dict[str, list[dict]] = {}
+    for row in pending:
+        by_account.setdefault(row["account_id"], []).append(row)
+
+    notified_accounts = 0
+    for account_id, rows in by_account.items():
 _background_webhook_tasks: set[asyncio.Task] = set()
 
 
@@ -411,21 +437,52 @@ def _send_notifications(
         account = control_db.get_account(account_id)
         if account is None or account.email is None:
             logger.warning(
-                "Monitoring alert for account %s has no email on file — not sent (%d change(s)).",
+                "Monitoring alert for account %s has no email on file — not sent (%d change(s)). "
+                "Marked sent anyway: there is no email to retry delivery to on a later cycle.",
                 account_id,
-                len(outcomes),
+                len(rows),
             )
+            control_db.mark_notifications_sent([r["notification_id"] for r in rows])
             continue
-        ordered = sorted(outcomes, key=significance_rank)
+
+        pairs = [
+            (
+                MonitoringRunOutcome(
+                    monitoring_id="",
+                    account_id=r["account_id"],
+                    domain=r["domain"],
+                    speed=r["speed"],
+                    scan_id=r["scan_id"],
+                    hosts_added=r["hosts_added"],
+                    hosts_removed=r["hosts_removed"],
+                    asset_count=r["asset_count"],
+                    asset_digest=r["asset_digest"],
+                    needs_review=r["needs_review"],
+                    review_reason=r["review_reason"],
+                ),
+                r["notification_id"],
+            )
+            for r in rows
+        ]
+        ordered_pairs = sorted(pairs, key=lambda pair: significance_rank(pair[0]))
         cap = api_settings.monitoring_max_domains_per_email
-        shown, truncated = ordered[:cap], ordered[cap:]
-        summary_lines = [_render_outcome_line(o) for o in shown]
+        shown_pairs, truncated_pairs = ordered_pairs[:cap], ordered_pairs[cap:]
+        summary_lines = [_render_outcome_line(outcome) for outcome, _ in shown_pairs]
+
         email_sender.send_monitoring_alert(
             to=account.email,
             account_id=account_id,
             summary_lines=summary_lines,
-            truncated_count=len(truncated),
+            truncated_count=len(truncated_pairs),
         )
+        # Only reached if the send above didn't raise — a raised
+        # exception here (simulating a crash) leaves every row for this
+        # account still unsent, to be retried by the next flush.
+        control_db.mark_notifications_sent(
+            [notification_id for _, notification_id in ordered_pairs]
+        )
+        notified_accounts += 1
+    return notified_accounts
 
 
 def _render_outcome_line(outcome: MonitoringRunOutcome) -> str:
@@ -450,11 +507,11 @@ def run_monitoring_cycle(
     cycle's own control flow, not in any one account's data."""
     budget = _CycleBudget.start(api_settings.monitoring_cycle_time_budget_seconds)
     stats = {"harvested": 0, "enqueued": 0, "skipped_errors": 0, "notified_accounts": 0}
-    outcomes_by_account: dict[str, list[MonitoringRunOutcome]] = {}
 
     for speed in _SPEEDS:
         pending_rows = control_db.list_pending_monitoring_harvest(speed=speed)
         updates: list[dict] = []
+        notifications: list[dict] = []
         for row in pending_rows:
             if budget.exhausted():
                 break
@@ -476,12 +533,34 @@ def run_monitoring_cycle(
                 updates.append(update)
                 stats["harvested"] += 1
             if outcome is not None:
-                outcomes_by_account.setdefault(outcome.account_id, []).append(outcome)
+                # Written to the durable outbox in the SAME transaction
+                # as `update` below (both go into the same
+                # `batch_record_monitoring_progress` call) — never held
+                # only in memory. See `monitoring_pending_notifications`'s
+                # own schema comment (api/control_db.py) for the real bug
+                # this closes: a crash between the row update and a
+                # deferred, in-memory-only send used to lose the
+                # notification permanently.
+                notifications.append(
+                    {
+                        "account_id": outcome.account_id,
+                        "domain": outcome.domain,
+                        "speed": outcome.speed,
+                        "scan_id": outcome.scan_id,
+                        "hosts_added": outcome.hosts_added,
+                        "hosts_removed": outcome.hosts_removed,
+                        "asset_count": outcome.asset_count,
+                        "asset_digest": outcome.asset_digest,
+                        "needs_review": outcome.needs_review,
+                        "review_reason": outcome.review_reason,
+                    }
+                )
             if len(updates) >= api_settings.monitoring_batch_size:
-                control_db.batch_record_monitoring_progress(updates)
+                control_db.batch_record_monitoring_progress(updates, notifications=notifications)
                 updates = []
-        if updates:
-            control_db.batch_record_monitoring_progress(updates)
+                notifications = []
+        if updates or notifications:
+            control_db.batch_record_monitoring_progress(updates, notifications=notifications)
 
     now_iso = _now_iso()
     for speed in _SPEEDS:
@@ -522,14 +601,9 @@ def run_monitoring_cycle(
             if len(page) < api_settings.monitoring_batch_size:
                 break
 
-    if outcomes_by_account:
-        _send_notifications(
-            control_db=control_db,
-            email_sender=email_sender,
-            api_settings=api_settings,
-            outcomes_by_account=outcomes_by_account,
-        )
-        stats["notified_accounts"] = len(outcomes_by_account)
+    stats["notified_accounts"] = _flush_pending_notifications(
+        control_db=control_db, email_sender=email_sender, api_settings=api_settings
+    )
     return stats
 
 

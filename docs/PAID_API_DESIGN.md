@@ -2955,6 +2955,50 @@ looking identical to "not due yet," picked up cleanly by the next cycle
 with no separate checkpoint/offset table and no risk of double
 processing.
 
+**Updated 2026-09-24 — the interrupt-safety claim above is now PROVEN,
+and a real bug it caught along the way is fixed**: this was previously
+asserted in prose only. `tests/test_monitoring_worker.py::
+TestCycleIsSafeToInterruptMidWay` seeds 6 due domains, forces a real,
+deterministic mid-cycle stop (a tiny `monitoring_cycle_time_budget_seconds`
+combined with a real per-row delay added to a genuine dependency call,
+`classify_scan_gate` — never a mock of the monitoring logic itself), and
+proves: the rows already processed are untouched by a second, resuming
+call (same `scan_id`, never re-enqueued); the rows not yet reached are
+completely unwritten (no partial state); and the combined end state of
+(interrupted + resumed) matches a single uninterrupted run over an
+identical seed.
+
+Proving this surfaced a REAL bug, not a hypothetical one:
+`TestNoLostOrDuplicateNotificationAcrossAnInterruption` showed that a
+harvested outcome worth emailing lived ONLY in an in-memory dict for the
+rest of that one `run_monitoring_cycle` call, sent (if at all) as the
+function's very last step — after `batch_record_monitoring_progress` had
+already advanced `next_*_due_at` and overwritten `last_asset_digest`
+(the only place the PREVIOUS baseline needed to reconstruct the diff was
+available). A crash between that DB write and the deferred send
+permanently lost the notification: the next cycle's own digest
+comparison sees no change at all, because the row already reflects the
+new state. Confirmed for real (not assumed) by running the new test
+against the pre-fix code — it failed exactly as predicted
+(`notified_accounts == 0` after the simulated crash) — then fixed:
+
+- A new durable outbox table, `monitoring_pending_notifications`
+  (`api/control_db.py`), written in the EXACT SAME transaction as the
+  row's own progress update (`batch_record_monitoring_progress`, which
+  now takes an optional `notifications` argument) — the two facts ("this
+  domain's progress was recorded" and "there is something to tell the
+  account about it") can no longer be separated by a crash.
+- `run_monitoring_cycle` no longer sends from an in-memory dict scoped to
+  its own call; `_flush_pending_notifications` reads every `sent_at IS
+  NULL` row — from ANY past cycle, not just this one — at the end of
+  each cycle, so a notification stranded by an earlier interrupted cycle
+  is delivered by the very next one.
+- Deliberately send-then-mark, not mark-then-send: a crash between an
+  account's email actually sending and `mark_notifications_sent`
+  committing can produce at most one duplicate email for that account,
+  never a silent loss — the accepted direction to err in for a security-
+  relevant change notification.
+
 **Speed 2 at scale, stated honestly**: the scale numbers above are the
 MONITORING BOOKKEEPING layer (the `monitored_domains` table itself) at
 300k rows — they say nothing about 300k concurrent active pipeline runs,
