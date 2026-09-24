@@ -158,15 +158,30 @@ docker compose run --rm api \
 ## 5. Running it
 
 ```bash
-cp config/.env.example .env   # then edit — see api/settings.py for every API-specific var
+cp api/.env.example .env   # then edit — every API-specific variable, documented inline
 cp Caddyfile.example Caddyfile   # then edit — see §2
 mkdir -p docker-data/api_data && sudo chown -R 10001:10001 docker-data/api_data
 
 docker compose build
 docker compose up -d api caddy
-docker compose logs -f api caddy   # watch startup: worker/reconciliation/backup loops
-                                    # starting, and Caddy's certificate issuance
+docker compose logs -f api caddy   # watch startup: worker/reconciliation/backup/monitoring
+                                    # loops starting, and Caddy's certificate issuance
 ```
+
+**`api/.env.example`, not `config/.env.example`** — confirmed by reading
+the code, not assumed: `api/tenancy.py::account_settings` constructs each
+account's `config.settings.Settings` DIRECTLY (`Settings(project_root=...)`),
+never via `Settings.from_env()`, so an API-triggered scan never reads
+`config/.env.example`'s `ENABLE_*`/tool-path variables at all — every
+account gets the exact same fixed tool selection (that dataclass's own
+hardcoded defaults) regardless of what's in the environment. This is
+deliberate per-tenant isolation (a shared server-level env var steering
+every account's scan behavior would itself be a real multi-tenancy leak),
+not an oversight, but it does mean copying `config/.env.example` into an
+API-only deployment's `.env` accomplishes nothing — `api/.env.example` is
+the file that actually matters here. If this same host is ALSO running
+the separate `hydra` CLI service from `docker-compose.yml`, copy
+`config/.env.example` too; the two files' variables never collide.
 
 ## 6. How do I know it's actually up
 
@@ -182,8 +197,8 @@ Point an external uptime monitor (UptimeRobot, Better Uptime, a simple
 cron+curl, whatever's already in use) at this URL, expecting `200`.
 Unlike a bare "the process is running" check, this genuinely verifies
 `control_db` is reachable (a real query, not just an in-memory object)
-and that the scan-worker, reconciliation, and backup loops are each
-still alive (a real per-loop heartbeat timestamp, not just "the asyncio
+and that the scan-worker, reconciliation, backup, and continuous-
+monitoring loops are each still alive (a real per-loop heartbeat timestamp, not just "the asyncio
 task object hasn't been garbage collected" — see `api/health.py`'s own
 docstring for why that distinction matters). A `503` response body
 names exactly which check failed:

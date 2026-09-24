@@ -100,7 +100,17 @@ def backup_sqlite_file(source_path: Path, dest_path: Path) -> None:
     docstring for why this, never a raw file copy. `dest_path`'s parent
     is created if needed; a destination file that doesn't exist yet is
     exactly what `sqlite3.connect` on a fresh path already handles
-    (creates an empty database, which `.backup()` then populates)."""
+    (creates an empty database, which `.backup()` then populates).
+
+    **Locked down to `0o600` after writing** — a real, confirmed gap
+    found while verifying the backup/restore path end to end: `control.db`
+    itself is created with `0o600` (`ControlDB.__init__`, owner
+    read/write only), but `sqlite3.connect()` on a brand-new destination
+    path creates it with the process's ordinary umask-derived permissions
+    — `0o644` (world-readable) on a typical deployment. A backup
+    snapshot contains the exact same sensitive rows the original does
+    (API-key hashes, account emails, billing state) and must never be
+    LESS protected than the file it was copied from."""
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     source_conn = sqlite3.connect(source_path)
     try:
@@ -111,6 +121,7 @@ def backup_sqlite_file(source_path: Path, dest_path: Path) -> None:
             dest_conn.close()
     finally:
         source_conn.close()
+    dest_path.chmod(0o600)
 
 
 def _recon_db_path(api_settings: APISettings, account_id: str) -> Path:
