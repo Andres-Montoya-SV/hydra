@@ -2688,10 +2688,39 @@ detector (`modules/wildcard_check.py`, read from the scan's
 `wildcard_check.jsonl` artifact) did NOT already flag wildcard DNS for
 that run — a real, already-explained cause of an inflated count is never
 double-counted as a second, contradictory kind of alarm. A flagged
-domain's `status` becomes `'needs_review'`; monitoring keeps running
-every cycle (a human clearing the review is not required for scanning
-to continue), but no further notification fires until the count changes
-again.
+domain's `status` becomes `'needs_review'`.
+
+**Updated 2026-09-24 — Speed 2 pauses on `needs_review`, Speed 1 does
+not**: the original text above (and this round's own first pass) let a
+`needs_review` domain keep accruing full active pipeline runs every
+cadence indefinitely — exactly the scale/cost risk the ceiling exists to
+catch, now made worse by continuing to auto-scan it. Fixed:
+
+- **Speed 2 (active) is excluded from `list_due_active_monitoring_page`
+  at the query level** the moment `status = 'needs_review'` — a
+  deliberately DIFFERENT mechanism from how `'paused_verification_lapsed'`
+  is handled (that state is re-checked every cycle in Python,
+  `_try_enqueue_one`, so a verification that quietly becomes fresh again
+  resumes on the very next poll). `needs_review` has no equivalent
+  "became fresh again" condition to poll for — only a human clearing it
+  changes anything — so excluding it from the due set entirely, rather
+  than re-deriving the same "skip" decision from Python on every single
+  cycle, is both simpler and correct for that semantics.
+- **Speed 1 (passive) keeps running** — cheap, generates no active
+  target traffic, and lets the operator watch whether the count settles
+  back down before deciding what to do. A later passive cycle's smaller
+  count IS recorded (`last_asset_count`, visible via `GET
+  /domains/{domain}/monitoring`) but never silently flips `status` back
+  to `'active'` on its own — `_harvest_one` treats `needs_review` as
+  sticky (`row.status == "needs_review" or jump.needs_review`) precisely
+  so a domain that spikes and later happens to dip back under the
+  ceiling on an ordinary cycle doesn't self-heal the flag; only the
+  explicit acknowledge endpoint below does.
+- **`POST /domains/{domain}/monitoring/acknowledge`** clears
+  `status`/`needs_review` back to `'active'`/`false`. No separate
+  "resume" step is needed: `next_active_due_at` was never advanced while
+  the row was excluded from the due set, so it's already due again the
+  moment `status` changes — Speed 2 resumes on the very next cycle.
 
 ### Notifications — capped, ordered, never per-domain
 
@@ -2775,6 +2804,7 @@ durable-queue section above for that mechanism's own design.
 |---|---|---|
 | `POST` | `/domains/{domain}/monitoring` | Opt in (idempotent — a second call updates `speed2`). `403` if the domain isn't currently verified, or if `speed2: true` on a tier without it. |
 | `GET` | `/domains/{domain}/monitoring` | Current status, schedule, last asset count. `404` if never opted in. |
+| `POST` | `/domains/{domain}/monitoring/acknowledge` | Clears a `needs_review` flag and resumes Speed 2. `404` if never opted in, `409` if not currently flagged. |
 | `DELETE` | `/domains/{domain}/monitoring` | Opt out. `404` if never opted in. |
 
 ### New settings (env-configurable, `api/settings.py`)
@@ -2798,10 +2828,14 @@ durable-queue section above for that mechanism's own design.
   checkpoint record.
 - **Per-domain notification preferences** (digest frequency, channel
   other than email) — one email shape, one cadence, for every account.
-- **A UI/endpoint for clearing `needs_review`** — the status is visible
-  via `GET /domains/{domain}/monitoring`, but nothing clears it
-  automatically except the count naturally coming back under the
-  ceiling on a later run; there is no explicit "acknowledge" action.
+- ~~A UI/endpoint for clearing `needs_review`.~~ — **resolved 2026-09-24**,
+  see "Speed 2 pauses on `needs_review`" above:
+  `POST /domains/{domain}/monitoring/acknowledge`.
+- **Any smarter auto-resolution of a `needs_review` domain** (sampling,
+  auto-scoping to bring the count back down) — an explicit human
+  acknowledge is the accepted answer for now; a genuinely huge but
+  legitimate attack surface still needs a person to decide, not a
+  heuristic.
 - **Coordinating monitoring's own scan bursts with `TierLimits.
   priority_queue`** — still a recorded-but-inert field (per the durable-
   queue section above); a monitoring-triggered burst of Speed 2 scans

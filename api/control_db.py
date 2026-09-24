@@ -1258,11 +1258,34 @@ class ControlDB:
         """Speed 2's equivalent of `list_due_passive_monitoring_page` —
         same keyset-pagination shape, scoped to `speed2_enabled` rows
         whose `next_active_due_at` (never NULL for those rows) has
-        passed."""
+        passed.
+
+        `status != 'needs_review'` is enforced HERE, at the query level
+        — deliberately a DIFFERENT mechanism from how
+        `'paused_verification_lapsed'` is handled (that state is instead
+        re-checked every cycle inside `_try_enqueue_one`, in Python, so a
+        verification that quietly becomes fresh again resumes monitoring
+        on the very next poll with no action required). `needs_review`
+        has no equivalent "became fresh again" condition to poll for —
+        Part B's asset-count sanity ceiling exists precisely because a
+        human is expected to look, and the task's own explicit
+        requirement is that NOTHING auto-clears it, ever, no matter how
+        many cycles pass or how the count changes. Excluding it from the
+        due set entirely is simpler and correct for that "only an
+        explicit action changes this" semantics — there is nothing to
+        re-check on a schedule, unlike verification freshness. Clearing
+        it (`clear_needs_review`, via `POST
+        /domains/{domain}/monitoring/acknowledge`) does not need to
+        touch `next_active_due_at` either: it was never advanced while
+        the domain was excluded here, so the moment `status` changes
+        back to `'active'` the row is already due again, and Speed 2
+        resumes on the very next cycle without any special-cased
+        "resume" logic of its own."""
         with self._connect() as conn:
             if cursor is None:
                 rows = conn.execute(
                     "SELECT * FROM monitored_domains WHERE speed2_enabled = 1 "
+                    "AND status != 'needs_review' "
                     "AND pending_active_scan_id IS NULL "
                     "AND next_active_due_at IS NOT NULL AND next_active_due_at <= ? "
                     "ORDER BY next_active_due_at, monitoring_id LIMIT ?",
@@ -1272,6 +1295,7 @@ class ControlDB:
                 cursor_due_at, cursor_id = cursor
                 rows = conn.execute(
                     "SELECT * FROM monitored_domains WHERE speed2_enabled = 1 "
+                    "AND status != 'needs_review' "
                     "AND pending_active_scan_id IS NULL "
                     "AND next_active_due_at IS NOT NULL AND next_active_due_at <= ? "
                     "AND (next_active_due_at, monitoring_id) > (?, ?) "
@@ -1279,6 +1303,24 @@ class ControlDB:
                     (due_before, cursor_due_at, cursor_id, limit),
                 ).fetchall()
         return [_monitored_domain_record_from_row(row) for row in rows]
+
+    def clear_needs_review(self, account_id: str, domain: str) -> bool:
+        """The human-acknowledge action `POST
+        /domains/{domain}/monitoring/acknowledge` performs — the ONLY
+        way a `needs_review` domain's status ever changes, by design.
+        Only actually updates a row currently IN `needs_review` (mirrors
+        `revoke_key`'s "only act on the state this call is meaningful
+        for" discipline) — the router turns a `False` return into a
+        clear "nothing to acknowledge" response rather than a silent
+        no-op success, so a client can't mistake "already fine" for "I
+        just cleared something real"."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE monitored_domains SET status = 'active', needs_review = 0, "
+                "updated_at = ? WHERE account_id = ? AND domain = ? AND status = 'needs_review'",
+                (_now_iso(), account_id, domain),
+            )
+        return cursor.rowcount > 0
 
     def mark_monitoring_scan_enqueued(
         self, monitoring_id: str, *, speed: Literal["passive", "active"], scan_id: str
