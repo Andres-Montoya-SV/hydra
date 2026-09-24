@@ -59,6 +59,25 @@ FINDING_GLOSSARY: dict[str, dict[str, str]] = {
         "what": "A brand-derived cloud bucket returned a public object listing.",
         "why": "Public listings often leak sensitive files; treat as high priority.",
     },
+    "email-exposure": {
+        "what": (
+            "A work email address or personnel name for this target was publicly "
+            "indexed (modules/theharvester.py)."
+        ),
+        "why": (
+            "Not itself a technical vulnerability — evidence of phishing-surface/"
+            "social-engineering exposure, informational unless the program's own "
+            "rules treat it otherwise."
+        ),
+    },
+    "tls-finding": {
+        "what": "A TLS/certificate configuration observation from sslyze (modules/sslyze.py).",
+        "why": (
+            "Certificate/protocol/cipher weaknesses vary widely in severity — read "
+            "the finding's own description before triaging; sslyze reports posture, "
+            "not a single fixed vulnerability class."
+        ),
+    },
     "hidden-endpoint-discovered": {
         "what": (
             "A wordlist-brute-forced path responded live — never surfaced by "
@@ -69,6 +88,8 @@ FINDING_GLOSSARY: dict[str, dict[str, str]] = {
             "directories are frequently left behind after a deploy; severity "
             "depends on what was found (a .git/.env leak is critical, a "
             "generic 200 on an obscure path is lower priority)."
+        ),
+    },
     "leaked-secret": {
         "what": (
             "gitleaks matched a credential pattern in a public GitHub "
@@ -81,6 +102,8 @@ FINDING_GLOSSARY: dict[str, dict[str, str]] = {
             "rotated but still confirms real exposure. The secret value "
             "itself is never stored by Hydra — only enough metadata (rule, "
             "file, line, commit) to locate and act on it."
+        ),
+    },
     "subdomain-takeover": {
         "what": (
             "A subdomain's DNS record points at a third-party service the "
