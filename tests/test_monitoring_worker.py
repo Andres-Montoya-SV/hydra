@@ -314,6 +314,178 @@ class TestHarvestingAndNotifications:
         assert sender.monitoring_alerts == []
 
 
+class TestNeedsReviewPausesActiveScanning:
+    """A `needs_review` domain must stop accruing Speed 2 (active) scans
+    until a human explicitly acknowledges it — the whole point of the
+    asset-count sanity ceiling is that automatic re-scanning of a
+    likely-spurious huge attack surface stops, not that it keeps running
+    on the same schedule with a label attached. Speed 1 (passive) is a
+    deliberate exception: cheap, no active target traffic, and useful
+    for an operator to watch whether the count settles back down on its
+    own before they decide what to do."""
+
+    def _flag_needs_review(
+        self, control_db: ControlDB, api_settings: APISettings, account_id: str, domain: str
+    ) -> None:
+        """Drives a real domain into `needs_review` the same way
+        production does — two real passive cycles, the second one's
+        count jumping past the fixture's ceiling (5) — rather than
+        hand-writing the status via SQL, so this helper exercises the
+        exact mechanism under test, not a shortcut around it.
+
+        Deliberately `speed2=False` throughout: enabling Speed 2 up
+        front would let the FIRST (pre-flag) cycle enqueue a real active
+        scan of its own before the domain ever becomes `needs_review`,
+        which would leave a stray `pending_active_scan_id` around and
+        confuse what a test checks afterward. Tests that need Speed 2
+        enabled call `create_or_update_monitored_domain` themselves,
+        AFTER this helper returns, to flip it on against an
+        already-flagged domain — the actual scenario this whole task is
+        about."""
+        record = _monitor(control_db, api_settings, account_id, domain, speed2=False)
+        _make_due(control_db, record.monitoring_id)
+        run_monitoring_cycle(
+            api_settings=api_settings, control_db=control_db, email_sender=_RecordingEmailSender()
+        )
+        scan_id = control_db.get_monitored_domain(account_id, domain).pending_passive_scan_id
+        _write_hosts(api_settings, account_id, scan_id, ["a." + domain])
+        control_db.update_scan_status(scan_id, "completed")
+        run_monitoring_cycle(
+            api_settings=api_settings, control_db=control_db, email_sender=_RecordingEmailSender()
+        )
+
+        _make_due(control_db, record.monitoring_id)
+        run_monitoring_cycle(
+            api_settings=api_settings, control_db=control_db, email_sender=_RecordingEmailSender()
+        )
+        scan_id_2 = control_db.get_monitored_domain(account_id, domain).pending_passive_scan_id
+        _write_hosts(api_settings, account_id, scan_id_2, [f"h{i}.{domain}" for i in range(10)])
+        control_db.update_scan_status(scan_id_2, "completed")
+        run_monitoring_cycle(
+            api_settings=api_settings, control_db=control_db, email_sender=_RecordingEmailSender()
+        )
+
+        flagged = control_db.get_monitored_domain(account_id, domain)
+        assert flagged.status == "needs_review"
+        assert flagged.needs_review is True
+
+    def _enable_speed2(
+        self, control_db: ControlDB, api_settings: APISettings, account_id: str, domain: str
+    ) -> None:
+        """Opts an already-`needs_review` domain into Speed 2 — the
+        real-world order of events this task is actually about (a
+        domain gets flagged, and only then does someone try to turn on
+        active monitoring for it, or it was already on when the flag
+        tripped)."""
+        control_db.create_or_update_monitored_domain(
+            account_id=account_id,
+            domain=domain,
+            speed2_enabled=True,
+            passive_interval_hours=api_settings.monitoring_passive_interval_hours,
+            active_interval_hours=api_settings.monitoring_active_interval_hours,
+        )
+
+    def test_needs_review_row_is_excluded_from_the_due_active_page(
+        self, control_db: ControlDB, api_settings: APISettings
+    ) -> None:
+        account_id = _account(control_db, tier="pro")
+        _verify_domain(control_db, account_id, "example.com")
+        self._flag_needs_review(control_db, api_settings, account_id, "example.com")
+        self._enable_speed2(control_db, api_settings, account_id, "example.com")
+        record = control_db.get_monitored_domain(account_id, "example.com")
+        _make_due(control_db, record.monitoring_id)  # overdue AND speed2_enabled
+
+        due_before = datetime.now(timezone.utc).isoformat()
+        page = control_db.list_due_active_monitoring_page(
+            due_before=due_before, cursor=None, limit=100
+        )
+
+        assert record.monitoring_id not in {r.monitoring_id for r in page}
+
+    def test_a_full_cycle_never_enqueues_speed2_for_a_needs_review_domain(
+        self, control_db: ControlDB, api_settings: APISettings, sender: _RecordingEmailSender
+    ) -> None:
+        account_id = _account(control_db, tier="pro")
+        _verify_domain(control_db, account_id, "example.com")
+        self._flag_needs_review(control_db, api_settings, account_id, "example.com")
+        self._enable_speed2(control_db, api_settings, account_id, "example.com")
+        record = control_db.get_monitored_domain(account_id, "example.com")
+        _make_due(control_db, record.monitoring_id)
+
+        run_monitoring_cycle(api_settings=api_settings, control_db=control_db, email_sender=sender)
+
+        updated = control_db.get_monitored_domain(account_id, "example.com")
+        assert updated.pending_active_scan_id is None
+        assert updated.status == "needs_review"
+
+    def test_passive_speed1_keeps_running_while_needs_review(
+        self, control_db: ControlDB, api_settings: APISettings, sender: _RecordingEmailSender
+    ) -> None:
+        account_id = _account(control_db, tier="pro")
+        _verify_domain(control_db, account_id, "example.com")
+        self._flag_needs_review(control_db, api_settings, account_id, "example.com")
+        record = control_db.get_monitored_domain(account_id, "example.com")
+        _make_due(control_db, record.monitoring_id)
+
+        run_monitoring_cycle(api_settings=api_settings, control_db=control_db, email_sender=sender)
+
+        updated = control_db.get_monitored_domain(account_id, "example.com")
+        # Speed 1 was enqueued normally despite needs_review — a real,
+        # new pending passive scan, not skipped like Speed 2 was.
+        assert updated.pending_passive_scan_id is not None
+
+    def test_a_smaller_count_on_a_later_passive_cycle_does_not_auto_clear_needs_review(
+        self, control_db: ControlDB, api_settings: APISettings, sender: _RecordingEmailSender
+    ) -> None:
+        account_id = _account(control_db, tier="pro")
+        _verify_domain(control_db, account_id, "example.com")
+        self._flag_needs_review(control_db, api_settings, account_id, "example.com")
+        record = control_db.get_monitored_domain(account_id, "example.com")
+
+        # A later passive cycle reports a count back under the ceiling.
+        _make_due(control_db, record.monitoring_id)
+        run_monitoring_cycle(api_settings=api_settings, control_db=control_db, email_sender=sender)
+        scan_id = control_db.get_monitored_domain(account_id, "example.com").pending_passive_scan_id
+        _write_hosts(api_settings, account_id, scan_id, ["a.example.com"])
+        control_db.update_scan_status(scan_id, "completed")
+        run_monitoring_cycle(api_settings=api_settings, control_db=control_db, email_sender=sender)
+
+        updated = control_db.get_monitored_domain(account_id, "example.com")
+        assert updated.last_asset_count == 1  # the smaller count WAS recorded
+        assert updated.status == "needs_review"  # but the flag stayed sticky
+        assert updated.needs_review is True
+
+    def test_acknowledge_clears_the_flag_and_the_next_cycle_resumes_speed2(
+        self, control_db: ControlDB, api_settings: APISettings, sender: _RecordingEmailSender
+    ) -> None:
+        account_id = _account(control_db, tier="pro")
+        _verify_domain(control_db, account_id, "example.com")
+        self._flag_needs_review(control_db, api_settings, account_id, "example.com")
+        self._enable_speed2(control_db, api_settings, account_id, "example.com")
+        record = control_db.get_monitored_domain(account_id, "example.com")
+        _make_due(control_db, record.monitoring_id)
+
+        cleared = control_db.clear_needs_review(account_id, "example.com")
+        assert cleared is True
+        acknowledged = control_db.get_monitored_domain(account_id, "example.com")
+        assert acknowledged.status == "active"
+        assert acknowledged.needs_review is False
+
+        run_monitoring_cycle(api_settings=api_settings, control_db=control_db, email_sender=sender)
+
+        resumed = control_db.get_monitored_domain(account_id, "example.com")
+        assert resumed.pending_active_scan_id is not None
+
+    def test_clear_needs_review_is_a_noop_when_not_currently_flagged(
+        self, control_db: ControlDB, api_settings: APISettings
+    ) -> None:
+        account_id = _account(control_db, tier="pro")
+        _verify_domain(control_db, account_id, "example.com")
+        _monitor(control_db, api_settings, account_id, "example.com")
+
+        assert control_db.clear_needs_review(account_id, "example.com") is False
+
+
 class TestErrorIsolationAndIdempotency:
     def test_one_accounts_missing_recon_db_never_blocks_another_accounts_cycle(
         self, control_db: ControlDB, api_settings: APISettings, sender: _RecordingEmailSender

@@ -7,6 +7,7 @@ methods, exercise the real endpoint under test" split
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -130,6 +131,75 @@ class TestGetAndDelete:
         api_key, _ = create_verified_account(client)
         resp = client.delete(f"/domains/{DOMAIN}/monitoring", headers=_auth(api_key))
         assert resp.status_code == 404
+
+
+class TestAcknowledge:
+    def _opt_in_and_flag_needs_review(self, client: TestClient) -> tuple[str, str]:
+        """Returns (api_key, account_id) for a Pro-tier account with
+        `DOMAIN` opted in and directly marked `needs_review` — the
+        worker-level mechanism that actually PRODUCES this state
+        (`api/monitoring_worker.py`) is already covered end-to-end by
+        `tests/test_monitoring_worker.py`; this router test's subject is
+        the acknowledge ENDPOINT, so seeding the precondition directly
+        via `ControlDB` (the same split every other router test file
+        uses for its own precondition) keeps it focused."""
+        api_key, account_id = create_verified_account(client)
+        seed_verified_domain(client, account_id, DOMAIN)
+        client.app.state.control_db.set_tier(account_id, "pro")
+        client.post(f"/domains/{DOMAIN}/monitoring", json={}, headers=_auth(api_key))
+        control_db = client.app.state.control_db
+        with sqlite3.connect(control_db.db_path) as conn:
+            conn.execute(
+                "UPDATE monitored_domains SET status = 'needs_review', needs_review = 1 "
+                "WHERE account_id = ? AND domain = ?",
+                (account_id, DOMAIN),
+            )
+        return api_key, account_id
+
+    def test_acknowledge_clears_a_flagged_domain(self, client: TestClient) -> None:
+        api_key, _account_id = self._opt_in_and_flag_needs_review(client)
+
+        resp = client.post(f"/domains/{DOMAIN}/monitoring/acknowledge", headers=_auth(api_key))
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "active"
+        assert body["needs_review"] is False
+
+    def test_acknowledge_on_a_domain_not_flagged_is_409(self, client: TestClient) -> None:
+        api_key, account_id = create_verified_account(client)
+        seed_verified_domain(client, account_id, DOMAIN)
+        client.app.state.control_db.set_tier(account_id, "pro")
+        client.post(f"/domains/{DOMAIN}/monitoring", json={}, headers=_auth(api_key))
+
+        resp = client.post(f"/domains/{DOMAIN}/monitoring/acknowledge", headers=_auth(api_key))
+
+        assert resp.status_code == 409
+
+    def test_acknowledge_on_a_domain_never_monitored_is_404(self, client: TestClient) -> None:
+        api_key, _ = create_verified_account(client)
+        resp = client.post(f"/domains/{DOMAIN}/monitoring/acknowledge", headers=_auth(api_key))
+        assert resp.status_code == 404
+
+    def test_a_different_accounts_key_cannot_acknowledge_someone_elses_domain(
+        self, client: TestClient
+    ) -> None:
+        _api_key_a, _account_a = self._opt_in_and_flag_needs_review(client)
+        api_key_b, _account_b = create_verified_account(client)
+
+        resp = client.post(f"/domains/{DOMAIN}/monitoring/acknowledge", headers=_auth(api_key_b))
+
+        assert resp.status_code == 404
+
+    def test_get_after_acknowledge_reflects_the_cleared_state(self, client: TestClient) -> None:
+        api_key, _account_id = self._opt_in_and_flag_needs_review(client)
+        client.post(f"/domains/{DOMAIN}/monitoring/acknowledge", headers=_auth(api_key))
+
+        resp = client.get(f"/domains/{DOMAIN}/monitoring", headers=_auth(api_key))
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "active"
+        assert resp.json()["needs_review"] is False
 
 
 class TestMultiTenantIsolation:

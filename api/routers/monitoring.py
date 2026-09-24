@@ -100,6 +100,44 @@ def get_monitoring(
     return _to_response(record)
 
 
+@router.post("/{domain}/monitoring/acknowledge", response_model=MonitoringStatusResponse)
+def acknowledge_monitoring_review(
+    domain: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> MonitoringStatusResponse:
+    """Clears a `needs_review` flag (Part B's asset-count sanity
+    ceiling) — the ONLY way that status ever changes; nothing in the
+    monitoring cycle itself auto-clears it, no matter how the asset
+    count moves on a later run (`api/monitoring_worker.py::_harvest_one`'s
+    own module comment has the full reasoning). Resuming normal Speed 2
+    scheduling needs no extra step beyond this: `next_active_due_at` was
+    never advanced while `status == 'needs_review'` excluded the row
+    from `list_due_active_monitoring_page`, so the row is already due
+    again the moment `status` flips back to `'active'` here."""
+    control_db = _control_db(request)
+    domain = normalize_domain(domain)
+
+    record = control_db.get_monitored_domain(auth.account_id, domain)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"{domain!r} is not being monitored")
+    if record.status != "needs_review":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{domain!r} is not currently flagged for review (status: {record.status!r}).",
+        )
+
+    control_db.clear_needs_review(auth.account_id, domain)
+    updated = control_db.get_monitored_domain(auth.account_id, domain)
+    if updated is None:
+        # Not reachable in ordinary operation (nothing else deletes a
+        # monitored_domains row concurrently with this call), but this
+        # endpoint's own contract promises a real, current
+        # MonitoringStatusResponse — never silently return stale data.
+        raise HTTPException(status_code=500, detail="Monitoring row disappeared during acknowledge")
+    return _to_response(updated)
+
+
 @router.delete("/{domain}/monitoring", status_code=204)
 def delete_monitoring(
     domain: str,
