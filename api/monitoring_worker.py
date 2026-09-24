@@ -349,40 +349,14 @@ def _try_enqueue_one(
     control_db.mark_monitoring_scan_enqueued(row.monitoring_id, speed=speed, scan_id=scan_id)
 
 
-def _flush_pending_notifications(
-    *, control_db: ControlDB, email_sender: EmailSender, api_settings: APISettings
-) -> int:
-    """Reads the DURABLE outbox (`monitoring_pending_notifications`),
-    never an in-memory dict scoped to this one call — a row written by
-    an EARLIER cycle that crashed before reaching this same step is
-    still `sent_at IS NULL` and gets flushed here exactly the same as
-    one this very cycle's own harvest phase just wrote. This is the
-    real fix for the lost-notification bug described in that table's own
-    schema comment; see it for the full reasoning.
-
-    Ordering per account is deliberately send-THEN-mark: if the process
-    dies between the two, the next flush (this cycle's caller running
-    again, or a fresh process entirely) finds the row still unsent and
-    re-sends it — at most one duplicate, never a silent loss. Returns
-    the number of accounts actually notified, for the caller's stats."""
-    pending = control_db.list_unsent_notifications()
-    if not pending:
-        return 0
-
-    by_account: dict[str, list[dict]] = {}
-    for row in pending:
-        by_account.setdefault(row["account_id"], []).append(row)
-
-    notified_accounts = 0
-    for account_id, rows in by_account.items():
 _background_webhook_tasks: set[asyncio.Task] = set()
 
 
 def _deliver_webhooks_for_outcome(control_db: ControlDB, outcome: MonitoringRunOutcome) -> None:
-    """The exact same significance decision that just put `outcome` in
-    `outcomes_by_account` (i.e. it was worth an email) is reused here,
-    verbatim — `api/webhooks.py::event_for_monitoring_outcome` derives
-    its event type from `outcome.needs_review`, never a second
+    """The exact same significance decision that already put `outcome`
+    on the durable notification outbox (i.e. it was worth an email) is
+    reused here, verbatim — `api/webhooks.py::event_for_monitoring_outcome`
+    derives its event type from `outcome.needs_review`, never a second
     "is this worth alerting" computation.
 
     Bridges this module's own synchronous call shape (`run_monitoring_cycle`
@@ -413,38 +387,53 @@ def _deliver_webhooks_for_outcome(control_db: ControlDB, outcome: MonitoringRunO
     task.add_done_callback(_background_webhook_tasks.discard)
 
 
-def _send_notifications(
-    *,
-    control_db: ControlDB,
-    email_sender: EmailSender,
-    api_settings: APISettings,
-    outcomes_by_account: dict[str, list[MonitoringRunOutcome]],
-) -> None:
-    for account_id, outcomes in outcomes_by_account.items():
-        for outcome in outcomes:
+def _flush_pending_notifications(
+    *, control_db: ControlDB, email_sender: EmailSender, api_settings: APISettings
+) -> int:
+    """Reads the DURABLE outbox (`monitoring_pending_notifications`),
+    never an in-memory dict scoped to this one call — a row written by
+    an EARLIER cycle that crashed before reaching this same step is
+    still `sent_at IS NULL` and gets flushed here exactly the same as
+    one this very cycle's own harvest phase just wrote. This is the
+    real fix for the lost-notification bug described in that table's own
+    schema comment; see it for the full reasoning.
+
+    Ordering per account is deliberately send-THEN-mark: if the process
+    dies between the two, the next flush (this cycle's caller running
+    again, or a fresh process entirely) finds the row still unsent and
+    re-sends it — at most one duplicate, never a silent loss. Returns
+    the number of accounts actually notified, for the caller's stats.
+
+    Webhook delivery (`_deliver_webhooks_for_outcome`) is driven by the
+    SAME outbox rows as the email, one call per outcome, never a second
+    independent "is this worth alerting" decision — this is what
+    guarantees email and webhook notifications can never disagree about
+    which changes were significant. It runs AFTER the email attempt (or
+    after marking sent, for an account with no email on file) so that a
+    webhook-delivery failure can never prevent or delay the email; each
+    call has its own `try`/`except` so one outcome's failing webhook
+    never blocks another outcome's, or another account's, delivery."""
+    pending = control_db.list_unsent_notifications()
+    if not pending:
+        return 0
+
+    by_account: dict[str, list[dict]] = {}
+    for row in pending:
+        by_account.setdefault(row["account_id"], []).append(row)
+
+    def _deliver_webhooks_for_pairs(pairs: list[tuple[MonitoringRunOutcome, str]]) -> None:
+        for outcome, _notification_id in pairs:
             try:
                 _deliver_webhooks_for_outcome(control_db, outcome)
             except Exception:
-                # Per-account isolation extends to webhook delivery
-                # scheduling itself — a bug here must never prevent this
-                # same account's (or any other account's) email below.
                 logger.exception(
                     "Error scheduling webhook delivery for account %s domain %s",
-                    account_id,
+                    outcome.account_id,
                     outcome.domain,
                 )
 
-        account = control_db.get_account(account_id)
-        if account is None or account.email is None:
-            logger.warning(
-                "Monitoring alert for account %s has no email on file — not sent (%d change(s)). "
-                "Marked sent anyway: there is no email to retry delivery to on a later cycle.",
-                account_id,
-                len(rows),
-            )
-            control_db.mark_notifications_sent([r["notification_id"] for r in rows])
-            continue
-
+    notified_accounts = 0
+    for account_id, rows in by_account.items():
         pairs = [
             (
                 MonitoringRunOutcome(
@@ -464,6 +453,19 @@ def _send_notifications(
             )
             for r in rows
         ]
+
+        account = control_db.get_account(account_id)
+        if account is None or account.email is None:
+            logger.warning(
+                "Monitoring alert for account %s has no email on file — not sent (%d change(s)). "
+                "Marked sent anyway: there is no email to retry delivery to on a later cycle.",
+                account_id,
+                len(rows),
+            )
+            control_db.mark_notifications_sent([r["notification_id"] for r in rows])
+            _deliver_webhooks_for_pairs(pairs)
+            continue
+
         ordered_pairs = sorted(pairs, key=lambda pair: significance_rank(pair[0]))
         cap = api_settings.monitoring_max_domains_per_email
         shown_pairs, truncated_pairs = ordered_pairs[:cap], ordered_pairs[cap:]
@@ -482,6 +484,7 @@ def _send_notifications(
             [notification_id for _, notification_id in ordered_pairs]
         )
         notified_accounts += 1
+        _deliver_webhooks_for_pairs(ordered_pairs)
     return notified_accounts
 
 
