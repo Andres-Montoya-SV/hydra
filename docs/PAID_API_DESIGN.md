@@ -2977,6 +2977,182 @@ durable-queue section above for that mechanism's own design.
   competes for `max_concurrent_scans` slots on the same FIFO
   (`created_at`) basis as everything else.
 
+## Outbound webhooks — 2026-09-24
+
+A single generic, signed outbound webhook — a customer pastes their own
+Slack/Teams incoming-webhook URL (or any HTTPS endpoint they control,
+including a Zapier/n8n bridge into Jira or anything else) and Hydra
+POSTs a JSON event to it — gets most of the value of a native
+Slack/Teams/Jira integration for a fraction of the surface area. Reuses,
+never reinvents, two things this codebase already has real answers for:
+"is this notification-worthy" (the exact same significance decision
+`api/monitoring_worker.py` already makes for the email path) and
+SSRF/private-network defense (`core/collection/ssrf.py`'s real, tested
+resolve-then-classify-every-IP policy, used everywhere else this project
+makes an outbound connection to a caller-influenced hostname).
+
+### Event types
+
+| Event | Fires when |
+|---|---|
+| `monitoring.changed` | A monitored domain's asset set changed (hosts added/removed), per the continuous-monitoring section above. |
+| `monitoring.needs_review` | A monitored domain tripped the asset-count sanity ceiling. |
+| `finding.high_severity` | A completed scan produced one or more `critical`/`high` severity findings. |
+
+A fixed, closed set (`api/webhooks.py::EVENT_TYPES`) — registering for an
+unknown event type is a `422`, never a silently-ignored typo.
+
+### Payload schema
+
+```json
+{
+  "event": "monitoring.changed",
+  "domain": "example.com",
+  "speed": "passive",
+  "asset_count": 42,
+  "hosts_added": ["new.example.com"],
+  "hosts_removed": [],
+  "needs_review": false
+}
+```
+
+`monitoring.needs_review` adds a `"review_reason"` string field.
+`finding.high_severity`'s shape:
+
+```json
+{
+  "event": "finding.high_severity",
+  "domain": "example.com",
+  "scan_id": "a1b2c3...",
+  "finding_count": 3,
+  "findings": [
+    {"host": "app.example.com", "template_id": "leaked-secret", "severity": "critical", "name": "..."}
+  ]
+}
+```
+
+`findings` is capped at 20 entries per delivery (`_MAX_FINDINGS_PER_WEBHOOK`,
+`api/scan_orchestrator.py`) — the same "one bounded, readable payload,
+never an unbounded one" reasoning the monitoring email's own domain cap
+uses. Each finding entry contains ONLY `host`/`template_id`/`severity`/
+`name` — never a raw secret value (never present in a `Finding` object
+to begin with, per `modules/github_secrets.py`'s own redaction
+guarantee) and never any other account's data.
+
+### Signature scheme — so a customer can verify delivery is real
+
+Every delivery carries two headers:
+
+- `X-Hydra-Event`: the event type (e.g. `monitoring.changed`).
+- `X-Hydra-Signature`: `sha256=<hex HMAC-SHA256 digest>` of the exact raw
+  request body, keyed by the webhook's own secret (shown exactly once,
+  at registration — the same "never re-displayed" shape API keys already
+  use). The same `sha256=` prefix convention GitHub's own outbound
+  webhooks use.
+
+A receiver verifies by computing the same HMAC over the raw body with
+their own copy of the secret and comparing (constant-time) against the
+header — `api/webhooks.py::verify_signature` is the reference
+implementation this project's own tests use to prove a tampered body
+fails verification.
+
+### SSRF policy — stated plainly
+
+- **`https://` only.** No `http`, `file`, `gopher`, or any other scheme.
+- **Real DNS resolution, then every resolved IP is checked** against
+  `core/collection/ssrf.py`'s existing blocklist (RFC1918, loopback,
+  link-local including the `169.254.169.254` cloud-metadata address,
+  carrier-grade NAT, multicast, reserved, `::1`, `fc00::/7`, `fe80::/10`)
+  — the SAME policy, not a second hand-rolled one, already used
+  everywhere else this project makes an outbound connection to a
+  caller-influenced hostname.
+- **Checked at registration AND at every single delivery attempt**
+  (including every retry) — never once and cached. This is the real
+  DNS-rebinding defense: a URL that resolves to a public address at
+  registration time but rebinds to a private/metadata address by the
+  time an event actually fires is still refused, because the check
+  re-resolves fresh every time, not from a stored IP.
+- **Connects to the resolved (pinned) IP directly** — never lets the
+  HTTP client re-resolve the hostname itself at connect time, which
+  would reopen exactly the TOCTOU window a rebinding attack needs. The
+  original hostname is still sent via the `Host` header (virtual-hosting)
+  and via `httpx`'s `extensions={"sni_hostname": ...}` (so TLS
+  certificate verification still checks the real hostname, not the IP
+  literal) — confirmed working for real against a live HTTPS site before
+  relying on it, not assumed from reading `httpx`'s docs alone.
+- **`CollectionGateway`/`ScopeEnforcingProxy` (the OTHER egress-control
+  layer this project has) is deliberately NOT used here** — that
+  machinery authorizes a hostname against a *target's* `CollectionScope`;
+  a webhook URL is the opposite kind of destination (an account's own
+  third-party endpoint, never inside any scan's scope). Reusing it would
+  be a category error — either reject every real webhook destination, or
+  require inventing a permissive fake scope that would then leak into
+  the same object real recon collection is authorized against. See
+  `api/webhooks.py`'s own module docstring for the full reasoning.
+
+### Retries, backoff, and disable-after-failure
+
+- Up to 3 attempts per event delivery (`MAX_DELIVERY_ATTEMPTS`), with a
+  1s then 5s backoff between attempts (`RETRY_BACKOFF_SECONDS`) — bounded
+  so a slow/unreachable receiver never ties up the triggering account's
+  own notification path (composes with the monitoring loop's existing
+  per-account error isolation: one account's webhook delivery is wrapped
+  in its own `try`/`except`, same as every other per-domain operation
+  there).
+- After 5 CONSECUTIVE events that each exhausted their own retries and
+  still failed (`DISABLE_AFTER_CONSECUTIVE_FAILURES`), the webhook is
+  automatically disabled (`status: "disabled"`) and never attempted
+  again automatically — a dead endpoint stops being retried forever.
+  Re-enabling requires deleting and re-registering (the simplest correct
+  behavior for this pass; a dedicated "re-enable" endpoint is a real,
+  deferred non-goal, not an oversight).
+- A successful delivery resets the consecutive-failure counter to 0.
+
+### Per-account cap
+
+10 webhooks per account (`MAX_WEBHOOKS_PER_ACCOUNT`) — an account cannot
+use webhook registration to fan out an unbounded number of outbound
+requests from Hydra's own infrastructure. Checked before the (slower)
+real DNS/SSRF validation, so the cheapest rejection happens first.
+
+### New endpoints (`api/routers/webhooks.py`)
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/webhooks` | Register. `422` for a non-https URL, an unknown event type, or a private/loopback/metadata destination. `403` past the per-account cap. Returns the raw secret ONCE. |
+| `GET` | `/webhooks` | List this account's webhooks (never includes `secret`). |
+| `DELETE` | `/webhooks/{webhook_id}` | Opt out. `404` for an unknown id or another account's webhook (never `403`, which would confirm its existence). |
+
+### How to point this at Slack or Teams
+
+Both Slack's and Microsoft Teams' "incoming webhook" features give you a
+plain HTTPS URL that already accepts a JSON `POST` — register that exact
+URL here with the event types you want. Hydra's own JSON body isn't in
+either platform's native "attachment" format, so a receiving Slack/Teams
+workflow typically needs one small transform step (a Zapier/n8n/Power
+Automate step, or a few lines in whatever already receives the webhook)
+to reshape `{"event": ..., "domain": ..., ...}` into a chat message —
+this project deliberately does not build that transform itself (a native
+Slack/Teams app is exactly the bespoke-integration scope this task
+avoided; see Non-goals below).
+
+### Explicit non-goals — deferred, not silently skipped
+
+- **A native Slack app, Jira app, or Teams app.** The generic signed
+  webhook is deliberately the whole scope for this pass.
+- **Re-enabling a disabled webhook without deleting and re-registering.**
+- **Inbound webhooks, or any control-plane action triggered from
+  outside.** This is outbound notification only.
+- **A durable, persisted delivery queue surviving a process restart
+  mid-delivery.** Delivery is synchronous-to-the-triggering-event
+  (scheduled as a background `asyncio` task when the real monitoring
+  loop is running, or run to completion immediately when called
+  directly, e.g. by tests) — a process crash mid-retry loses that one
+  in-flight delivery attempt, the same durability level the monitoring
+  email path already has and never claimed to exceed.
+- **Per-webhook event-type editing after registration.** Delete and
+  re-register with the new set.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —

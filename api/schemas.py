@@ -160,6 +160,33 @@ class MonitoringStatusResponse(BaseModel):
     needs_review: bool
 
 
+class RegisterWebhookRequest(BaseModel):
+    url: str = Field(min_length=1, description="Must be https:// and not a private/loopback host.")
+    event_types: list[str] = Field(
+        min_length=1,
+        description="Which events to receive — see api/webhooks.py::EVENT_TYPES for the full set.",
+    )
+
+
+class WebhookResponse(BaseModel):
+    webhook_id: str
+    url: str
+    event_types: list[str]
+    status: Literal["active", "disabled"]
+    consecutive_failures: int
+    last_delivery_at: str | None
+    last_success_at: str | None
+    last_error: str | None
+    created_at: str
+
+
+class WebhookCreatedResponse(WebhookResponse):
+    secret: str = Field(
+        description="Shown exactly once, at creation — save it now. Used to verify the "
+        "X-Hydra-Signature header on every delivery."
+    )
+
+
 # --- Part B/D: tiers, subscription management, Wompi (Round 3) --------
 
 

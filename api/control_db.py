@@ -19,6 +19,7 @@ identically to "not found").
 
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -240,6 +241,39 @@ CREATE INDEX IF NOT EXISTS idx_monitored_domains_passive_due
 CREATE INDEX IF NOT EXISTS idx_monitored_domains_active_due
     ON monitored_domains(next_active_due_at, monitoring_id);
 CREATE INDEX IF NOT EXISTS idx_monitored_domains_account ON monitored_domains(account_id);
+
+-- Outbound webhooks ("Hydra API — outbound webhooks" task). One row per
+-- registered delivery target — a customer's own Slack/Teams incoming-
+-- webhook URL, or any HTTPS endpoint they control. `secret` is generated
+-- by Hydra at creation time and shown to the client exactly once (the
+-- same "only a value the client already has, never re-displayed" shape
+-- api_keys already uses for its own raw key) — it is never re-derivable
+-- from `secret` alone being lost; a client who loses it re-registers.
+-- `event_types_json` is a JSON array of the small, fixed event-type set
+-- (api/webhooks.py::EVENT_TYPES) this webhook wants delivered — never an
+-- open string, so a typo can't silently create a permanently-unmatched
+-- subscription.
+-- `status` is 'active' or 'disabled' — flips to 'disabled' automatically
+-- once `consecutive_failures` reaches api/webhooks.py's own threshold
+-- (a dead endpoint stops being retried forever, per the task's own
+-- "dead-letter/disable-after-N-failures" requirement); re-enabling
+-- requires deleting and re-registering (simplest correct behavior for
+-- this pass — see docs/PAID_API_DESIGN.md's non-goals for this task).
+CREATE TABLE IF NOT EXISTS webhooks (
+    webhook_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(account_id),
+    url TEXT NOT NULL,
+    secret TEXT NOT NULL,
+    event_types_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_delivery_at TEXT,
+    last_success_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhooks_account ON webhooks(account_id);
 
 -- Part B (docs/PAID_API_DESIGN.md, Round 3) tier/subscription state. One
 -- row per account, created at account-creation time defaulting to
@@ -475,6 +509,22 @@ class MonitoredDomainRecord:
     last_asset_digest: str | None
     last_asset_count: int | None
     needs_review: bool
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class WebhookRecord:
+    webhook_id: str
+    account_id: str
+    url: str
+    secret: str
+    event_types: tuple[str, ...]
+    status: str
+    consecutive_failures: int
+    last_delivery_at: str | None
+    last_success_at: str | None
+    last_error: str | None
     created_at: str
     updated_at: str
 
@@ -1390,6 +1440,118 @@ class ControlDB:
             row = conn.execute("SELECT COUNT(*) AS c FROM monitored_domains").fetchone()
         return int(row["c"])
 
+    # --- outbound webhooks -------------------------------------------
+
+    def count_webhooks_for_account(self, account_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM webhooks WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        return int(row["c"])
+
+    def create_webhook(
+        self, *, account_id: str, url: str, secret: str, event_types: tuple[str, ...]
+    ) -> WebhookRecord:
+        webhook_id = secrets.token_hex(16)
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO webhooks "
+                "(webhook_id, account_id, url, secret, event_types_json, status, "
+                "consecutive_failures, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)",
+                (webhook_id, account_id, url, secret, json.dumps(list(event_types)), now, now),
+            )
+        return WebhookRecord(
+            webhook_id=webhook_id,
+            account_id=account_id,
+            url=url,
+            secret=secret,
+            event_types=event_types,
+            status="active",
+            consecutive_failures=0,
+            last_delivery_at=None,
+            last_success_at=None,
+            last_error=None,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def get_webhook(self, webhook_id: str, account_id: str) -> WebhookRecord | None:
+        """The same Part F.3 double-check every other account-scoped
+        lookup in this file already enforces — a webhook_id that exists
+        but belongs to a different account returns `None`, identical to
+        one that doesn't exist at all, never a 403 that would confirm
+        its existence to a non-owner."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM webhooks WHERE webhook_id = ? AND account_id = ?",
+                (webhook_id, account_id),
+            ).fetchone()
+        return None if row is None else _webhook_record_from_row(row)
+
+    def list_webhooks_for_account(self, account_id: str) -> list[WebhookRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM webhooks WHERE account_id = ? ORDER BY created_at", (account_id,)
+            ).fetchall()
+        return [_webhook_record_from_row(row) for row in rows]
+
+    def list_active_webhooks_for_event(
+        self, account_id: str, event_type: str
+    ) -> list[WebhookRecord]:
+        """Subscriber lookup for delivery — `status = 'active'` only (a
+        disabled webhook is never attempted again automatically), event
+        membership checked in Python since SQLite has no native JSON-
+        array-contains operator portable across the versions this
+        project supports; the per-account webhook count is always small
+        (a real, enforced cap — `api/webhooks.py::MAX_WEBHOOKS_PER_ACCOUNT`),
+        so this is never a hot-path performance concern."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM webhooks WHERE account_id = ? AND status = 'active'", (account_id,)
+            ).fetchall()
+        return [
+            record
+            for row in rows
+            if event_type in (record := _webhook_record_from_row(row)).event_types
+        ]
+
+    def delete_webhook(self, webhook_id: str, account_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM webhooks WHERE webhook_id = ? AND account_id = ?",
+                (webhook_id, account_id),
+            )
+        return cursor.rowcount > 0
+
+    def record_webhook_delivery_success(self, webhook_id: str) -> None:
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE webhooks SET consecutive_failures = 0, last_delivery_at = ?, "
+                "last_success_at = ?, last_error = NULL, updated_at = ? WHERE webhook_id = ?",
+                (now, now, now, webhook_id),
+            )
+
+    def record_webhook_delivery_failure(
+        self, webhook_id: str, *, error: str, disable_after: int
+    ) -> None:
+        """One atomic UPDATE decides both the incremented failure count
+        AND whether that increment crosses the disable threshold — never
+        a read-then-write pair, which would leave a window where a
+        concurrent successful delivery's reset could be silently
+        overwritten by a failure recorded from a stale read."""
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE webhooks SET consecutive_failures = consecutive_failures + 1, "
+                "last_delivery_at = ?, last_error = ?, updated_at = ?, "
+                "status = CASE WHEN consecutive_failures + 1 >= ? THEN 'disabled' ELSE status END "
+                "WHERE webhook_id = ?",
+                (now, error, now, disable_after, webhook_id),
+            )
+
     # --- subscriptions / tiers (Part B, Round 3) ------------------------
 
     def create_default_subscription(self, account_id: str, *, tier: str = "free") -> None:
@@ -1947,6 +2109,23 @@ def _monitored_domain_record_from_row(row: sqlite3.Row) -> MonitoredDomainRecord
         last_asset_digest=row["last_asset_digest"],
         last_asset_count=row["last_asset_count"],
         needs_review=bool(row["needs_review"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _webhook_record_from_row(row: sqlite3.Row) -> WebhookRecord:
+    return WebhookRecord(
+        webhook_id=row["webhook_id"],
+        account_id=row["account_id"],
+        url=row["url"],
+        secret=row["secret"],
+        event_types=tuple(json.loads(row["event_types_json"])),
+        status=row["status"],
+        consecutive_failures=row["consecutive_failures"],
+        last_delivery_at=row["last_delivery_at"],
+        last_success_at=row["last_success_at"],
+        last_error=row["last_error"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
