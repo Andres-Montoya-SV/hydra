@@ -43,3 +43,11 @@ reports/*.bak
 .vscode/
 *.swp
 .DS_Store
+
+# A real captured Wompi sandbox webhook (scripts/capture_wompi_webhook.py)
+# contains a real customer's own email/name — never committed. Dropped in
+# locally by an operator to activate
+# tests/test_wompi_real_capture_replay.py's otherwise-skipped test; see
+# that file's own docstring and docs/PAID_API_DESIGN.md's operator
+# runbook for exactly where this goes and how to redact it first.
+/tests/fixtures/wompi_real_capture.json

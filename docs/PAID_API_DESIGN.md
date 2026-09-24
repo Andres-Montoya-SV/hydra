@@ -1166,6 +1166,175 @@ anything is activated. A forged or fabricated transaction cannot pass
 both checks. What changed today is visibility into this working (or a
 real webhook being rejected), not the mechanism's correctness itself.
 
+### Wompi webhook — confirmed against current official docs, sandbox capture still pending — 2026-09-24
+
+This re-checks the "documentation-terminology-confirmed, not observed-
+in-production-confirmed" inference above, this time by fetching Wompi's
+CURRENT live documentation (not from training memory) and comparing it
+field-by-field against what `api/wompi_client.py`/
+`api/routers/subscription.py` assume. **Note the correct doc host is
+`docs.wompi.sv` (El Salvador) — `docs.wompi.co` is a different product
+(Colombia) and was not consulted.**
+
+**Signature scheme** — [`docs.wompi.sv/webhook/validar-webhook.md`](https://docs.wompi.sv/webhook/validar-webhook.md):
+
+| | Assumed (code, before this check) | Documented (fetched live) | Match? |
+|---|---|---|---|
+| Header name | `wompi_hash` | "Todo webhook enviado por Wompi incluirá el header `wompi_hash`" | ✅ exact |
+| String-to-sign | the raw request body, byte-for-byte, unmodified | "Leer el 'body' completo del webhook. Asegurarse leerlo tal cual es enviado sin agregar ningún espacio o salto de linea" (read the full body exactly as sent, without adding any space or line break) | ✅ exact — confirms `raw_body: bytes` must never be re-serialized from parsed JSON before hashing, which `api/routers/subscription.py` already does correctly (it hashes the literal request bytes, parses JSON only afterward) |
+| Algorithm | HMAC-SHA256 | HMAC-SHA256 | ✅ exact |
+| Key | the OAuth `client_secret` ("API Secret") | "utilizando el API Secret de su aplicativo de Wompi como llave del HMAC" (using the API Secret of your Wompi application as the HMAC key) | ✅ exact wording — see below for what "confirmed" does and does not mean here |
+| Comparison | constant-time (`hmac.compare_digest`) | not specified either way by the doc (expected — this is an implementation detail, not a protocol detail) | not a doc claim to confirm; already correct in `api/wompi_client.py::verify_webhook_signature` regardless |
+
+**Is the webhook secret really the same value as the OAuth client secret?**
+[`docs.wompi.sv/autenticacion/autenticacion.md`](https://docs.wompi.sv/autenticacion/autenticacion.md)
+independently confirms the OAuth `client_secret` is *also* labeled "API
+Secret" in the Wompi dashboard (panel.wompi.sv): "el App ID corresponde
+a `client_id` y API Secret a `client_secret`." That page does not
+mention or link to any separate, webhook-specific secret, and the
+webhook doc names its HMAC key with the identical term ("API Secret").
+Two independent doc pages using the same term for what appears to be
+the same credential is stronger evidence than before, but it is still
+**terminology matching across two doc pages, not a byte-for-byte
+observed signature from a real webhook** — Wompi could in principle
+mint a distinct secret under the same label and this documentation
+search would not surface that. **This one specific point remains
+"must confirm against a live sandbox capture"** — see the runbook
+below; nothing else in this table does.
+
+**Payload envelope** — [`docs.wompi.sv/webhook/definicion-webhook.md`](https://docs.wompi.sv/webhook/definicion-webhook.md),
+full documented example fetched live:
+
+```json
+{
+  "IdCuenta": "980b36e6-15ab-463f-4444-ada3e396fe48",
+  "FechaTransaccion": "2020-07-07T21:27:03.3403497-06:00",
+  "Monto": 1,
+  "ModuloUtilizado": "BotonPago",
+  "FormaPagoUtilizada": "PagoNormal",
+  "IdTransaccion": "2bedafea-0924-49f0-927d-8c638e193990",
+  "ResultadoTransaccion": "ExitosaAprobada",
+  "CodigoAutorizacion": "ba7dbfd3-50d1-403c-bbfd-d3be5dc766f8",
+  "IdIntentoPago": "c6e10505-cada-4ae7-9892-d8786b7f455f",
+  "Cantidad": 1,
+  "EsProductiva": false,
+  "Aplicativo": {"Nombre": "Sitio Web Bitworks", "Url": "https://www.bitworks.com.sv/", "Id": "d432aef2-3333-4a75-4444-22e20789834a"},
+  "EnlacePago": {"Id": 66, "IdentificadorEnlaceComercio": "OC1234", "NombreProducto": "Camisa Azula"},
+  "cliente": {"Nombre": "string", "Email": "string", "additionalProp1": "string", "additionalProp2": "string"}
+}
+```
+
+Every field `api/routers/subscription.py::wompi_webhook` reads
+(`IdTransaccion`, `ResultadoTransaccion`, `cliente.Email`,
+`EnlacePago.NombreProducto`, `Monto`) is present with the exact spelling
+and nesting the handler already assumes — **zero discrepancies found,
+zero code changes needed** in either `api/wompi_client.py` or
+`api/routers/subscription.py`.
+
+**One deliberate non-issue, written down rather than silently
+ignored**: the documented example includes `EsProductiva: false` (a
+sandbox/test-mode flag on the transaction itself), which the handler
+does not read. This is intentional, not an oversight — Hydra's own
+sandbox/live separation is which `WOMPI_CLIENT_ID`/`WOMPI_CLIENT_SECRET`
+an operator has configured, not a per-transaction flag Wompi happens to
+echo back; branching handler behavior on a payload field would be
+redundant with (and could disagree with) which credentials are actually
+configured.
+
+**Statuses meaning paid/pending/failed**: the fetched doc page only
+shows one concrete value, `"ExitosaAprobada"`, in its example — it does
+not publish a comprehensive enum of every failure/pending status
+string. The handler's existing design does not need one: it treats
+`"ExitosaAprobada"` as the sole success case and **everything else** as
+a non-success (routed to grace-period-start-if-known-billing-email,
+Part D.3), which is the correct posture given Wompi's own docs never
+promise a closed, stable set of failure strings to match against
+individually — matching on the one documented success string and
+treating all else as "not a confirmed success" is more robust to
+undocumented status values than trying to enumerate failure states.
+**This remains implicitly "must confirm against live sandbox
+capture"** in the sense that only a real declined/pending transaction
+would show what other status strings actually look like in practice —
+but no code change follows from that uncertainty either way, since the
+handler already treats "not the one known success string" as the safe
+default.
+
+**`scripts/capture_wompi_webhook.py`: extended or not, stated
+explicitly**. It was NOT extended. It already captures exactly what a
+future replay test needs — raw headers (preserving `wompi_hash` and its
+casing), the exact raw body bytes as sent (`raw_body_text`), and the
+parsed JSON for convenience (`parsed_json_body`) — and deliberately does
+zero verification/interpretation of its own, which is correct: it's a
+capture tool, not a second implementation of the checks under test.
+Extending it would only be justified if the replay test needed some
+piece of wire data the script doesn't already save, and it does not.
+
+**The replay test**: `tests/test_wompi_real_capture_replay.py` is
+skipped (not xfail, not deleted) with a clear, actionable reason until a
+real capture exists at `tests/fixtures/wompi_real_capture.json`
+(gitignored) and `WOMPI_REAL_CAPTURE_SECRET` is set. Once both are
+present it: (1) verifies the REAL captured signature against the REAL
+secret using `verify_webhook_signature` — the one concrete confirmation
+this whole section is building toward; (2) asserts the real captured
+payload has every field the handler reads; (3) replays the real raw
+bytes through the actual `POST /webhooks/wompi` endpoint end-to-end,
+dynamically seeding a matching pending enrollment from whatever
+email/tier the real capture happens to contain (unpredictable ahead of
+time), and asserts a sane, non-crashing outcome. A fourth, optional env
+var `WOMPI_REAL_CAPTURE_CLIENT_ID` additionally exercises the handler's
+independent `api.wompi.sv` re-confirmation call for real; without it,
+that step correctly fails for lack of credentials and the handler
+correctly refuses to act (`502`), which the test treats as an expected,
+passing outcome, not a failure.
+
+**Operator runbook for Andrés — the exact steps to produce the one
+remaining confirmation**:
+
+1. Create (or reuse) a Wompi merchant account and switch it to
+   development/sandbox mode at [panel.wompi.sv](https://panel.wompi.sv).
+2. In that dashboard, find the app's **App ID** (`client_id`) and **API
+   Secret** (`client_secret` — per the doc excerpt above, this is the
+   same value the webhook signature is keyed with). Export them locally
+   as `WOMPI_CLIENT_ID`/`WOMPI_CLIENT_SECRET` — never commit them.
+3. Start the capture server: `python3 scripts/capture_wompi_webhook.py`
+   (see its own `--help`/docstring for `--out-dir`/`--port`). Expose it
+   to the internet with a tunnel (e.g. `ngrok http 8787`, matching
+   whatever port you started it on) — Wompi's servers must be able to
+   reach this URL directly; localhost is not enough.
+4. In the Wompi dashboard, configure that tunnel's public HTTPS URL as
+   the app's webhook URL.
+5. Run one real test transaction: either complete a real sandbox
+   payment on the app's `EnlacePagoRecurrente` link, or use whatever
+   test-transaction trigger the Wompi dev-mode dashboard offers.
+6. The capture server writes one timestamped JSON file per received
+   request under its `--out-dir` (default `/tmp/wompi_captures`). Pick
+   the one real webhook delivery, confirm it looks like a genuine Wompi
+   payload (has `wompi_hash`, `IdTransaccion`, etc.), then **redact
+   nothing except verify it's the one file you mean to use** and copy
+   it to `tests/fixtures/wompi_real_capture.json` (already gitignored —
+   double-check `git status` shows nothing new before ever running `git
+   add` near it, since it contains a real customer's own email/name).
+7. Export `WOMPI_REAL_CAPTURE_SECRET` to the same `API Secret` from step
+   2 (never commit it), and run
+   `pytest tests/test_wompi_real_capture_replay.py -v` — it should go
+   from 3 skipped to 3 passed. If the signature test fails, that is a
+   genuine, high-priority finding: it would mean the documented scheme
+   above does not match what Wompi's real sandbox actually sends, and
+   `api/wompi_client.py::verify_webhook_signature` needs to change to
+   match reality, not the other way around.
+8. Optionally also export `WOMPI_REAL_CAPTURE_CLIENT_ID` (the App ID
+   from step 2) to additionally exercise the handler's independent
+   `api.wompi.sv` re-confirmation call for real.
+
+**What this section does NOT claim**: the Wompi webhook is not
+"confirmed working against Wompi" — every dimension checked against
+Wompi's current published documentation matches the code exactly, and
+the code is now ready for the one remaining live confirmation above.
+The single specific thing still unconfirmed is whether the OAuth
+`client_secret` and the webhook HMAC key are truly the same live value
+in production, not just the same documented term — that, and only that,
+needs the sandbox runbook above to close out.
+
 ### Task 3.2 — Payment failure / grace period (Part D.3, confirmed as drafted)
 
 3-day grace period (`GRACE_PERIOD_DAYS`, `api/subscriptions.py`): a
