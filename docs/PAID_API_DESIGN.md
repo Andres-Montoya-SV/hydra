@@ -3506,6 +3506,85 @@ backfill pass Fase 03 built (`api/asset_backfill.py`,
 through run history — and are equally NOT wired into the live
 scan-completion path yet.
 
+## Fase 05 — Temporal state, snapshots, and change detection (`api/change_detection.py`, `api/change_backfill.py`) — 2026-09-25
+
+With Fase 03's Asset identity and Fase 04's Observations/Evidence in
+place, this phase adds what actually differentiates an EASM product from
+a bare scanner: knowing what CHANGED, not just what exists today. One
+new table, `change_events`, organization-scoped, one row per actual
+state TRANSITION (never one row per run — a run that changes nothing
+produces no row).
+
+**The five states, one sentence each** (also the literal docstring of
+`api/change_detection.py`, and the exact behavior its tests pin down):
+
+| State | Meaning |
+|---|---|
+| `NEW` | the first run that ever observed this asset |
+| `UNCHANGED` | this run observed the exact same facts as last time |
+| `CHANGED` | this run observed this asset, but at least one fact differs from last time |
+| `DISAPPEARED` | not observed for `missed_run_threshold` (default **2**) CONSECUTIVE relevant runs |
+| `REAPPEARED` | a `DISAPPEARED` asset was observed again; settles back to `UNCHANGED` on the next matching observation |
+
+**The decision engine is a pure function, no exceptions**:
+`compute_asset_state_transitions` takes a chronological list of
+`RunObservationOutcome` (`run_id`, `observed`, `observation_digest`) and
+returns the `ChangeEvent`s that pure logic decided — no LLM, no
+probabilistic scoring, no database access. The exact same input always
+produces the exact same output
+(`tests/test_change_detection.py::TestDeterminism`). Every one of the
+five transitions is pinned down with fixed fixtures
+(`TestEachOfTheFiveTransitions`) — those tests ARE the living spec the
+phase's own prompt asked for.
+
+**Why a single missed run is never enough — `DEFAULT_MISSED_RUN_THRESHOLD
+= 2`, justified**: a scan can fail to observe a real, still-existing
+asset for reasons that have nothing to do with the asset (a DNS
+timeout, a transient rate limit) — the exact case the phase's prompt
+names. Requiring TWO CONSECUTIVE misses means a single bad run can never
+hide a real asset, while a genuine disappearance is still caught within
+one extra cycle, not an unbounded wait. Proven against REAL scans (not
+just the pure-function fixtures) in
+`tests/test_change_backfill.py::TestFailToleranceWithRealScans`: one
+real scan that completed but observed nothing leaves the asset's state
+at `new`/whatever it was, unaffected; two consecutive such scans do
+transition it to `disappeared`, and a later successful scan transitions
+it to `reappeared` — using the SAME asset identity row from Fase 03,
+never a new one.
+
+**A real false-disappearance risk found and closed before it shipped**:
+the first design considered "every completed scan in this organization
+is a check for every asset in it." That is wrong the moment an
+organization monitors more than one distinct domain — a scan of
+`other-target.example` would then count as a "missed run" for an asset
+that only ever lived under `example.com`, eventually misfiring a false
+`DISAPPEARED`. Fixed by scoping "relevant runs" per asset to only the
+scans whose target domain actually covers that asset's own host
+(`api/change_detection.py::host_for_asset` + reusing — never
+reinventing — `api.domain_verification.domain_is_covered`, the SAME
+subdomain-aware coverage check `POST /scans`'s own verified-domain gate
+already uses). Proven directly:
+`tests/test_change_backfill.py::TestOrganizationIsolation::
+test_a_scan_for_an_unrelated_domain_in_the_same_organization_is_never_counted_as_a_miss`
+runs 5 scans of a second, unrelated target and confirms none of them
+count against the first target's own asset.
+
+**Cheap queries, by construction**: `list_change_events_for_asset`
+("historial de cambios de este asset") and `list_change_events_for_run`
+("todos los cambios detectados en este run") are both index range scans
+(`idx_change_events_asset`/`idx_change_events_run`), never a full scan
+of `observations`.
+
+**What did NOT happen, per the phase's own instructions**: nothing here
+sends a notification — Fase 09 decides what to do with this record, this
+phase only produces it. No LLM or fuzzy heuristic anywhere in the
+decision path. Built as its own pass (`api/change_backfill.py`) over
+Fase 03/04's already-populated tables, not a change to
+`api/asset_backfill.py`'s existing per-host loop — change detection is
+fundamentally per-asset-across-all-its-runs, a different shape than
+Fase 03/04's per-host-per-run processing. Not wired into the live
+scan-completion path, same as Fase 03/04.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
