@@ -3339,6 +3339,88 @@ proof). That is what `organizations`' scope now sits on top of
 `core/intel/scope.py`/`core/intel/authorize.py` was touched by this
 phase.
 
+## Fase 03 — Asset identity across runs (`api/control_db.py`, `api/asset_identity.py`, `api/asset_backfill.py`) — 2026-09-25
+
+The real gap this phase closes, confirmed directly in `core/store.py`:
+every table's `UNIQUE` constraint is scoped to `run_id` —
+`UNIQUE(run_id, domain)`, `UNIQUE(run_id, host, url)`,
+`UNIQUE(run_id, host, port, protocol)`, `UNIQUE(run_id, host,
+record_type, value)`, `UNIQUE(run_id, url)` — so scanning the same
+domain twice has never produced two rows anyone could relate to each
+other. Two new tables, scoped to `organization_id` (never `run_id`),
+give assets a real identity that survives across scans:
+
+- `assets` — one row per real-world thing (`asset_type` + `identity_key`
+  unique per organization): `domain`, `url`, `port`, `dns_record`.
+- `asset_identifiers` — secondary, purely descriptive identifiers (IPs
+  observed for a domain) attached to whichever asset actually observed
+  them.
+
+**The reconciliation function, in plain terms**: `api/asset_identity.py::
+reconcile_observation` looks up one exact string
+(`organization_id` + `asset_type` + `identity_key` — e.g.
+`"domain:example.com"`) against everything ever recorded for that
+organization. A match means "the same asset, seen again" (its
+`last_seen_at`/`last_seen_run_id` get touched). No match means a
+genuinely new asset. That is the ENTIRE decision — no fuzzy matching, no
+heuristic, no scoring. This is a pure function (no I/O, no
+`datetime.now()`, no randomness) precisely so it can be tested with
+fixed fixtures and always produce the same decision for the same input,
+per the phase's own requirement.
+
+**Why a shared IP can never merge two different assets, by
+construction, not by an extra rule bolted on**: an IP is recorded as an
+`asset_identifiers` row, and identifiers are NEVER used as a
+reconciliation lookup key — only the primary `identity_key` is. Two
+different domains that happen to share an IP (a shared CDN — the
+phase's own required adversarial case) simply each get their own
+`ip` identifier row pointing at their own, separate `asset_id`. Proven
+directly: `tests/test_asset_identity.py::
+TestSharedIpNeverMergesTwoDifferentAssets` (pure logic) and
+`tests/test_asset_backfill.py::TestCrossOrganizationIsolationIsAdversariallyProven`
+(real two-organization, real shared-`Host` backfill — including the
+harder case of two organizations under the SAME billing account, and
+the simpler case of two entirely different accounts). Both prove the
+resulting `assets` rows are structurally distinct, never shared, and
+that each organization's own `list_assets_for_organization` never
+surfaces the other's row.
+
+**Identity key format — absorbed, not reinvented**: per the Fase 01
+consolidation plan's own decision ("Asset ... absorbs `IntelEntity`"),
+`domain`/`url` identity keys are built via `core.intel.model.entity_id()`
+verbatim, reusing its `"type:key"` string convention. `port`/
+`dns_record` are NOT in `core.intel.model.EntityType` (the phase's own
+required asset-type list includes them; that module doesn't need them
+for its own purpose) — `api/asset_identity.py` adds these two as its own
+additive, analogously-formatted string keys, never a change to
+`core.intel.model.EntityType` itself.
+
+**What did NOT happen, per the phase's own explicit instructions**: no
+`run_id`-scoped table in `core/store.py` was touched, migrated, or
+deleted — `hosts`/`ports`/`dns_records`/`urls` remain exactly the raw,
+per-run record they always were; `assets` sits alongside them, never
+replacing them. `CollectionGateway`/`ScopeEnforcingProxy` and the
+scanning flow itself were not touched — this phase is entirely about
+what happens to a scan's ALREADY-WRITTEN results, never the scan itself.
+
+**Backfill against real, representative history — not live wiring**:
+`api/asset_backfill.py::backfill_assets_for_organization` replays an
+organization's own completed scans (oldest first, each scan's `Host`
+rows read back from that scan's own account's real `AssetStore`) through
+the same reconciliation logic. `tests/test_asset_backfill.py` runs this
+against REAL multi-scan histories (never fixtures standing in for
+`AssetStore` itself) and includes a manually-verified sample
+(`test_a_manually_sampled_asset_carries_the_right_evidence`: one
+specific asset's `organization_id`, `last_seen_run_id`, and identifier
+list checked by hand against exactly what was fed into that scan).
+**Explicit non-goal**: this backfill is NOT wired into
+`api/scan_orchestrator.py`/`api/monitoring_worker.py`'s live
+scan-completion path in this phase — the prompt's own instructions
+scope this phase to "qué pasa DESPUÉS de que el scan ya corrió," and
+live per-scan wiring is deferred to whichever later phase (04,
+"Observaciones y evidencia," is the natural candidate) actually needs
+it triggered automatically rather than backfilled on demand.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —

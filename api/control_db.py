@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
+from api.asset_identity import ExistingAsset, ReconciliationDecision
 from core.store import connect_sqlite
 
 _SCHEMA = """
@@ -88,6 +89,63 @@ CREATE INDEX IF NOT EXISTS idx_account_org_roles_org
     ON account_organization_roles(organization_id);
 CREATE INDEX IF NOT EXISTS idx_account_org_roles_account
     ON account_organization_roles(account_id);
+
+-- Fase 03 (EASM roadmap, docs/easm/00_consolidation_plan.md) — the
+-- cross-run Asset the consolidation plan's own glossary calls for:
+-- "absorbs core/intel/model.py's IntelEntity identity scheme; new
+-- cross-run table needed." Scoped to `organization_id`, NEVER `run_id`
+-- — this is precisely the thing every run_id-scoped table in
+-- `core/store.py` (hosts, ports, dns_records, urls, ...) cannot
+-- express: "is this the same real-world asset as one observed in an
+-- earlier run." `core/assets.py`'s `Host` and its sub-entities are
+-- UNCHANGED and remain the per-run collection result (Fase 01's own
+-- "coexist, Host reconciles INTO this, never the other way around"
+-- decision) — nothing here replaces or migrates any run_id-scoped
+-- table. `identity_key` is built by `api/asset_identity.py`'s pure,
+-- DB-free functions (reused, not reinvented, from
+-- `core.intel.model.entity_id()`'s own `"type:key"` format for the
+-- `domain`/`url` asset types; `port`/`dns_record` are this module's own
+-- additive extension — see its docstring). The
+-- `(organization_id, asset_type, identity_key)` UNIQUE constraint IS the
+-- entire reconciliation rule: an exact match on this triple is always
+-- "the same asset, seen again," by construction — never a fuzzy/
+-- heuristic merge (see `api/asset_identity.py`'s module docstring for
+-- why this is also what makes the cross-organization-shared-IP
+-- adversarial case structurally safe: a shared IP is recorded as an
+-- `asset_identifiers` row on whichever asset actually observed it,
+-- never used as a lookup key here).
+CREATE TABLE IF NOT EXISTS assets (
+    asset_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    asset_type TEXT NOT NULL,
+    identity_key TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    last_seen_run_id TEXT,
+    UNIQUE (organization_id, asset_type, identity_key)
+);
+CREATE INDEX IF NOT EXISTS idx_assets_organization ON assets(organization_id);
+
+-- One asset can carry more than one identifier over its lifetime (a
+-- host resolving to a different IP on a later run does not make it a
+-- new asset) — `identifier_value` is deliberately UNIQUE per
+-- (organization, identifier_type), NOT per asset: this is what makes
+-- "which asset (if any) already claims this identifier" an unambiguous
+-- lookup, and is a plain data table, never itself a reconciliation
+-- input (see `assets`' own comment above and
+-- `api/asset_identity.py`'s module docstring for why identifiers are
+-- observational metadata, not a merge key).
+CREATE TABLE IF NOT EXISTS asset_identifiers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    identifier_type TEXT NOT NULL,
+    identifier_value TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    UNIQUE (organization_id, identifier_type, identifier_value)
+);
+CREATE INDEX IF NOT EXISTS idx_asset_identifiers_asset ON asset_identifiers(asset_id);
 
 CREATE TABLE IF NOT EXISTS api_keys (
     key_id TEXT PRIMARY KEY,
@@ -691,6 +749,28 @@ class OrganizationRecord:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class AssetRecord:
+    asset_id: str
+    organization_id: str
+    asset_type: str
+    identity_key: str
+    first_seen_at: str
+    last_seen_at: str
+    last_seen_run_id: str | None
+
+
+@dataclass(frozen=True)
+class AssetIdentifierRecord:
+    id: int
+    asset_id: str
+    organization_id: str
+    identifier_type: str
+    identifier_value: str
+    first_seen_at: str
+    last_seen_at: str
+
+
 _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("email", "TEXT"),
     ("email_verified_at", "TEXT"),
@@ -1105,6 +1185,144 @@ class ControlDB:
                 (organization_id,),
             ).fetchall()
         return [_scan_record_from_row(row) for row in rows]
+
+    # --- assets (Fase 03, EASM roadmap) ---------------------------------
+
+    def get_asset_by_identity(
+        self, *, organization_id: str, asset_type: str, identity_key: str
+    ) -> AssetRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM assets WHERE organization_id = ? AND asset_type = ? "
+                "AND identity_key = ?",
+                (organization_id, asset_type, identity_key),
+            ).fetchone()
+        return None if row is None else _asset_record_from_row(row)
+
+    def get_asset(self, asset_id: str) -> AssetRecord | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM assets WHERE asset_id = ?", (asset_id,)).fetchone()
+        return None if row is None else _asset_record_from_row(row)
+
+    def existing_assets_for_organization(self, organization_id: str) -> dict[str, ExistingAsset]:
+        """The exact input shape `api/asset_identity.py::reconcile_observation`/
+        `reconcile_host_observations` need — EVERY asset this
+        organization already has, of every type, keyed by `identity_key`
+        alone (never colliding across types, since every identity_key
+        already carries its own type as a string prefix — see
+        `api/asset_identity.py`'s key builders — so one combined dict is
+        both correct and one query per organization instead of one per
+        asset_type per host, which matters for `api/asset_backfill.py`
+        replaying a whole account's run history). Built fresh from EVERY
+        asset ever recorded for this organization, never just the most
+        recent run's — this is what makes a reappeared asset (gone for
+        one run, back the next) reconcile to the SAME row rather than a
+        new one."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT asset_id, asset_type, identity_key FROM assets WHERE organization_id = ?",
+                (organization_id,),
+            ).fetchall()
+        return {
+            row["identity_key"]: ExistingAsset(
+                asset_id=row["asset_id"],
+                asset_type=row["asset_type"],
+                identity_key=row["identity_key"],
+            )
+            for row in rows
+        }
+
+    def apply_asset_reconciliation(
+        self,
+        *,
+        organization_id: str,
+        run_id: str,
+        decisions: list[ReconciliationDecision],
+        observed_at: str | None = None,
+    ) -> None:
+        """The I/O half of `api/asset_identity.py`'s pure
+        `reconcile_observation`/`reconcile_host_observations` — takes
+        the DECISIONS that pure logic already made (this method makes no
+        reconciliation decisions of its own) and persists them: a new
+        row for `is_new` decisions, `last_seen_at`/`last_seen_run_id`
+        touched for existing ones, plus an upserted
+        `asset_identifiers` row (e.g. an observed IP) for each identifier
+        the decision carries — attached to the asset that decision
+        resolved to, per (organization_id, identifier_type,
+        identifier_value), never a new row when that exact identifier is
+        already recorded for that exact asset (`INSERT OR IGNORE`, since
+        the table's own UNIQUE constraint already prevents a duplicate,
+        and re-observing the same still-current IP on a later run is the
+        overwhelmingly common case, not an error)."""
+        observed_at = observed_at or _now_iso()
+        with self._connect() as conn:
+            for decision in decisions:
+                if decision.is_new:
+                    conn.execute(
+                        "INSERT INTO assets (asset_id, organization_id, asset_type, "
+                        "identity_key, first_seen_at, last_seen_at, last_seen_run_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            decision.asset_id,
+                            organization_id,
+                            decision.asset_type,
+                            decision.identity_key,
+                            observed_at,
+                            observed_at,
+                            run_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE assets SET last_seen_at = ?, last_seen_run_id = ? "
+                        "WHERE asset_id = ?",
+                        (observed_at, run_id, decision.asset_id),
+                    )
+                for identifier_type, identifier_value in decision.identifiers:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO asset_identifiers "
+                        "(asset_id, organization_id, identifier_type, identifier_value, "
+                        "first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            decision.asset_id,
+                            organization_id,
+                            identifier_type,
+                            identifier_value,
+                            observed_at,
+                            observed_at,
+                        ),
+                    )
+                    conn.execute(
+                        "UPDATE asset_identifiers SET last_seen_at = ? "
+                        "WHERE organization_id = ? AND identifier_type = ? "
+                        "AND identifier_value = ?",
+                        (observed_at, organization_id, identifier_type, identifier_value),
+                    )
+
+    def list_assets_for_organization(
+        self, organization_id: str, *, asset_type: str | None = None
+    ) -> list[AssetRecord]:
+        with self._connect() as conn:
+            if asset_type is None:
+                rows = conn.execute(
+                    "SELECT * FROM assets WHERE organization_id = ? ORDER BY first_seen_at",
+                    (organization_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM assets WHERE organization_id = ? AND asset_type = ? "
+                    "ORDER BY first_seen_at",
+                    (organization_id, asset_type),
+                ).fetchall()
+        return [_asset_record_from_row(row) for row in rows]
+
+    def list_identifiers_for_asset(self, asset_id: str) -> list[AssetIdentifierRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM asset_identifiers WHERE asset_id = ? ORDER BY first_seen_at",
+                (asset_id,),
+            ).fetchall()
+        return [_asset_identifier_record_from_row(row) for row in rows]
 
     # --- account-creation rate limiting (Hallazgo 1) --------------------
 
@@ -2661,6 +2879,30 @@ def _webhook_record_from_row(row: sqlite3.Row) -> WebhookRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         organization_id=row["organization_id"],
+    )
+
+
+def _asset_record_from_row(row: sqlite3.Row) -> AssetRecord:
+    return AssetRecord(
+        asset_id=row["asset_id"],
+        organization_id=row["organization_id"],
+        asset_type=row["asset_type"],
+        identity_key=row["identity_key"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        last_seen_run_id=row["last_seen_run_id"],
+    )
+
+
+def _asset_identifier_record_from_row(row: sqlite3.Row) -> AssetIdentifierRecord:
+    return AssetIdentifierRecord(
+        id=row["id"],
+        asset_id=row["asset_id"],
+        organization_id=row["organization_id"],
+        identifier_type=row["identifier_type"],
+        identifier_value=row["identifier_value"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
     )
 
 
