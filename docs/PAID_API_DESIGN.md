@@ -3231,6 +3231,23 @@ avoided; see Non-goals below).
 - **Per-webhook event-type editing after registration.** Delete and
   re-register with the new set.
 
+## EASM domain-model consolidation plan — 2026-09-24
+
+Before building the full EASM (External Attack Surface Management)
+domain model described in the next several rounds (Organization, Asset
+identity, Observations/Evidence, change detection, relationship graph,
+Exposure history, monitoring/API integration on top of it), a read-only
+reconnaissance phase mapped every existing "asset-model-shaped" thing in
+this codebase (`core/assets.py`, `core/intel/`, `core/intelligence/`,
+`core/store.py`, plus the control-plane's own `accounts`/
+`monitored_domains`) against the new model's vocabulary, so the new
+rounds absorb/wrap what already exists correctly instead of building a
+fourth parallel "asset" system. Full glossary, overlap table, and
+absorb/wrap/coexist decisions: [`docs/easm/00_consolidation_plan.md`](easm/00_consolidation_plan.md).
+Binding on every later EASM round — a later round using different
+terminology for the same concept is a bug in that round's own PR, not a
+reason to update the glossary after the fact.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
