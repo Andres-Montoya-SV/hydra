@@ -3421,6 +3421,91 @@ live per-scan wiring is deferred to whichever later phase (04,
 "Observaciones y evidencia," is the natural candidate) actually needs
 it triggered automatically rather than backfilled on demand.
 
+## Fase 04 — Observations and evidence (`api/observation_identity.py`, `api/control_db.py`, `api/asset_backfill.py`) — 2026-09-25
+
+Fase 03 gave an asset stable identity across runs; this phase adds the
+other half: what a specific run concretely observed about that asset,
+and the evidence backing it. Two new tables, both scoped to
+`organization_id`:
+
+- `evidence` — the deduplicated raw fact (`source`, `detail`,
+  `confidence_score`) backing an observation.
+- `observations` — one row per (asset, run, evidence): "this run saw
+  this fact about this asset."
+
+**Where the evidence content actually comes from — a real correction
+made before writing any code**: the obvious first instinct was to match
+an observation back to `Host.provenance`
+(`core.provenance.ProvenanceRecord`, already real, already populated).
+Checked against actual call sites in `core/parsers/registry.py` first:
+`field="port"` records `value=f"{port.port}/{port.protocol}"`, but
+`field="url"` records `value=line[:200]` — a truncated RAW line, not the
+canonical `URL.url` string a `url` observation is keyed on. Matching by
+field/value string equality would have been fragile and could have
+silently produced wrong evidence links. Instead, evidence is read
+directly off the exact sub-entity each observation is about —
+`Port.source`/`.confidence_score`, `DnsRecord.source`/
+`.confidence_score`, `URL.source`/`.confidence_score`,
+`TechnologyFinding.source`/`.confidence`, `HttpService.source`/
+`.confidence_score` for a header — which is precise by construction,
+never a match that could point at the wrong thing.
+
+**Deduplication, proven with a real 5-run replay**
+(`tests/test_observation_backfill.py::
+TestEvidenceDeduplicationAcrossRepeatedRuns`): the same port, with the
+same detected service, replayed across 5 completed scans produces 10
+observations (2 facts × 5 runs — an observation is EXPECTED once per
+run, that's what gives historial) but exactly 2 evidence rows (one per
+distinct fact), each with `last_seen_run_id` advancing to the most
+recent run. A later run reporting a genuinely DIFFERENT fact (the same
+port, a different detected service — a real service migration) is
+proven to create a new evidence row rather than being folded into the
+old one.
+
+**Traceability, shown for real, not just asserted** — a real scan
+seeded through this exact pipeline (`api/asset_backfill.py`, no mocks),
+then queried with `ControlDB.list_observations_for_asset` (one query,
+no manual join against any `run_id`-scoped raw table):
+
+```
+Backfill summary: BackfillSummary(scans_processed=1, hosts_processed=1,
+  assets_created=2, assets_touched=0, observations_recorded=2,
+  observations_already_present=0, evidence_created_or_touched=2)
+
+Asset: AssetRecord(asset_id='67fde2908e...', asset_type='port',
+  identity_key='port:demo.example.com:443:tcp', ...)
+
+Observation: ObservationRecord(observation_id='1b57a4c2...',
+  asset_id='67fde2908e...', run_id='b62a1b7997...',
+  observation_type='port_open', evidence_id='d4914604...', ...)
+Evidence: EvidenceRecord(evidence_id='d4914604...', source='naabu',
+  detail='https', confidence_score=50, ...)
+```
+
+From the `Observation` row alone: `run_id` gives the exact originating
+scan; `evidence_id` resolves (in the same query) to the full `Evidence`
+row — `source='naabu'`, `detail='https'`, `confidence_score=50` — the
+precise fact that justified recording this observation. Never
+"observation exists, provenance unclear."
+
+**Isolation, same adversarial pattern as Fase 03, applied here**:
+`tests/test_observation_backfill.py::
+TestOrganizationIsolationForObservationsAndEvidence` proves two
+organizations (including the same-billing-account consultant case)
+observing the identical shared host never end up sharing an
+`observation_id` or `evidence_id` — each gets its own, fully separate
+rows.
+
+**What did NOT happen**: no `run_id`-scoped raw table in
+`core/store.py` was touched. Nothing here computes or stores a risk
+judgment — every observation is a neutral fact ("we saw X"); Fase 08's
+Exposure model, not this one, is where a pattern of observations becomes
+a risk finding. `evidence`/`observations` are populated by the SAME
+backfill pass Fase 03 built (`api/asset_backfill.py`,
+`backfill_assets_for_organization`) — not a second, independent walk
+through run history — and are equally NOT wired into the live
+scan-completion path yet.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —

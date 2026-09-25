@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Literal
 
 from api.asset_identity import ExistingAsset, ReconciliationDecision
+from api.observation_identity import EvidenceContent
 from core.store import connect_sqlite
 
 _SCHEMA = """
@@ -146,6 +147,62 @@ CREATE TABLE IF NOT EXISTS asset_identifiers (
     UNIQUE (organization_id, identifier_type, identifier_value)
 );
 CREATE INDEX IF NOT EXISTS idx_asset_identifiers_asset ON asset_identifiers(asset_id);
+
+-- Fase 04 (EASM roadmap): the deduplicated raw evidence backing an
+-- observation. Content comes directly from the exact `core/assets.py`
+-- sub-entity an observation is about (`Port.source`/`.confidence_score`,
+-- `DnsRecord.source`/`.confidence_score`, `URL.source`/
+-- `.confidence_score`, `TechnologyFinding.source`/`.confidence`,
+-- `HttpService.source`/`.confidence_score` for a header) — never a fuzzy
+-- match against the separate, free-text-keyed `Host.provenance` list
+-- (checked against real `core/parsers/registry.py` call sites before
+-- deciding this — see `api/observation_identity.py`'s own docstring for
+-- why that match would have been unreliable). Deduplicated by CONTENT
+-- scoped to one asset: the SAME (source, detail, confidence_score)
+-- observed again on a later run reuses this same row (`last_seen_at`/
+-- `last_seen_run_id` advance) rather than creating a new one — this is
+-- what makes the phase's own "5 runs, no wasted duplicate evidence"
+-- requirement real, not just a check on top of "insert everything."
+CREATE TABLE IF NOT EXISTS evidence (
+    evidence_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    source TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    confidence_score INTEGER,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    last_seen_run_id TEXT,
+    UNIQUE (organization_id, asset_id, source, detail, confidence_score)
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_asset ON evidence(asset_id);
+
+-- Fase 04: the normalized "what this run observed about this asset"
+-- projection the Fase 01 consolidation plan's glossary calls
+-- "Observation" — one row per (asset, run, evidence), deliberately never
+-- a copy of any run_id-scoped raw table in `core/store.py` (those stay
+-- exactly as they are — see this table's own backfill in
+-- `api/asset_backfill.py` for the one place that reads them). A neutral
+-- fact only ("we saw X") — NEVER a risk judgment; Fase 08's Exposure
+-- model is what turns a pattern of observations into a risk finding,
+-- and is intentionally a separate, later concern (see this phase's own
+-- "no mezclar observación con exposure" instruction).
+-- `UNIQUE(asset_id, run_id, evidence_id)` is what makes replaying the
+-- same run through the backfill twice (Fase 03's own idempotency
+-- precedent) never create a duplicate observation row.
+CREATE TABLE IF NOT EXISTS observations (
+    observation_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    run_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    observation_type TEXT NOT NULL,
+    evidence_id TEXT NOT NULL REFERENCES evidence(evidence_id),
+    observed_at TEXT NOT NULL,
+    UNIQUE (asset_id, run_id, evidence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_observations_asset ON observations(asset_id);
+CREATE INDEX IF NOT EXISTS idx_observations_run ON observations(run_id);
 
 CREATE TABLE IF NOT EXISTS api_keys (
     key_id TEXT PRIMARY KEY,
@@ -771,6 +828,42 @@ class AssetIdentifierRecord:
     last_seen_at: str
 
 
+@dataclass(frozen=True)
+class EvidenceRecord:
+    evidence_id: str
+    organization_id: str
+    asset_id: str
+    source: str
+    detail: str
+    confidence_score: int | None
+    first_seen_at: str
+    last_seen_at: str
+    last_seen_run_id: str | None
+
+
+@dataclass(frozen=True)
+class ObservationRecord:
+    observation_id: str
+    organization_id: str
+    asset_id: str
+    run_id: str
+    account_id: str
+    observation_type: str
+    evidence_id: str
+    observed_at: str
+
+
+@dataclass(frozen=True)
+class ObservationWithEvidence:
+    """The single-query traceability shape the phase's own prompt asks
+    for: from one row, an observation's `run_id` (its origin) AND the
+    full evidence that backs it, with no manual join against the raw
+    run_id-scoped tables required."""
+
+    observation: ObservationRecord
+    evidence: EvidenceRecord
+
+
 _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("email", "TEXT"),
     ("email_verified_at", "TEXT"),
@@ -1323,6 +1416,131 @@ class ControlDB:
                 (asset_id,),
             ).fetchall()
         return [_asset_identifier_record_from_row(row) for row in rows]
+
+    # --- observations and evidence (Fase 04, EASM roadmap) --------------
+
+    def find_or_create_evidence(
+        self,
+        *,
+        organization_id: str,
+        asset_id: str,
+        content: EvidenceContent,
+        run_id: str,
+        observed_at: str | None = None,
+    ) -> str:
+        """The evidence-side reconciliation: an exact match on
+        `(organization_id, asset_id, source, detail, confidence_score)`
+        — the table's own UNIQUE constraint — means "the same fact,
+        observed again," and only `last_seen_at`/`last_seen_run_id`
+        advance; no match means a genuinely new evidence row. Same "exact
+        value match, never fuzzy" discipline `api/asset_identity.py`
+        already established for asset identity, applied here to evidence
+        content instead."""
+        observed_at = observed_at or _now_iso()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT evidence_id FROM evidence WHERE organization_id = ? AND asset_id = ? "
+                "AND source = ? AND detail = ? AND confidence_score IS ?",
+                (
+                    organization_id,
+                    asset_id,
+                    content.source,
+                    content.detail,
+                    content.confidence_score,
+                ),
+            ).fetchone()
+            if row is not None:
+                evidence_id = row["evidence_id"]
+                conn.execute(
+                    "UPDATE evidence SET last_seen_at = ?, last_seen_run_id = ? "
+                    "WHERE evidence_id = ?",
+                    (observed_at, run_id, evidence_id),
+                )
+                return evidence_id
+            evidence_id = secrets.token_hex(16)
+            conn.execute(
+                "INSERT INTO evidence (evidence_id, organization_id, asset_id, source, detail, "
+                "confidence_score, first_seen_at, last_seen_at, last_seen_run_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    evidence_id,
+                    organization_id,
+                    asset_id,
+                    content.source,
+                    content.detail,
+                    content.confidence_score,
+                    observed_at,
+                    observed_at,
+                    run_id,
+                ),
+            )
+        return evidence_id
+
+    def get_evidence(self, evidence_id: str) -> EvidenceRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM evidence WHERE evidence_id = ?", (evidence_id,)
+            ).fetchone()
+        return None if row is None else _evidence_record_from_row(row)
+
+    def record_observation(
+        self,
+        *,
+        organization_id: str,
+        asset_id: str,
+        run_id: str,
+        account_id: str,
+        observation_type: str,
+        evidence_id: str,
+        observed_at: str | None = None,
+    ) -> str | None:
+        """Records that THIS run observed THIS fact about THIS asset.
+        `INSERT OR IGNORE` against the table's own
+        `UNIQUE(asset_id, run_id, evidence_id)` constraint — replaying
+        the same run through the backfill a second time (Fase 03's own
+        idempotency precedent) creates zero duplicate rows. Returns the
+        new `observation_id`, or `None` if this exact (asset, run,
+        evidence) combination was already recorded."""
+        observed_at = observed_at or _now_iso()
+        observation_id = secrets.token_hex(16)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO observations (observation_id, organization_id, asset_id, "
+                "run_id, account_id, observation_type, evidence_id, observed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    observation_id,
+                    organization_id,
+                    asset_id,
+                    run_id,
+                    account_id,
+                    observation_type,
+                    evidence_id,
+                    observed_at,
+                ),
+            )
+        return observation_id if cursor.rowcount else None
+
+    def list_observations_for_asset(self, asset_id: str) -> list[ObservationWithEvidence]:
+        """The phase's own required "one query, no manual joins against
+        the raw tables" traceability: every observation this asset has
+        ever had, each one already carrying its own `run_id` (where it
+        came from) and its full, resolved `EvidenceRecord` (what backs
+        it) — a real SQL join against `evidence` (an already-normalized,
+        Fase-04-owned table), never against any run_id-scoped raw table
+        in `core/store.py`."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT o.*, "
+                "e.source AS e_source, e.detail AS e_detail, "
+                "e.confidence_score AS e_confidence_score, e.first_seen_at AS e_first_seen_at, "
+                "e.last_seen_at AS e_last_seen_at, e.last_seen_run_id AS e_last_seen_run_id, "
+                "e.organization_id AS e_organization_id, e.asset_id AS e_asset_id "
+                "FROM observations o JOIN evidence e ON o.evidence_id = e.evidence_id "
+                "WHERE o.asset_id = ? ORDER BY o.observed_at",
+                (asset_id,),
+            ).fetchall()
+        return [_observation_with_evidence_from_row(row) for row in rows]
 
     # --- account-creation rate limiting (Hallazgo 1) --------------------
 
@@ -2904,6 +3122,45 @@ def _asset_identifier_record_from_row(row: sqlite3.Row) -> AssetIdentifierRecord
         first_seen_at=row["first_seen_at"],
         last_seen_at=row["last_seen_at"],
     )
+
+
+def _evidence_record_from_row(row: sqlite3.Row) -> EvidenceRecord:
+    return EvidenceRecord(
+        evidence_id=row["evidence_id"],
+        organization_id=row["organization_id"],
+        asset_id=row["asset_id"],
+        source=row["source"],
+        detail=row["detail"],
+        confidence_score=row["confidence_score"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        last_seen_run_id=row["last_seen_run_id"],
+    )
+
+
+def _observation_with_evidence_from_row(row: sqlite3.Row) -> ObservationWithEvidence:
+    observation = ObservationRecord(
+        observation_id=row["observation_id"],
+        organization_id=row["organization_id"],
+        asset_id=row["asset_id"],
+        run_id=row["run_id"],
+        account_id=row["account_id"],
+        observation_type=row["observation_type"],
+        evidence_id=row["evidence_id"],
+        observed_at=row["observed_at"],
+    )
+    evidence = EvidenceRecord(
+        evidence_id=row["evidence_id"],
+        organization_id=row["e_organization_id"],
+        asset_id=row["e_asset_id"],
+        source=row["e_source"],
+        detail=row["e_detail"],
+        confidence_score=row["e_confidence_score"],
+        first_seen_at=row["e_first_seen_at"],
+        last_seen_at=row["e_last_seen_at"],
+        last_seen_run_id=row["e_last_seen_run_id"],
+    )
+    return ObservationWithEvidence(observation=observation, evidence=evidence)
 
 
 def _account_record_from_row(row: sqlite3.Row) -> AccountRecord:
