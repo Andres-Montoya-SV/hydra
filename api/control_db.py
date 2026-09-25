@@ -51,6 +51,44 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email)
     WHERE email IS NOT NULL;
 
+-- Fase 02 (EASM roadmap — docs/easm/00_consolidation_plan.md's glossary:
+-- "Organization... coexists with `accounts`; phase 02 extends") — the
+-- TARGET organization being monitored, deliberately separate from
+-- `accounts` (billing/login identity: Wompi, API keys, tier all stay on
+-- `accounts` unchanged; see this table's own module docstring at the top
+-- of this file for why that boundary matters). One `account` can hold a
+-- role on one or more `organizations` (a security consultant managing
+-- several clients under one billing account is the real case this
+-- separation is for) — access is entirely mediated through
+-- `account_organization_roles` below, never a direct FK from
+-- `organizations` back to a single owning account.
+CREATE TABLE IF NOT EXISTS organizations (
+    organization_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- One row per (account, organization) the account has a role on.
+-- 'owner' can modify the organization's scope and manage its membership;
+-- 'viewer' is read-only on both — checked via `role_can_modify_scope`/
+-- `role_can_manage_members` below, never re-derived ad hoc at a call
+-- site. No granular per-resource permission system yet (not needed by
+-- this phase), but the (account_id, organization_id) composite primary
+-- key plus a free-text `role` column is extensible without a schema
+-- change if a third role is added later.
+CREATE TABLE IF NOT EXISTS account_organization_roles (
+    account_id TEXT NOT NULL REFERENCES accounts(account_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    role TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (account_id, organization_id)
+);
+CREATE INDEX IF NOT EXISTS idx_account_org_roles_org
+    ON account_organization_roles(organization_id);
+CREATE INDEX IF NOT EXISTS idx_account_org_roles_account
+    ON account_organization_roles(account_id);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     key_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(account_id),
@@ -99,9 +137,17 @@ CREATE TABLE IF NOT EXISTS scans (
     retry_count INTEGER NOT NULL DEFAULT 0,
     worker_id TEXT,
     heartbeat_at TEXT,
-    trigger_source TEXT NOT NULL DEFAULT 'manual'
+    trigger_source TEXT NOT NULL DEFAULT 'manual',
+    -- Fase 02: nullable at the schema level only because SQLite cannot
+    -- ALTER TABLE ADD a NOT NULL column with a per-row (not fixed)
+    -- default onto a table that already has rows — every code path that
+    -- writes a scan (`create_scan`) always resolves and stores a real
+    -- organization_id, so in practice this is never actually null for a
+    -- row created after Fase 02 shipped; see `default_organization_id_for_account`.
+    organization_id TEXT REFERENCES organizations(organization_id)
 );
 CREATE INDEX IF NOT EXISTS idx_scans_account_id ON scans(account_id);
+CREATE INDEX IF NOT EXISTS idx_scans_organization_id ON scans(organization_id);
 CREATE INDEX IF NOT EXISTS idx_scans_status ON scans(status);
 
 -- Durable-queue fix, continued: a persisted replacement for
@@ -158,9 +204,14 @@ CREATE TABLE IF NOT EXISTS domain_verifications (
     verified_at TEXT,
     expires_at TEXT,
     last_checked_at TEXT,
-    last_check_error TEXT
+    last_check_error TEXT,
+    -- Fase 02: see the identical comment on `scans.organization_id` for
+    -- why this is schema-nullable but application-guaranteed non-null.
+    organization_id TEXT REFERENCES organizations(organization_id)
 );
 CREATE INDEX IF NOT EXISTS idx_domain_verifications_domain ON domain_verifications(domain);
+CREATE INDEX IF NOT EXISTS idx_domain_verifications_organization
+    ON domain_verifications(organization_id);
 CREATE INDEX IF NOT EXISTS idx_domain_verifications_account
     ON domain_verifications(account_id, domain);
 
@@ -229,6 +280,9 @@ CREATE TABLE IF NOT EXISTS monitored_domains (
     needs_review INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    -- Fase 02: see the identical comment on `scans.organization_id` for
+    -- why this is schema-nullable but application-guaranteed non-null.
+    organization_id TEXT REFERENCES organizations(organization_id),
     UNIQUE (account_id, domain)
 );
 -- The monitoring loop's own read pattern is always "rows due now,
@@ -241,6 +295,8 @@ CREATE INDEX IF NOT EXISTS idx_monitored_domains_passive_due
 CREATE INDEX IF NOT EXISTS idx_monitored_domains_active_due
     ON monitored_domains(next_active_due_at, monitoring_id);
 CREATE INDEX IF NOT EXISTS idx_monitored_domains_account ON monitored_domains(account_id);
+CREATE INDEX IF NOT EXISTS idx_monitored_domains_organization
+    ON monitored_domains(organization_id);
 
 -- A durable outbox for continuous-monitoring notifications — closes a
 -- real gap found while proving `run_monitoring_cycle`'s own "safe to
@@ -314,9 +370,13 @@ CREATE TABLE IF NOT EXISTS webhooks (
     last_success_at TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    -- Fase 02: see the identical comment on `scans.organization_id` for
+    -- why this is schema-nullable but application-guaranteed non-null.
+    organization_id TEXT REFERENCES organizations(organization_id)
 );
 CREATE INDEX IF NOT EXISTS idx_webhooks_account ON webhooks(account_id);
+CREATE INDEX IF NOT EXISTS idx_webhooks_organization ON webhooks(organization_id);
 
 -- Part B (docs/PAID_API_DESIGN.md, Round 3) tier/subscription state. One
 -- row per account, created at account-creation time defaulting to
@@ -455,6 +515,27 @@ class DuplicateEmailError(Exception):
     account" requirement) — the router turns this into a 409."""
 
 
+def role_can_modify_scope(role: str | None) -> bool:
+    """Fase 02: whether `role` (as returned by
+    `ControlDB.get_role_for_account_organization`) may change an
+    organization's authorized scope (register/verify a new domain,
+    change monitoring settings for one). Only `'owner'` can — `'viewer'`
+    and `None` (no role at all) cannot. A pure function, not a method,
+    so callers never have to construct a `ControlDB` just to ask "is this
+    role allowed to do X" — the same shape `api/subscriptions.py`'s own
+    tier-limit checks already use for the identical reason."""
+    return role == "owner"
+
+
+def role_can_manage_members(role: str | None) -> bool:
+    """Fase 02: whether `role` may add/change another account's role on
+    this organization (invite a member, promote/demote them). Only
+    `'owner'` can, for the same reason `role_can_modify_scope` is
+    owner-only — a read-only member must never be able to grant itself
+    or anyone else more access than it was given."""
+    return role == "owner"
+
+
 @dataclass(frozen=True)
 class AccountRecord:
     account_id: str
@@ -494,6 +575,7 @@ class ScanRecord:
     worker_id: str | None
     heartbeat_at: str | None
     trigger_source: str
+    organization_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -554,6 +636,7 @@ class MonitoredDomainRecord:
     needs_review: bool
     created_at: str
     updated_at: str
+    organization_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -570,6 +653,7 @@ class WebhookRecord:
     last_error: str | None
     created_at: str
     updated_at: str
+    organization_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -596,6 +680,15 @@ class DomainVerificationRecord:
     expires_at: str | None
     last_checked_at: str | None
     last_check_error: str | None
+    organization_id: str | None = None
+
+
+@dataclass(frozen=True)
+class OrganizationRecord:
+    organization_id: str
+    name: str
+    created_at: str
+    updated_at: str
 
 
 _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -621,6 +714,15 @@ _SCANS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 _SUBSCRIPTIONS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("white_label_company_name", "TEXT"),
 )
+
+# Fase 02 (EASM roadmap): every one of these four tables predates the
+# `organizations` concept, so an existing `control.db` needs this column
+# ALTER'd on exactly like the migrations above. Nullable here (SQLite
+# cannot ALTER TABLE ADD a NOT NULL column with a per-row default onto a
+# table that already has rows) — `_backfill_organizations` below fills
+# every existing row's real value once `organizations`/
+# `account_organization_roles` exist.
+_ORGANIZATION_ID_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("organization_id", "TEXT"),)
 
 
 def _migrate_table_columns(
@@ -653,6 +755,57 @@ def _migrate_table_columns(
             )  # noqa: S608  # nosec B608
 
 
+_ORGANIZATION_SCOPED_TABLES: tuple[str, ...] = (
+    "domain_verifications",
+    "monitored_domains",
+    "scans",
+    "webhooks",
+)
+
+
+def _backfill_organizations(conn: sqlite3.Connection) -> None:
+    """Fase 02's actual data migration: every account that predates the
+    `organizations` concept (no row of its own in
+    `account_organization_roles` yet) gets a real, distinct organization,
+    1:1, automatically — no user action required, and this changes
+    nothing observable for that account (every existing account-scoped
+    accessor keeps returning exactly the same rows; only the new
+    organization-scoped accessors become meaningful for it). Runs once
+    per `ControlDB()` construction; a cheap no-op after the first real
+    run, since the `NOT IN` subquery then matches zero accounts. A
+    brand-new account never reaches this function at all —
+    `create_account` provisions its organization inline, in the SAME
+    transaction as the account row itself, so it's never in the "missing
+    an organization" state this function looks for."""
+    accounts_without_org = conn.execute(
+        "SELECT account_id, email FROM accounts WHERE account_id NOT IN "
+        "(SELECT account_id FROM account_organization_roles)"
+    ).fetchall()
+    now = _now_iso()
+    for row in accounts_without_org:
+        account_id = row["account_id"]
+        organization_id = secrets.token_hex(16)
+        name = row["email"] or f"Organization for account {account_id[:8]}"
+        conn.execute(
+            "INSERT INTO organizations (organization_id, name, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (organization_id, name, now, now),
+        )
+        conn.execute(
+            "INSERT INTO account_organization_roles "
+            "(account_id, organization_id, role, created_at) VALUES (?, ?, 'owner', ?)",
+            (account_id, organization_id, now),
+        )
+        for table in _ORGANIZATION_SCOPED_TABLES:
+            conn.execute(
+                # table is always one of the fixed literals above, never
+                # external input.
+                f"UPDATE {table} SET organization_id = ? "  # noqa: S608  # nosec B608
+                "WHERE account_id = ? AND organization_id IS NULL",
+                (organization_id, account_id),
+            )
+
+
 class ControlDB:
     """One instance per process, backed by one SQLite file
     (`APISettings.control_db_path`) — this is the only database in the
@@ -666,7 +819,10 @@ class ControlDB:
             _migrate_table_columns(conn, "accounts", _ACCOUNTS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "scans", _SCANS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "subscriptions", _SUBSCRIPTIONS_MIGRATION_COLUMNS)
+            for table in _ORGANIZATION_SCOPED_TABLES:
+                _migrate_table_columns(conn, table, _ORGANIZATION_ID_MIGRATION_COLUMNS)
             conn.executescript(_SCHEMA)
+            _backfill_organizations(conn)
         for suffix in ("", "-wal", "-shm"):
             path = Path(f"{self.db_path}{suffix}")
             if path.exists():
@@ -716,8 +872,15 @@ class ControlDB:
         already registered to a different account — enforced by the
         table's own partial unique index (`WHERE email IS NOT NULL`),
         not just application-level convention, so this can never be
-        bypassed by a second, uncoordinated code path."""
+        bypassed by a second, uncoordinated code path.
+
+        Fase 02: every new account gets its own 1:1 `organization` (owner
+        role) created in this SAME transaction — never deferred to the
+        next `ControlDB()` startup's `_backfill_organizations` sweep,
+        which exists only for accounts that predate this feature."""
         account_id = secrets.token_hex(16)
+        organization_id = secrets.token_hex(16)
+        now = _now_iso()
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -726,11 +889,26 @@ class ControlDB:
                     "VALUES (?, ?, ?, ?, ?)",
                     (
                         account_id,
-                        _now_iso(),
+                        now,
                         email,
                         email_verification_token,
                         email_verification_token_expires_at,
                     ),
+                )
+                conn.execute(
+                    "INSERT INTO organizations (organization_id, name, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        organization_id,
+                        email or f"Organization for account {account_id[:8]}",
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO account_organization_roles "
+                    "(account_id, organization_id, role, created_at) VALUES (?, ?, 'owner', ?)",
+                    (account_id, organization_id, now),
                 )
         except sqlite3.IntegrityError as exc:
             raise DuplicateEmailError(f"{email!r} is already registered") from exc
@@ -782,6 +960,151 @@ class ControlDB:
                 "email_verification_token_expires_at = ? WHERE account_id = ?",
                 (token, expires_at, account_id),
             )
+
+    # --- organizations (Fase 02, EASM roadmap) --------------------------
+
+    def default_organization_id_for_account(self, account_id: str) -> str:
+        """The account's own OWNER organization — every account has
+        exactly one as of either `create_account`'s inline provisioning
+        (new accounts) or the one-time `_backfill_organizations` sweep at
+        `ControlDB()` startup (accounts that predate Fase 02). Used
+        internally by every `create_*` method below that accepts an
+        `organization_id: str | None` parameter, so every existing
+        caller — every router, every pre-existing test — keeps working
+        completely unchanged without ever having to learn about
+        organizations. If more than one owner role exists for this
+        account (a future phase's multi-owner-organization feature), the
+        oldest one is treated as "the account's own" — the 1:1 one it
+        started with."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT organization_id FROM account_organization_roles "
+                "WHERE account_id = ? AND role = 'owner' ORDER BY created_at LIMIT 1",
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(
+                f"account {account_id!r} has no organization — should be impossible after "
+                "Fase 02's create_account provisioning / _backfill_organizations migration"
+            )
+        return row["organization_id"]
+
+    def create_organization(self, *, name: str) -> str:
+        """A SECOND (or later) organization for an account that already
+        has its 1:1 default one — e.g. a consultant onboarding a new
+        client. Grants no role to anyone by itself;
+        `add_account_organization_role` is a separate, explicit call."""
+        organization_id = secrets.token_hex(16)
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO organizations (organization_id, name, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (organization_id, name, now, now),
+            )
+        return organization_id
+
+    def get_organization(self, organization_id: str) -> OrganizationRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM organizations WHERE organization_id = ?", (organization_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return OrganizationRecord(
+            organization_id=row["organization_id"],
+            name=row["name"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def add_account_organization_role(
+        self, *, account_id: str, organization_id: str, role: str
+    ) -> None:
+        """`role` is `'owner'` or `'viewer'` — anything else is a caller
+        bug, not user input to validate gently. Upserts: re-granting a
+        role a second time (or changing it) replaces the prior row for
+        this (account, organization) pair rather than erroring, since the
+        table's own primary key is exactly that pair."""
+        if role not in ("owner", "viewer"):
+            raise ValueError(f"unknown organization role: {role!r}")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO account_organization_roles "
+                "(account_id, organization_id, role, created_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(account_id, organization_id) DO UPDATE SET role = excluded.role",
+                (account_id, organization_id, role, _now_iso()),
+            )
+
+    def get_role_for_account_organization(
+        self, account_id: str, organization_id: str
+    ) -> str | None:
+        """`None` means this account has no role on this organization at
+        all — indistinguishable from "organization doesn't exist" to a
+        caller deciding access, which is the correct posture (never leak
+        which is true)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT role FROM account_organization_roles "
+                "WHERE account_id = ? AND organization_id = ?",
+                (account_id, organization_id),
+            ).fetchone()
+        return row["role"] if row else None
+
+    def list_organizations_for_account(self, account_id: str) -> list[tuple[str, str]]:
+        """`(organization_id, role)` pairs, oldest first — the first
+        entry is always the account's own 1:1 default organization for
+        an account that has never been granted access to a second one."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT organization_id, role FROM account_organization_roles "
+                "WHERE account_id = ? ORDER BY created_at",
+                (account_id,),
+            ).fetchall()
+        return [(row["organization_id"], row["role"]) for row in rows]
+
+    def get_verified_domains_for_organization(
+        self, organization_id: str, *, now: str | None = None
+    ) -> list[DomainVerificationRecord]:
+        """The organization-scoped twin of `get_verified_domains_for_account`
+        — every currently-active (verified, unexpired) domain this
+        ORGANIZATION holds, never leaking a sibling organization's domains
+        even when both share the same `account_id` (the consultant-with-
+        two-clients case Fase 02 exists for)."""
+        now = now or _now_iso()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM domain_verifications "
+                "WHERE organization_id = ? AND status = 'verified' AND expires_at > ?",
+                (organization_id, now),
+            ).fetchall()
+        return [_verification_record_from_row(row) for row in rows]
+
+    def list_monitored_domains_for_organization(
+        self, organization_id: str
+    ) -> list[MonitoredDomainRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM monitored_domains WHERE organization_id = ? ORDER BY created_at",
+                (organization_id,),
+            ).fetchall()
+        return [_monitored_domain_record_from_row(row) for row in rows]
+
+    def list_webhooks_for_organization(self, organization_id: str) -> list[WebhookRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM webhooks WHERE organization_id = ? ORDER BY created_at",
+                (organization_id,),
+            ).fetchall()
+        return [_webhook_record_from_row(row) for row in rows]
+
+    def list_scans_for_organization(self, organization_id: str) -> list[ScanRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scans WHERE organization_id = ? ORDER BY created_at",
+                (organization_id,),
+            ).fetchall()
+        return [_scan_record_from_row(row) for row in rows]
 
     # --- account-creation rate limiting (Hallazgo 1) --------------------
 
@@ -928,15 +1251,20 @@ class ControlDB:
         domain: str,
         db_path: str,
         trigger_source: str = "manual",
+        organization_id: str | None = None,
     ) -> None:
+        """`organization_id` defaults to the account's own organization
+        (Fase 02) when not given explicitly — every pre-existing caller
+        (every router, every test) keeps working unchanged."""
+        organization_id = organization_id or self.default_organization_id_for_account(account_id)
         now = _now_iso()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO scans "
                 "(scan_id, account_id, domain, db_path, status, created_at, updated_at, "
-                "trigger_source) "
-                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
-                (scan_id, account_id, domain, db_path, now, now, trigger_source),
+                "trigger_source, organization_id) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+                (scan_id, account_id, domain, db_path, now, now, trigger_source, organization_id),
             )
 
     def update_scan_status(
@@ -1063,16 +1391,21 @@ class ControlDB:
     # --- domain verification (Part A) --------------------------------
 
     def create_domain_verification(
-        self, *, account_id: str, domain: str, token: str
+        self, *, account_id: str, domain: str, token: str, organization_id: str | None = None
     ) -> DomainVerificationRecord:
+        """`organization_id` defaults to the account's own organization
+        (Fase 02) when not given explicitly — see `create_scan`'s
+        identical note."""
+        organization_id = organization_id or self.default_organization_id_for_account(account_id)
         verification_id = secrets.token_hex(16)
         now = _now_iso()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO domain_verifications "
-                "(verification_id, account_id, domain, token, method, status, created_at) "
-                "VALUES (?, ?, ?, ?, NULL, 'pending', ?)",
-                (verification_id, account_id, domain, token, now),
+                "(verification_id, account_id, domain, token, method, status, created_at, "
+                "organization_id) "
+                "VALUES (?, ?, ?, ?, NULL, 'pending', ?, ?)",
+                (verification_id, account_id, domain, token, now, organization_id),
             )
         return DomainVerificationRecord(
             verification_id=verification_id,
@@ -1086,6 +1419,7 @@ class ControlDB:
             expires_at=None,
             last_checked_at=None,
             last_check_error=None,
+            organization_id=organization_id,
         )
 
     def get_latest_pending_verification(
@@ -1199,6 +1533,7 @@ class ControlDB:
         speed2_enabled: bool,
         passive_interval_hours: int,
         active_interval_hours: int,
+        organization_id: str | None = None,
     ) -> MonitoredDomainRecord:
         """Idempotent opt-in/settings-change entry point for
         `POST /domains/{domain}/monitoring` — a second call for the same
@@ -1210,7 +1545,13 @@ class ControlDB:
         after it was off schedules the next active scan a full cadence
         out from now, not immediately — the client just asked to start
         monitoring, not to force an immediate scan (POST /scans already
-        exists for that)."""
+        exists for that).
+
+        `organization_id` defaults to the account's own organization
+        (Fase 02) when not given explicitly, and is only ever written on
+        the INSERT branch — an already-existing row's organization never
+        changes on a settings update."""
+        organization_id = organization_id or self.default_organization_id_for_account(account_id)
         now = _now_iso()
         next_passive_due_at = (
             datetime.now(timezone.utc) + timedelta(hours=passive_interval_hours)
@@ -1231,7 +1572,7 @@ class ControlDB:
                     "INSERT INTO monitored_domains "
                     "(monitoring_id, account_id, domain, speed2_enabled, status, "
                     "next_passive_due_at, next_active_due_at, needs_review, created_at, "
-                    "updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?, 0, ?, ?)",
+                    "updated_at, organization_id) VALUES (?, ?, ?, ?, 'active', ?, ?, 0, ?, ?, ?)",
                     (
                         monitoring_id,
                         account_id,
@@ -1241,6 +1582,7 @@ class ControlDB:
                         next_active_due_at,
                         now,
                         now,
+                        organization_id,
                     ),
                 )
             else:
@@ -1617,17 +1959,36 @@ class ControlDB:
         return int(row["c"])
 
     def create_webhook(
-        self, *, account_id: str, url: str, secret: str, event_types: tuple[str, ...]
+        self,
+        *,
+        account_id: str,
+        url: str,
+        secret: str,
+        event_types: tuple[str, ...],
+        organization_id: str | None = None,
     ) -> WebhookRecord:
+        """`organization_id` defaults to the account's own organization
+        (Fase 02) when not given explicitly — see `create_scan`'s
+        identical note."""
+        organization_id = organization_id or self.default_organization_id_for_account(account_id)
         webhook_id = secrets.token_hex(16)
         now = _now_iso()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO webhooks "
                 "(webhook_id, account_id, url, secret, event_types_json, status, "
-                "consecutive_failures, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)",
-                (webhook_id, account_id, url, secret, json.dumps(list(event_types)), now, now),
+                "consecutive_failures, created_at, updated_at, organization_id) "
+                "VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)",
+                (
+                    webhook_id,
+                    account_id,
+                    url,
+                    secret,
+                    json.dumps(list(event_types)),
+                    now,
+                    now,
+                    organization_id,
+                ),
             )
         return WebhookRecord(
             webhook_id=webhook_id,
@@ -1638,6 +1999,7 @@ class ControlDB:
             status="active",
             consecutive_failures=0,
             last_delivery_at=None,
+            organization_id=organization_id,
             last_success_at=None,
             last_error=None,
             created_at=now,
@@ -2226,6 +2588,7 @@ def _verification_record_from_row(row: sqlite3.Row) -> DomainVerificationRecord:
         expires_at=row["expires_at"],
         last_checked_at=row["last_checked_at"],
         last_check_error=row["last_check_error"],
+        organization_id=row["organization_id"],
     )
 
 
@@ -2255,6 +2618,7 @@ def _scan_record_from_row(row: sqlite3.Row) -> ScanRecord:
         worker_id=row["worker_id"],
         heartbeat_at=row["heartbeat_at"],
         trigger_source=row["trigger_source"],
+        organization_id=row["organization_id"],
     )
 
 
@@ -2278,6 +2642,7 @@ def _monitored_domain_record_from_row(row: sqlite3.Row) -> MonitoredDomainRecord
         needs_review=bool(row["needs_review"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        organization_id=row["organization_id"],
     )
 
 
@@ -2295,6 +2660,7 @@ def _webhook_record_from_row(row: sqlite3.Row) -> WebhookRecord:
         last_error=row["last_error"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        organization_id=row["organization_id"],
     )
 
 
