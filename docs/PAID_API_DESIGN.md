@@ -3248,6 +3248,97 @@ Binding on every later EASM round — a later round using different
 terminology for the same concept is a bug in that round's own PR, not a
 reason to update the glossary after the fact.
 
+## Fase 02 — Organization (`api/control_db.py`) — 2026-09-25
+
+Per the consolidation plan's own decision ("Organization... coexists
+with `accounts`; phase 02 extends"), two new tables separate TARGET
+organization identity from billing/login identity:
+
+- `organizations` (`organization_id`, `name`, timestamps) — the company
+  being monitored. Never directly tied to a single account by FK; access
+  is entirely mediated through the next table, so one organization could
+  in principle be shared by more than one billing account in a later
+  phase without a schema change.
+- `account_organization_roles` — `(account_id, organization_id)` primary
+  key, one `role` column (`'owner'` or `'viewer'` today; extensible
+  without a schema migration if a third role is added later). `owner`
+  can modify the organization's scope and manage its membership;
+  `viewer` can do neither — checked via the new pure functions
+  `role_can_modify_scope`/`role_can_manage_members`
+  (`api/control_db.py`), never re-derived ad hoc at a call site.
+
+**What did NOT change**: `accounts` — billing identity, Wompi enrollment,
+API keys, tier/subscription state all stay exactly where they were.
+Nothing about `POST /accounts`, `POST /scans`, `POST /domains/{domain}/
+verify`, `POST /domains/{domain}/monitoring`, or `POST /webhooks`
+changed shape, request or response — every existing endpoint keeps
+working byte-for-byte identically. This was possible because every
+`create_*` method that writes a row now scoped by organization
+(`create_scan`, `create_domain_verification`,
+`create_or_update_monitored_domain`, `create_webhook`) accepts an
+`organization_id: str | None = None` parameter that, when omitted
+(every existing caller), resolves internally to the account's own
+default organization via the new `default_organization_id_for_account`.
+
+**The 1:1 migration, and why it's safe for accounts already in
+production**: `create_account` now provisions a brand-new account's
+organization + owner role inline, in the SAME transaction as the
+account row — a new account is never observed in a
+"missing-its-organization" state. An account that predates this feature
+is caught by a new `_backfill_organizations` sweep that runs once per
+`ControlDB()` process start: every account with no row yet in
+`account_organization_roles` gets a fresh `organizations` row (named
+after its email, or `"Organization for account {id[:8]}"` if it has
+none) plus an `owner` role, and every one of its existing
+`domain_verifications`/`monitored_domains`/`scans`/`webhooks` rows gets
+backfilled with that organization's id. The sweep is a cheap no-op on
+every later process start (the `NOT IN` guard matches zero accounts once
+migrated). Tested against a real pre-migration schema snapshot (verified
+against `git show main:api/control_db.py`, not reconstructed from
+memory) with real seeded rows in all four scoped tables — see
+`tests/test_organizations.py::TestMigrationAgainstRealPreExistingData`
+for the actual migration run and its asserted-unchanged output.
+
+**Isolation, proven directly against `ControlDB`, not (yet) through new
+endpoints**: `tests/test_organizations.py::
+TestOrganizationIsolationEvenUnderTheSameAccount` seeds two
+organizations under ONE billing account (the consultant-with-two-clients
+case this phase exists for) and proves the new organization-scoped
+accessors (`get_verified_domains_for_organization`,
+`list_monitored_domains_for_organization`,
+`list_webhooks_for_organization`, `list_scans_for_organization`) never
+cross-leak, even though both organizations share `account_id`.
+
+**Explicit non-goal, stated plainly**: no new "manage organizations" API
+endpoints (create a second organization, invite a member, switch the
+active organization for a request) shipped in this phase — the phase's
+own required tests are all satisfiable, and were satisfied, at the
+`ControlDB` layer directly. Every account today still has exactly one
+organization it owns, so no client-visible concept of "which
+organization is this request for" exists yet. A future phase (or an
+addendum to this one) that wants a consultant to actually create a
+second organization through the API, not just through direct `ControlDB`
+calls in a test, needs new endpoints — deliberately not built here to
+keep this phase's surface to what was actually asked for.
+
+**Reused, not reinvented**: the phase 02 prompt named
+`AuthorizedCollectionTarget`/`core/intel/scope.py`/
+`core/intel/authorize.py` as "the existing scope authorization mechanism
+to reuse." Checked against real code and found to be the wrong
+reference: those are the per-network-request-time SSRF/collection
+authorization objects the scan pipeline uses INSIDE a running scan
+(`core/collection/target.py::AuthorizedCollectionTarget`,
+`core/intel/scope.py::CollectionScope`) — a different, lower layer than
+what an organization's authorized domain scope actually means at the
+product level. The real existing mechanism or an organization's scope —
+already used to gate `POST /scans` and `POST /domains/{domain}/
+monitoring` via `_require_verified_domain_or_403` in both routers — is
+`domain_verifications` (DNS TXT / well-known-file domain-ownership
+proof). That is what `organizations`' scope now sits on top of
+(`domain_verifications.organization_id`), and nothing in
+`core/intel/scope.py`/`core/intel/authorize.py` was touched by this
+phase.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
