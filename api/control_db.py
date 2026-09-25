@@ -204,6 +204,34 @@ CREATE TABLE IF NOT EXISTS observations (
 CREATE INDEX IF NOT EXISTS idx_observations_asset ON observations(asset_id);
 CREATE INDEX IF NOT EXISTS idx_observations_run ON observations(run_id);
 
+-- Fase 05 (EASM roadmap): one row per ACTUAL state transition an asset
+-- went through (`api/change_detection.py::compute_asset_state_transitions`
+-- is the sole, pure, deterministic decision-maker — never an LLM, never
+-- a fuzzy heuristic, per the phase's own explicit requirement). Never
+-- one row per run — a run that leaves an asset's state unchanged
+-- produces no row here at all, so this table is exactly the change
+-- history, not a heartbeat log. `UNIQUE(asset_id, run_id)` makes
+-- replaying the change-detection backfill idempotent, matching Fase
+-- 03/04's own precedent; at most one transition can be attributed to
+-- any single run for a given asset (a run either observed it or didn't,
+-- and NEW/UNCHANGED/CHANGED/DISAPPEARED/REAPPEARED are mutually
+-- exclusive outcomes for that one run).
+CREATE TABLE IF NOT EXISTS change_events (
+    change_event_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    run_id TEXT NOT NULL,
+    previous_state TEXT,
+    new_state TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    previous_digest TEXT,
+    new_digest TEXT,
+    detected_at TEXT NOT NULL,
+    UNIQUE (asset_id, run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_change_events_asset ON change_events(asset_id, detected_at);
+CREATE INDEX IF NOT EXISTS idx_change_events_run ON change_events(run_id);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     key_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(account_id),
@@ -862,6 +890,20 @@ class ObservationWithEvidence:
 
     observation: ObservationRecord
     evidence: EvidenceRecord
+
+
+@dataclass(frozen=True)
+class ChangeEventRecord:
+    change_event_id: str
+    organization_id: str
+    asset_id: str
+    run_id: str
+    previous_state: str | None
+    new_state: str
+    reason: str
+    previous_digest: str | None
+    new_digest: str | None
+    detected_at: str
 
 
 _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -1541,6 +1583,105 @@ class ControlDB:
                 (asset_id,),
             ).fetchall()
         return [_observation_with_evidence_from_row(row) for row in rows]
+
+    def observation_digest_input_for_run(
+        self, *, asset_id: str, run_id: str
+    ) -> list[tuple[str, str, str, int | None]]:
+        """Every `(observation_type, evidence.source, evidence.detail,
+        evidence.confidence_score)` tuple this ONE run recorded for this
+        ONE asset — the exact, ready-to-hash input
+        `api/change_detection.py::observation_digest` needs. An empty
+        list here is exactly what "this run did not observe this asset"
+        means to the change-detection engine."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT o.observation_type, e.source, e.detail, e.confidence_score "
+                "FROM observations o JOIN evidence e ON o.evidence_id = e.evidence_id "
+                "WHERE o.asset_id = ? AND o.run_id = ?",
+                (asset_id, run_id),
+            ).fetchall()
+        return [
+            (row["observation_type"], row["source"], row["detail"], row["confidence_score"])
+            for row in rows
+        ]
+
+    def record_change_event(
+        self,
+        *,
+        organization_id: str,
+        asset_id: str,
+        run_id: str,
+        previous_state: str | None,
+        new_state: str,
+        reason: str,
+        previous_digest: str | None,
+        new_digest: str | None,
+        detected_at: str | None = None,
+    ) -> str | None:
+        """Persists ONE `ChangeEvent` the pure engine already decided —
+        this method makes no decision of its own. `INSERT OR IGNORE`
+        against `UNIQUE(asset_id, run_id)` makes replaying the
+        change-detection backfill a second time produce zero duplicate
+        rows (Fase 03/04's own idempotency precedent). Returns the new
+        `change_event_id`, or `None` if this (asset, run) pair already
+        had a recorded transition."""
+        detected_at = detected_at or _now_iso()
+        change_event_id = secrets.token_hex(16)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO change_events (change_event_id, organization_id, "
+                "asset_id, run_id, previous_state, new_state, reason, previous_digest, "
+                "new_digest, detected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    change_event_id,
+                    organization_id,
+                    asset_id,
+                    run_id,
+                    previous_state,
+                    new_state,
+                    reason,
+                    previous_digest,
+                    new_digest,
+                    detected_at,
+                ),
+            )
+        return change_event_id if cursor.rowcount else None
+
+    def list_change_events_for_asset(self, asset_id: str) -> list[ChangeEventRecord]:
+        """The phase's own required "historial de cambios de este
+        asset" — an index range scan on `idx_change_events_asset`
+        (`asset_id`, `detected_at`), never a full-table scan."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM change_events WHERE asset_id = ? ORDER BY detected_at",
+                (asset_id,),
+            ).fetchall()
+        return [_change_event_record_from_row(row) for row in rows]
+
+    def list_change_events_for_run(self, run_id: str) -> list[ChangeEventRecord]:
+        """The phase's own required "todos los cambios detectados en
+        este run" — an index range scan on `idx_change_events_run`."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM change_events WHERE run_id = ? ORDER BY detected_at",
+                (run_id,),
+            ).fetchall()
+        return [_change_event_record_from_row(row) for row in rows]
+
+    def get_current_lifecycle_state_for_asset(self, asset_id: str) -> str | None:
+        """The most recent recorded transition's `new_state` — cheap
+        (same index as `list_change_events_for_asset`, `LIMIT 1`), and
+        `None` for an asset that has never had a recorded transition
+        (unreachable in practice once the backfill has run at least
+        once, since every asset's very first observation always
+        produces a `NEW` event)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT new_state FROM change_events WHERE asset_id = ? "
+                "ORDER BY detected_at DESC LIMIT 1",
+                (asset_id,),
+            ).fetchone()
+        return row["new_state"] if row else None
 
     # --- account-creation rate limiting (Hallazgo 1) --------------------
 
@@ -3161,6 +3302,21 @@ def _observation_with_evidence_from_row(row: sqlite3.Row) -> ObservationWithEvid
         last_seen_run_id=row["e_last_seen_run_id"],
     )
     return ObservationWithEvidence(observation=observation, evidence=evidence)
+
+
+def _change_event_record_from_row(row: sqlite3.Row) -> ChangeEventRecord:
+    return ChangeEventRecord(
+        change_event_id=row["change_event_id"],
+        organization_id=row["organization_id"],
+        asset_id=row["asset_id"],
+        run_id=row["run_id"],
+        previous_state=row["previous_state"],
+        new_state=row["new_state"],
+        reason=row["reason"],
+        previous_digest=row["previous_digest"],
+        new_digest=row["new_digest"],
+        detected_at=row["detected_at"],
+    )
 
 
 def _account_record_from_row(row: sqlite3.Row) -> AccountRecord:
