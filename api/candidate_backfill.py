@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from api.candidate_assets import candidate_from_indicator_row
 from api.tenancy import account_db_path
 from core.store import AssetStore
-
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from api.control_db import ControlDB
