@@ -84,7 +84,7 @@ def candidate_from_indicator_row(row: dict[str, object]) -> CandidateAssetDraft 
 
     # Older intel_indicators rows do not persist normalized_value. Always
     # canonicalize ourselves rather than trusting a run's incidental casing.
-    normalized = normalize_candidate_value(kind, supplied_normalized or display_value)
+    normalized = normalize_candidate_value(kind, display_value or supplied_normalized)
     if not normalized:
         return None
 
@@ -102,7 +102,10 @@ def candidate_from_indicator_row(row: dict[str, object]) -> CandidateAssetDraft 
 
     authorization_status = str(row.get("authorization_status") or "").strip()
     if not authorization_status:
-        authorization_status = "ALLOW" if scope_status == ScopeStatus.IN_SCOPE.value else "DENY"
+        # Scope classification alone is never sufficient to reconstruct an
+        # operation-specific authorization decision. Missing historical
+        # authorization data therefore fails closed even for IN_SCOPE.
+        authorization_status = "DENY"
 
     try:
         depth = max(0, int(str(row.get("depth") or 0)))
