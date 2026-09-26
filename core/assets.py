@@ -485,6 +485,21 @@ class Host:
                     current.technologies.append(technology)
                     technology_keys.add(key)
 
+            # Intelligence providers may also enrich the same canonical URL
+            # with rendered/browser metadata. Preserve primary httpx fields
+            # when the enrichment has no value, but do not discard real
+            # visual evidence simply because the service already existed.
+            if svc.title:
+                current.title = svc.title
+            if svc.body_hash:
+                current.body_hash = svc.body_hash
+            if svc.response_fingerprint:
+                current.response_fingerprint = svc.response_fingerprint
+            if svc.screenshot_path:
+                current.screenshot_path = svc.screenshot_path
+            if svc.redirect_chain:
+                current.redirect_chain = list(svc.redirect_chain)
+
     def _merge_dns(self, records: list[DnsRecord]) -> None:
         existing = {(r.record_type, r.value) for r in self.dns_records}
         for rec in records:
