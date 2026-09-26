@@ -70,6 +70,25 @@ class TestSettings:
         assert settings.enable_sslyze is False
         assert settings.enable_wafw00f is False
 
+    def test_from_env_parses_whatweb_settings(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ENABLE_WHATWEB", "true")
+        monkeypatch.setenv("WHATWEB_TIMEOUT", "45")
+        monkeypatch.setenv("WHATWEB_THREADS", "7")
+        monkeypatch.setenv("WHATWEB_MAX_URLS", "13")
+        monkeypatch.setenv("WHATWEB_PATH", "/usr/local/bin/whatweb")
+        settings = Settings.from_env(project_root=project_root)
+        assert settings.enable_whatweb is True
+        assert settings.whatweb_timeout == 45
+        assert settings.whatweb_threads == 7
+        assert settings.whatweb_max_urls == 13
+        assert settings.whatweb_path == Path("/usr/local/bin/whatweb")
+
+    def test_whatweb_is_off_by_default(self, project_root: Path) -> None:
+        settings = Settings(project_root=project_root)
+        assert settings.enable_whatweb is False
+
     def test_from_env_parses_headers_json(
         self, project_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
