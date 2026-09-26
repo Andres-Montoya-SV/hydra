@@ -97,7 +97,7 @@ code, resolve the binary through `core/dependencies`/`ToolManager`
 first, the same way every existing plugin does via
 `context.resolved_binaries`, rather than trusting raw PATH search.
 
-2. **`final`** (`python:3.11-slim-bookworm`) — the runtime:
+2. **`final`** (`python:3.12-slim-bookworm`) — the runtime:
    - The 7 Go binaries above, copied from the builder stage.
    - `nmap`, `jq` (apt) — the non-Go tools Hydra's plugins call. (No
      `whois` package: `modules/whois.py` uses Hydra's own native Python
@@ -175,7 +175,7 @@ installs.
 | `playwright install-deps webkit` (apt) | ~670 MB | WebKit's OS-level shared-library dependencies (GTK, GStreamer, X11, font/codec libraries) — Playwright's own supported dependency installer for Debian 12; not something worth hand-rolling a fragile minimal package list to shave, since it would need re-validating against every Playwright release. |
 | `pip install` (all 3 requirements files) + WebKit browser download | ~575 MB | `/opt/venv` (≈281 MB — the largest single package is `playwright`'s own site-packages directory at 135 MB, because the Python `playwright` package bundles a full Node.js driver binary internally) + `/opt/playwright` (≈280 MB, the WebKit engine binary itself, which decompresses to roughly 3x its ~96 MB download size). |
 | 7 Go binaries | ~437 MB | `nuclei` alone is 169 MB (embeds a template engine and its own TLS stack); the rest average 30–75 MB each — normal for statically-linked Go security tooling. |
-| Python 3.11 base (`slim-bookworm`) | ~108 MB | The base image itself. |
+| Python 3.12 base (`slim-bookworm`) | ~108 MB | The stable runtime line used by the Dockerfile and covered by Hydra CI. |
 
 Check the current size yourself with `docker images hydra` after building.
 If it grows noticeably beyond ~2.7 GB on a future change, `docker history
