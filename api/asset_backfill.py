@@ -160,7 +160,7 @@ def backfill_assets_for_organization(
 
         for resource in store.get_cloud_resources(scan.scan_id):
             resource_name = str(resource.get("resource_name") or "").strip()
-            if not resource_name:
+            if not resource_name or not resource.get("exists_flag"):
                 continue
             cloud_observation = cloud_storage_observation(resource)
             decision = reconcile_observation(
@@ -194,7 +194,13 @@ def backfill_assets_for_organization(
                         f"public_listable={bool(resource.get('public_listable'))};"
                         f"url={resource.get('url') or ''}"
                     ),
-                    confidence_score=int(resource.get("confidence_score") or 70),
+                    confidence_score=int(
+                        str(
+                            resource.get("confidence_score")
+                            if resource.get("confidence_score") is not None
+                            else 70
+                        )
+                    ),
                 ),
                 run_id=scan.scan_id,
                 observed_at=observed_at,

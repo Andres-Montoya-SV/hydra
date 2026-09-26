@@ -284,14 +284,12 @@ class TestCloudStorageBackfill:
         assert len(cloud_assets) == 1
         assert cloud_assets[0].identity_key == "cloud_storage:s3:example-assets"
 
-        domains = control_db.list_assets_for_organization(
-            organization_id, asset_type="domain"
-        )
+        domains = control_db.list_assets_for_organization(organization_id, asset_type="domain")
         assert {asset.identity_key for asset in domains} == {"domain:example.com"}
 
         observations = control_db.list_observations_for_asset(cloud_assets[0].asset_id)
         assert len(observations) == 1
-        assert observations[0].observation_type == "cloud_storage_observed"
+        assert observations[0].observation.observation_type == "cloud_storage_observed"
 
     def test_same_cloud_resource_across_runs_reconciles_to_one_asset(
         self, control_db: ControlDB, api_settings: APISettings
@@ -452,3 +450,28 @@ class TestCrossOrganizationIsolationIsAdversariallyProven:
         )
         assert asset_a is not None and asset_b is not None
         assert asset_a.asset_id != asset_b.asset_id
+
+
+def test_cloud_persistence_is_idempotent_and_excludes_unproven_resources(tmp_path):
+    store = AssetStore(tmp_path / "cloud.db")
+    store.create_run(ScanRun(run_id="cloud-replay", started_at="2026-01-01"))
+    valid = {
+        "provider": "s3",
+        "bucket": "example-assets",
+        "exists": True,
+        "classification": "exists_private",
+        "status_code": 403,
+    }
+    store.record_cloud_resources("cloud-replay", [valid])
+    original = store.get_cloud_resources("cloud-replay")
+    store.record_cloud_resources("cloud-replay", [valid])
+    assert store.get_cloud_resources("cloud-replay") == original
+    store.record_cloud_resources(
+        "cloud-replay",
+        [
+            {**valid, "bucket": "absent", "exists": False},
+            {**valid, "bucket": "unknown", "classification": "unknown"},
+            {**valid, "bucket": "unsupported", "provider": "unknown"},
+        ],
+    )
+    assert store.get_cloud_resources("cloud-replay") == original

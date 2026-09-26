@@ -91,12 +91,14 @@ class TestIdentitiesForHost:
 
 class TestCloudStorageIdentity:
     def test_provider_qualifies_bucket_identity(self) -> None:
-        assert cloud_storage_identity_key(
-            provider="S3", resource_name="Example-Assets"
-        ) == "cloud_storage:s3:example-assets"
-        assert cloud_storage_identity_key(
-            provider="gcs", resource_name="Example-Assets"
-        ) == "cloud_storage:gcs:example-assets"
+        assert (
+            cloud_storage_identity_key(provider="S3", resource_name="Example-Assets")
+            == "cloud_storage:s3:example-assets"
+        )
+        assert (
+            cloud_storage_identity_key(provider="gcs", resource_name="Example-Assets")
+            == "cloud_storage:gcs:example-assets"
+        )
 
     def test_cloud_observation_uses_url_as_secondary_identifier_only(self) -> None:
         observation = cloud_storage_observation(
@@ -108,9 +110,7 @@ class TestCloudStorageIdentity:
         )
         assert observation.asset_type == ASSET_TYPE_CLOUD_STORAGE
         assert observation.identity_key == "cloud_storage:s3:example-assets"
-        assert observation.identifiers == (
-            ("url", "https://example-assets.s3.amazonaws.com/"),
-        )
+        assert observation.identifiers == (("url", "https://example-assets.s3.amazonaws.com/"),)
 
 
 class TestReconciliationIsDeterministic:

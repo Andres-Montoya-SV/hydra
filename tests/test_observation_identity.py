@@ -80,9 +80,7 @@ class TestObservationsForHost:
             if d.observation_type == OBSERVATION_TYPE_DNS_POSTURE_TAG
         ]
         assert {d.evidence.detail for d in drafts} == {"spf", "weak-spf"}
-        assert {d.identity_key for d in drafts} == {
-            "dns_record:example.com:TXT:v=spf1 +all"
-        }
+        assert {d.identity_key for d in drafts} == {"dns_record:example.com:TXT:v=spf1 +all"}
         assert all(d.asset_type == "dns_record" for d in drafts)
 
     def test_duplicate_dns_security_tags_are_collapsed(self) -> None:
