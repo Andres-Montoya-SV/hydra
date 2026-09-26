@@ -113,8 +113,7 @@ def _write_oos_escape_template(templates_dir: Path, oos_port: int) -> None:
     not "is this address routable" based.
     """
     templates_dir.mkdir(parents=True, exist_ok=True)
-    (templates_dir / "oos_escape.yaml").write_text(
-        f"""\
+    (templates_dir / "oos_escape.yaml").write_text(f"""\
 id: test-oos-escape
 info:
   name: test oos escape
@@ -131,8 +130,7 @@ http:
       - type: status
         status:
           - 200
-"""
-    )
+""")
 
 
 async def _run_nuclei_through_proxy(

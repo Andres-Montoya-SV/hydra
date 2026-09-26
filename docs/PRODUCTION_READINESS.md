@@ -1,3 +1,9 @@
+> **2026-09-26 scope correction:** the certification below describes an earlier
+> CLI/core revision. It does **not** certify the current multi-tenant EASM or
+> frontend for production. The current release assessment is
+> [EASM release audit](EASM_RELEASE_AUDIT.md); unresolved release blockers there
+> take precedence over the historical verdict below.
+
 # Hydra — Production Readiness Certification
 
 **Status: certification, not a hardening round.** Branch

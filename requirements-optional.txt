@@ -15,11 +15,10 @@ openai==3.13.0
 # Markdown format (the command's default) needs no extra dependency at
 # all; this is only required for the --format docx option.
 python-docx==1.2.0
-# TLS/certificate posture (modules/sslyze.py) — opt-in
-# (ENABLE_SSLYZE=true). Pure Python, no other system dependency
-# (confirmed by installing and running it for real during that module's
-# own development — see its docstring).
-sslyze==6.3.1
+# Certificate parsing for archived SSLyze output. SSLyze execution is on a
+# security hold: 6.3.1 requires cryptography<47; fixes require >=50.
+# See docs/SSLYZE_SECURITY_HOLD.md. Do not reinstall it with --no-deps.
+cryptography==50.0.1
 # WAF/CDN fingerprinting (modules/wafw00f.py) — opt-in
 # (ENABLE_WAFW00F=true). Pure Python, no other system dependency.
 wafw00f==2.4.2

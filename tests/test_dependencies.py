@@ -27,13 +27,19 @@ class TestRegistry:
         assert anew.allow_smoke_test
         assert not anew.version_commands
 
-    def test_sslyze_and_wafw00f_are_pip_installable(self) -> None:
-        for name in ("sslyze", "wafw00f"):
+    def test_wafw00f_is_pip_installable(self) -> None:
+        for name in ("wafw00f",):
             defn = get_tool_definition(name)
             assert defn.install_pip == name
             methods = defn.install_methods()
             assert any(m.kind is InstallKind.PIP for m in methods)
             assert install_hint_for(defn, is_macos=True, is_linux=False) == f"pip install {name}"
+
+    def test_sslyze_cannot_be_automatically_reinstalled_during_security_hold(self) -> None:
+        defn = get_tool_definition("sslyze")
+        assert defn.install_pip is None
+        assert all(m.kind is InstallKind.MANUAL for m in defn.install_methods())
+        assert "Security hold" in install_hint_for(defn, is_macos=False, is_linux=True)
 
     def test_theharvester_has_no_fabricated_install_category(self) -> None:
         """Genuinely none of homebrew/apt/go/pip fit (requires Python

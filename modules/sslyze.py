@@ -1,5 +1,9 @@
 """sslyze TLS/certificate posture plugin (optional, active).
 
+SECURITY HOLD (2026-09-26): execution and automatic installation are blocked
+until an upstream release accepts patched cryptography. The historical design
+below and pure parser remain for archived evidence; see SSLYZE_SECURITY_HOLD.md.
+
 **Why sslyze over testssl.sh**: sslyze is a pure Python package
 (`pip install sslyze`, confirmed against its real current PyPI page and
 its `pyproject.toml` — no other system dependency), so it installs into
@@ -81,6 +85,8 @@ from core.plugin_base import PluginResult
 from modules._base import BaseToolPlugin
 from utils.files import write_jsonl
 
+# Not an operator/environment bypass: removal requires a reviewed dependency fix.
+SSLYZE_SECURITY_HOLD = True
 _MAX_HOSTS_PER_RUN = 10
 _WEAK_PROTOCOL_KEYS = (
     "ssl_2_0_cipher_suites",
@@ -102,7 +108,7 @@ class SslyzePlugin(BaseToolPlugin):
     # TLS configuration is a live, time-varying property (cert renewal,
     # config changes) — never silently replay a stale scan result.
     cacheable = False
-    install_hint_macos = "pip install sslyze  (requirements-optional.txt)"
+    install_hint_macos = "Security hold: see docs/SSLYZE_SECURITY_HOLD.md"
     install_hint_linux = install_hint_macos
 
     def is_enabled(self) -> bool:
@@ -112,6 +118,10 @@ class SslyzePlugin(BaseToolPlugin):
         return self.settings.sslyze_path
 
     async def run(self, context: PipelineContext, input_path: Path) -> PluginResult:
+        if SSLYZE_SECURITY_HOLD:
+            message = "SSLyze execution blocked: vulnerable dependency; see SSLYZE_SECURITY_HOLD.md"
+            context.add_warning(message)
+            return PluginResult(success=False, message=message)
         alive_urls = self._alive_urls(context)
         https_urls = [u for u in alive_urls if u.startswith("https://")]
         if not https_urls:

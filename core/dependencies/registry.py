@@ -233,7 +233,7 @@ _register(
         version_commands=(("--version",),),
         health_commands=(("--help",),),
         capabilities=frozenset({"tls_posture", "certificate_analysis"}),
-        install_pip="sslyze",
+        install_manual="Security hold: see docs/SSLYZE_SECURITY_HOLD.md; do not install SSLyze.",
     )
 )
 
