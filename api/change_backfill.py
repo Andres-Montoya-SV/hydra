@@ -51,6 +51,7 @@ class ChangeDetectionSummary:
     relevant_run_checks: int
     change_events_recorded: int
     change_events_already_present: int
+    assets_skipped_unsupported_type: int
 
 
 def detect_and_record_changes_for_organization(
@@ -78,10 +79,24 @@ def detect_and_record_changes_for_organization(
     relevant_run_checks = 0
     change_events_recorded = 0
     change_events_already_present = 0
+    assets_skipped_unsupported_type = 0
 
     for asset in control_db.list_assets_for_organization(organization_id):
         assets_processed += 1
-        host = host_for_asset(asset_type=asset.asset_type, identity_key=asset.identity_key)
+        try:
+            host = host_for_asset(asset_type=asset.asset_type, identity_key=asset.identity_key)
+        except ValueError:
+            # `host_for_asset` only knows how to extract a domain for the
+            # four host-shaped asset types (domain/port/dns_record/url).
+            # A type it doesn't recognize (e.g. `cloud_storage`, which has
+            # no single domain a scan's target could ever "cover") must
+            # never abort change detection for every OTHER asset this
+            # organization has — that would turn one unsupported asset
+            # type into a denial of the whole detection pass, which is a
+            # worse failure than the narrow case this loop can't yet
+            # handle. Skipped, counted, never silently guessed at.
+            assets_skipped_unsupported_type += 1
+            continue
         relevant_scans = [s for s in scans if domain_is_covered(host, s.domain)]
 
         run_outcomes = []
@@ -123,4 +138,5 @@ def detect_and_record_changes_for_organization(
         relevant_run_checks=relevant_run_checks,
         change_events_recorded=change_events_recorded,
         change_events_already_present=change_events_already_present,
+        assets_skipped_unsupported_type=assets_skipped_unsupported_type,
     )

@@ -1617,9 +1617,18 @@ class ControlDB:
             ).fetchone()
         return None if row is None else _asset_record_from_row(row)
 
-    def get_asset(self, asset_id: str) -> AssetRecord | None:
+    def get_asset(self, organization_id: str, asset_id: str) -> AssetRecord | None:
+        """Tenant-safe by construction — mirrors `get_exposure_for_organization`'s
+        own "a mismatched organization is indistinguishable from an unknown
+        id" discipline, rather than the bare `WHERE asset_id = ?` this
+        method originally had (a latent cross-tenant IDOR: unreachable
+        today only because nothing calls it yet, closed before any future
+        router gets the chance to)."""
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM assets WHERE asset_id = ?", (asset_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM assets WHERE organization_id = ? AND asset_id = ?",
+                (organization_id, asset_id),
+            ).fetchone()
         return None if row is None else _asset_record_from_row(row)
 
     def existing_assets_for_organization(self, organization_id: str) -> dict[str, ExistingAsset]:
@@ -1844,11 +1853,18 @@ class ControlDB:
                 ).fetchall()
         return [_candidate_asset_record_from_row(row) for row in rows]
 
-    def get_candidate_asset(self, candidate_asset_id: str) -> CandidateAssetRecord | None:
+    def get_candidate_asset(
+        self, organization_id: str, candidate_asset_id: str
+    ) -> CandidateAssetRecord | None:
+        """Tenant-safe by construction — see `get_asset`'s identical note;
+        this method originally had no `organization_id` filter at all, a
+        latent cross-tenant IDOR unreachable only because nothing calls it
+        yet."""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM candidate_assets WHERE candidate_asset_id = ?",
-                (candidate_asset_id,),
+                "SELECT * FROM candidate_assets WHERE organization_id = ? "
+                "AND candidate_asset_id = ?",
+                (organization_id, candidate_asset_id),
             ).fetchone()
         return None if row is None else _candidate_asset_record_from_row(row)
 
@@ -2371,12 +2387,18 @@ class ControlDB:
                     break
         return list(found.values()), False
 
-    def list_relationship_evidence(self, relationship_id: str) -> list[RelationshipEvidenceRecord]:
+    def list_relationship_evidence(
+        self, organization_id: str, relationship_id: str
+    ) -> list[RelationshipEvidenceRecord]:
+        """Tenant-safe by construction — mirrors `list_exposure_evidence`'s
+        own `(organization_id, exposure_id)` scoping; this method
+        originally took only `relationship_id`, a latent cross-tenant IDOR
+        unreachable only because no Relationships API router exists yet."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM relationship_evidence WHERE relationship_id = ? "
-                "ORDER BY observed_at, relationship_evidence_id",
-                (relationship_id,),
+                "SELECT * FROM relationship_evidence WHERE organization_id = ? "
+                "AND relationship_id = ? ORDER BY observed_at, relationship_evidence_id",
+                (organization_id, relationship_id),
             ).fetchall()
         return [_relationship_evidence_record_from_row(row) for row in rows]
 
