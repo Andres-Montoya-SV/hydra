@@ -60,6 +60,7 @@ from core.assets import Host
 OBSERVATION_TYPE_DOMAIN_RESOLVED = "domain_resolved"
 OBSERVATION_TYPE_PORT_OPEN = "port_open"
 OBSERVATION_TYPE_DNS_RECORD_PRESENT = "dns_record_present"
+OBSERVATION_TYPE_DNS_POSTURE_TAG = "dns_posture_tag"
 OBSERVATION_TYPE_URL_DISCOVERED = "url_discovered"
 OBSERVATION_TYPE_TECHNOLOGY_DETECTED = "technology_detected"
 OBSERVATION_TYPE_SECURITY_HEADER_PRESENT = "security_header_present"
@@ -131,18 +132,32 @@ def observations_for_host(host: Host) -> list[ObservationDraft]:
         )
 
     for record in host.dns_records:
+        record_key = dns_record_identity_key(
+            host=record.host, record_type=record.record_type, value=record.value
+        )
         drafts.append(
             ObservationDraft(
                 asset_type=ASSET_TYPE_DNS_RECORD,
-                identity_key=dns_record_identity_key(
-                    host=record.host, record_type=record.record_type, value=record.value
-                ),
+                identity_key=record_key,
                 observation_type=OBSERVATION_TYPE_DNS_RECORD_PRESENT,
                 evidence=EvidenceContent(
                     source=record.source, detail="", confidence_score=record.confidence_score
                 ),
             )
         )
+        for tag in sorted(set(record.security_tags)):
+            drafts.append(
+                ObservationDraft(
+                    asset_type=ASSET_TYPE_DNS_RECORD,
+                    identity_key=record_key,
+                    observation_type=OBSERVATION_TYPE_DNS_POSTURE_TAG,
+                    evidence=EvidenceContent(
+                        source=record.source,
+                        detail=tag,
+                        confidence_score=record.confidence_score,
+                    ),
+                )
+            )
 
     for url in host.urls:
         drafts.append(
