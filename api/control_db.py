@@ -29,6 +29,7 @@ from typing import Literal
 
 from api.asset_identity import ExistingAsset, ReconciliationDecision
 from api.candidate_assets import CandidateAssetDraft
+from api.exposure_identity import ExposureDraft
 from api.observation_identity import EvidenceContent
 from api.relationship_identity import RelationshipDraft
 from core.store import connect_sqlite
@@ -233,6 +234,69 @@ CREATE TABLE IF NOT EXISTS change_events (
 );
 CREATE INDEX IF NOT EXISTS idx_change_events_asset ON change_events(asset_id, detected_at);
 CREATE INDEX IF NOT EXISTS idx_change_events_run ON change_events(run_id);
+
+-- Fase 08 (EASM roadmap): durable external exposures. A raw Finding remains
+-- a run-scoped detector result in the per-account AssetStore; this table is
+-- the cross-run EASM identity of a security-relevant condition on one durable
+-- Asset. Identity is exact and deterministic: organization + asset + source +
+-- template + normalized location. No fuzzy deduplication, AI classification,
+-- or ownership/scope inference occurs here.
+CREATE TABLE IF NOT EXISTS exposures (
+    exposure_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    source TEXT NOT NULL,
+    template_id TEXT NOT NULL,
+    location TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    confidence_score INTEGER,
+    status TEXT NOT NULL DEFAULT 'open',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    first_seen_run_id TEXT NOT NULL,
+    last_seen_run_id TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_run_id TEXT,
+    resolution_reason TEXT,
+    UNIQUE (organization_id, asset_id, source, template_id, location)
+);
+CREATE INDEX IF NOT EXISTS idx_exposures_organization
+    ON exposures(organization_id, status, severity);
+CREATE INDEX IF NOT EXISTS idx_exposures_asset
+    ON exposures(asset_id, status, last_seen_at);
+
+-- Immutable per-run support for an Exposure. The source finding remains in
+-- its original AssetStore; this row records which account/run/finding id
+-- supported the durable exposure so an analyst can trace it back precisely.
+CREATE TABLE IF NOT EXISTS exposure_evidence (
+    exposure_evidence_id TEXT PRIMARY KEY,
+    exposure_id TEXT NOT NULL REFERENCES exposures(exposure_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    account_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    finding_id INTEGER NOT NULL,
+    observed_at TEXT NOT NULL,
+    UNIQUE (exposure_id, run_id, finding_id)
+);
+CREATE INDEX IF NOT EXISTS idx_exposure_evidence_exposure
+    ON exposure_evidence(exposure_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_exposure_evidence_run
+    ON exposure_evidence(organization_id, run_id);
+
+CREATE TABLE IF NOT EXISTS exposure_history (
+    event_id TEXT PRIMARY KEY,
+    exposure_id TEXT NOT NULL REFERENCES exposures(exposure_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    event_type TEXT NOT NULL CHECK(event_type IN ('observed','reopened','resolved')),
+    happened_at TEXT NOT NULL,
+    run_id TEXT,
+    reason TEXT NOT NULL,
+    UNIQUE(exposure_id, event_type, run_id, happened_at)
+);
+CREATE INDEX IF NOT EXISTS idx_exposure_history
+    ON exposure_history(organization_id, exposure_id, happened_at);
 
 -- Fase 06 (EASM roadmap): organization-scoped Candidate Assets. The
 -- run-scoped `core.store.intel_indicators` rows remain the source event;
@@ -937,6 +1001,39 @@ class AssetRecord:
     first_seen_at: str
     last_seen_at: str
     last_seen_run_id: str | None
+
+
+@dataclass(frozen=True)
+class ExposureRecord:
+    exposure_id: str
+    organization_id: str
+    asset_id: str
+    source: str
+    template_id: str
+    location: str
+    severity: str
+    title: str
+    description: str
+    confidence_score: int | None
+    status: str
+    first_seen_at: str
+    last_seen_at: str
+    first_seen_run_id: str
+    last_seen_run_id: str
+    resolved_at: str | None
+    resolved_run_id: str | None
+    resolution_reason: str | None
+
+
+@dataclass(frozen=True)
+class ExposureEvidenceRecord:
+    exposure_evidence_id: str
+    exposure_id: str
+    organization_id: str
+    account_id: str
+    run_id: str
+    finding_id: int
+    observed_at: str
 
 
 @dataclass(frozen=True)
@@ -1716,6 +1813,218 @@ class ControlDB:
                 (candidate_asset_id,),
             ).fetchone()
         return None if row is None else _candidate_asset_record_from_row(row)
+
+    # --- exposures (Fase 08, EASM roadmap) -----------------------------
+
+    def upsert_exposure(
+        self,
+        *,
+        organization_id: str,
+        account_id: str,
+        run_id: str,
+        finding_id: int,
+        draft: ExposureDraft,
+        observed_at: str | None = None,
+    ) -> tuple[str, bool, bool]:
+        """Persist one durable Exposure plus this run's supporting Finding.
+
+        Re-observing an exposure reopens it if it had previously been
+        explicitly resolved. Absence from a later run does NOT resolve it:
+        Hydra does not yet persist enough per-provider execution outcome to
+        prove that "missing finding" means "collector ran successfully and
+        confirmed the condition is gone."
+        """
+        if finding_id <= 0 or not draft.source.strip() or not draft.template_id.strip():
+            raise ValueError("exposure requires a finding and a detector rule")
+        observed_at = observed_at or _now_iso()
+        with self._connect() as conn:
+            asset = conn.execute(
+                "SELECT organization_id FROM assets WHERE asset_id = ?",
+                (draft.asset_id,),
+            ).fetchone()
+            if asset is None or str(asset["organization_id"]) != organization_id:
+                raise ValueError("exposure asset_id does not belong to organization")
+
+            scan = conn.execute(
+                "SELECT account_id, organization_id FROM scans WHERE scan_id = ?", (run_id,)
+            ).fetchone()
+            if (
+                scan is None
+                or scan["organization_id"] != organization_id
+                or scan["account_id"] != account_id
+            ):
+                raise ValueError("exposure evidence run does not belong to account/organization")
+
+            row = conn.execute(
+                "SELECT * FROM exposures WHERE organization_id = ? "
+                "AND asset_id = ? AND source = ? AND template_id = ? AND location = ?",
+                (
+                    organization_id,
+                    draft.asset_id,
+                    draft.source,
+                    draft.template_id,
+                    draft.location,
+                ),
+            ).fetchone()
+            created = row is None
+            if row is not None:
+                duplicate = conn.execute(
+                    "SELECT 1 FROM exposure_evidence WHERE exposure_id = ? "
+                    "AND run_id = ? AND finding_id = ?",
+                    (row["exposure_id"], run_id, finding_id),
+                ).fetchone()
+                if duplicate is not None:
+                    return str(row["exposure_id"]), False, False
+            reopening = bool(
+                row is not None
+                and row["status"] == "resolved"
+                and observed_at > (row["resolved_at"] or row["last_seen_at"])
+            )
+            if created:
+                exposure_id = secrets.token_hex(16)
+                conn.execute(
+                    "INSERT INTO exposures (exposure_id, organization_id, asset_id, source, "
+                    "template_id, location, severity, title, description, confidence_score, "
+                    "status, first_seen_at, last_seen_at, first_seen_run_id, last_seen_run_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
+                    (
+                        exposure_id,
+                        organization_id,
+                        draft.asset_id,
+                        draft.source,
+                        draft.template_id,
+                        draft.location,
+                        draft.severity,
+                        draft.title,
+                        draft.description,
+                        draft.confidence_score,
+                        observed_at,
+                        observed_at,
+                        run_id,
+                        run_id,
+                    ),
+                )
+            else:
+                exposure_id = str(row["exposure_id"])
+                conn.execute(
+                    "UPDATE exposures SET severity = ?, title = ?, description = ?, "
+                    "confidence_score = ?, status = ?, last_seen_at = ?, "
+                    "last_seen_run_id = ? WHERE exposure_id = ? AND organization_id = ? "
+                    "AND last_seen_at <= ?",
+                    (
+                        draft.severity,
+                        draft.title,
+                        draft.description,
+                        draft.confidence_score,
+                        "reopened" if reopening else row["status"],
+                        observed_at,
+                        run_id,
+                        exposure_id,
+                        organization_id,
+                        observed_at,
+                    ),
+                )
+
+            exposure_evidence_id = secrets.token_hex(16)
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO exposure_evidence "
+                "(exposure_evidence_id, exposure_id, organization_id, account_id, "
+                "run_id, finding_id, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    exposure_evidence_id,
+                    exposure_id,
+                    organization_id,
+                    account_id,
+                    run_id,
+                    finding_id,
+                    observed_at,
+                ),
+            )
+            evidence_created = bool(cursor.rowcount)
+            if evidence_created:
+                conn.execute(
+                    "INSERT OR IGNORE INTO exposure_history "
+                    "(event_id, exposure_id, organization_id, event_type, happened_at, run_id, reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        secrets.token_hex(16),
+                        exposure_id,
+                        organization_id,
+                        "reopened" if reopening else "observed",
+                        observed_at,
+                        run_id,
+                        f"{draft.source}:{draft.template_id}; finding={finding_id}",
+                    ),
+                )
+        return exposure_id, created, evidence_created
+
+    def resolve_exposure(
+        self,
+        *,
+        organization_id: str,
+        exposure_id: str,
+        resolved_at: str,
+        resolution_reason: str,
+        resolved_run_id: str | None = None,
+    ) -> bool:
+        """Explicitly resolve one exposure; absence from a run never calls this."""
+        if not resolution_reason.strip():
+            raise ValueError("resolution requires a reason")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE exposures SET status = 'resolved', resolved_at = ?, "
+                "resolved_run_id = ?, resolution_reason = ? "
+                "WHERE exposure_id = ? AND organization_id = ? AND status != 'resolved' "
+                "AND last_seen_at <= ?",
+                (
+                    resolved_at,
+                    resolved_run_id,
+                    resolution_reason,
+                    exposure_id,
+                    organization_id,
+                    resolved_at,
+                ),
+            )
+            if cursor.rowcount:
+                conn.execute(
+                    "INSERT INTO exposure_history "
+                    "(event_id, exposure_id, organization_id, event_type, happened_at, run_id, reason) "
+                    "VALUES (?, ?, ?, 'resolved', ?, ?, ?)",
+                    (
+                        secrets.token_hex(16),
+                        exposure_id,
+                        organization_id,
+                        resolved_at,
+                        resolved_run_id,
+                        resolution_reason,
+                    ),
+                )
+        return bool(cursor.rowcount)
+
+    def list_exposures_for_organization(
+        self,
+        organization_id: str,
+        *,
+        status: str | None = None,
+        severity: str | None = None,
+    ) -> list[ExposureRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM exposures WHERE organization_id = ? "
+                "AND (? IS NULL OR status = ?) AND (? IS NULL OR severity = ?) "
+                "ORDER BY first_seen_at, exposure_id",
+                (organization_id, status, status, severity, severity),
+            ).fetchall()
+        return [_exposure_record_from_row(row) for row in rows]
+
+    def list_exposure_evidence(self, exposure_id: str) -> list[ExposureEvidenceRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM exposure_evidence WHERE exposure_id = ? "
+                "ORDER BY observed_at, exposure_evidence_id",
+                (exposure_id,),
+            ).fetchall()
+        return [_exposure_evidence_record_from_row(row) for row in rows]
 
     # --- relationships (Fase 07, EASM roadmap) -------------------------
 
@@ -3715,6 +4024,41 @@ def _asset_record_from_row(row: sqlite3.Row) -> AssetRecord:
         first_seen_at=row["first_seen_at"],
         last_seen_at=row["last_seen_at"],
         last_seen_run_id=row["last_seen_run_id"],
+    )
+
+
+def _exposure_record_from_row(row: sqlite3.Row) -> ExposureRecord:
+    return ExposureRecord(
+        exposure_id=row["exposure_id"],
+        organization_id=row["organization_id"],
+        asset_id=row["asset_id"],
+        source=row["source"],
+        template_id=row["template_id"],
+        location=row["location"],
+        severity=row["severity"],
+        title=row["title"],
+        description=row["description"],
+        confidence_score=row["confidence_score"],
+        status=row["status"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        first_seen_run_id=row["first_seen_run_id"],
+        last_seen_run_id=row["last_seen_run_id"],
+        resolved_at=row["resolved_at"],
+        resolved_run_id=row["resolved_run_id"],
+        resolution_reason=row["resolution_reason"],
+    )
+
+
+def _exposure_evidence_record_from_row(row: sqlite3.Row) -> ExposureEvidenceRecord:
+    return ExposureEvidenceRecord(
+        exposure_evidence_id=row["exposure_evidence_id"],
+        exposure_id=row["exposure_id"],
+        organization_id=row["organization_id"],
+        account_id=row["account_id"],
+        run_id=row["run_id"],
+        finding_id=int(row["finding_id"]),
+        observed_at=row["observed_at"],
     )
 
 
