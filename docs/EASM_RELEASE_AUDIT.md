@@ -50,6 +50,11 @@ authorization path, or treating frontend demo data as live backend data.
   resource identity on replay. Correct the test to inspect the documented
   observation wrapper. Preserve the reviewed DNS and visual changes when
   resolving the stacked branch conflicts.
+- Dependencies: upgrade python-dotenv from 1.0.1 to patched 1.2.2 in both
+  dependency manifests for GHSA-mf9w-mj56-hr94; add a runtime pip-audit CI gate
+  and weekly dependency/action update PRs. The corrected runtime audit reports
+  no known vulnerabilities (this does not audit the separate Go binaries).
+  Advisory: https://github.com/theskumar/python-dotenv/security/advisories/GHSA-mf9w-mj56-hr94
 - CI: pin checkout/setup-python to verified commit SHAs, restrict token to
   contents:read, bound job runtime, and run real-container checks on merged
   main as well as PRs. Keep all existing confinement checks.
@@ -79,6 +84,18 @@ hidden by changing the tests. Container CI provides the separate real-tool
 validation; use the exact commit's Actions results for release evidence.
 Three different Python versions do not count as three complete consecutive
 pipeline runs. No phase is certified against that original requirement here.
+
+## Repository enforcement
+
+The active backend ruleset `main-protection` (ID 23964855) requires a pull
+request and blocks deletion/force pushes, but its `required_status_checks`
+list is **empty**. CI success is currently a review discipline, not an enforced
+merge gate. Configure required `check (3.10)`, `check (3.11)`, `check (3.12)` and
+`docker` and `dependency-audit` checks and require an up-to-date branch (or a tested merge queue).
+The frontend and styling ruleset listings are empty; that does not establish
+whether legacy branch protection exists. Verify their protection and require
+`validate` before merging. The connected GitHub capability does not provide
+administration writes, so these settings were not changed or claimed enforced.
 
 ## Remaining deployment acceptance
 
