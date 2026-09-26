@@ -369,3 +369,98 @@ class TestRelationshipBackfill:
             )
 
         assert control_db.list_relationships_for_organization(org_a) == []
+
+
+def test_bounded_neighborhood_volume_and_tenant_isolation(control_db: ControlDB) -> None:
+    """3,000 edges, cycles, depth bound, result cap and foreign roots."""
+    from time import perf_counter
+
+    account = control_db.create_account(email="volume@example.com")
+    org, _ = control_db.list_organizations_for_account(account)[0]
+    other = control_db.create_account(email="other-volume@example.com")
+    other_org, _ = control_db.list_organizations_for_account(other)[0]
+    control_db.apply_asset_reconciliation(
+        organization_id=org,
+        run_id="volume-run",
+        observed_at="2026-01-01",
+        decisions=[
+            ReconciliationDecision(
+                asset_id="root",
+                asset_type="domain",
+                identity_key="domain:0",
+                is_new=True,
+                identifiers=(),
+            )
+        ],
+    )
+    # Persist a realistic graph efficiently; every edge has supporting evidence.
+    with control_db._connect() as conn:
+        conn.executemany(
+            "INSERT INTO relationships (relationship_id, organization_id, source_entity, "
+            "relationship_type, target_entity, confidence, first_seen_at, last_seen_at, "
+            "last_seen_run_id) VALUES (?, ?, ?, 'SHARES_IPV4', ?, 'HIGH', ?, ?, ?)",
+            [
+                (
+                    f"edge-{i:05}",
+                    org,
+                    f"domain:{i}",
+                    f"domain:{(i+1)%3000}",
+                    "2026-01-01",
+                    "2026-01-01",
+                    "volume-run",
+                )
+                for i in range(3000)
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO relationship_evidence (relationship_evidence_id, relationship_id, "
+            "organization_id, run_id, source_evidence_id, observed_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (f"ev-{i}", f"edge-{i:05}", org, "volume-run", f"source-{i}", "2026-01-01")
+                for i in range(3000)
+            ],
+        )
+    start = perf_counter()
+    edges, truncated = control_db.relationship_neighborhood(org, "root", max_depth=3)
+    elapsed = perf_counter() - start
+    assert len(edges) == 6
+    assert not truncated
+    assert elapsed < 2.0, f"3000-edge graph took {elapsed:.3f}s"
+    limited, truncated = control_db.relationship_neighborhood(org, "root", max_depth=8, max_edges=3)
+    assert len(limited) == 3 and truncated
+    assert control_db.relationship_neighborhood(other_org, "root") == ([], False)
+    with pytest.raises(ValueError):
+        control_db.relationship_neighborhood(org, "root", max_depth=100)
+    print(f"3000-edge neighborhood: {elapsed:.6f}s; 6 edges at depth 3")
+
+
+def test_relationship_rejects_empty_evidence_and_foreign_run(
+    control_db: ControlDB, api_settings: APISettings
+) -> None:
+    from dataclasses import replace
+
+    account = control_db.create_account(email="evidence-boundary@example.com")
+    org, _ = control_db.list_organizations_for_account(account)[0]
+    other = control_db.create_account(email="evidence-other@example.com")
+    other_org, _ = control_db.list_organizations_for_account(other)[0]
+    run = _relationship_scan(control_db, api_settings, account_id=account, organization_id=org)
+    draft = relationship_from_rows(
+        {
+            "source_entity": "domain:a",
+            "target_entity": "domain:b",
+            "relationship_type": "SHARES_IPV4",
+            "confidence": "HIGH",
+            "evidence_id": "ev",
+        },
+        {"evidence_id": "ev"},
+    )
+    assert draft is not None
+    with pytest.raises(ValueError, match="requires traceable evidence"):
+        control_db.upsert_relationship(
+            organization_id=org,
+            run_id=run,
+            draft=replace(draft, evidence=replace(draft.evidence, source_evidence_id="")),
+        )
+    with pytest.raises(ValueError, match="run does not belong"):
+        control_db.upsert_relationship(organization_id=other_org, run_id=run, draft=draft)
+    assert control_db.list_relationships_for_organization(other_org) == []

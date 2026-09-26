@@ -1736,6 +1736,8 @@ class ControlDB:
         they never participate in identity or authorization. Returns
         (relationship_id, created, evidence_created).
         """
+        if draft.evidence is None or not draft.evidence.source_evidence_id.strip():
+            raise ValueError("relationship requires traceable evidence")
         observed_at = observed_at or _now_iso()
 
         with self._connect() as conn:
@@ -1751,6 +1753,12 @@ class ControlDB:
                 ).fetchone()
                 if row is None or str(row["organization_id"]) != organization_id:
                     raise ValueError(f"{label}_asset_id does not belong to organization")
+
+            scan = conn.execute(
+                "SELECT organization_id FROM scans WHERE scan_id = ?", (run_id,)
+            ).fetchone()
+            if scan is None or scan["organization_id"] != organization_id:
+                raise ValueError("run does not belong to organization")
 
             row = conn.execute(
                 "SELECT relationship_id FROM relationships "
@@ -1853,6 +1861,59 @@ class ControlDB:
                     (organization_id, relationship_type),
                 ).fetchall()
         return [_relationship_record_from_row(row) for row in rows]
+
+    def relationship_neighborhood(
+        self,
+        organization_id: str,
+        asset_id: str,
+        *,
+        max_depth: int = 1,
+        max_edges: int = 1000,
+    ) -> tuple[list[RelationshipRecord], bool]:
+        """Bounded breadth-first graph view; no scope or ownership inference.
+
+        Returns (edges, truncated). Explicit limits prevent dense cyclic graphs
+        from expanding without bound. An unknown/foreign asset returns no data.
+        """
+        if not 1 <= max_depth <= 8 or not 1 <= max_edges <= 5000:
+            raise ValueError("depth must be 1..8 and max_edges 1..5000")
+        with self._connect() as conn:
+            asset = conn.execute(
+                "SELECT identity_key FROM assets WHERE organization_id = ? AND asset_id = ?",
+                (organization_id, asset_id),
+            ).fetchone()
+            if asset is None:
+                return [], False
+            frontier = {str(asset["identity_key"])}
+            visited: set[str] = set()
+            found: dict[str, RelationshipRecord] = {}
+            for _ in range(max_depth):
+                visited.update(frontier)
+                following: set[str] = set()
+                ordered = sorted(frontier)
+                for offset in range(0, len(ordered), 200):
+                    chunk = ordered[offset : offset + 200]
+                    rows = conn.execute(
+                        "WITH frontier AS (SELECT value FROM json_each(?)) "
+                        "SELECT r.* FROM relationships r WHERE r.organization_id = ? "
+                        "AND (r.source_entity IN (SELECT value FROM frontier) "
+                        "OR r.target_entity IN (SELECT value FROM frontier)) "
+                        "AND EXISTS (SELECT 1 FROM relationship_evidence e "
+                        "WHERE e.relationship_id = r.relationship_id "
+                        "AND e.organization_id = r.organization_id) "
+                        "ORDER BY r.relationship_id LIMIT ?",
+                        (json.dumps(chunk), organization_id, max_edges + 1),
+                    ).fetchall()
+                    for row in rows:
+                        edge = _relationship_record_from_row(row)
+                        if edge.relationship_id not in found and len(found) >= max_edges:
+                            return list(found.values()), True
+                        found[edge.relationship_id] = edge
+                        following.update((edge.source_entity, edge.target_entity))
+                frontier = following - visited
+                if not frontier:
+                    break
+        return list(found.values()), False
 
     def list_relationship_evidence(self, relationship_id: str) -> list[RelationshipEvidenceRecord]:
         with self._connect() as conn:

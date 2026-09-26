@@ -92,3 +92,19 @@ Nothing in the Fase 07 tables feeds `CollectionScope` or
 - no graph traversal that expands active scan scope
 - no migration of legacy `graph_nodes` / `graph_edges` yet
 - no API router yet; that belongs to the API-surface phase
+
+## Integration review — 2026-09-26
+
+The persistence boundary now rejects empty evidence identifiers and a run owned
+by a different organization, independently of the normalizer. The graph remains
+a projection of `core.intel.model.Relationship`, per Fase 01's absorb decision;
+no second correlation engine was introduced.
+
+`relationship_neighborhood(organization_id, asset_id, max_depth=1, max_edges=1000)`
+provides bounded breadth-first traversal (depth 1–8; edges 1–5000). Foreign roots
+return the same empty response as missing roots. Edges without evidence are
+excluded, cycles terminate, and truncation is explicit.
+
+Measured fixture: 3,000-edge cyclic graph, depth 3 -> 6 edges in 0.003733 seconds
+on the review runner. The regression test also verifies the edge cap and tenant
+isolation. This measures the fixture, not a production latency guarantee.
