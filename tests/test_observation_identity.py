@@ -97,6 +97,33 @@ class TestObservationsForHost:
         assert drafts[0].evidence.detail == "nginx"
         assert drafts[0].evidence.confidence_score == 90
 
+    def test_a_versioned_technology_preserves_version_in_cross_run_evidence(self) -> None:
+        host = Host(
+            domain="example.com",
+            http_services=[
+                HttpService(
+                    url="https://example.com/",
+                    host="example.com",
+                    technologies=[
+                        TechnologyFinding(
+                            name="nginx",
+                            version="1.26.2",
+                            source="whatweb",
+                            confidence=80,
+                        )
+                    ],
+                )
+            ],
+        )
+        drafts = [
+            d
+            for d in observations_for_host(host)
+            if d.observation_type == OBSERVATION_TYPE_TECHNOLOGY_DETECTED
+        ]
+        assert len(drafts) == 1
+        assert drafts[0].evidence.detail == "nginx@1.26.2"
+        assert drafts[0].evidence.source == "whatweb"
+
     def test_a_present_security_header_is_attached_to_the_domain_asset(self) -> None:
         host = Host(
             domain="example.com",
