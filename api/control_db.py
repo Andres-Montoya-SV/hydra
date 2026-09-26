@@ -234,6 +234,56 @@ CREATE TABLE IF NOT EXISTS change_events (
 CREATE INDEX IF NOT EXISTS idx_change_events_asset ON change_events(asset_id, detected_at);
 CREATE INDEX IF NOT EXISTS idx_change_events_run ON change_events(run_id);
 
+-- Fase 08 (EASM roadmap): durable external exposures. A raw Finding remains
+-- a run-scoped detector result in the per-account AssetStore; this table is
+-- the cross-run EASM identity of a security-relevant condition on one durable
+-- Asset. Identity is exact and deterministic: organization + asset + source +
+-- template + normalized location. No fuzzy deduplication, AI classification,
+-- or ownership/scope inference occurs here.
+CREATE TABLE IF NOT EXISTS exposures (
+    exposure_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    source TEXT NOT NULL,
+    template_id TEXT NOT NULL,
+    location TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    confidence_score INTEGER,
+    status TEXT NOT NULL DEFAULT 'open',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    first_seen_run_id TEXT NOT NULL,
+    last_seen_run_id TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_run_id TEXT,
+    resolution_reason TEXT,
+    UNIQUE (organization_id, asset_id, source, template_id, location)
+);
+CREATE INDEX IF NOT EXISTS idx_exposures_organization
+    ON exposures(organization_id, status, severity);
+CREATE INDEX IF NOT EXISTS idx_exposures_asset
+    ON exposures(asset_id, status, last_seen_at);
+
+-- Immutable per-run support for an Exposure. The source finding remains in
+-- its original AssetStore; this row records which account/run/finding id
+-- supported the durable exposure so an analyst can trace it back precisely.
+CREATE TABLE IF NOT EXISTS exposure_evidence (
+    exposure_evidence_id TEXT PRIMARY KEY,
+    exposure_id TEXT NOT NULL REFERENCES exposures(exposure_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    account_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    finding_id INTEGER NOT NULL,
+    observed_at TEXT NOT NULL,
+    UNIQUE (exposure_id, run_id, finding_id)
+);
+CREATE INDEX IF NOT EXISTS idx_exposure_evidence_exposure
+    ON exposure_evidence(exposure_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_exposure_evidence_run
+    ON exposure_evidence(organization_id, run_id);
+
 -- Fase 06 (EASM roadmap): organization-scoped Candidate Assets. The
 -- run-scoped `core.store.intel_indicators` rows remain the source event;
 -- this table answers "have we discovered this candidate before?" across
