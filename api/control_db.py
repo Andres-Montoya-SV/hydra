@@ -938,6 +938,39 @@ class AssetRecord:
 
 
 @dataclass(frozen=True)
+class ExposureRecord:
+    exposure_id: str
+    organization_id: str
+    asset_id: str
+    source: str
+    template_id: str
+    location: str
+    severity: str
+    title: str
+    description: str
+    confidence_score: int | None
+    status: str
+    first_seen_at: str
+    last_seen_at: str
+    first_seen_run_id: str
+    last_seen_run_id: str
+    resolved_at: str | None
+    resolved_run_id: str | None
+    resolution_reason: str | None
+
+
+@dataclass(frozen=True)
+class ExposureEvidenceRecord:
+    exposure_evidence_id: str
+    exposure_id: str
+    organization_id: str
+    account_id: str
+    run_id: str
+    finding_id: int
+    observed_at: str
+
+
+@dataclass(frozen=True)
 class CandidateAssetRecord:
     candidate_asset_id: str
     organization_id: str
