@@ -17,9 +17,14 @@ STATUS_STYLES = {
     ToolStatus.READY: "green",
     ToolStatus.RUNNING: "bold yellow",
     ToolStatus.COMPLETED: "bold green",
+    ToolStatus.SUCCESS_WITH_RESULTS: "bold green",
+    ToolStatus.SUCCESS_NO_RESULTS: "green",
+    ToolStatus.PARTIAL: "bold yellow",
+    ToolStatus.BLOCKED_BY_SCOPE: "yellow",
     ToolStatus.SKIPPED: "dim",
     ToolStatus.FAILED: "bold red",
     ToolStatus.MISSING: "red",
+    ToolStatus.UNAVAILABLE: "red",
 }
 
 
