@@ -220,13 +220,11 @@ async def _probe_target(
         # context, present or future.
         await _install_scope_request_guard(browser_context, context, blocked_counts)
         page = await browser_context.new_page()
-        await page.add_init_script(
-            """
+        await page.add_init_script("""
             Object.defineProperty(window, 'RTCPeerConnection', {value: undefined});
             Object.defineProperty(window, 'webkitRTCPeerConnection', {value: undefined});
             Object.defineProperty(navigator, 'geolocation', {value: undefined});
-            """
-        )
+            """)
         redirects: list[str] = []
 
         def capture_response(response: object) -> None:

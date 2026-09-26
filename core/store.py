@@ -2571,14 +2571,12 @@ class AssetStore:
                 ).fetchone()
                 if row:
                     return row["run_id"]
-            row = conn.execute(
-                """
+            row = conn.execute("""
                 SELECT run_id FROM runs
                 WHERE finished_at IS NOT NULL AND finished_at != ''
                 ORDER BY started_at DESC
                 LIMIT 1
-                """
-            ).fetchone()
+                """).fetchone()
         return row["run_id"] if row else None
 
     def find_latest_finished_run_for_program(self, program_name: str) -> str | None:

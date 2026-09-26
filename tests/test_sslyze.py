@@ -237,9 +237,27 @@ class TestScopeEnforcement:
 
         import modules.sslyze as sslyze_module
 
+        # Exercise the preserved authorization logic with a fake tool only.
+        # The production security hold is independently tested below.
+        monkeypatch.setattr(sslyze_module, "SSLYZE_SECURITY_HOLD", False)
         monkeypatch.setattr(sslyze_module.SslyzePlugin, "_run_tool", fake_run_tool)
         await plugin.run(context, tmp_path / "unused")
 
         joined = " ".join(captured_args)
         assert "example.com" in joined
         assert "evil-out-of-scope.example" not in joined
+
+
+@pytest.mark.asyncio
+async def test_security_hold_blocks_before_target_discovery_or_subprocess(tmp_path, monkeypatch):
+    plugin = SslyzePlugin(Settings(project_root=tmp_path, enable_sslyze=True))
+    context = PipelineContext(targets=[], output_dir=tmp_path)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Security hold must prevent target discovery and execution")
+
+    monkeypatch.setattr(plugin, "_alive_urls", unexpected)
+    monkeypatch.setattr(plugin, "_run_tool", unexpected)
+    result = await plugin.run(context, tmp_path / "unused")
+    assert not result.success and not result.skipped
+    assert "vulnerable dependency" in result.message

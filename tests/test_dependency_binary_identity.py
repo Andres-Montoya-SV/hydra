@@ -37,13 +37,11 @@ def _write_impostor_script(path: Path, *, output: str, exit_code: int = 0) -> No
     package's own console script has: it runs fine, it's just a
     different tool entirely."""
     path.write_text(
-        textwrap.dedent(
-            f"""\
+        textwrap.dedent(f"""\
             #!/bin/sh
             echo {output!r}
             exit {exit_code}
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
