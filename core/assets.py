@@ -491,7 +491,23 @@ class Host:
             # visual evidence simply because the service already existed.
             if svc.title:
                 current.title = svc.title
-            if svc.body_hash:
+            # `body_hash` is httpx's raw-HTTP-response hash, and
+            # core/diff.py's BODY_HASH_CHANGED reads exactly this field to
+            # decide whether to fire a real change-detection event/webhook.
+            # browser_probe's own HttpService sets `body_hash` to a
+            # JS-rendered DOM hash (core/parsers/registry.py's
+            # BrowserProbeParser) — a fundamentally different, much more
+            # volatile signal (timestamps, nonces, rotating banners, ads
+            # change it on nearly every render even when the real HTTP
+            # response is byte-identical). Letting it unconditionally
+            # overwrite an already-established httpx hash turned
+            # BODY_HASH_CHANGED into near-constant false-positive noise —
+            # a real, confirmed bug (docs/easm/VISUAL_ASSET_INTELLIGENCE.md's
+            # own design explicitly promises this never happens). Only
+            # accept an incoming body_hash when nothing has set one yet for
+            # this canonical service — never let a later enrichment pass
+            # clobber a value already anchored to the real response.
+            if svc.body_hash and not current.body_hash:
                 current.body_hash = svc.body_hash
             if svc.response_fingerprint:
                 current.response_fingerprint = svc.response_fingerprint

@@ -151,6 +151,63 @@ def test_visual_provider_enriches_existing_http_service() -> None:
     assert service.screenshot_path == "browser_probe_screenshots/example.com.png"
 
 
+def test_visual_enrichment_never_overwrites_an_already_established_httpx_body_hash() -> None:
+    """Regression: `core/diff.py`'s BODY_HASH_CHANGED reads
+    `HttpService.body_hash` to decide whether to fire a real change-
+    detection event/webhook. browser_probe's own rendered-DOM hash is a
+    fundamentally different, far more volatile signal (timestamps,
+    nonces, rotating banners/ads change it on nearly every render even
+    when the real HTTP response is byte-identical) — it must never
+    silently replace an httpx-anchored hash, or every scan of a page with
+    dynamic content would look like its body changed.
+
+    `test_visual_provider_enriches_existing_http_service` above still
+    proves the legitimate case (enrichment fills in a body_hash when
+    httpx never set one) — this test proves the harmful case it didn't
+    cover: httpx DID set a real one first."""
+    canonical = Host(
+        domain="example.com",
+        http_services=[
+            HttpService(
+                url="https://example.com/",
+                host="example.com",
+                status_code=200,
+                body_hash="real-httpx-response-hash",
+                source="httpx",
+            )
+        ],
+    )
+    visual_run_1 = Host(
+        domain="example.com",
+        http_services=[
+            HttpService(
+                url="https://example.com/",
+                host="example.com",
+                body_hash="dom-hash-with-todays-timestamp",
+                source="browser_probe",
+            )
+        ],
+    )
+    canonical.merge_from(visual_run_1)
+    assert canonical.http_services[0].body_hash == "real-httpx-response-hash"
+
+    # A second run's render (a different timestamp/nonce baked into the
+    # page, real HTTP response unchanged) must not flip it either.
+    visual_run_2 = Host(
+        domain="example.com",
+        http_services=[
+            HttpService(
+                url="https://example.com/",
+                host="example.com",
+                body_hash="dom-hash-with-a-different-timestamp",
+                source="browser_probe",
+            )
+        ],
+    )
+    canonical.merge_from(visual_run_2)
+    assert canonical.http_services[0].body_hash == "real-httpx-response-hash"
+
+
 def test_visual_artifact_path_round_trips_through_sqlite(tmp_path: Path) -> None:
     store = AssetStore(tmp_path / "recon.db")
     run_id = "visual-roundtrip"

@@ -206,7 +206,14 @@ class TestRelationshipBackfill:
         assert summary.relationships_touched == 1
         assert summary.evidence_rows_recorded == 2
         assert len(relationships) == 1
-        assert len(control_db.list_relationship_evidence(relationships[0].relationship_id)) == 2
+        assert (
+            len(
+                control_db.list_relationship_evidence(
+                    organization_id, relationships[0].relationship_id
+                )
+            )
+            == 2
+        )
 
     def test_certificate_endpoint_does_not_need_to_be_fabricated_as_asset(
         self, control_db: ControlDB, api_settings: APISettings

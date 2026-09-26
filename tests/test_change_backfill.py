@@ -502,3 +502,64 @@ class TestOrganizationIsolation:
             identity_key="domain:first-target.example",
         )
         assert control_db.get_current_lifecycle_state_for_asset(first_asset.asset_id) == "new"
+
+
+class TestUnsupportedAssetTypesNeverAbortTheWholeOrganizationsDetection:
+    """Regression: `host_for_asset` only knows how to extract a domain for
+    the four host-shaped asset types (domain/port/dns_record/url) —
+    `cloud_storage` (added by the later cloud-asset-discovery work) has no
+    single domain a scan's target could ever "cover," so it used to raise
+    an uncaught `ValueError` straight out of the per-asset loop. That
+    aborted change detection for the ENTIRE organization on the very
+    first cloud_storage asset it hit — including domains that had
+    nothing to do with cloud discovery. Proven fixed here: a real
+    cloud_storage asset must never prevent a real domain asset in the
+    SAME organization from getting its own, correct change-detection
+    history."""
+
+    def test_a_cloud_storage_asset_is_skipped_not_a_crash(
+        self, control_db: ControlDB, api_settings: APISettings
+    ) -> None:
+        account_id = control_db.create_account(email="cloudowner@example.com")
+        organization_id, _role = control_db.list_organizations_for_account(account_id)[0]
+
+        scan_id = _run_scan(
+            control_db,
+            api_settings,
+            account_id=account_id,
+            organization_id=organization_id,
+            domain="example.com",
+            hosts=[Host(domain="example.com")],
+        )
+        store = AssetStore(account_db_path(api_settings, account_id))
+        store.record_cloud_resources(
+            scan_id,
+            [
+                {
+                    "provider": "s3",
+                    "bucket": "example-backups",
+                    "url": "https://example-backups.s3.amazonaws.com",
+                    "classification": "exists_private",
+                    "exists": True,
+                }
+            ],
+        )
+        _reconcile(control_db, api_settings, organization_id)
+
+        cloud_asset = control_db.get_asset_by_identity(
+            organization_id=organization_id,
+            asset_type="cloud_storage",
+            identity_key="cloud_storage:s3:example-backups",
+        )
+        assert cloud_asset is not None  # the reconciliation itself worked
+
+        # This must not raise, and must still process the domain asset.
+        summary = detect_and_record_changes_for_organization(
+            control_db=control_db, organization_id=organization_id
+        )
+        assert summary.assets_skipped_unsupported_type == 1
+
+        domain_asset = control_db.get_asset_by_identity(
+            organization_id=organization_id, asset_type="domain", identity_key="domain:example.com"
+        )
+        assert control_db.get_current_lifecycle_state_for_asset(domain_asset.asset_id) == "new"

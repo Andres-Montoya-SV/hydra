@@ -3600,6 +3600,26 @@ does not yet have the granular execution states (`SUCCESS_WITH_RESULTS`
 vs `SUCCESS_NO_RESULTS` vs `PARTIAL` vs `BLOCKED_BY_SCOPE`) the
 roadmap's own Invariant 7 requires.
 
+## `main` state review and hardening — 2026-09-26
+
+Between the Fase 00 baseline and this review, `main` advanced through
+Fases 06-16 of the EASM roadmap without this review's involvement,
+several PRs bundling more than one phase's work together. A full state
+review (three parallel deep-audits plus direct verification of the
+highest-risk items) found and fixed two real, confirmed bugs: a crash
+in change detection on any `cloud_storage` asset that would abort the
+whole organization's pass, and a spurious-notification bug where
+`browser_probe`'s rendered-DOM hash was silently overwriting httpx's
+real response hash, causing near-constant false `BODY_HASH_CHANGED`
+webhook noise — directly contradicting the Visual Intelligence phase's
+own documented design. Also closed three latent (not yet exploitable)
+cross-tenant IDOR footguns in `api/control_db.py` accessors missing
+`organization_id` scoping. Full detail, including real gaps found but
+deliberately NOT fixed here (Fase 06's promotion/audit workflow was
+never built; `core/registry.py` never migrated off the legacy graph
+engine; Exposure's required three-nature distinction doesn't exist):
+[`docs/easm/audit_2026-09-26_main_state_review.md`](easm/audit_2026-09-26_main_state_review.md).
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
