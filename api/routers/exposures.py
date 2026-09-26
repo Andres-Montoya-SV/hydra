@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, ExposureRecord
-from api.schemas import ExposureEvidenceResponse, ExposureHistoryResponse, ExposureResponse
+from api.schemas import (
+    ExposureEvidenceResponse,
+    ExposureHistoryResponse,
+    ExposureResponse,
+    ResolveExposureRequest,
+)
 
 router = APIRouter(prefix="/organizations", tags=["exposures"])
 
@@ -118,3 +124,38 @@ def list_history(
         )
         for row in db.list_exposure_history(organization_id, exposure_id)
     ]
+
+
+@router.post(
+    "/{organization_id}/exposures/{exposure_id}/resolve",
+    response_model=ExposureResponse,
+)
+def resolve_exposure(
+    organization_id: str,
+    exposure_id: str,
+    body: ResolveExposureRequest,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> ExposureResponse:
+    db = _db(request)
+    role = db.get_role_for_account_organization(auth.account_id, organization_id)
+    if role is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if role != "owner":
+        raise HTTPException(status_code=403, detail="Owner role required")
+    if db.get_exposure_for_organization(organization_id, exposure_id) is None:
+        raise HTTPException(status_code=404, detail="Exposure not found")
+
+    changed = db.resolve_exposure(
+        organization_id=organization_id,
+        exposure_id=exposure_id,
+        resolved_at=datetime.now(timezone.utc).isoformat(),
+        resolution_reason=body.reason.strip(),
+    )
+    if not changed:
+        raise HTTPException(status_code=409, detail="Exposure is already resolved")
+
+    row = db.get_exposure_for_organization(organization_id, exposure_id)
+    if row is None:
+        raise HTTPException(status_code=500, detail="Exposure disappeared")
+    return _to_response(row)
