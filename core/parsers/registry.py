@@ -862,9 +862,9 @@ class BrowserProbeParser(ToolParser):
             )
             service_url = normalize_http_url(browser_http_url or httpx_url or f"https://{domain}")
             host = Host(domain=domain)
+            # A destination URL alone is not proof that visual capture succeeded.
             has_visual_evidence = bool(
-                browser_http_url
-                or record.get("raw_artifact")
+                record.get("raw_artifact")
                 or record.get("screenshot_path")
                 or record.get("rendered_html_sha256")
                 or record.get("screenshot_sha256")
