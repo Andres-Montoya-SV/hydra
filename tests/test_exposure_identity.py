@@ -164,7 +164,6 @@ def test_five_runs_resolution_replay_and_reopening_keep_history(tmp_path):
     assert "fixture:admin-exposed" in events[0]["reason"]
 
 
-
 def test_exposure_history_and_evidence_are_tenant_scoped(tmp_path):
     from api.asset_identity import ReconciliationDecision
     from api.control_db import ControlDB
