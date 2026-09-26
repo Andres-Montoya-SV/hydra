@@ -31,6 +31,7 @@ from api.asset_identity import ExistingAsset, ReconciliationDecision
 from api.candidate_assets import CandidateAssetDraft
 from api.exposure_identity import ExposureDraft
 from api.observation_identity import EvidenceContent
+from api.relationship_identity import RelationshipDraft
 from core.store import connect_sqlite
 
 _SCHEMA = """
@@ -336,6 +337,58 @@ CREATE INDEX IF NOT EXISTS idx_candidate_assets_organization
     ON candidate_assets(organization_id, first_seen_at);
 CREATE INDEX IF NOT EXISTS idx_candidate_assets_value
     ON candidate_assets(organization_id, candidate_type, normalized_value);
+
+-- Fase 07 (EASM roadmap): the durable, organization-scoped projection of
+-- core.intel.model.Relationship. The run-scoped intel_relationships table
+-- remains the immutable source observation. This table answers whether the
+-- same typed edge has been observed across scans. Entity ids are preserved
+-- even when an endpoint is not currently promoted to an Asset (for example a
+-- certificate entity); optional asset FKs are merely links to known durable
+-- assets and are NEVER used as the relationship identity rule.
+CREATE TABLE IF NOT EXISTS relationships (
+    relationship_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    source_entity TEXT NOT NULL,
+    relationship_type TEXT NOT NULL,
+    target_entity TEXT NOT NULL,
+    source_asset_id TEXT REFERENCES assets(asset_id),
+    target_asset_id TEXT REFERENCES assets(asset_id),
+    confidence TEXT NOT NULL,
+    strength TEXT NOT NULL DEFAULT '',
+    data_json TEXT NOT NULL DEFAULT '{}',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    last_seen_run_id TEXT NOT NULL,
+    UNIQUE (organization_id, source_entity, relationship_type, target_entity)
+);
+CREATE INDEX IF NOT EXISTS idx_relationships_organization
+    ON relationships(organization_id, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_relationships_source
+    ON relationships(organization_id, source_entity, relationship_type);
+CREATE INDEX IF NOT EXISTS idx_relationships_target
+    ON relationships(organization_id, target_entity, relationship_type);
+
+-- One evidence row per concrete source evidence observation that supported a
+-- durable edge in a particular run. Never overwrite or collapse different
+-- source evidence across runs: the relationship row is the cross-run identity,
+-- this table is the audit trail explaining WHY Hydra believes the edge exists.
+CREATE TABLE IF NOT EXISTS relationship_evidence (
+    relationship_evidence_id TEXT PRIMARY KEY,
+    relationship_id TEXT NOT NULL REFERENCES relationships(relationship_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    run_id TEXT NOT NULL,
+    source_evidence_id TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    collector TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    observed_at TEXT NOT NULL,
+    UNIQUE (relationship_id, run_id, source_evidence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_relationship_evidence_relationship
+    ON relationship_evidence(relationship_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_relationship_evidence_run
+    ON relationship_evidence(organization_id, run_id);
 
 CREATE TABLE IF NOT EXISTS api_keys (
     key_id TEXT PRIMARY KEY,
@@ -1004,6 +1057,37 @@ class CandidateAssetRecord:
     source_entity_id: str
     parent_indicator_id: str | None
     lineage_reference: str
+
+
+@dataclass(frozen=True)
+class RelationshipRecord:
+    relationship_id: str
+    organization_id: str
+    source_entity: str
+    relationship_type: str
+    target_entity: str
+    source_asset_id: str | None
+    target_asset_id: str | None
+    confidence: str
+    strength: str
+    data_json: str
+    first_seen_at: str
+    last_seen_at: str
+    last_seen_run_id: str
+
+
+@dataclass(frozen=True)
+class RelationshipEvidenceRecord:
+    relationship_evidence_id: str
+    relationship_id: str
+    organization_id: str
+    run_id: str
+    source_evidence_id: str
+    source: str
+    collector: str
+    reason: str
+    metadata_json: str
+    observed_at: str
 
 
 @dataclass(frozen=True)
@@ -1941,6 +2025,213 @@ class ControlDB:
                 (exposure_id,),
             ).fetchall()
         return [_exposure_evidence_record_from_row(row) for row in rows]
+
+    # --- relationships (Fase 07, EASM roadmap) -------------------------
+
+    def upsert_relationship(
+        self,
+        *,
+        organization_id: str,
+        run_id: str,
+        draft: RelationshipDraft,
+        source_asset_id: str | None = None,
+        target_asset_id: str | None = None,
+        observed_at: str | None = None,
+    ) -> tuple[str, bool, bool]:
+        """Persist one typed edge across runs plus this run's source evidence.
+
+        Identity is exactly (organization, source entity, relationship type,
+        target entity). Optional Asset links are descriptive conveniences only;
+        they never participate in identity or authorization. Returns
+        (relationship_id, created, evidence_created).
+        """
+        if draft.evidence is None or not draft.evidence.source_evidence_id.strip():
+            raise ValueError("relationship requires traceable evidence")
+        observed_at = observed_at or _now_iso()
+
+        with self._connect() as conn:
+            for label, asset_id in (
+                ("source", source_asset_id),
+                ("target", target_asset_id),
+            ):
+                if asset_id is None:
+                    continue
+                row = conn.execute(
+                    "SELECT organization_id FROM assets WHERE asset_id = ?",
+                    (asset_id,),
+                ).fetchone()
+                if row is None or str(row["organization_id"]) != organization_id:
+                    raise ValueError(f"{label}_asset_id does not belong to organization")
+
+            scan = conn.execute(
+                "SELECT organization_id FROM scans WHERE scan_id = ?", (run_id,)
+            ).fetchone()
+            if scan is None or scan["organization_id"] != organization_id:
+                raise ValueError("run does not belong to organization")
+
+            row = conn.execute(
+                "SELECT relationship_id FROM relationships "
+                "WHERE organization_id = ? AND source_entity = ? "
+                "AND relationship_type = ? AND target_entity = ?",
+                (
+                    organization_id,
+                    draft.source_entity,
+                    draft.relationship_type,
+                    draft.target_entity,
+                ),
+            ).fetchone()
+            created = row is None
+            if created:
+                relationship_id = secrets.token_hex(16)
+                conn.execute(
+                    "INSERT INTO relationships (relationship_id, organization_id, "
+                    "source_entity, relationship_type, target_entity, source_asset_id, "
+                    "target_asset_id, confidence, strength, data_json, first_seen_at, "
+                    "last_seen_at, last_seen_run_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        relationship_id,
+                        organization_id,
+                        draft.source_entity,
+                        draft.relationship_type,
+                        draft.target_entity,
+                        source_asset_id,
+                        target_asset_id,
+                        draft.confidence,
+                        draft.strength,
+                        draft.data_json,
+                        observed_at,
+                        observed_at,
+                        run_id,
+                    ),
+                )
+            else:
+                relationship_id = str(row["relationship_id"])
+                conn.execute(
+                    "UPDATE relationships SET "
+                    "source_asset_id = COALESCE(?, source_asset_id), "
+                    "target_asset_id = COALESCE(?, target_asset_id), "
+                    "confidence = ?, strength = ?, data_json = ?, "
+                    "last_seen_at = ?, last_seen_run_id = ? "
+                    "WHERE relationship_id = ? AND organization_id = ?",
+                    (
+                        source_asset_id,
+                        target_asset_id,
+                        draft.confidence,
+                        draft.strength,
+                        draft.data_json,
+                        observed_at,
+                        run_id,
+                        relationship_id,
+                        organization_id,
+                    ),
+                )
+
+            relationship_evidence_id = secrets.token_hex(16)
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO relationship_evidence "
+                "(relationship_evidence_id, relationship_id, organization_id, run_id, "
+                "source_evidence_id, source, collector, reason, metadata_json, observed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    relationship_evidence_id,
+                    relationship_id,
+                    organization_id,
+                    run_id,
+                    draft.evidence.source_evidence_id,
+                    draft.evidence.source,
+                    draft.evidence.collector,
+                    draft.evidence.reason,
+                    draft.evidence.metadata_json,
+                    draft.evidence.observed_at or observed_at,
+                ),
+            )
+            evidence_created = bool(cursor.rowcount)
+
+        return relationship_id, created, evidence_created
+
+    def list_relationships_for_organization(
+        self,
+        organization_id: str,
+        *,
+        relationship_type: str | None = None,
+    ) -> list[RelationshipRecord]:
+        with self._connect() as conn:
+            if relationship_type is None:
+                rows = conn.execute(
+                    "SELECT * FROM relationships WHERE organization_id = ? "
+                    "ORDER BY first_seen_at, relationship_id",
+                    (organization_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM relationships WHERE organization_id = ? "
+                    "AND relationship_type = ? ORDER BY first_seen_at, relationship_id",
+                    (organization_id, relationship_type),
+                ).fetchall()
+        return [_relationship_record_from_row(row) for row in rows]
+
+    def relationship_neighborhood(
+        self,
+        organization_id: str,
+        asset_id: str,
+        *,
+        max_depth: int = 1,
+        max_edges: int = 1000,
+    ) -> tuple[list[RelationshipRecord], bool]:
+        """Bounded breadth-first graph view; no scope or ownership inference.
+
+        Returns (edges, truncated). Explicit limits prevent dense cyclic graphs
+        from expanding without bound. An unknown/foreign asset returns no data.
+        """
+        if not 1 <= max_depth <= 8 or not 1 <= max_edges <= 5000:
+            raise ValueError("depth must be 1..8 and max_edges 1..5000")
+        with self._connect() as conn:
+            asset = conn.execute(
+                "SELECT identity_key FROM assets WHERE organization_id = ? AND asset_id = ?",
+                (organization_id, asset_id),
+            ).fetchone()
+            if asset is None:
+                return [], False
+            frontier = {str(asset["identity_key"])}
+            visited: set[str] = set()
+            found: dict[str, RelationshipRecord] = {}
+            for _ in range(max_depth):
+                visited.update(frontier)
+                following: set[str] = set()
+                ordered = sorted(frontier)
+                for offset in range(0, len(ordered), 200):
+                    chunk = ordered[offset : offset + 200]
+                    rows = conn.execute(
+                        "WITH frontier AS (SELECT value FROM json_each(?)) "
+                        "SELECT r.* FROM relationships r WHERE r.organization_id = ? "
+                        "AND (r.source_entity IN (SELECT value FROM frontier) "
+                        "OR r.target_entity IN (SELECT value FROM frontier)) "
+                        "AND EXISTS (SELECT 1 FROM relationship_evidence e "
+                        "WHERE e.relationship_id = r.relationship_id "
+                        "AND e.organization_id = r.organization_id) "
+                        "ORDER BY r.relationship_id LIMIT ?",
+                        (json.dumps(chunk), organization_id, max_edges + 1),
+                    ).fetchall()
+                    for row in rows:
+                        edge = _relationship_record_from_row(row)
+                        if edge.relationship_id not in found and len(found) >= max_edges:
+                            return list(found.values()), True
+                        found[edge.relationship_id] = edge
+                        following.update((edge.source_entity, edge.target_entity))
+                frontier = following - visited
+                if not frontier:
+                    break
+        return list(found.values()), False
+
+    def list_relationship_evidence(self, relationship_id: str) -> list[RelationshipEvidenceRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM relationship_evidence WHERE relationship_id = ? "
+                "ORDER BY observed_at, relationship_evidence_id",
+                (relationship_id,),
+            ).fetchall()
+        return [_relationship_evidence_record_from_row(row) for row in rows]
 
     # --- observations and evidence (Fase 04, EASM roadmap) --------------
 
@@ -3792,6 +4083,39 @@ def _candidate_asset_record_from_row(row: sqlite3.Row) -> CandidateAssetRecord:
         source_entity_id=row["source_entity_id"],
         parent_indicator_id=row["parent_indicator_id"],
         lineage_reference=row["lineage_reference"],
+    )
+
+
+def _relationship_record_from_row(row: sqlite3.Row) -> RelationshipRecord:
+    return RelationshipRecord(
+        relationship_id=row["relationship_id"],
+        organization_id=row["organization_id"],
+        source_entity=row["source_entity"],
+        relationship_type=row["relationship_type"],
+        target_entity=row["target_entity"],
+        source_asset_id=row["source_asset_id"],
+        target_asset_id=row["target_asset_id"],
+        confidence=row["confidence"],
+        strength=row["strength"],
+        data_json=row["data_json"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        last_seen_run_id=row["last_seen_run_id"],
+    )
+
+
+def _relationship_evidence_record_from_row(row: sqlite3.Row) -> RelationshipEvidenceRecord:
+    return RelationshipEvidenceRecord(
+        relationship_evidence_id=row["relationship_evidence_id"],
+        relationship_id=row["relationship_id"],
+        organization_id=row["organization_id"],
+        run_id=row["run_id"],
+        source_evidence_id=row["source_evidence_id"],
+        source=row["source"],
+        collector=row["collector"],
+        reason=row["reason"],
+        metadata_json=row["metadata_json"],
+        observed_at=row["observed_at"],
     )
 
 
