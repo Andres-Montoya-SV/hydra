@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from api.candidate_backfill import backfill_candidate_assets_for_organization
 from api.candidate_assets import candidate_from_indicator_row, normalize_candidate_value
+from api.candidate_backfill import backfill_candidate_assets_for_organization
 from api.control_db import ControlDB
 from api.settings import APISettings
 from api.tenancy import account_db_path
