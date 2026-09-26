@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from core.intel.correlate import score_to_band
-from core.models import PipelineContext, RunSummary
+from core.models import PipelineContext, RunSummary, ToolStatus
 from core.verification.grounding import (
     downgrade_note,
     downgraded_confidence_score,
