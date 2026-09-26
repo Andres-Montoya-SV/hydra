@@ -694,9 +694,7 @@ class Settings:
             enable_sslyze=_bool(os.getenv("ENABLE_SSLYZE")),
             enable_wafw00f=_bool(os.getenv("ENABLE_WAFW00F")),
             enable_whatweb=_bool(os.getenv("ENABLE_WHATWEB")),
-            whatweb_timeout=_int(
-                os.getenv("WHATWEB_TIMEOUT"), 30, "WHATWEB_TIMEOUT", maximum=300
-            ),
+            whatweb_timeout=_int(os.getenv("WHATWEB_TIMEOUT"), 30, "WHATWEB_TIMEOUT", maximum=300),
             whatweb_threads=_int(os.getenv("WHATWEB_THREADS"), 10, "WHATWEB_THREADS", maximum=50),
             whatweb_max_urls=_int(
                 os.getenv("WHATWEB_MAX_URLS"), 20, "WHATWEB_MAX_URLS", maximum=100
