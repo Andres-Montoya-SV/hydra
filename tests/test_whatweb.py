@@ -127,5 +127,45 @@ class TestWhatWebAuthorization:
         assert "--follow-redirect=never" in captured
         assert "--proxy" in captured
 
+    @pytest.mark.asyncio
+    async def test_program_attribution_is_forwarded_to_whatweb(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = Settings(
+            project_root=tmp_path,
+            enable_whatweb=True,
+            user_agent="hydra/1.0",
+            attribution_user_agent="bugcrowd; researcher",
+            researcher_attribution_header={"X-HackerOne-Research": "researcher"},
+        )
+        context = self._context(tmp_path)
+        plugin = WhatWebPlugin(settings)
+        captured: list[str] = []
+
+        async def fake_run_tool(self_, ctx, args, *, input_data=None, timeout=None):  # noqa: ANN001
+            captured.extend(args)
+            (tmp_path / "run" / "whatweb.json").write_text("[]", encoding="utf-8")
+            return 0, "", ""
+
+        class FakeProxy:
+            proxy_url = "http://127.0.0.1:7777"
+
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def fake_confinement(self_, ctx):  # noqa: ANN001
+            yield FakeProxy()
+
+        monkeypatch.setattr(WhatWebPlugin, "_run_tool", fake_run_tool)
+        monkeypatch.setattr(WhatWebPlugin, "_crawler_confinement", fake_confinement)
+
+        await plugin.run(context, tmp_path / "unused")
+        joined = " ".join(captured)
+        assert "--aggression=1" in captured
+        assert "--user-agent" in captured
+        assert "bugcrowd; researcher" in joined
+        assert "--header" in captured
+        assert "X-HackerOne-Research:researcher" in joined
+
     def test_disabled_by_default(self, tmp_path: Path) -> None:
         assert WhatWebPlugin(Settings(project_root=tmp_path)).is_enabled() is False
