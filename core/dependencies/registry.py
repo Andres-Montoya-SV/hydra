@@ -252,7 +252,7 @@ _register(
     ToolDefinition(
         name="whatweb",
         display_name="WhatWeb",
-        version_commands=(("--version",), ("-v",)),
+        version_commands=(("--version",),),
         health_commands=(("--help",), ("-h",)),
         capabilities=frozenset({"technology_detection", "technology_intelligence"}),
         install_apt="whatweb",
