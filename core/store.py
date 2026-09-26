@@ -683,6 +683,28 @@ CREATE TABLE IF NOT EXISTS typosquat_candidates (
 
 CREATE INDEX IF NOT EXISTS idx_typosquat_run ON typosquat_candidates(run_id, severity);
 
+-- Cloud resources discovered by an explicitly-authorized cloud provider
+-- probe. Kept out of hosts: cloud storage is not a DNS Host.
+CREATE TABLE IF NOT EXISTS cloud_resources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    resource_type TEXT NOT NULL DEFAULT 'storage',
+    resource_name TEXT NOT NULL,
+    url TEXT,
+    classification TEXT,
+    exists_flag INTEGER NOT NULL DEFAULT 1,
+    public_listable INTEGER NOT NULL DEFAULT 0,
+    status_code INTEGER,
+    body_hash TEXT,
+    raw_artifact TEXT,
+    confidence_score INTEGER DEFAULT 70,
+    UNIQUE(run_id, provider, resource_type, resource_name),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_resources_run
+    ON cloud_resources(run_id, provider, resource_type);
+
 CREATE TABLE IF NOT EXISTS result_cache (
     cache_key TEXT PRIMARY KEY,
     tool TEXT NOT NULL,
@@ -1156,6 +1178,46 @@ class AssetStore:
                     "SELECT * FROM intel_network_requests WHERE run_id=? ORDER BY id",
                     (run_id,),
                 ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_cloud_resources(self, run_id: str, resources: list[dict]) -> None:
+        """Persist authorized cloud-storage observations outside the Host model."""
+        if not resources:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO cloud_resources
+                   (run_id, provider, resource_type, resource_name, url,
+                    classification, exists_flag, public_listable, status_code,
+                    body_hash, raw_artifact, confidence_score)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id,
+                        str(item.get("provider") or "cloud").lower(),
+                        "storage",
+                        str(item.get("bucket") or "").strip().lower(),
+                        str(item.get("url") or "") or None,
+                        str(item.get("classification") or "") or None,
+                        1 if item.get("exists", True) else 0,
+                        1 if item.get("public_listable") else 0,
+                        item.get("status_code"),
+                        str(item.get("body_hash") or "") or None,
+                        str(item.get("raw_artifact") or "") or None,
+                        85 if item.get("public_listable") else 70,
+                    )
+                    for item in resources
+                    if item.get("bucket")
+                ],
+            )
+
+    def get_cloud_resources(self, run_id: str) -> list[dict[str, object]]:
+        """Read normalized run-scoped cloud resources for EASM reconciliation."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cloud_resources WHERE run_id=? ORDER BY provider, resource_name",
+                (run_id,),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def record_typosquat_candidates(self, run_id: str, candidates: list[dict]) -> None:
