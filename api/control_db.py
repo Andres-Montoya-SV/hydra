@@ -3671,6 +3671,41 @@ def _asset_record_from_row(row: sqlite3.Row) -> AssetRecord:
     )
 
 
+def _exposure_record_from_row(row: sqlite3.Row) -> ExposureRecord:
+    return ExposureRecord(
+        exposure_id=row["exposure_id"],
+        organization_id=row["organization_id"],
+        asset_id=row["asset_id"],
+        source=row["source"],
+        template_id=row["template_id"],
+        location=row["location"],
+        severity=row["severity"],
+        title=row["title"],
+        description=row["description"],
+        confidence_score=row["confidence_score"],
+        status=row["status"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        first_seen_run_id=row["first_seen_run_id"],
+        last_seen_run_id=row["last_seen_run_id"],
+        resolved_at=row["resolved_at"],
+        resolved_run_id=row["resolved_run_id"],
+        resolution_reason=row["resolution_reason"],
+    )
+
+
+def _exposure_evidence_record_from_row(row: sqlite3.Row) -> ExposureEvidenceRecord:
+    return ExposureEvidenceRecord(
+        exposure_evidence_id=row["exposure_evidence_id"],
+        exposure_id=row["exposure_id"],
+        organization_id=row["organization_id"],
+        account_id=row["account_id"],
+        run_id=row["run_id"],
+        finding_id=int(row["finding_id"]),
+        observed_at=row["observed_at"],
+    )
+
+
 def _candidate_asset_record_from_row(row: sqlite3.Row) -> CandidateAssetRecord:
     return CandidateAssetRecord(
         candidate_asset_id=row["candidate_asset_id"],
