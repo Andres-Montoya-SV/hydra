@@ -298,6 +298,22 @@ CREATE TABLE IF NOT EXISTS exposure_history (
 CREATE INDEX IF NOT EXISTS idx_exposure_history
     ON exposure_history(organization_id, exposure_id, happened_at);
 
+-- Provider execution outcomes are operational evidence for exposure lifecycle.
+-- They intentionally do NOT resolve an exposure by themselves: a run-level
+-- provider success does not prove exhaustive coverage of every asset.
+CREATE TABLE IF NOT EXISTS provider_run_outcomes (
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    account_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    output_lines INTEGER NOT NULL DEFAULT 0,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, provider)
+);
+CREATE INDEX IF NOT EXISTS idx_provider_run_outcomes_org
+    ON provider_run_outcomes(organization_id, run_id, provider);
+
 -- Fase 06 (EASM roadmap): organization-scoped Candidate Assets. The
 -- run-scoped `core.store.intel_indicators` rows remain the source event;
 -- this table answers "have we discovered this candidate before?" across
@@ -1034,6 +1050,28 @@ class ExposureEvidenceRecord:
     run_id: str
     finding_id: int
     observed_at: str
+
+
+@dataclass(frozen=True)
+class ExposureHistoryRecord:
+    event_id: str
+    exposure_id: str
+    organization_id: str
+    event_type: str
+    happened_at: str
+    run_id: str | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class ProviderRunOutcomeRecord:
+    organization_id: str
+    account_id: str
+    run_id: str
+    provider: str
+    outcome: str
+    output_lines: int
+    recorded_at: str
 
 
 @dataclass(frozen=True)
@@ -2001,30 +2039,139 @@ class ControlDB:
                 )
         return bool(cursor.rowcount)
 
+    def get_exposure_for_organization(
+        self, organization_id: str, exposure_id: str
+    ) -> ExposureRecord | None:
+        """Tenant-safe exposure lookup.
+
+        A mismatched organization is intentionally indistinguishable from an
+        unknown exposure id. API callers must never learn whether another
+        tenant owns the guessed identifier.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM exposures WHERE organization_id = ? AND exposure_id = ?",
+                (organization_id, exposure_id),
+            ).fetchone()
+        return None if row is None else _exposure_record_from_row(row)
+
     def list_exposures_for_organization(
         self,
         organization_id: str,
         *,
         status: str | None = None,
         severity: str | None = None,
+        asset_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
     ) -> list[ExposureRecord]:
+        """Bounded, tenant-scoped exposure inventory for API/product use."""
+        limit = max(1, min(500, int(limit)))
+        offset = max(0, int(offset))
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM exposures WHERE organization_id = ? "
                 "AND (? IS NULL OR status = ?) AND (? IS NULL OR severity = ?) "
-                "ORDER BY first_seen_at, exposure_id",
-                (organization_id, status, status, severity, severity),
+                "AND (? IS NULL OR asset_id = ?) "
+                "ORDER BY last_seen_at DESC, exposure_id LIMIT ? OFFSET ?",
+                (
+                    organization_id,
+                    status,
+                    status,
+                    severity,
+                    severity,
+                    asset_id,
+                    asset_id,
+                    limit,
+                    offset,
+                ),
             ).fetchall()
         return [_exposure_record_from_row(row) for row in rows]
 
-    def list_exposure_evidence(self, exposure_id: str) -> list[ExposureEvidenceRecord]:
+    def list_exposure_evidence(
+        self, organization_id: str, exposure_id: str
+    ) -> list[ExposureEvidenceRecord]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM exposure_evidence WHERE exposure_id = ? "
-                "ORDER BY observed_at, exposure_evidence_id",
-                (exposure_id,),
+                "SELECT * FROM exposure_evidence WHERE organization_id = ? "
+                "AND exposure_id = ? ORDER BY observed_at, exposure_evidence_id",
+                (organization_id, exposure_id),
             ).fetchall()
         return [_exposure_evidence_record_from_row(row) for row in rows]
+
+    def list_exposure_history(
+        self, organization_id: str, exposure_id: str
+    ) -> list[ExposureHistoryRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM exposure_history WHERE organization_id = ? "
+                "AND exposure_id = ? ORDER BY happened_at, event_id",
+                (organization_id, exposure_id),
+            ).fetchall()
+        return [_exposure_history_record_from_row(row) for row in rows]
+
+    def record_provider_run_outcomes(
+        self,
+        *,
+        organization_id: str,
+        account_id: str,
+        run_id: str,
+        outcomes: list[tuple[str, str, int]],
+    ) -> None:
+        """Persist Fase-09 provider outcomes as durable operational evidence."""
+        allowed_outcomes = {
+            "success_with_results",
+            "success_no_results",
+            "partial",
+            "blocked_by_scope",
+            "skipped",
+            "unavailable",
+            "failed",
+        }
+        for provider, outcome, _output_lines in outcomes:
+            if not provider.strip() or outcome not in allowed_outcomes:
+                raise ValueError("invalid provider execution outcome")
+        with self._connect() as conn:
+            scan = conn.execute(
+                "SELECT account_id, organization_id FROM scans WHERE scan_id = ?",
+                (run_id,),
+            ).fetchone()
+            if (
+                scan is None
+                or scan["account_id"] != account_id
+                or scan["organization_id"] != organization_id
+            ):
+                raise ValueError("provider outcome run does not belong to account/organization")
+            now = _now_iso()
+            for provider, outcome, output_lines in outcomes:
+                conn.execute(
+                    "INSERT INTO provider_run_outcomes "
+                    "(organization_id, account_id, run_id, provider, outcome, output_lines, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(run_id, provider) DO UPDATE SET "
+                    "outcome=excluded.outcome, output_lines=excluded.output_lines, "
+                    "recorded_at=excluded.recorded_at",
+                    (
+                        organization_id,
+                        account_id,
+                        run_id,
+                        provider,
+                        outcome,
+                        max(0, int(output_lines)),
+                        now,
+                    ),
+                )
+
+    def list_provider_run_outcomes(
+        self, organization_id: str, run_id: str
+    ) -> list[ProviderRunOutcomeRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM provider_run_outcomes WHERE organization_id = ? "
+                "AND run_id = ? ORDER BY provider",
+                (organization_id, run_id),
+            ).fetchall()
+        return [_provider_run_outcome_record_from_row(row) for row in rows]
 
     # --- relationships (Fase 07, EASM roadmap) -------------------------
 
@@ -4059,6 +4206,30 @@ def _exposure_evidence_record_from_row(row: sqlite3.Row) -> ExposureEvidenceReco
         run_id=row["run_id"],
         finding_id=int(row["finding_id"]),
         observed_at=row["observed_at"],
+    )
+
+
+def _exposure_history_record_from_row(row: sqlite3.Row) -> ExposureHistoryRecord:
+    return ExposureHistoryRecord(
+        event_id=row["event_id"],
+        exposure_id=row["exposure_id"],
+        organization_id=row["organization_id"],
+        event_type=row["event_type"],
+        happened_at=row["happened_at"],
+        run_id=row["run_id"],
+        reason=row["reason"],
+    )
+
+
+def _provider_run_outcome_record_from_row(row: sqlite3.Row) -> ProviderRunOutcomeRecord:
+    return ProviderRunOutcomeRecord(
+        organization_id=row["organization_id"],
+        account_id=row["account_id"],
+        run_id=row["run_id"],
+        provider=row["provider"],
+        outcome=row["outcome"],
+        output_lines=int(row["output_lines"]),
+        recorded_at=row["recorded_at"],
     )
 
 

@@ -124,7 +124,7 @@ def test_five_runs_resolution_replay_and_reopening_keep_history(tmp_path):
     rows = db.list_exposures_for_organization(org)
     assert len(rows) == 1
     exposure_id = rows[0].exposure_id
-    assert len(db.list_exposure_evidence(exposure_id)) == 5
+    assert len(db.list_exposure_evidence(org, exposure_id)) == 5
     assert db.resolve_exposure(
         organization_id=org,
         exposure_id=exposure_id,
@@ -162,6 +162,209 @@ def test_five_runs_resolution_replay_and_reopening_keep_history(tmp_path):
         ).fetchall()
     assert [row["event_type"] for row in events] == ["observed"] * 5 + ["resolved", "reopened"]
     assert "fixture:admin-exposed" in events[0]["reason"]
+
+
+def test_exposure_history_and_evidence_are_tenant_scoped(tmp_path):
+    from api.asset_identity import ReconciliationDecision
+    from api.control_db import ControlDB
+
+    db = ControlDB(tmp_path / "control.db")
+    account_a = db.create_account(email="exposure-a@example.com")
+    org_a, _ = db.list_organizations_for_account(account_a)[0]
+    account_b = db.create_account(email="exposure-b@example.com")
+    org_b, _ = db.list_organizations_for_account(account_b)[0]
+
+    db.apply_asset_reconciliation(
+        organization_id=org_a,
+        run_id="seed-a",
+        decisions=[
+            ReconciliationDecision(
+                asset_id="asset-a",
+                asset_type="domain",
+                identity_key="domain:example.com",
+                is_new=True,
+                identifiers=(),
+            )
+        ],
+        observed_at="2026-01-01",
+    )
+    db.create_scan(
+        scan_id="run-a",
+        account_id=account_a,
+        organization_id=org_a,
+        domain="example.com",
+        db_path=str(tmp_path),
+    )
+    draft = exposure_from_finding(
+        {
+            "host": "example.com",
+            "template_id": "admin-exposed",
+            "severity": "high",
+            "source": "fixture",
+        },
+        asset_id="asset-a",
+    )
+    assert draft is not None
+    exposure_id, _, _ = db.upsert_exposure(
+        organization_id=org_a,
+        account_id=account_a,
+        run_id="run-a",
+        finding_id=1,
+        draft=draft,
+        observed_at="2026-01-02",
+    )
+
+    assert db.get_exposure_for_organization(org_a, exposure_id) is not None
+    assert db.get_exposure_for_organization(org_b, exposure_id) is None
+    assert len(db.list_exposure_evidence(org_a, exposure_id)) == 1
+    assert db.list_exposure_evidence(org_b, exposure_id) == []
+    assert len(db.list_exposure_history(org_a, exposure_id)) == 1
+    assert db.list_exposure_history(org_b, exposure_id) == []
+
+
+def test_exposure_inventory_is_bounded_and_filterable(tmp_path):
+    from api.asset_identity import ReconciliationDecision
+    from api.control_db import ControlDB
+
+    db = ControlDB(tmp_path / "control.db")
+    account = db.create_account(email="exposure-list@example.com")
+    org, _ = db.list_organizations_for_account(account)[0]
+    db.apply_asset_reconciliation(
+        organization_id=org,
+        run_id="seed",
+        decisions=[
+            ReconciliationDecision(
+                asset_id="asset",
+                asset_type="domain",
+                identity_key="domain:example.com",
+                is_new=True,
+                identifiers=(),
+            )
+        ],
+        observed_at="2026-01-01",
+    )
+    for i, severity in enumerate(("low", "high", "critical"), start=1):
+        run_id = f"run-{i}"
+        db.create_scan(
+            scan_id=run_id,
+            account_id=account,
+            organization_id=org,
+            domain="example.com",
+            db_path=str(tmp_path),
+        )
+        draft = exposure_from_finding(
+            {
+                "host": "example.com",
+                "template_id": f"detector-{i}",
+                "severity": severity,
+                "source": "fixture",
+            },
+            asset_id="asset",
+        )
+        assert draft is not None
+        db.upsert_exposure(
+            organization_id=org,
+            account_id=account,
+            run_id=run_id,
+            finding_id=i,
+            draft=draft,
+            observed_at=f"2026-01-0{i + 1}",
+        )
+
+    assert len(db.list_exposures_for_organization(org, limit=2)) == 2
+    critical = db.list_exposures_for_organization(org, severity="critical")
+    assert len(critical) == 1
+    assert critical[0].severity == "critical"
+    by_asset = db.list_exposures_for_organization(org, asset_id="asset")
+    assert len(by_asset) == 3
+
+
+def test_provider_outcomes_are_durable_and_tenant_scoped(tmp_path):
+    from api.control_db import ControlDB
+
+    db = ControlDB(tmp_path / "control.db")
+    account = db.create_account(email="provider-ledger@example.com")
+    org, _ = db.list_organizations_for_account(account)[0]
+    other = db.create_account(email="provider-ledger-other@example.com")
+    other_org, _ = db.list_organizations_for_account(other)[0]
+    db.create_scan(
+        scan_id="run-provider",
+        account_id=account,
+        organization_id=org,
+        domain="example.com",
+        db_path=str(tmp_path),
+    )
+
+    db.record_provider_run_outcomes(
+        organization_id=org,
+        account_id=account,
+        run_id="run-provider",
+        outcomes=[
+            ("nuclei", "success_no_results", 0),
+            ("httpx", "success_with_results", 4),
+            ("whatweb", "blocked_by_scope", 0),
+        ],
+    )
+
+    rows = db.list_provider_run_outcomes(org, "run-provider")
+    assert [(row.provider, row.outcome, row.output_lines) for row in rows] == [
+        ("httpx", "success_with_results", 4),
+        ("nuclei", "success_no_results", 0),
+        ("whatweb", "blocked_by_scope", 0),
+    ]
+    assert db.list_provider_run_outcomes(other_org, "run-provider") == []
+
+
+def test_provider_outcome_rejects_unknown_terminal_state(tmp_path):
+    import pytest
+
+    from api.control_db import ControlDB
+
+    db = ControlDB(tmp_path / "control.db")
+    account = db.create_account(email="provider-invalid@example.com")
+    org, _ = db.list_organizations_for_account(account)[0]
+    db.create_scan(
+        scan_id="run-invalid-provider",
+        account_id=account,
+        organization_id=org,
+        domain="example.com",
+        db_path=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="invalid provider execution outcome"):
+        db.record_provider_run_outcomes(
+            organization_id=org,
+            account_id=account,
+            run_id="run-invalid-provider",
+            outcomes=[("nuclei", "completed-but-maybe", 0)],
+        )
+
+
+def test_provider_outcome_rejects_foreign_run(tmp_path):
+    import pytest
+
+    from api.control_db import ControlDB
+
+    db = ControlDB(tmp_path / "control.db")
+    owner = db.create_account(email="provider-owner@example.com")
+    owner_org, _ = db.list_organizations_for_account(owner)[0]
+    foreign = db.create_account(email="provider-foreign@example.com")
+    foreign_org, _ = db.list_organizations_for_account(foreign)[0]
+    db.create_scan(
+        scan_id="foreign-provider-run",
+        account_id=foreign,
+        organization_id=foreign_org,
+        domain="example.com",
+        db_path=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="does not belong"):
+        db.record_provider_run_outcomes(
+            organization_id=owner_org,
+            account_id=owner,
+            run_id="foreign-provider-run",
+            outcomes=[("nuclei", "success_no_results", 0)],
+        )
 
 
 def test_exposure_rejects_foreign_run_and_missing_rule(tmp_path):
