@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from api.asset_identity import ExistingAsset, ReconciliationDecision
+from api.asset_identity import ReconciliationDecision
 from api.control_db import ControlDB
 from api.relationship_backfill import backfill_relationships_for_organization
 from api.relationship_identity import relationship_from_rows
