@@ -329,3 +329,48 @@ class HypothesesAssessmentResponse(BaseModel):
     trustworthy_count: int
     degraded_from_adversarial: bool = False
     actual_cost_usd: float
+
+
+# --- EASM Exposure inventory (Fase 08 hardening) ----------------------
+
+
+class ExposureResponse(BaseModel):
+    exposure_id: str
+    organization_id: str
+    asset_id: str
+    source: str
+    template_id: str
+    location: str
+    severity: Literal["low", "medium", "high", "critical"]
+    title: str
+    description: str
+    confidence_score: int | None = None
+    status: Literal["open", "reopened", "resolved"]
+    first_seen_at: str
+    last_seen_at: str
+    first_seen_run_id: str
+    last_seen_run_id: str
+    resolved_at: str | None = None
+    resolved_run_id: str | None = None
+    resolution_reason: str | None = None
+
+
+class ExposureEvidenceResponse(BaseModel):
+    exposure_evidence_id: str
+    exposure_id: str
+    run_id: str
+    finding_id: int
+    observed_at: str
+
+
+class ExposureHistoryResponse(BaseModel):
+    event_id: str
+    exposure_id: str
+    event_type: Literal["observed", "reopened", "resolved"]
+    happened_at: str
+    run_id: str | None = None
+    reason: str
+
+
+class ResolveExposureRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=1000)
