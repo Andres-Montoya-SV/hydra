@@ -1253,9 +1253,7 @@ class PipelineRunner:
         start = time.monotonic()
         try:
             raw_input_had_data = bool(
-                input_path.exists()
-                and input_path.is_file()
-                and input_path.stat().st_size > 0
+                input_path.exists() and input_path.is_file() and input_path.stat().st_size > 0
             )
             input_path = self._gate_active_input(context, plugin, input_path)
             if (
