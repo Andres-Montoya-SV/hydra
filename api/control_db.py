@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Literal
 
 from api.asset_identity import ExistingAsset, ReconciliationDecision
+from api.candidate_assets import CandidateAssetDraft
 from api.observation_identity import EvidenceContent
 from core.store import connect_sqlite
 
@@ -231,6 +232,46 @@ CREATE TABLE IF NOT EXISTS change_events (
 );
 CREATE INDEX IF NOT EXISTS idx_change_events_asset ON change_events(asset_id, detected_at);
 CREATE INDEX IF NOT EXISTS idx_change_events_run ON change_events(run_id);
+
+-- Fase 06 (EASM roadmap): organization-scoped Candidate Assets. The
+-- run-scoped `core.store.intel_indicators` rows remain the source event;
+-- this table answers "have we discovered this candidate before?" across
+-- scans. A row is intelligence, not ownership and not authorization.
+-- OUT_OF_SCOPE/UNKNOWN/NOT_ALLOWED candidates are intentionally retained
+-- here so attribution/history is not destroyed, but nothing in this table
+-- is an input to CollectionScope or authorize_active_indicator.
+--
+-- `lineage_reference` is intentionally NOT a foreign key. The legacy
+-- intel_indicators.evidence_id field is documented as overloaded: some
+-- producers store an intel_evidence id, others an observation id. Fase 06
+-- preserves that reference verbatim rather than pretending its type is
+-- stronger than the source can prove.
+CREATE TABLE IF NOT EXISTS candidate_assets (
+    candidate_asset_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    candidate_type TEXT NOT NULL,
+    normalized_value TEXT NOT NULL,
+    display_value TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    first_seen_run_id TEXT NOT NULL,
+    last_seen_run_id TEXT NOT NULL,
+    scope_status TEXT NOT NULL,
+    collection_status TEXT NOT NULL,
+    authorization_status TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    depth INTEGER NOT NULL DEFAULT 0,
+    priority INTEGER NOT NULL DEFAULT 100,
+    collector TEXT NOT NULL DEFAULT '',
+    source_entity_id TEXT NOT NULL DEFAULT '',
+    parent_indicator_id TEXT,
+    lineage_reference TEXT NOT NULL DEFAULT '',
+    UNIQUE (organization_id, candidate_type, normalized_value)
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_assets_organization
+    ON candidate_assets(organization_id, first_seen_at);
+CREATE INDEX IF NOT EXISTS idx_candidate_assets_value
+    ON candidate_assets(organization_id, candidate_type, normalized_value);
 
 CREATE TABLE IF NOT EXISTS api_keys (
     key_id TEXT PRIMARY KEY,
@@ -846,6 +887,29 @@ class AssetRecord:
 
 
 @dataclass(frozen=True)
+class CandidateAssetRecord:
+    candidate_asset_id: str
+    organization_id: str
+    candidate_type: str
+    normalized_value: str
+    display_value: str
+    first_seen_at: str
+    last_seen_at: str
+    first_seen_run_id: str
+    last_seen_run_id: str
+    scope_status: str
+    collection_status: str
+    authorization_status: str
+    reason: str
+    depth: int
+    priority: int
+    collector: str
+    source_entity_id: str
+    parent_indicator_id: str | None
+    lineage_reference: str
+
+
+@dataclass(frozen=True)
 class AssetIdentifierRecord:
     id: int
     asset_id: str
@@ -1458,6 +1522,116 @@ class ControlDB:
                 (asset_id,),
             ).fetchall()
         return [_asset_identifier_record_from_row(row) for row in rows]
+
+    # --- candidate assets (Fase 06, EASM roadmap) ----------------------
+
+    def upsert_candidate_asset(
+        self,
+        *,
+        organization_id: str,
+        run_id: str,
+        draft: CandidateAssetDraft,
+        observed_at: str | None = None,
+    ) -> tuple[str, bool]:
+        """Persist one exact candidate identity across runs.
+
+        Returns `(candidate_asset_id, created)`. Existing rows keep their
+        original first-seen identity and receive the latest run's lifecycle
+        metadata. This method never creates an `assets` row and never calls
+        any authorization primitive.
+        """
+        observed_at = observed_at or _now_iso()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT candidate_asset_id FROM candidate_assets "
+                "WHERE organization_id = ? AND candidate_type = ? "
+                "AND normalized_value = ?",
+                (organization_id, draft.candidate_type, draft.normalized_value),
+            ).fetchone()
+            if row is not None:
+                candidate_asset_id = str(row["candidate_asset_id"])
+                conn.execute(
+                    "UPDATE candidate_assets SET display_value = ?, last_seen_at = ?, "
+                    "last_seen_run_id = ?, scope_status = ?, collection_status = ?, "
+                    "authorization_status = ?, reason = ?, depth = ?, priority = ?, "
+                    "collector = ?, source_entity_id = ?, parent_indicator_id = ?, "
+                    "lineage_reference = ? WHERE candidate_asset_id = ?",
+                    (
+                        draft.display_value,
+                        observed_at,
+                        run_id,
+                        draft.scope_status,
+                        draft.collection_status,
+                        draft.authorization_status,
+                        draft.reason,
+                        draft.depth,
+                        draft.priority,
+                        draft.collector,
+                        draft.source_entity_id,
+                        draft.parent_indicator_id,
+                        draft.lineage_reference,
+                        candidate_asset_id,
+                    ),
+                )
+                return candidate_asset_id, False
+
+            candidate_asset_id = secrets.token_hex(16)
+            conn.execute(
+                "INSERT INTO candidate_assets (candidate_asset_id, organization_id, "
+                "candidate_type, normalized_value, display_value, first_seen_at, "
+                "last_seen_at, first_seen_run_id, last_seen_run_id, scope_status, "
+                "collection_status, authorization_status, reason, depth, priority, "
+                "collector, source_entity_id, parent_indicator_id, lineage_reference) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    candidate_asset_id,
+                    organization_id,
+                    draft.candidate_type,
+                    draft.normalized_value,
+                    draft.display_value,
+                    observed_at,
+                    observed_at,
+                    run_id,
+                    run_id,
+                    draft.scope_status,
+                    draft.collection_status,
+                    draft.authorization_status,
+                    draft.reason,
+                    draft.depth,
+                    draft.priority,
+                    draft.collector,
+                    draft.source_entity_id,
+                    draft.parent_indicator_id,
+                    draft.lineage_reference,
+                ),
+            )
+        return candidate_asset_id, True
+
+    def list_candidate_assets_for_organization(
+        self, organization_id: str, *, candidate_type: str | None = None
+    ) -> list[CandidateAssetRecord]:
+        with self._connect() as conn:
+            if candidate_type is None:
+                rows = conn.execute(
+                    "SELECT * FROM candidate_assets WHERE organization_id = ? "
+                    "ORDER BY first_seen_at, candidate_asset_id",
+                    (organization_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM candidate_assets WHERE organization_id = ? "
+                    "AND candidate_type = ? ORDER BY first_seen_at, candidate_asset_id",
+                    (organization_id, candidate_type),
+                ).fetchall()
+        return [_candidate_asset_record_from_row(row) for row in rows]
+
+    def get_candidate_asset(self, candidate_asset_id: str) -> CandidateAssetRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM candidate_assets WHERE candidate_asset_id = ?",
+                (candidate_asset_id,),
+            ).fetchone()
+        return None if row is None else _candidate_asset_record_from_row(row)
 
     # --- observations and evidence (Fase 04, EASM roadmap) --------------
 
@@ -3250,6 +3424,30 @@ def _asset_record_from_row(row: sqlite3.Row) -> AssetRecord:
         first_seen_at=row["first_seen_at"],
         last_seen_at=row["last_seen_at"],
         last_seen_run_id=row["last_seen_run_id"],
+    )
+
+
+def _candidate_asset_record_from_row(row: sqlite3.Row) -> CandidateAssetRecord:
+    return CandidateAssetRecord(
+        candidate_asset_id=row["candidate_asset_id"],
+        organization_id=row["organization_id"],
+        candidate_type=row["candidate_type"],
+        normalized_value=row["normalized_value"],
+        display_value=row["display_value"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        first_seen_run_id=row["first_seen_run_id"],
+        last_seen_run_id=row["last_seen_run_id"],
+        scope_status=row["scope_status"],
+        collection_status=row["collection_status"],
+        authorization_status=row["authorization_status"],
+        reason=row["reason"],
+        depth=int(row["depth"]),
+        priority=int(row["priority"]),
+        collector=row["collector"],
+        source_entity_id=row["source_entity_id"],
+        parent_indicator_id=row["parent_indicator_id"],
+        lineage_reference=row["lineage_reference"],
     )
 
 
