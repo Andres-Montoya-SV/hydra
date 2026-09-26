@@ -68,7 +68,11 @@ A normalized record retains:
 
 The canonical parser attaches these to the existing `HttpService.technologies`
 list. Fase 04 then creates durable `technology_detected` observations/evidence
-without schema duplication.
+without schema duplication. Fase 06 additionally preserves a provider-supported
+version in the evidence detail (for example `nginx@1.26.2`); unversioned facts
+retain the previous name-only representation. Because Fase 05 hashes evidence
+detail when deriving change events, a real version transition is now visible
+cross-run instead of collapsing to the same technology name.
 
 ## Product semantics
 
