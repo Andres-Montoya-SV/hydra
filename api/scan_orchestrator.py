@@ -125,6 +125,22 @@ async def execute_scan(
             )
         else:
             control_db.update_scan_status(scan_id, "completed")
+            # Persist the Fase-09 execution outcome ledger before any
+            # downstream notification/workflow logic consumes the run.
+            # This is run-level operational evidence only; it deliberately
+            # does NOT auto-resolve asset exposures because provider success
+            # alone is not proof of exhaustive per-asset coverage.
+            scan_record = control_db.get_owned_scan(scan_id, account_id)
+            if scan_record is not None and scan_record.organization_id:
+                control_db.record_provider_run_outcomes(
+                    organization_id=scan_record.organization_id,
+                    account_id=account_id,
+                    run_id=scan_id,
+                    outcomes=[
+                        (name, info.status.value, info.output_lines)
+                        for name, info in sorted(context.tool_states.items())
+                    ],
+                )
             # Deliberately its OWN try/except, never inside the same
             # scope as the scan's own status transition above: a bug or
             # a slow/unreachable webhook receiver here must never
