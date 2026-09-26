@@ -161,6 +161,21 @@ class TestRelationshipNormalization:
             is None
         )
 
+    def test_unknown_confidence_is_rejected(self) -> None:
+        assert (
+            relationship_from_rows(
+                {
+                    "source_entity": "domain:a.example.com",
+                    "target_entity": "domain:b.example.com",
+                    "relationship_type": "SHARES_IPV4",
+                    "confidence": "ABSOLUTE_TRUTH",
+                    "evidence_id": "ev-1",
+                },
+                {"evidence_id": "ev-1"},
+            )
+            is None
+        )
+
 
 class TestRelationshipBackfill:
     def test_same_edge_across_runs_is_one_cross_run_relationship(
@@ -299,3 +314,58 @@ class TestRelationshipBackfill:
         a = control_db.list_relationships_for_organization(org_a)[0]
         b = control_db.list_relationships_for_organization(org_b)[0]
         assert a.relationship_id != b.relationship_id
+
+    def test_asset_link_from_another_organization_is_rejected(
+        self, control_db: ControlDB, api_settings: APISettings
+    ) -> None:
+        account_a = control_db.create_account(email="rel-link-a@example.com")
+        account_b = control_db.create_account(email="rel-link-b@example.com")
+        org_a, _ = control_db.list_organizations_for_account(account_a)[0]
+        org_b, _ = control_db.list_organizations_for_account(account_b)[0]
+
+        control_db.apply_asset_reconciliation(
+            organization_id=org_b,
+            run_id="foreign-seed",
+            observed_at="2026-01-01T00:00:00+00:00",
+            decisions=[
+                ReconciliationDecision(
+                    asset_id="foreign-asset",
+                    asset_type="domain",
+                    identity_key="domain:a.example.com",
+                    is_new=True,
+                    identifiers=(),
+                )
+            ],
+        )
+
+        draft = relationship_from_rows(
+            {
+                "source_entity": "domain:a.example.com",
+                "target_entity": "domain:b.example.com",
+                "relationship_type": "SHARES_IPV4",
+                "confidence": "HIGH",
+                "strength": "strong",
+                "evidence_id": "ev-foreign",
+                "data_json": "{}",
+            },
+            {
+                "evidence_id": "ev-foreign",
+                "source": "fixture",
+                "collector": "fixture",
+                "reason": "shared signal",
+                "metadata_json": "{}",
+                "observed_at": "2026-01-01T00:00:00+00:00",
+            },
+        )
+        assert draft is not None
+
+        with pytest.raises(ValueError, match="does not belong to organization"):
+            control_db.upsert_relationship(
+                organization_id=org_a,
+                run_id="run-a",
+                draft=draft,
+                source_asset_id="foreign-asset",
+                observed_at="2026-01-01T00:00:00+00:00",
+            )
+
+        assert control_db.list_relationships_for_organization(org_a) == []
