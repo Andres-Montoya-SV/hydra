@@ -14,6 +14,7 @@ browser sandbox are NOT an anonymity or containment boundary.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -25,6 +26,7 @@ from core.plugin_base import PluginResult
 from modules._base import BaseToolPlugin
 from utils.files import write_jsonl
 from utils.security import (
+    atomic_write_bytes,
     atomic_write_text,
     relative_output_path,
     validate_output_path,
@@ -142,6 +144,10 @@ class BrowserProbePlugin(BaseToolPlugin):
                                 "redirect_chain": [],
                                 "cloaking_suspected": False,
                                 "raw_artifact": None,
+                                "screenshot_path": None,
+                                "screenshot_sha256": None,
+                                "rendered_html_sha256": None,
+                                "title": None,
                                 "error": str(exc)[:240],
                                 "blocked_subresources": {},
                                 "blocked_subresources_total": 0,
@@ -249,10 +255,10 @@ async def _probe_target(
         httpx_host = _url_host(target["httpx_final_url"])
         cloaking = bool(browser_host and httpx_host and browser_host != httpx_host)
 
-        # Persist the fully rendered HTML so an analyst can audit what the
-        # mobile WebKit view actually saw — same raw-artifact pattern as
-        # whois_raw.txt / port_verify_raw/.
-        raw_artifact = await _write_html_artifact(context, target["host"], page, browser_final_url)
+        # Visual Intelligence is neutral evidence about the rendered service,
+        # not a vulnerability verdict. Capture bounded visual artifacts for
+        # every successfully-created page; cloaking remains a separate finding.
+        visual = await _capture_visual_artifacts(context, target["host"], page, browser_final_url)
 
         return {
             "host": target["host"],
@@ -260,7 +266,7 @@ async def _probe_target(
             "browser_final_url": browser_final_url,
             "redirect_chain": redirects,
             "cloaking_suspected": cloaking,
-            "raw_artifact": raw_artifact,
+            **visual,
             "error": error,
             "blocked_subresources": blocked_counts,
             "blocked_subresources_total": sum(blocked_counts.values()),
@@ -271,29 +277,75 @@ async def _probe_target(
         await browser_context.close()
 
 
-async def _write_html_artifact(
+async def _capture_visual_artifacts(
     context: PipelineContext,
     host: str,
     page: object,
     final_url: str,
-) -> str | None:
+) -> dict[str, object]:
+    """Persist rendered HTML + a bounded viewport screenshot.
+
+    Screenshots are intentionally viewport-only. A hostile or pathological
+    page can make `full_page=True` allocate an arbitrarily tall image; Hydra
+    needs a bounded artifact suitable for repeated EASM collection.
+    """
     try:
         html = await page.content()
     except Exception:
         html = ""
+    html_text = html if isinstance(html, str) else ""
+    rendered = f"<!-- final_url: {final_url} -->\n{html_text}"
+    rendered_sha256 = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
     try:
-        filename = validate_safe_filename(f"{host}.html")
+        title_value = await page.title()
+        title = str(title_value).strip() or None
+    except Exception:
+        title = None
+
+    try:
+        html_name = validate_safe_filename(f"{host}.html")
+        screenshot_name = validate_safe_filename(f"{host}.png")
     except ValidationError:
-        filename = validate_safe_filename(f"host-{abs(hash(host))}.html")
-    raw_path = validate_output_path(
-        context.output_dir / "browser_probe_raw" / filename, context.output_dir
+        safe = f"host-{hashlib.sha256(host.encode('utf-8')).hexdigest()[:16]}"
+        html_name = validate_safe_filename(f"{safe}.html")
+        screenshot_name = validate_safe_filename(f"{safe}.png")
+
+    html_path = validate_output_path(
+        context.output_dir / "browser_probe_raw" / html_name,
+        context.output_dir,
     )
-    content = f"<!-- final_url: {final_url} -->\n{html if isinstance(html, str) else ''}"
+    screenshot_path = validate_output_path(
+        context.output_dir / "browser_probe_screenshots" / screenshot_name,
+        context.output_dir,
+    )
+
+    raw_artifact: str | None = None
+    screenshot_artifact: str | None = None
+    screenshot_sha256: str | None = None
+
     try:
-        atomic_write_text(raw_path, content)
-    except OSError:
-        return None
-        return relative_output_path(raw_path, context.output_dir)
+        atomic_write_text(html_path, rendered)
+        raw_artifact = relative_output_path(html_path, context.output_dir)
+    except OSError as exc:
+        logger.warning("browser_probe: failed to persist rendered HTML for %s: %s", host, exc)
+
+    try:
+        screenshot_bytes = await page.screenshot(full_page=False, type="png")
+        if isinstance(screenshot_bytes, bytes):
+            atomic_write_bytes(screenshot_path, screenshot_bytes)
+            screenshot_artifact = relative_output_path(screenshot_path, context.output_dir)
+            screenshot_sha256 = hashlib.sha256(screenshot_bytes).hexdigest()
+    except Exception as exc:
+        logger.warning("browser_probe: failed to capture screenshot for %s: %s", host, exc)
+
+    return {
+        "raw_artifact": raw_artifact,
+        "screenshot_path": screenshot_artifact,
+        "screenshot_sha256": screenshot_sha256,
+        "rendered_html_sha256": rendered_sha256,
+        "title": title,
+    }
 
 
 def allow_browser_navigation(url: str, context: PipelineContext) -> bool:
