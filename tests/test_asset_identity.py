@@ -13,6 +13,7 @@ history) is in `tests/test_asset_backfill.py`.
 from __future__ import annotations
 
 from api.asset_identity import (
+    ASSET_TYPE_CLOUD_STORAGE,
     ASSET_TYPE_DNS_RECORD,
     ASSET_TYPE_DOMAIN,
     ASSET_TYPE_PORT,
@@ -20,6 +21,8 @@ from api.asset_identity import (
     IDENTIFIER_TYPE_IP,
     AssetObservation,
     ExistingAsset,
+    cloud_storage_identity_key,
+    cloud_storage_observation,
     dns_record_identity_key,
     domain_identity_key,
     identities_for_host,
@@ -84,6 +87,30 @@ class TestIdentitiesForHost:
         observations = identities_for_host(host)
         types = {o.asset_type for o in observations}
         assert types == {ASSET_TYPE_DOMAIN, ASSET_TYPE_PORT, ASSET_TYPE_DNS_RECORD, ASSET_TYPE_URL}
+
+
+class TestCloudStorageIdentity:
+    def test_provider_qualifies_bucket_identity(self) -> None:
+        assert cloud_storage_identity_key(
+            provider="S3", resource_name="Example-Assets"
+        ) == "cloud_storage:s3:example-assets"
+        assert cloud_storage_identity_key(
+            provider="gcs", resource_name="Example-Assets"
+        ) == "cloud_storage:gcs:example-assets"
+
+    def test_cloud_observation_uses_url_as_secondary_identifier_only(self) -> None:
+        observation = cloud_storage_observation(
+            {
+                "provider": "s3",
+                "resource_name": "example-assets",
+                "url": "https://example-assets.s3.amazonaws.com/",
+            }
+        )
+        assert observation.asset_type == ASSET_TYPE_CLOUD_STORAGE
+        assert observation.identity_key == "cloud_storage:s3:example-assets"
+        assert observation.identifiers == (
+            ("url", "https://example-assets.s3.amazonaws.com/"),
+        )
 
 
 class TestReconciliationIsDeterministic:
