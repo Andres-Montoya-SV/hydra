@@ -7,6 +7,7 @@ on what `observations_for_host` derives.
 from __future__ import annotations
 
 from api.observation_identity import (
+    OBSERVATION_TYPE_DNS_POSTURE_TAG,
     OBSERVATION_TYPE_DNS_RECORD_PRESENT,
     OBSERVATION_TYPE_DOMAIN_RESOLVED,
     OBSERVATION_TYPE_PORT_OPEN,
@@ -59,6 +60,54 @@ class TestObservationsForHost:
         assert len(drafts) == 1
         assert drafts[0].identity_key == "dns_record:example.com:A:1.2.3.4"
         assert drafts[0].evidence.source == "dnsx"
+
+    def test_dns_security_tags_become_temporal_posture_observations(self) -> None:
+        host = Host(
+            domain="example.com",
+            dns_records=[
+                DnsRecord(
+                    host="example.com",
+                    record_type="TXT",
+                    value="v=spf1 +all",
+                    source="dnsx",
+                    security_tags=["spf", "weak-spf"],
+                )
+            ],
+        )
+        drafts = [
+            d
+            for d in observations_for_host(host)
+            if d.observation_type == OBSERVATION_TYPE_DNS_POSTURE_TAG
+        ]
+        assert {d.evidence.detail for d in drafts} == {"spf", "weak-spf"}
+        assert {d.identity_key for d in drafts} == {
+            "dns_record:example.com:TXT:v=spf1 +all"
+        }
+        assert all(d.asset_type == "dns_record" for d in drafts)
+
+    def test_duplicate_dns_security_tags_are_collapsed(self) -> None:
+        host = Host(
+            domain="example.com",
+            dns_records=[
+                DnsRecord(
+                    host="example.com",
+                    record_type="CAA",
+                    value='0 issue "letsencrypt.org"',
+                    source="dnsx",
+                    security_tags=[
+                        "certificate-authority-policy",
+                        "certificate-authority-policy",
+                    ],
+                )
+            ],
+        )
+        drafts = [
+            d
+            for d in observations_for_host(host)
+            if d.observation_type == OBSERVATION_TYPE_DNS_POSTURE_TAG
+        ]
+        assert len(drafts) == 1
+        assert drafts[0].evidence.detail == "certificate-authority-policy"
 
     def test_a_url_produces_its_own_observation(self) -> None:
         host = Host(
