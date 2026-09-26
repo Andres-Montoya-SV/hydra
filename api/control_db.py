@@ -29,6 +29,7 @@ from typing import Literal
 
 from api.asset_identity import ExistingAsset, ReconciliationDecision
 from api.candidate_assets import CandidateAssetDraft
+from api.exposure_identity import ExposureDraft
 from api.observation_identity import EvidenceContent
 from core.store import connect_sqlite
 
