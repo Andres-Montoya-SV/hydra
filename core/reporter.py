@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from core.intel.correlate import score_to_band
-from core.models import PipelineContext, RunSummary
+from core.models import PipelineContext, RunSummary, ToolStatus
 from core.verification.grounding import (
     downgrade_note,
     downgraded_confidence_score,
@@ -41,13 +41,24 @@ class ReportGenerator:
         tools_failed = []
         tools_skipped = []
 
+        successful = {
+            ToolStatus.COMPLETED,
+            ToolStatus.SUCCESS_WITH_RESULTS,
+            ToolStatus.SUCCESS_NO_RESULTS,
+        }
+        failed = {ToolStatus.FAILED, ToolStatus.PARTIAL}
+        skipped = {
+            ToolStatus.SKIPPED,
+            ToolStatus.MISSING,
+            ToolStatus.UNAVAILABLE,
+            ToolStatus.BLOCKED_BY_SCOPE,
+        }
         for _name, info in context.tool_states.items():
-            status = info.status.value
-            if status == "completed":
+            if info.status in successful:
                 tools_run.append(info.name)
-            elif status == "failed":
+            elif info.status in failed:
                 tools_failed.append(info.name)
-            elif status in ("skipped", "missing"):
+            elif info.status in skipped:
                 tools_skipped.append(info.name)
 
         return RunSummary(

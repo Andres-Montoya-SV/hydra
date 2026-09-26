@@ -24,6 +24,11 @@ class PluginResult:
     message: str = ""
     data: dict | None = None
     skipped: bool = False
+    # Explicit execution semantics for Fase 09. These flags are deliberately
+    # orthogonal to success so a provider can report a bounded partial result
+    # without pretending it was a clean run.
+    partial: bool = False
+    blocked_by_scope: bool = False
 
 
 class ReconPlugin(ABC):
@@ -50,6 +55,10 @@ class ReconPlugin(ABC):
     produces: ClassVar[tuple[str, ...]] = ()
     followup_kinds: ClassVar[tuple[str, ...]] = ()
     capability: ClassVar[str] = ""
+    # Minimal product-level provider metadata. Existing plugins need not all
+    # override these during Fase 09; provider_contract derives safe defaults.
+    provider_kind: ClassVar[str] = ""
+    supported_asset_types: ClassVar[tuple[str, ...]] = ()
     active_collection: ClassVar[bool] = False
     strict_opsec_allowed: ClassVar[bool] = False
     _registry: ClassVar[list[type[ReconPlugin]]] = []

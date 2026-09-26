@@ -1231,7 +1231,11 @@ class PipelineRunner:
                 message="Blocked by strict OPSEC policy",
             )
         info = context.tool_states.get(plugin.name)
-        if info and info.status in (ToolStatus.MISSING, ToolStatus.SKIPPED):
+        if info and info.status in (
+            ToolStatus.MISSING,
+            ToolStatus.UNAVAILABLE,
+            ToolStatus.SKIPPED,
+        ):
             async with self._context_lock:
                 context.total_skipped += 1
             return None
@@ -1248,7 +1252,38 @@ class PipelineRunner:
 
         start = time.monotonic()
         try:
+            raw_input_had_data = bool(
+                input_path.exists() and input_path.is_file() and input_path.stat().st_size > 0
+            )
             input_path = self._gate_active_input(context, plugin, input_path)
+            if (
+                plugin.active_collection
+                and raw_input_had_data
+                and input_path.exists()
+                and input_path.is_file()
+                and input_path.stat().st_size == 0
+            ):
+                # authorize_plugin_input already made the actual scope
+                # decision and persisted the denied indicators. This branch
+                # only classifies the execution outcome; it is not a second
+                # authorization system.
+                duration = time.monotonic() - start
+                plugin.update_status(
+                    context,
+                    ToolStatus.BLOCKED_BY_SCOPE,
+                    duration_seconds=duration,
+                    output_lines=0,
+                    error_message="All active inputs were blocked by CollectionScope",
+                )
+                async with self._context_lock:
+                    context.total_skipped += 1
+                return PluginResult(
+                    success=False,
+                    skipped=True,
+                    blocked_by_scope=True,
+                    message="All active inputs were blocked by CollectionScope",
+                )
+
             cached = self._load_cached_result(context, plugin, input_path)
             if cached:
                 return cached
@@ -1257,8 +1292,16 @@ class PipelineRunner:
             async with self._context_lock:
                 if plugin.name in context.tool_states:
                     context.tool_states[plugin.name].duration_seconds = duration
+            from core.provider_contract import execution_status_for_result
+
+            normalized_status = execution_status_for_result(result)
+            plugin.update_status(
+                context,
+                normalized_status,
+                duration_seconds=duration,
+                output_lines=result.lines_produced,
+            )
             if result.skipped:
-                plugin.update_status(context, ToolStatus.SKIPPED, duration_seconds=duration)
                 async with self._context_lock:
                     context.total_skipped += 1
                 self._emit_log("INFO", f"{plugin.display_name}: {result.message}")
@@ -1443,10 +1486,15 @@ class PipelineRunner:
                 "WARNING",
                 "httpx cache restored without httpx.json — structured probe data is empty",
             )
+        cached_lines = int(entry.get("lines_produced") or 0)
         plugin.update_status(
             context,
-            ToolStatus.COMPLETED,
-            output_lines=int(entry.get("lines_produced") or 0),
+            (
+                ToolStatus.SUCCESS_WITH_RESULTS
+                if cached_lines > 0
+                else ToolStatus.SUCCESS_NO_RESULTS
+            ),
+            output_lines=cached_lines,
         )
         self._emit_log("INFO", f"{plugin.display_name}: reused cached artifact")
         if context.registry:
