@@ -315,6 +315,31 @@ def test_provider_outcomes_are_durable_and_tenant_scoped(tmp_path):
     assert db.list_provider_run_outcomes(other_org, "run-provider") == []
 
 
+def test_provider_outcome_rejects_unknown_terminal_state(tmp_path):
+    import pytest
+
+    from api.control_db import ControlDB
+
+    db = ControlDB(tmp_path / "control.db")
+    account = db.create_account(email="provider-invalid@example.com")
+    org, _ = db.list_organizations_for_account(account)[0]
+    db.create_scan(
+        scan_id="run-invalid-provider",
+        account_id=account,
+        organization_id=org,
+        domain="example.com",
+        db_path=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="invalid provider execution outcome"):
+        db.record_provider_run_outcomes(
+            organization_id=org,
+            account_id=account,
+            run_id="run-invalid-provider",
+            outcomes=[("nuclei", "completed-but-maybe", 0)],
+        )
+
+
 def test_provider_outcome_rejects_foreign_run(tmp_path):
     import pytest
 
