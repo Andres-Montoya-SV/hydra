@@ -2119,6 +2119,18 @@ class ControlDB:
         outcomes: list[tuple[str, str, int]],
     ) -> None:
         """Persist Fase-09 provider outcomes as durable operational evidence."""
+        allowed_outcomes = {
+            "success_with_results",
+            "success_no_results",
+            "partial",
+            "blocked_by_scope",
+            "skipped",
+            "unavailable",
+            "failed",
+        }
+        for provider, outcome, _output_lines in outcomes:
+            if not provider.strip() or outcome not in allowed_outcomes:
+                raise ValueError("invalid provider execution outcome")
         with self._connect() as conn:
             scan = conn.execute(
                 "SELECT account_id, organization_id FROM scans WHERE scan_id = ?",
