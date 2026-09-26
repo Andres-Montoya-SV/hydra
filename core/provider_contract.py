@@ -14,7 +14,6 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 
 import modules  # noqa: F401  # register ReconPlugin subclasses
-
 from core.collection.crawler_proxy import PROXY_VERIFIED_TOOLS
 from core.dependencies.registry import get_tool_definition
 from core.models import ToolStatus
