@@ -33,8 +33,13 @@ import secrets
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from api.asset_identity import ExistingAsset, reconcile_host_observations
-from api.observation_identity import observations_for_host
+from api.asset_identity import (
+    ExistingAsset,
+    cloud_storage_observation,
+    reconcile_host_observations,
+    reconcile_observation,
+)
+from api.observation_identity import EvidenceContent, observations_for_host
 from api.tenancy import account_db_path
 from core.store import AssetStore
 
@@ -152,6 +157,62 @@ def backfill_assets_for_organization(
                     observations_recorded += 1
                 else:
                     observations_already_present += 1
+
+        for resource in store.get_cloud_resources(scan.scan_id):
+            resource_name = str(resource.get("resource_name") or "").strip()
+            if not resource_name:
+                continue
+            cloud_observation = cloud_storage_observation(resource)
+            decision = reconcile_observation(
+                observation=cloud_observation,
+                existing_by_identity_key=existing,
+                new_asset_id=lambda: secrets.token_hex(16),
+            )
+            control_db.apply_asset_reconciliation(
+                organization_id=organization_id,
+                run_id=scan.scan_id,
+                decisions=[decision],
+                observed_at=observed_at,
+            )
+            if decision.is_new:
+                assets_created += 1
+            else:
+                assets_touched += 1
+            existing[decision.identity_key] = ExistingAsset(
+                asset_id=decision.asset_id,
+                asset_type=decision.asset_type,
+                identity_key=decision.identity_key,
+            )
+
+            evidence_id = control_db.find_or_create_evidence(
+                organization_id=organization_id,
+                asset_id=decision.asset_id,
+                content=EvidenceContent(
+                    source="cloud_bucket_enum",
+                    detail=(
+                        f"classification={resource.get('classification') or 'unknown'};"
+                        f"public_listable={bool(resource.get('public_listable'))};"
+                        f"url={resource.get('url') or ''}"
+                    ),
+                    confidence_score=int(resource.get("confidence_score") or 70),
+                ),
+                run_id=scan.scan_id,
+                observed_at=observed_at,
+            )
+            evidence_created_or_touched += 1
+            observation_id = control_db.record_observation(
+                organization_id=organization_id,
+                asset_id=decision.asset_id,
+                run_id=scan.scan_id,
+                account_id=scan.account_id,
+                observation_type="cloud_storage_observed",
+                evidence_id=evidence_id,
+                observed_at=observed_at,
+            )
+            if observation_id is not None:
+                observations_recorded += 1
+            else:
+                observations_already_present += 1
 
     return BackfillSummary(
         scans_processed=scans_processed,
