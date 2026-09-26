@@ -2200,9 +2200,7 @@ class AssetStore:
             tls_cipher=row["tls_cipher"] if "tls_cipher" in row.keys() else None,
             response_fingerprint=row["response_fingerprint"],
             redirect_chain=json.loads(row["redirect_chain_json"] or "[]"),
-            screenshot_path=(
-                row["screenshot_path"] if "screenshot_path" in row.keys() else None
-            ),
+            screenshot_path=row["screenshot_path"] if "screenshot_path" in row.keys() else None,
         )
 
     def _row_to_port(self, row: sqlite3.Row) -> Port:
