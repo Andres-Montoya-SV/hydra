@@ -173,11 +173,7 @@ def observations_for_host(host: Host) -> list[ObservationDraft]:
                         # collapsing both runs to the same "nginx" evidence.
                         # Unversioned technologies retain the exact pre-Fase-06
                         # representation for backwards compatibility.
-                        detail=(
-                            f"{tech.name}@{tech.version}"
-                            if tech.version
-                            else tech.name
-                        ),
+                        detail=f"{tech.name}@{tech.version}" if tech.version else tech.name,
                         confidence_score=tech.confidence,
                     ),
                 )
