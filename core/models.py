@@ -16,10 +16,18 @@ class ToolStatus(str, Enum):
     CHECKING = "checking"
     READY = "ready"
     RUNNING = "running"
+    # Legacy terminal state retained for direct plugin callers and old
+    # persisted/report fixtures. PipelineRunner normalizes completed provider
+    # executions into the more precise Fase-09 outcomes below.
     COMPLETED = "completed"
+    SUCCESS_WITH_RESULTS = "success_with_results"
+    SUCCESS_NO_RESULTS = "success_no_results"
+    PARTIAL = "partial"
+    BLOCKED_BY_SCOPE = "blocked_by_scope"
     SKIPPED = "skipped"
     FAILED = "failed"
     MISSING = "missing"
+    UNAVAILABLE = "unavailable"
 
 
 class PipelineStage(str, Enum):
