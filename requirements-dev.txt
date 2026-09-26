@@ -5,7 +5,7 @@ isort==6.0.1
 mypy==1.15.0
 pytest==9.0.3
 pytest-asyncio==1.4.0
-ruff==0.11.2
+ruff==0.16.8
 # httpx: needed for fastapi.testclient.TestClient (tests/test_api_*.py).
 # Since Round 2, the API itself also depends on this directly
 # (requirements-api.txt — api/domain_verification.py's well-known-file
