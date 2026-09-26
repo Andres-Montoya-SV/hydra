@@ -71,6 +71,7 @@ HEAD_BLURBS: dict[str, str] = {
     "theharvester": "email/personnel OSINT head",
     "sslyze": "TLS/certificate posture head",
     "wafw00f": "WAF/CDN fingerprinting head",
+    "whatweb": "Technology Intelligence enrichment head",
     "ffuf": "hidden endpoint / content discovery head",
     "dnstwist": "domain permutation / typosquat monitoring head",
     "github_secrets": "leaked-secrets (public GitHub repos) head",
