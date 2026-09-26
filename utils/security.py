@@ -361,6 +361,20 @@ def validate_positive_int(
     return value
 
 
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Write bytes atomically with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp_path.write_bytes(content)
+        tmp_path.chmod(0o600)
+        tmp_path.replace(path)
+    except OSError:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
     """Write text atomically via a temporary file in the same directory.
 
