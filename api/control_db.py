@@ -1750,9 +1750,7 @@ class ControlDB:
                     (asset_id,),
                 ).fetchone()
                 if row is None or str(row["organization_id"]) != organization_id:
-                    raise ValueError(
-                        f"{label}_asset_id does not belong to organization"
-                    )
+                    raise ValueError(f"{label}_asset_id does not belong to organization")
 
             row = conn.execute(
                 "SELECT relationship_id FROM relationships "
@@ -1856,9 +1854,7 @@ class ControlDB:
                 ).fetchall()
         return [_relationship_record_from_row(row) for row in rows]
 
-    def list_relationship_evidence(
-        self, relationship_id: str
-    ) -> list[RelationshipEvidenceRecord]:
+    def list_relationship_evidence(self, relationship_id: str) -> list[RelationshipEvidenceRecord]:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM relationship_evidence WHERE relationship_id = ? "
@@ -3703,9 +3699,7 @@ def _relationship_record_from_row(row: sqlite3.Row) -> RelationshipRecord:
     )
 
 
-def _relationship_evidence_record_from_row(
-    row: sqlite3.Row,
-) -> RelationshipEvidenceRecord:
+def _relationship_evidence_record_from_row(row: sqlite3.Row) -> RelationshipEvidenceRecord:
     return RelationshipEvidenceRecord(
         relationship_evidence_id=row["relationship_evidence_id"],
         relationship_id=row["relationship_id"],
