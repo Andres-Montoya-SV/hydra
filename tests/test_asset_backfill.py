@@ -242,6 +242,105 @@ class TestBackfillAgainstRealRunHistory:
         assert identifiers[0].identifier_value == "9.9.9.9"
 
 
+class TestCloudStorageBackfill:
+    def test_cloud_bucket_is_a_cloud_storage_asset_not_a_domain(
+        self, control_db: ControlDB, api_settings: APISettings
+    ) -> None:
+        account_id = control_db.create_account(email="cloud-owner@example.com")
+        organization_id, _role = control_db.list_organizations_for_account(account_id)[0]
+        scan_id = _run_completed_scan(
+            control_db,
+            api_settings,
+            account_id=account_id,
+            organization_id=organization_id,
+            domain="example.com",
+            hosts=[Host(domain="example.com")],
+        )
+        store = AssetStore(account_db_path(api_settings, account_id))
+        store.record_cloud_resources(
+            scan_id,
+            [
+                {
+                    "provider": "s3",
+                    "bucket": "example-assets",
+                    "url": "https://example-assets.s3.amazonaws.com/",
+                    "classification": "exists_private",
+                    "exists": True,
+                    "public_listable": False,
+                    "status_code": 403,
+                }
+            ],
+        )
+
+        backfill_assets_for_organization(
+            control_db=control_db,
+            api_settings=api_settings,
+            organization_id=organization_id,
+        )
+
+        cloud_assets = control_db.list_assets_for_organization(
+            organization_id, asset_type="cloud_storage"
+        )
+        assert len(cloud_assets) == 1
+        assert cloud_assets[0].identity_key == "cloud_storage:s3:example-assets"
+
+        domains = control_db.list_assets_for_organization(
+            organization_id, asset_type="domain"
+        )
+        assert {asset.identity_key for asset in domains} == {"domain:example.com"}
+
+        observations = control_db.list_observations_for_asset(cloud_assets[0].asset_id)
+        assert len(observations) == 1
+        assert observations[0].observation_type == "cloud_storage_observed"
+
+    def test_same_cloud_resource_across_runs_reconciles_to_one_asset(
+        self, control_db: ControlDB, api_settings: APISettings
+    ) -> None:
+        account_id = control_db.create_account(email="cloud-history@example.com")
+        organization_id, _role = control_db.list_organizations_for_account(account_id)[0]
+
+        for classification, public in (
+            ("exists_private", False),
+            ("public_listable", True),
+        ):
+            scan_id = _run_completed_scan(
+                control_db,
+                api_settings,
+                account_id=account_id,
+                organization_id=organization_id,
+                domain="example.com",
+                hosts=[Host(domain="example.com")],
+            )
+            AssetStore(account_db_path(api_settings, account_id)).record_cloud_resources(
+                scan_id,
+                [
+                    {
+                        "provider": "gcs",
+                        "bucket": "example-assets",
+                        "url": "https://storage.googleapis.com/example-assets",
+                        "classification": classification,
+                        "exists": True,
+                        "public_listable": public,
+                        "status_code": 200 if public else 403,
+                    }
+                ],
+            )
+
+        summary = backfill_assets_for_organization(
+            control_db=control_db,
+            api_settings=api_settings,
+            organization_id=organization_id,
+        )
+
+        cloud_assets = control_db.list_assets_for_organization(
+            organization_id, asset_type="cloud_storage"
+        )
+        assert len(cloud_assets) == 1
+        assert cloud_assets[0].identity_key == "cloud_storage:gcs:example-assets"
+        assert summary.assets_created == 2
+        assert summary.assets_touched == 2
+
+
 class TestCrossOrganizationIsolationIsAdversariallyProven:
     """The phase's own required adversarial case: two DIFFERENT
     organizations scan the SAME public host (a shared CDN case) — they
