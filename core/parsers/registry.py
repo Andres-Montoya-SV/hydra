@@ -838,7 +838,7 @@ class ThreatIntelParser(ToolParser):
 
 
 class BrowserProbeParser(ToolParser):
-    """Create a finding when browser and httpx destinations disagree."""
+    """Normalize rendered browser metadata; flag destination cloaking separately."""
 
     tool_name = "browser_probe"
 
@@ -852,40 +852,79 @@ class BrowserProbeParser(ToolParser):
         path = artifact or output_dir / "browser_probe.jsonl"
         hosts: list[Host] = []
         for record in read_jsonl(path):
-            if not record.get("cloaking_suspected"):
-                continue
             domain = normalize_domain(str(record.get("host", "")))
             if not domain:
                 continue
             httpx_url = str(record.get("httpx_final_url", ""))
             browser_url = str(record.get("browser_final_url", ""))
+            browser_http_url = (
+                browser_url if browser_url.startswith(("http://", "https://")) else ""
+            )
+            service_url = normalize_http_url(browser_http_url or httpx_url or f"https://{domain}")
             host = Host(domain=domain)
-            finding = Finding(
-                host=domain,
-                template_id="cloaking-detected",
-                severity="medium",
-                name="Browser destination differs from HTTP probe",
-                source="browser_probe",
-                url=browser_url or None,
-                description=(
-                    f"httpx ended at {httpx_url}; mobile WebKit ended at {browser_url}. "
-                    "Different destination hosts can indicate cloaking, conditional "
-                    "redirects, or ordinary client-specific routing; verify manually."
-                ),
-                confidence_score=75,
+            has_visual_evidence = bool(
+                browser_http_url
+                or record.get("raw_artifact")
+                or record.get("screenshot_path")
+                or record.get("rendered_html_sha256")
+                or record.get("screenshot_sha256")
+                or record.get("title")
             )
-            host.findings.append(finding)
-            host.add_provenance(
-                record_observation(
-                    tool="browser_probe",
-                    field="finding",
-                    value=finding.template_id,
-                    confidence=75,
-                    verified_by=["webkit", "httpx_comparison"],
-                    artifact_path=str(path),
+            if has_visual_evidence:
+                host.http_services.append(
+                    HttpService(
+                        url=service_url,
+                        host=domain,
+                        title=_optional_str(record.get("title")),
+                        body_hash=_optional_str(record.get("rendered_html_sha256")),
+                        response_fingerprint=_optional_str(record.get("screenshot_sha256")),
+                        redirect_chain=[
+                            str(item) for item in (record.get("redirect_chain") or []) if item
+                        ],
+                        source="browser_probe",
+                        confidence_score=85,
+                        screenshot_path=_optional_str(record.get("screenshot_path")),
+                    )
                 )
-            )
-            hosts.append(host)
+                host.add_provenance(
+                    record_observation(
+                        tool="browser_probe",
+                        field="visual_observation",
+                        value=service_url,
+                        confidence=85,
+                        verified_by=["webkit_render"],
+                        artifact_path=str(record.get("raw_artifact") or path),
+                    )
+                )
+
+            if record.get("cloaking_suspected"):
+                finding = Finding(
+                    host=domain,
+                    template_id="cloaking-detected",
+                    severity="medium",
+                    name="Browser destination differs from HTTP probe",
+                    source="browser_probe",
+                    url=browser_url or None,
+                    description=(
+                        f"httpx ended at {httpx_url}; mobile WebKit ended at {browser_url}. "
+                        "Different destination hosts can indicate cloaking, conditional "
+                        "redirects, or ordinary client-specific routing; verify manually."
+                    ),
+                    confidence_score=75,
+                )
+                host.findings.append(finding)
+                host.add_provenance(
+                    record_observation(
+                        tool="browser_probe",
+                        field="finding",
+                        value=finding.template_id,
+                        confidence=75,
+                        verified_by=["webkit", "httpx_comparison"],
+                        artifact_path=str(path),
+                    )
+                )
+            if has_visual_evidence or record.get("cloaking_suspected"):
+                hosts.append(host)
         return hosts, []
 
 
