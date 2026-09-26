@@ -50,9 +50,9 @@ def normalize_exposure_location(url: object, host: object) -> str:
                 except ValueError:
                     port = None
                 default = 443 if scheme == "https" else 80
-                netloc = hostname
+                netloc = f"[{hostname}]" if ":" in hostname else hostname
                 if port and port != default:
-                    netloc = f"{hostname}:{port}"
+                    netloc = f"{netloc}:{port}"
                 path = parsed.path or "/"
                 if path != "/":
                     path = path.rstrip("/")
@@ -89,7 +89,7 @@ def exposure_from_finding(
         confidence_score = None
     else:
         try:
-            confidence_score = max(0, min(100, int(confidence_raw)))
+            confidence_score = max(0, min(100, int(str(confidence_raw))))
         except (TypeError, ValueError):
             confidence_score = None
 

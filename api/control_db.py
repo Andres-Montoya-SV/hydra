@@ -284,6 +284,19 @@ CREATE INDEX IF NOT EXISTS idx_exposure_evidence_exposure
 CREATE INDEX IF NOT EXISTS idx_exposure_evidence_run
     ON exposure_evidence(organization_id, run_id);
 
+CREATE TABLE IF NOT EXISTS exposure_history (
+    event_id TEXT PRIMARY KEY,
+    exposure_id TEXT NOT NULL REFERENCES exposures(exposure_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    event_type TEXT NOT NULL CHECK(event_type IN ('observed','reopened','resolved')),
+    happened_at TEXT NOT NULL,
+    run_id TEXT,
+    reason TEXT NOT NULL,
+    UNIQUE(exposure_id, event_type, run_id, happened_at)
+);
+CREATE INDEX IF NOT EXISTS idx_exposure_history
+    ON exposure_history(organization_id, exposure_id, happened_at);
+
 -- Fase 06 (EASM roadmap): organization-scoped Candidate Assets. The
 -- run-scoped `core.store.intel_indicators` rows remain the source event;
 -- this table answers "have we discovered this candidate before?" across
@@ -1737,6 +1750,8 @@ class ControlDB:
         prove that "missing finding" means "collector ran successfully and
         confirmed the condition is gone."
         """
+        if finding_id <= 0 or not draft.source.strip() or not draft.template_id.strip():
+            raise ValueError("exposure requires a finding and a detector rule")
         observed_at = observed_at or _now_iso()
         with self._connect() as conn:
             asset = conn.execute(
@@ -1746,8 +1761,18 @@ class ControlDB:
             if asset is None or str(asset["organization_id"]) != organization_id:
                 raise ValueError("exposure asset_id does not belong to organization")
 
+            scan = conn.execute(
+                "SELECT account_id, organization_id FROM scans WHERE scan_id = ?", (run_id,)
+            ).fetchone()
+            if (
+                scan is None
+                or scan["organization_id"] != organization_id
+                or scan["account_id"] != account_id
+            ):
+                raise ValueError("exposure evidence run does not belong to account/organization")
+
             row = conn.execute(
-                "SELECT exposure_id FROM exposures WHERE organization_id = ? "
+                "SELECT * FROM exposures WHERE organization_id = ? "
                 "AND asset_id = ? AND source = ? AND template_id = ? AND location = ?",
                 (
                     organization_id,
@@ -1758,6 +1783,19 @@ class ControlDB:
                 ),
             ).fetchone()
             created = row is None
+            if row is not None:
+                duplicate = conn.execute(
+                    "SELECT 1 FROM exposure_evidence WHERE exposure_id = ? "
+                    "AND run_id = ? AND finding_id = ?",
+                    (row["exposure_id"], run_id, finding_id),
+                ).fetchone()
+                if duplicate is not None:
+                    return str(row["exposure_id"]), False, False
+            reopening = bool(
+                row is not None
+                and row["status"] == "resolved"
+                and observed_at > (row["resolved_at"] or row["last_seen_at"])
+            )
             if created:
                 exposure_id = secrets.token_hex(16)
                 conn.execute(
@@ -1786,18 +1824,20 @@ class ControlDB:
                 exposure_id = str(row["exposure_id"])
                 conn.execute(
                     "UPDATE exposures SET severity = ?, title = ?, description = ?, "
-                    "confidence_score = ?, status = 'open', last_seen_at = ?, "
-                    "last_seen_run_id = ?, resolved_at = NULL, resolved_run_id = NULL, "
-                    "resolution_reason = NULL WHERE exposure_id = ? AND organization_id = ?",
+                    "confidence_score = ?, status = ?, last_seen_at = ?, "
+                    "last_seen_run_id = ? WHERE exposure_id = ? AND organization_id = ? "
+                    "AND last_seen_at <= ?",
                     (
                         draft.severity,
                         draft.title,
                         draft.description,
                         draft.confidence_score,
+                        "reopened" if reopening else row["status"],
                         observed_at,
                         run_id,
                         exposure_id,
                         organization_id,
+                        observed_at,
                     ),
                 )
 
@@ -1817,6 +1857,21 @@ class ControlDB:
                 ),
             )
             evidence_created = bool(cursor.rowcount)
+            if evidence_created:
+                conn.execute(
+                    "INSERT OR IGNORE INTO exposure_history "
+                    "(event_id, exposure_id, organization_id, event_type, happened_at, run_id, reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        secrets.token_hex(16),
+                        exposure_id,
+                        organization_id,
+                        "reopened" if reopening else "observed",
+                        observed_at,
+                        run_id,
+                        f"{draft.source}:{draft.template_id}; finding={finding_id}",
+                    ),
+                )
         return exposure_id, created, evidence_created
 
     def resolve_exposure(
@@ -1829,19 +1884,37 @@ class ControlDB:
         resolved_run_id: str | None = None,
     ) -> bool:
         """Explicitly resolve one exposure; absence from a run never calls this."""
+        if not resolution_reason.strip():
+            raise ValueError("resolution requires a reason")
         with self._connect() as conn:
             cursor = conn.execute(
                 "UPDATE exposures SET status = 'resolved', resolved_at = ?, "
                 "resolved_run_id = ?, resolution_reason = ? "
-                "WHERE exposure_id = ? AND organization_id = ?",
+                "WHERE exposure_id = ? AND organization_id = ? AND status != 'resolved' "
+                "AND last_seen_at <= ?",
                 (
                     resolved_at,
                     resolved_run_id,
                     resolution_reason,
                     exposure_id,
                     organization_id,
+                    resolved_at,
                 ),
             )
+            if cursor.rowcount:
+                conn.execute(
+                    "INSERT INTO exposure_history "
+                    "(event_id, exposure_id, organization_id, event_type, happened_at, run_id, reason) "
+                    "VALUES (?, ?, ?, 'resolved', ?, ?, ?)",
+                    (
+                        secrets.token_hex(16),
+                        exposure_id,
+                        organization_id,
+                        resolved_at,
+                        resolved_run_id,
+                        resolution_reason,
+                    ),
+                )
         return bool(cursor.rowcount)
 
     def list_exposures_for_organization(
@@ -1851,20 +1924,12 @@ class ControlDB:
         status: str | None = None,
         severity: str | None = None,
     ) -> list[ExposureRecord]:
-        clauses = ["organization_id = ?"]
-        params: list[object] = [organization_id]
-        if status is not None:
-            clauses.append("status = ?")
-            params.append(status)
-        if severity is not None:
-            clauses.append("severity = ?")
-            params.append(severity)
-        where = " AND ".join(clauses)
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM exposures WHERE {where} "
-                "ORDER BY first_seen_at, exposure_id",  # noqa: S608  # nosec B608
-                params,
+                "SELECT * FROM exposures WHERE organization_id = ? "
+                "AND (? IS NULL OR status = ?) AND (? IS NULL OR severity = ?) "
+                "ORDER BY first_seen_at, exposure_id",
+                (organization_id, status, status, severity, severity),
             ).fetchall()
         return [_exposure_record_from_row(row) for row in rows]
 
