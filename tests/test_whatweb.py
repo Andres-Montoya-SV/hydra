@@ -86,9 +86,7 @@ class TestTechnologyProviderMerge:
                     url="https://example.com/",
                     host="example.com",
                     source="httpx",
-                    technologies=[
-                        TechnologyFinding(name="nginx", source="httpx", confidence=80)
-                    ],
+                    technologies=[TechnologyFinding(name="nginx", source="httpx", confidence=80)],
                 )
             ],
         )
