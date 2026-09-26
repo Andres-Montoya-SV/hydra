@@ -144,6 +144,10 @@ class BrowserProbePlugin(BaseToolPlugin):
                                 "redirect_chain": [],
                                 "cloaking_suspected": False,
                                 "raw_artifact": None,
+                                "screenshot_path": None,
+                                "screenshot_sha256": None,
+                                "rendered_html_sha256": None,
+                                "title": None,
                                 "error": str(exc)[:240],
                                 "blocked_subresources": {},
                                 "blocked_subresources_total": 0,
@@ -251,9 +255,9 @@ async def _probe_target(
         httpx_host = _url_host(target["httpx_final_url"])
         cloaking = bool(browser_host and httpx_host and browser_host != httpx_host)
 
-        # Visual Intelligence is evidence about the rendered service, not a
-        # vulnerability verdict. Capture deterministic artifacts/metadata for
-        # every successfully created page; cloaking remains a separate finding.
+        # Visual Intelligence is neutral evidence about the rendered service,
+        # not a vulnerability verdict. Capture bounded visual artifacts for
+        # every successfully-created page; cloaking remains a separate finding.
         visual = await _capture_visual_artifacts(context, target["host"], page, browser_final_url)
 
         return {
@@ -279,14 +283,19 @@ async def _capture_visual_artifacts(
     page: object,
     final_url: str,
 ) -> dict[str, object]:
-    """Persist rendered HTML + screenshot and return neutral visual metadata."""
+    """Persist rendered HTML + a bounded viewport screenshot.
+
+    Screenshots are intentionally viewport-only. A hostile or pathological
+    page can make `full_page=True` allocate an arbitrarily tall image; Hydra
+    needs a bounded artifact suitable for repeated EASM collection.
+    """
     try:
         html = await page.content()
     except Exception:
         html = ""
     html_text = html if isinstance(html, str) else ""
     rendered = f"<!-- final_url: {final_url} -->\n{html_text}"
-    body_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest() if rendered else None
+    rendered_sha256 = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
 
     try:
         title_value = await page.title()
@@ -303,7 +312,8 @@ async def _capture_visual_artifacts(
         screenshot_name = validate_safe_filename(f"{safe}.png")
 
     html_path = validate_output_path(
-        context.output_dir / "browser_probe_raw" / html_name, context.output_dir
+        context.output_dir / "browser_probe_raw" / html_name,
+        context.output_dir,
     )
     screenshot_path = validate_output_path(
         context.output_dir / "browser_probe_screenshots" / screenshot_name,
@@ -321,7 +331,7 @@ async def _capture_visual_artifacts(
         logger.warning("browser_probe: failed to persist rendered HTML for %s: %s", host, exc)
 
     try:
-        screenshot_bytes = await page.screenshot(full_page=True, type="png")
+        screenshot_bytes = await page.screenshot(full_page=False, type="png")
         if isinstance(screenshot_bytes, bytes):
             atomic_write_bytes(screenshot_path, screenshot_bytes)
             screenshot_artifact = relative_output_path(screenshot_path, context.output_dir)
@@ -333,7 +343,7 @@ async def _capture_visual_artifacts(
         "raw_artifact": raw_artifact,
         "screenshot_path": screenshot_artifact,
         "screenshot_sha256": screenshot_sha256,
-        "rendered_html_sha256": body_hash,
+        "rendered_html_sha256": rendered_sha256,
         "title": title,
     }
 
