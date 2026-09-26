@@ -62,7 +62,9 @@ def _seed_exposure(client: TestClient, *, email: str) -> tuple[str, str, str, st
 
 def test_owner_can_read_history_and_resolve_exposure(tmp_path: Path) -> None:
     with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
-        api_key, _, org, exposure_id = _seed_exposure(client, email="exposure-api-owner@example.com")
+        api_key, _, org, exposure_id = _seed_exposure(
+            client, email="exposure-api-owner@example.com"
+        )
         headers = {"X-API-Key": api_key}
 
         listed = client.get(f"/organizations/{org}/exposures", headers=headers)
