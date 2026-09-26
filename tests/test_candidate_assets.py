@@ -115,6 +115,14 @@ class TestCandidateNormalization:
         assert draft.scope_status == "UNKNOWN"
         assert draft.authorization_status == "DENY"
 
+    def test_in_scope_without_explicit_authorization_still_fails_closed(self) -> None:
+        draft = candidate_from_indicator_row(
+            {"kind": "DOMAIN", "value": "inside.example.com", "scope_status": "IN_SCOPE"}
+        )
+        assert draft is not None
+        assert draft.scope_status == "IN_SCOPE"
+        assert draft.authorization_status == "DENY"
+
 
 class TestCandidateBackfill:
     def test_same_candidate_across_runs_is_one_cross_run_row(
