@@ -463,11 +463,27 @@ class Host:
                     current.warnings.append(warning)
 
     def _merge_http(self, services: list[HttpService]) -> None:
-        existing = {s.url for s in self.http_services}
+        existing = {s.url: s for s in self.http_services}
         for svc in services:
-            if svc.url not in existing:
+            current = existing.get(svc.url)
+            if current is None:
                 self.http_services.append(svc)
-                existing.add(svc.url)
+                existing[svc.url] = svc
+                continue
+
+            # Multiple EASM intelligence providers may enrich the same live
+            # HTTP service. URL identity deduplicates the service itself, but
+            # must never discard provider-specific technology observations
+            # (for example httpx first, WhatWeb second).
+            technology_keys = {
+                (technology.name.casefold(), technology.version or "")
+                for technology in current.technologies
+            }
+            for technology in svc.technologies:
+                key = (technology.name.casefold(), technology.version or "")
+                if key not in technology_keys:
+                    current.technologies.append(technology)
+                    technology_keys.add(key)
 
     def _merge_dns(self, records: list[DnsRecord]) -> None:
         existing = {(r.record_type, r.value) for r in self.dns_records}
