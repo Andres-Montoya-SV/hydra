@@ -53,7 +53,7 @@ fuzzier lookup.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from core.assets import Host, normalize_domain, normalize_http_url
@@ -66,6 +66,7 @@ ASSET_TYPE_DOMAIN = EntityType.DOMAIN.value.lower()
 ASSET_TYPE_URL = EntityType.URL.value.lower()
 ASSET_TYPE_PORT = "port"
 ASSET_TYPE_DNS_RECORD = "dns_record"
+ASSET_TYPE_CLOUD_STORAGE = "cloud_storage"
 
 # The identifier attached to a domain asset for each IP it was observed
 # resolving to — descriptive metadata only, NEVER a reconciliation lookup
@@ -90,6 +91,28 @@ def dns_record_identity_key(*, host: str, record_type: str, value: str) -> str:
     return (
         f"{ASSET_TYPE_DNS_RECORD}:{normalize_domain(host)}:"
         f"{record_type.upper()}:{normalized_value}"
+    )
+
+
+def cloud_storage_identity_key(*, provider: str, resource_name: str) -> str:
+    """Stable provider-qualified identity for external cloud storage."""
+    normalized_provider = provider.strip().lower()
+    normalized_name = resource_name.strip().lower()
+    return f"{ASSET_TYPE_CLOUD_STORAGE}:{normalized_provider}:{normalized_name}"
+
+
+def cloud_storage_observation(record: Mapping[str, object]) -> AssetObservation:
+    """Reduce one raw cloud_resources row to the normal reconciliation shape."""
+    provider = str(record.get("provider") or "cloud").strip().lower()
+    name = str(record.get("resource_name") or record.get("bucket") or "").strip().lower()
+    identifiers: list[tuple[str, str]] = []
+    url = str(record.get("url") or "").strip()
+    if url:
+        identifiers.append(("url", url))
+    return AssetObservation(
+        asset_type=ASSET_TYPE_CLOUD_STORAGE,
+        identity_key=cloud_storage_identity_key(provider=provider, resource_name=name),
+        identifiers=tuple(identifiers),
     )
 
 
