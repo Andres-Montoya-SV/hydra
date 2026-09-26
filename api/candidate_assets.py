@@ -105,11 +105,11 @@ def candidate_from_indicator_row(row: dict[str, object]) -> CandidateAssetDraft 
         authorization_status = "ALLOW" if scope_status == ScopeStatus.IN_SCOPE.value else "DENY"
 
     try:
-        depth = max(0, int(row.get("depth") or 0))
+        depth = max(0, int(str(row.get("depth") or 0)))
     except (TypeError, ValueError):
         depth = 0
     try:
-        priority = int(row.get("priority") or 100)
+        priority = int(str(row.get("priority") or 100))
     except (TypeError, ValueError):
         priority = 100
 
