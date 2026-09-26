@@ -96,9 +96,7 @@ def test_owner_can_read_history_and_resolve_exposure(tmp_path: Path) -> None:
 
 def test_foreign_account_cannot_probe_exposure_ids(tmp_path: Path) -> None:
     with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
-        _, _, org, exposure_id = _seed_exposure(
-            client, email="exposure-api-owner2@example.com"
-        )
+        _, _, org, exposure_id = _seed_exposure(client, email="exposure-api-owner2@example.com")
         foreign = client.post(
             "/accounts", json={"email": "exposure-api-foreign@example.com"}
         ).json()
