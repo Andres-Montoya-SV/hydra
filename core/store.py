@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS http_services (
     tls_cipher TEXT,
     response_fingerprint TEXT,
     redirect_chain_json TEXT,
+    screenshot_path TEXT,
     UNIQUE(run_id, host, url),
     FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
@@ -791,6 +792,7 @@ class AssetStore:
                 "tls_cipher": "ALTER TABLE http_services ADD COLUMN tls_cipher TEXT",
                 "response_fingerprint": "ALTER TABLE http_services ADD COLUMN response_fingerprint TEXT",
                 "redirect_chain_json": "ALTER TABLE http_services ADD COLUMN redirect_chain_json TEXT",
+                "screenshot_path": "ALTER TABLE http_services ADD COLUMN screenshot_path TEXT",
             },
             "dns_records": {
                 "priority": "ALTER TABLE dns_records ADD COLUMN priority INTEGER",
@@ -1899,8 +1901,8 @@ class AssetStore:
                (run_id, host, url, status_code, title, webserver, technologies_json,
                 headers_json, security_headers_json, cdn, waf, confidence, confidence_score,
                 body_hash, favicon_hash, content_length, response_size, tls_version, tls_cipher,
-                response_fingerprint, redirect_chain_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                response_fingerprint, redirect_chain_json, screenshot_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 service.host,
@@ -1923,6 +1925,7 @@ class AssetStore:
                 service.tls_cipher,
                 service.response_fingerprint,
                 json.dumps(service.redirect_chain),
+                service.screenshot_path,
             ),
         )
 
@@ -2197,6 +2200,9 @@ class AssetStore:
             tls_cipher=row["tls_cipher"] if "tls_cipher" in row.keys() else None,
             response_fingerprint=row["response_fingerprint"],
             redirect_chain=json.loads(row["redirect_chain_json"] or "[]"),
+            screenshot_path=(
+                row["screenshot_path"] if "screenshot_path" in row.keys() else None
+            ),
         )
 
     def _row_to_port(self, row: sqlite3.Row) -> Port:
