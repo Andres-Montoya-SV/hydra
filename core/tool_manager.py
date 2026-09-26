@@ -136,7 +136,11 @@ class ToolManager:
                     fix = report.recommendation or report.install_hint
                     context.add_error(f"{plugin.display_name}: {report.status_reason}. {fix}")
                 else:
-                    info.status = ToolStatus.SKIPPED
+                    # Enabled-but-missing is materially different from an
+                    # operator-disabled/intentional SKIPPED provider. Later
+                    # EASM reconciliation must not interpret unavailable
+                    # coverage as a clean "zero findings" result.
+                    info.status = ToolStatus.UNAVAILABLE
                     if report.health == ToolHealth.MISSING:
                         context.add_warning(f"{plugin.display_name}: {report.status_reason}")
 
