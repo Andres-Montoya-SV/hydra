@@ -110,20 +110,36 @@ class WhatWebPlugin(BaseToolPlugin):
             "--quiet",
             "--no-errors",
             "--colour=never",
+            "--aggression=1",
             "--follow-redirect=never",
             f"--max-threads={self.settings.whatweb_threads}",
             f"--open-timeout={self.settings.whatweb_timeout}",
             f"--read-timeout={self.settings.whatweb_timeout}",
             f"--log-json={raw_path}",
         ]
+        # Program-required researcher attribution must be preserved by every
+        # active target request, exactly like httpx/katana/nuclei. WhatWeb has
+        # first-class --user-agent/--header flags, so do not silently drop
+        # Hydra's centralized attribution policy here.
+        user_agent = self.settings.effective_user_agent()
+        if user_agent:
+            args.extend(["--user-agent", user_agent])
+        for key, value in self.settings.merged_headers().items():
+            args.extend(["--header", f"{key}:{value}"])
+
         args.extend(t.raw for t in targets)
 
         self.update_status(context, ToolStatus.RUNNING)
         async with self._crawler_confinement(context) as proxy:
             proxy_netloc = urlparse(proxy.proxy_url).netloc
             args.extend(["--proxy", proxy_netloc])
+            # Per-request open/read timeouts and total subprocess lifetime are
+            # different budgets. Give a bounded batch enough total time for
+            # several waves of targets instead of killing the whole process at
+            # exactly one request timeout.
+            process_timeout = max(60, self.settings.whatweb_timeout * 3)
             return_code, stdout, stderr = await self._run_tool(
-                context, args, timeout=self.settings.whatweb_timeout
+                context, args, timeout=process_timeout
             )
 
         self._scan_telemetry(context, stdout, stderr)
