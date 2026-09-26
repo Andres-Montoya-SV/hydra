@@ -280,6 +280,69 @@ def test_exposure_inventory_is_bounded_and_filterable(tmp_path):
     assert len(by_asset) == 3
 
 
+def test_provider_outcomes_are_durable_and_tenant_scoped(tmp_path):
+    from api.control_db import ControlDB
+
+    db = ControlDB(tmp_path / "control.db")
+    account = db.create_account(email="provider-ledger@example.com")
+    org, _ = db.list_organizations_for_account(account)[0]
+    other = db.create_account(email="provider-ledger-other@example.com")
+    other_org, _ = db.list_organizations_for_account(other)[0]
+    db.create_scan(
+        scan_id="run-provider",
+        account_id=account,
+        organization_id=org,
+        domain="example.com",
+        db_path=str(tmp_path),
+    )
+
+    db.record_provider_run_outcomes(
+        organization_id=org,
+        account_id=account,
+        run_id="run-provider",
+        outcomes=[
+            ("nuclei", "success_no_results", 0),
+            ("httpx", "success_with_results", 4),
+            ("whatweb", "blocked_by_scope", 0),
+        ],
+    )
+
+    rows = db.list_provider_run_outcomes(org, "run-provider")
+    assert [(row.provider, row.outcome, row.output_lines) for row in rows] == [
+        ("httpx", "success_with_results", 4),
+        ("nuclei", "success_no_results", 0),
+        ("whatweb", "blocked_by_scope", 0),
+    ]
+    assert db.list_provider_run_outcomes(other_org, "run-provider") == []
+
+
+def test_provider_outcome_rejects_foreign_run(tmp_path):
+    import pytest
+
+    from api.control_db import ControlDB
+
+    db = ControlDB(tmp_path / "control.db")
+    owner = db.create_account(email="provider-owner@example.com")
+    owner_org, _ = db.list_organizations_for_account(owner)[0]
+    foreign = db.create_account(email="provider-foreign@example.com")
+    foreign_org, _ = db.list_organizations_for_account(foreign)[0]
+    db.create_scan(
+        scan_id="foreign-provider-run",
+        account_id=foreign,
+        organization_id=foreign_org,
+        domain="example.com",
+        db_path=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="does not belong"):
+        db.record_provider_run_outcomes(
+            organization_id=owner_org,
+            account_id=owner,
+            run_id="foreign-provider-run",
+            outcomes=[("nuclei", "success_no_results", 0)],
+        )
+
+
 def test_exposure_rejects_foreign_run_and_missing_rule(tmp_path):
     from dataclasses import replace
 
