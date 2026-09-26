@@ -34,8 +34,8 @@ from modules import (
     unfurl,
     vuln_match,
     wafw00f,
-    whatweb,
     waybackurls,
+    whatweb,
     whois,
     wildcard_check,
 )
