@@ -258,9 +258,7 @@ async def _probe_target(
         # Visual Intelligence is neutral evidence about the rendered service,
         # not a vulnerability verdict. Capture bounded visual artifacts for
         # every successfully-created page; cloaking remains a separate finding.
-        visual = await _capture_visual_artifacts(
-            context, target["host"], page, browser_final_url
-        )
+        visual = await _capture_visual_artifacts(context, target["host"], page, browser_final_url)
 
         return {
             "host": target["host"],
@@ -330,26 +328,16 @@ async def _capture_visual_artifacts(
         atomic_write_text(html_path, rendered)
         raw_artifact = relative_output_path(html_path, context.output_dir)
     except OSError as exc:
-        logger.warning(
-            "browser_probe: failed to persist rendered HTML for %s: %s",
-            host,
-            exc,
-        )
+        logger.warning("browser_probe: failed to persist rendered HTML for %s: %s", host, exc)
 
     try:
         screenshot_bytes = await page.screenshot(full_page=False, type="png")
         if isinstance(screenshot_bytes, bytes):
             atomic_write_bytes(screenshot_path, screenshot_bytes)
-            screenshot_artifact = relative_output_path(
-                screenshot_path, context.output_dir
-            )
+            screenshot_artifact = relative_output_path(screenshot_path, context.output_dir)
             screenshot_sha256 = hashlib.sha256(screenshot_bytes).hexdigest()
     except Exception as exc:
-        logger.warning(
-            "browser_probe: failed to capture screenshot for %s: %s",
-            host,
-            exc,
-        )
+        logger.warning("browser_probe: failed to capture screenshot for %s: %s", host, exc)
 
     return {
         "raw_artifact": raw_artifact,
