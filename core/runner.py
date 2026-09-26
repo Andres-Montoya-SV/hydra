@@ -1149,6 +1149,14 @@ class PipelineRunner:
             if candidates:
                 store.record_typosquat_candidates(context.run_id, candidates)
 
+        # Cloud storage is persisted outside HostRegistry: bucket/account
+        # identity is a cloud resource, not a DNS hostname.
+        cloud_path = context.output_dir / "cloud_bucket_enum.jsonl"
+        if cloud_path.exists():
+            cloud_resources = read_jsonl(cloud_path)
+            if cloud_resources:
+                store.record_cloud_resources(context.run_id, cloud_resources)
+
         store.finish_run(
             context.run_id,
             host_count=len(hosts),
