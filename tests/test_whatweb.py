@@ -9,6 +9,7 @@ import pytest
 
 from config.settings import Settings
 from core.intel.scope import CollectionScope
+from core.assets import Host, HttpService, TechnologyFinding
 from core.models import DomainTarget, PipelineContext
 from core.parsers.registry import parse_tool_output
 from modules.whatweb import WhatWebPlugin, parse_whatweb_results
@@ -74,6 +75,50 @@ class TestWhatWebParserIntegration:
         assert service.technologies[0].name == "WordPress"
         assert service.technologies[0].version == "6.8"
         assert service.technologies[0].source == "whatweb"
+
+
+class TestTechnologyProviderMerge:
+    def test_whatweb_enrichment_survives_existing_httpx_service(self) -> None:
+        canonical = Host(
+            domain="example.com",
+            http_services=[
+                HttpService(
+                    url="https://example.com/",
+                    host="example.com",
+                    source="httpx",
+                    technologies=[
+                        TechnologyFinding(name="nginx", source="httpx", confidence=80)
+                    ],
+                )
+            ],
+        )
+        enrichment = Host(
+            domain="example.com",
+            http_services=[
+                HttpService(
+                    url="https://example.com/",
+                    host="example.com",
+                    source="whatweb",
+                    technologies=[
+                        TechnologyFinding(
+                            name="WordPress",
+                            version="6.8",
+                            source="whatweb",
+                            confidence=80,
+                        )
+                    ],
+                )
+            ],
+        )
+
+        canonical.merge_from(enrichment)
+
+        assert len(canonical.http_services) == 1
+        technologies = canonical.http_services[0].technologies
+        assert {(item.name, item.version, item.source) for item in technologies} == {
+            ("nginx", None, "httpx"),
+            ("WordPress", "6.8", "whatweb"),
+        }
 
 
 class TestWhatWebAuthorization:
