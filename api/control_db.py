@@ -1037,6 +1037,17 @@ class ExposureEvidenceRecord:
 
 
 @dataclass(frozen=True)
+class ExposureHistoryRecord:
+    event_id: str
+    exposure_id: str
+    organization_id: str
+    event_type: str
+    happened_at: str
+    run_id: str | None
+    reason: str
+
+
+@dataclass(frozen=True)
 class CandidateAssetRecord:
     candidate_asset_id: str
     organization_id: str
@@ -2001,30 +2012,76 @@ class ControlDB:
                 )
         return bool(cursor.rowcount)
 
+    def get_exposure_for_organization(
+        self, organization_id: str, exposure_id: str
+    ) -> ExposureRecord | None:
+        """Tenant-safe exposure lookup.
+
+        A mismatched organization is intentionally indistinguishable from an
+        unknown exposure id. API callers must never learn whether another
+        tenant owns the guessed identifier.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM exposures WHERE organization_id = ? AND exposure_id = ?",
+                (organization_id, exposure_id),
+            ).fetchone()
+        return None if row is None else _exposure_record_from_row(row)
+
     def list_exposures_for_organization(
         self,
         organization_id: str,
         *,
         status: str | None = None,
         severity: str | None = None,
+        asset_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
     ) -> list[ExposureRecord]:
+        """Bounded, tenant-scoped exposure inventory for API/product use."""
+        limit = max(1, min(500, int(limit)))
+        offset = max(0, int(offset))
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM exposures WHERE organization_id = ? "
                 "AND (? IS NULL OR status = ?) AND (? IS NULL OR severity = ?) "
-                "ORDER BY first_seen_at, exposure_id",
-                (organization_id, status, status, severity, severity),
+                "AND (? IS NULL OR asset_id = ?) "
+                "ORDER BY last_seen_at DESC, exposure_id LIMIT ? OFFSET ?",
+                (
+                    organization_id,
+                    status,
+                    status,
+                    severity,
+                    severity,
+                    asset_id,
+                    asset_id,
+                    limit,
+                    offset,
+                ),
             ).fetchall()
         return [_exposure_record_from_row(row) for row in rows]
 
-    def list_exposure_evidence(self, exposure_id: str) -> list[ExposureEvidenceRecord]:
+    def list_exposure_evidence(
+        self, organization_id: str, exposure_id: str
+    ) -> list[ExposureEvidenceRecord]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM exposure_evidence WHERE exposure_id = ? "
-                "ORDER BY observed_at, exposure_evidence_id",
-                (exposure_id,),
+                "SELECT * FROM exposure_evidence WHERE organization_id = ? "
+                "AND exposure_id = ? ORDER BY observed_at, exposure_evidence_id",
+                (organization_id, exposure_id),
             ).fetchall()
         return [_exposure_evidence_record_from_row(row) for row in rows]
+
+    def list_exposure_history(
+        self, organization_id: str, exposure_id: str
+    ) -> list[ExposureHistoryRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM exposure_history WHERE organization_id = ? "
+                "AND exposure_id = ? ORDER BY happened_at, event_id",
+                (organization_id, exposure_id),
+            ).fetchall()
+        return [_exposure_history_record_from_row(row) for row in rows]
 
     # --- relationships (Fase 07, EASM roadmap) -------------------------
 
@@ -4059,6 +4116,18 @@ def _exposure_evidence_record_from_row(row: sqlite3.Row) -> ExposureEvidenceReco
         run_id=row["run_id"],
         finding_id=int(row["finding_id"]),
         observed_at=row["observed_at"],
+    )
+
+
+def _exposure_history_record_from_row(row: sqlite3.Row) -> ExposureHistoryRecord:
+    return ExposureHistoryRecord(
+        event_id=row["event_id"],
+        exposure_id=row["exposure_id"],
+        organization_id=row["organization_id"],
+        event_type=row["event_type"],
+        happened_at=row["happened_at"],
+        run_id=row["run_id"],
+        reason=row["reason"],
     )
 
 
