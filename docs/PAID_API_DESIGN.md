@@ -3585,6 +3585,21 @@ fundamentally per-asset-across-all-its-runs, a different shape than
 Fase 03/04's per-host-per-run processing. Not wired into the live
 scan-completion path, same as Fase 03/04.
 
+## Fase 00 — EASM roadmap baseline, before Bloque A (Fases 06-21) — 2026-09-25
+
+One-time checkpoint before the 16-phase Bloque A-D build. Confirms Fases
+01-05 are merged (`main` at `35749f6`), restates Fase 01's own
+absorb/wrap/coexist decisions per system as binding on every later
+phase, inventories the security/collection-gateway/monitoring/parser/API
+surface the unified Fases 06-21 prompt names, and records a real,
+current pipeline baseline (1950 passed, 3 skipped, green 3x;
+compileall/ruff/black/isort/mypy/bandit all clean, zero real bandit
+findings). Full detail: [`docs/easm/00_baseline.md`](easm/00_baseline.md).
+One concrete gap surfaced for Fase 09 to close: `core/models.py::ToolStatus`
+does not yet have the granular execution states (`SUCCESS_WITH_RESULTS`
+vs `SUCCESS_NO_RESULTS` vs `PARTIAL` vs `BLOCKED_BY_SCOPE`) the
+roadmap's own Invariant 7 requires.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
