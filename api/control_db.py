@@ -1717,6 +1717,166 @@ class ControlDB:
             ).fetchone()
         return None if row is None else _candidate_asset_record_from_row(row)
 
+    # --- exposures (Fase 08, EASM roadmap) -----------------------------
+
+    def upsert_exposure(
+        self,
+        *,
+        organization_id: str,
+        account_id: str,
+        run_id: str,
+        finding_id: int,
+        draft: ExposureDraft,
+        observed_at: str | None = None,
+    ) -> tuple[str, bool, bool]:
+        """Persist one durable Exposure plus this run's supporting Finding.
+
+        Re-observing an exposure reopens it if it had previously been
+        explicitly resolved. Absence from a later run does NOT resolve it:
+        Hydra does not yet persist enough per-provider execution outcome to
+        prove that "missing finding" means "collector ran successfully and
+        confirmed the condition is gone."
+        """
+        observed_at = observed_at or _now_iso()
+        with self._connect() as conn:
+            asset = conn.execute(
+                "SELECT organization_id FROM assets WHERE asset_id = ?",
+                (draft.asset_id,),
+            ).fetchone()
+            if asset is None or str(asset["organization_id"]) != organization_id:
+                raise ValueError("exposure asset_id does not belong to organization")
+
+            row = conn.execute(
+                "SELECT exposure_id FROM exposures WHERE organization_id = ? "
+                "AND asset_id = ? AND source = ? AND template_id = ? AND location = ?",
+                (
+                    organization_id,
+                    draft.asset_id,
+                    draft.source,
+                    draft.template_id,
+                    draft.location,
+                ),
+            ).fetchone()
+            created = row is None
+            if created:
+                exposure_id = secrets.token_hex(16)
+                conn.execute(
+                    "INSERT INTO exposures (exposure_id, organization_id, asset_id, source, "
+                    "template_id, location, severity, title, description, confidence_score, "
+                    "status, first_seen_at, last_seen_at, first_seen_run_id, last_seen_run_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
+                    (
+                        exposure_id,
+                        organization_id,
+                        draft.asset_id,
+                        draft.source,
+                        draft.template_id,
+                        draft.location,
+                        draft.severity,
+                        draft.title,
+                        draft.description,
+                        draft.confidence_score,
+                        observed_at,
+                        observed_at,
+                        run_id,
+                        run_id,
+                    ),
+                )
+            else:
+                exposure_id = str(row["exposure_id"])
+                conn.execute(
+                    "UPDATE exposures SET severity = ?, title = ?, description = ?, "
+                    "confidence_score = ?, status = 'open', last_seen_at = ?, "
+                    "last_seen_run_id = ?, resolved_at = NULL, resolved_run_id = NULL, "
+                    "resolution_reason = NULL WHERE exposure_id = ? AND organization_id = ?",
+                    (
+                        draft.severity,
+                        draft.title,
+                        draft.description,
+                        draft.confidence_score,
+                        observed_at,
+                        run_id,
+                        exposure_id,
+                        organization_id,
+                    ),
+                )
+
+            exposure_evidence_id = secrets.token_hex(16)
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO exposure_evidence "
+                "(exposure_evidence_id, exposure_id, organization_id, account_id, "
+                "run_id, finding_id, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    exposure_evidence_id,
+                    exposure_id,
+                    organization_id,
+                    account_id,
+                    run_id,
+                    finding_id,
+                    observed_at,
+                ),
+            )
+            evidence_created = bool(cursor.rowcount)
+        return exposure_id, created, evidence_created
+
+    def resolve_exposure(
+        self,
+        *,
+        organization_id: str,
+        exposure_id: str,
+        resolved_at: str,
+        resolution_reason: str,
+        resolved_run_id: str | None = None,
+    ) -> bool:
+        """Explicitly resolve one exposure; absence from a run never calls this."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE exposures SET status = 'resolved', resolved_at = ?, "
+                "resolved_run_id = ?, resolution_reason = ? "
+                "WHERE exposure_id = ? AND organization_id = ?",
+                (
+                    resolved_at,
+                    resolved_run_id,
+                    resolution_reason,
+                    exposure_id,
+                    organization_id,
+                ),
+            )
+        return bool(cursor.rowcount)
+
+    def list_exposures_for_organization(
+        self,
+        organization_id: str,
+        *,
+        status: str | None = None,
+        severity: str | None = None,
+    ) -> list[ExposureRecord]:
+        clauses = ["organization_id = ?"]
+        params: list[object] = [organization_id]
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if severity is not None:
+            clauses.append("severity = ?")
+            params.append(severity)
+        where = " AND ".join(clauses)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM exposures WHERE {where} "
+                "ORDER BY first_seen_at, exposure_id",  # noqa: S608  # nosec B608
+                params,
+            ).fetchall()
+        return [_exposure_record_from_row(row) for row in rows]
+
+    def list_exposure_evidence(self, exposure_id: str) -> list[ExposureEvidenceRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM exposure_evidence WHERE exposure_id = ? "
+                "ORDER BY observed_at, exposure_evidence_id",
+                (exposure_id,),
+            ).fetchall()
+        return [_exposure_evidence_record_from_row(row) for row in rows]
+
     # --- observations and evidence (Fase 04, EASM roadmap) --------------
 
     def find_or_create_evidence(
