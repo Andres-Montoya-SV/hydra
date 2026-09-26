@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 
 from config.settings import Settings
-from core.intel.scope import CollectionScope
 from core.assets import Host, HttpService, TechnologyFinding
+from core.intel.scope import CollectionScope
 from core.models import DomainTarget, PipelineContext
 from core.parsers.registry import parse_tool_output
 from modules.whatweb import WhatWebPlugin, parse_whatweb_results
