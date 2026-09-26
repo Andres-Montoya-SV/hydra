@@ -1527,7 +1527,6 @@ class Wafw00fParser(ToolParser):
         return list(by_host.values()), []
 
 
-
 class WhatWebParser(ToolParser):
     """Normalize WhatWeb fingerprints into Hydra's existing HTTP technology model.
 
