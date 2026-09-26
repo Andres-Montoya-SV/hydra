@@ -1,6 +1,6 @@
-# EASM Fase 06 — Technology Intelligence
+# EASM capability — Technology Intelligence
 
-Status: implementation branch `feat/easm-technology-intelligence`.
+Status: merged capability. This document is intentionally not phase-numbered; the official EASM roadmap reserves Fase 06 for Candidate Assets.
 
 ## Decision
 
@@ -68,7 +68,7 @@ A normalized record retains:
 
 The canonical parser attaches these to the existing `HttpService.technologies`
 list. Fase 04 then creates durable `technology_detected` observations/evidence
-without schema duplication. Fase 06 additionally preserves a provider-supported
+without schema duplication. Technology Intelligence additionally preserves a provider-supported
 version in the evidence detail (for example `nginx@1.26.2`); unversioned facts
 retain the previous name-only representation. Because Fase 05 hashes evidence
 detail when deriving change events, a real version transition is now visible
