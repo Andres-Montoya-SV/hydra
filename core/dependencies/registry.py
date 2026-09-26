@@ -250,6 +250,25 @@ _register(
 
 _register(
     ToolDefinition(
+        name="whatweb",
+        display_name="WhatWeb",
+        version_commands=(("--version",),),
+        health_commands=(("--help",), ("-h",)),
+        capabilities=frozenset({"technology_detection", "technology_intelligence"}),
+        install_apt="whatweb",
+        # macOS has no stable Homebrew/core formula documented today; keep
+        # installation explicit instead of advertising a command Hydra has
+        # not verified. WhatWeb itself is a Ruby CLI distributed from source.
+        install_manual=(
+            "Install from https://github.com/urbanadventurer/WhatWeb "
+            "(see upstream installation instructions)"
+        ),
+        allow_smoke_test=True,
+    )
+)
+
+_register(
+    ToolDefinition(
         name="theharvester",
         display_name="theHarvester",
         health_commands=(("--help",), ("-h",)),

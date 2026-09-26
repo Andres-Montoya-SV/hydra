@@ -368,19 +368,15 @@ class TestNoResidualMergeCorruptionPatterns:
         several tracked files (`config/.env.example`, module docstrings)
         legitimately use longer `# ====...` banner comments, which a bare
         substring search would misfire on."""
-        import subprocess
-
-        # Fixed argv, no shell, no external input — git is already a
-        # hard dependency of running this test suite from a checkout at all.
-        tracked = subprocess.run(  # noqa: S603
-            ["git", "ls-files"], capture_output=True, text=True, check=True  # noqa: S607
-        ).stdout.splitlines()
+        # The production Docker image intentionally does not carry the git
+        # binary. Scan the clean checkout directly instead of making this
+        # source-integrity assertion depend on a deployment-unrelated CLI.
+        excluded_dirs = {".git", ".venv", "output", "logs", "reports", "node_modules"}
         conflict_start = re.compile(r"^<{7}( |$)")
         conflict_mid = re.compile(r"^={7}$")
         conflict_end = re.compile(r"^>{7}( |$)")
-        for name in tracked:
-            path = Path(name)
-            if not path.is_file():
+        for path in Path(".").rglob("*"):
+            if not path.is_file() or any(part in excluded_dirs for part in path.parts):
                 continue
             try:
                 lines = path.read_text(encoding="utf-8").splitlines()

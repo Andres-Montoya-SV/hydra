@@ -35,6 +35,7 @@ from modules import (
     vuln_match,
     wafw00f,
     waybackurls,
+    whatweb,
     whois,
     wildcard_check,
 )
@@ -69,6 +70,7 @@ __all__ = [
     "theharvester",
     "sslyze",
     "wafw00f",
+    "whatweb",
     "ffuf",
     "dnstwist",
     "github_secrets",

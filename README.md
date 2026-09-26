@@ -334,6 +334,7 @@ Hydra can run, as a "head"):
 │ sslyze            │ no     │ yes    │ sslyze — TLS/certificate posture head                      │
 │ soft404_check     │ yes    │ yes    │ soft404_check — soft-404 / catch-all detection head        │
 │ wafw00f           │ no     │ yes    │ wafw00f — WAF/CDN fingerprinting head                      │
+│ whatweb           │ no     │ yes    │ whatweb — Technology Intelligence enrichment head           │
 │ sub_takeover      │ no     │ yes    │ sub_takeover — subdomain takeover detection head           │
 │ threat_intel      │ yes    │ yes    │ threat_intel — host-reputation (URLhaus) head              │
 │ passive_dns       │ yes    │ yes    │ passive_dns — Passive DNS (certificate siblings)           │

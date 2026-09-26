@@ -165,7 +165,16 @@ def observations_for_host(host: Host) -> list[ObservationDraft]:
                     identity_key=domain_key,
                     observation_type=OBSERVATION_TYPE_TECHNOLOGY_DETECTED,
                     evidence=EvidenceContent(
-                        source=tech.source, detail=tech.name, confidence_score=tech.confidence
+                        source=tech.source,
+                        # Version is part of the observed fact when the
+                        # provider can support it. This keeps an upgrade such
+                        # as nginx 1.24 -> 1.26 visible to Fase 05's existing
+                        # observation digest/change detector instead of
+                        # collapsing both runs to the same "nginx" evidence.
+                        # Unversioned technologies retain the exact pre-Fase-06
+                        # representation for backwards compatibility.
+                        detail=f"{tech.name}@{tech.version}" if tech.version else tech.name,
+                        confidence_score=tech.confidence,
                     ),
                 )
             )

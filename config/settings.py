@@ -195,6 +195,7 @@ class Settings:
     theharvester_path: Path = field(default_factory=lambda: Path("theHarvester"))
     sslyze_path: Path = field(default_factory=lambda: Path("sslyze"))
     wafw00f_path: Path = field(default_factory=lambda: Path("wafw00f"))
+    whatweb_path: Path = field(default_factory=lambda: Path("whatweb"))
     ffuf_path: Path = field(default_factory=lambda: Path("ffuf"))
     dnstwist_path: Path = field(default_factory=lambda: Path("dnstwist"))
     gitleaks_path: Path = field(default_factory=lambda: Path("gitleaks"))
@@ -315,6 +316,13 @@ class Settings:
     enable_theharvester: bool = False
     enable_sslyze: bool = False
     enable_wafw00f: bool = False
+    # Technology Intelligence enrichment. Active, optional, and off by
+    # default: httpx remains the primary provider; WhatWeb contributes
+    # independent product fingerprints to the same TechnologyFinding model.
+    enable_whatweb: bool = False
+    whatweb_timeout: int = 30
+    whatweb_threads: int = 10
+    whatweb_max_urls: int = 20
     # Off by default. Passive with respect to the TARGET (never connects to
     # the target's own infrastructure), but a real third-party API/clone/
     # scan integration — see modules/github_secrets.py.
@@ -535,6 +543,7 @@ class Settings:
             theharvester_path=_safe_path(os.getenv("THEHARVESTER_PATH", ""), "theHarvester"),
             sslyze_path=_safe_path(os.getenv("SSLYZE_PATH", ""), "sslyze"),
             wafw00f_path=_safe_path(os.getenv("WAFW00F_PATH", ""), "wafw00f"),
+            whatweb_path=_safe_path(os.getenv("WHATWEB_PATH", ""), "whatweb"),
             dnstwist_path=_safe_path(os.getenv("DNSTWIST_PATH", ""), "dnstwist"),
             gitleaks_path=_safe_path(os.getenv("GITLEAKS_PATH", ""), "gitleaks"),
             timeout=_int(os.getenv("TIMEOUT"), 300, "TIMEOUT"),
@@ -684,6 +693,12 @@ class Settings:
             enable_theharvester=_bool(os.getenv("ENABLE_THEHARVESTER")),
             enable_sslyze=_bool(os.getenv("ENABLE_SSLYZE")),
             enable_wafw00f=_bool(os.getenv("ENABLE_WAFW00F")),
+            enable_whatweb=_bool(os.getenv("ENABLE_WHATWEB")),
+            whatweb_timeout=_int(os.getenv("WHATWEB_TIMEOUT"), 30, "WHATWEB_TIMEOUT", maximum=300),
+            whatweb_threads=_int(os.getenv("WHATWEB_THREADS"), 10, "WHATWEB_THREADS", maximum=50),
+            whatweb_max_urls=_int(
+                os.getenv("WHATWEB_MAX_URLS"), 20, "WHATWEB_MAX_URLS", maximum=100
+            ),
             enable_github_secrets=_bool(os.getenv("ENABLE_GITHUB_SECRETS")),
             enable_sub_takeover=_bool(os.getenv("ENABLE_SUB_TAKEOVER")),
             theharvester_timeout=_int(
@@ -1121,6 +1136,7 @@ class Settings:
             "theharvester": self.theharvester_path,
             "sslyze": self.sslyze_path,
             "wafw00f": self.wafw00f_path,
+            "whatweb": self.whatweb_path,
             "ffuf": self.ffuf_path,
             "dnstwist": self.dnstwist_path,
             "gitleaks": self.gitleaks_path,
@@ -1171,6 +1187,7 @@ class Settings:
                     ("theharvester", self.enable_theharvester),
                     ("sslyze", self.enable_sslyze),
                     ("wafw00f", self.enable_wafw00f),
+                    ("whatweb", self.enable_whatweb),
                     ("ffuf", self.enable_ffuf),
                     ("dnstwist", self.enable_dnstwist),
                     ("github_secrets", self.enable_github_secrets),

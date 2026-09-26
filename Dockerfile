@@ -45,7 +45,11 @@ RUN go install -v github.com/hakluke/hakrawler@2.1
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime
 # ---------------------------------------------------------------------------
-FROM python:3.15.0rc1-slim-bookworm AS final
+# Keep the container on a stable Python line that is covered by Hydra's
+# CI matrix and supported by binary-extension dependencies such as nassl
+# (pulled by sslyze). The previous 3.15.0rc1 base made pip resolution fail
+# because nassl 5.x had no cp315 distribution.
+FROM python:3.12-slim-bookworm AS final
 
 LABEL org.opencontainers.image.title="hydra" \
       org.opencontainers.image.description="Evidence-backed, scope-aware Attack Surface Intelligence control plane" \
