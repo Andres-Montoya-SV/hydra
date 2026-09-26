@@ -1527,6 +1527,59 @@ class Wafw00fParser(ToolParser):
         return list(by_host.values()), []
 
 
+
+class WhatWebParser(ToolParser):
+    """Normalize WhatWeb fingerprints into Hydra's existing HTTP technology model.
+
+    This is deliberately not a new EASM table. Fase 04 already turns every
+    `TechnologyFinding` attached to an HttpService into a durable
+    `technology_detected` observation with evidence and cross-run history.
+    """
+
+    tool_name = "whatweb"
+
+    def parse(
+        self, output_dir: Path, *, artifact: Path | None = None, run_id: str = ""
+    ) -> tuple[list[Host], list[str]]:
+        path = artifact or output_dir / "whatweb_technologies.jsonl"
+        by_host: dict[str, Host] = {}
+        for record in read_jsonl(path):
+            domain = normalize_domain(str(record.get("host") or ""))
+            technology = str(record.get("technology") or "").strip()
+            if not domain or not technology:
+                continue
+            url = normalize_http_url(str(record.get("url") or f"https://{domain}"))
+            host = by_host.setdefault(domain, Host(domain=domain))
+            service = next(
+                (candidate for candidate in host.http_services if candidate.url == url),
+                None,
+            )
+            if service is None:
+                service = HttpService(
+                    url=url,
+                    host=domain,
+                    source="whatweb",
+                    confidence_score=int(record.get("confidence_score") or 80),
+                )
+                host.http_services.append(service)
+            version = _optional_str(record.get("version"))
+            if not any(
+                existing.name.casefold() == technology.casefold()
+                and (existing.version or "") == (version or "")
+                for existing in service.technologies
+            ):
+                service.technologies.append(
+                    TechnologyFinding(
+                        name=technology,
+                        version=version,
+                        source="whatweb",
+                        confidence=int(record.get("confidence_score") or 80),
+                        verified_by=["whatweb_plugin_signature"],
+                    )
+                )
+        return list(by_host.values()), []
+
+
 class FfufParser(ToolParser):
     """Hidden endpoint/content discovery findings (modules/ffuf.py) — a
     real finding on the target's own infrastructure (unlike
@@ -1654,6 +1707,7 @@ PARSER_REGISTRY: dict[str, ToolParser] = {
         TheHarvesterParser(),
         SslyzeParser(),
         Wafw00fParser(),
+        WhatWebParser(),
         FfufParser(),
         GithubSecretsParser(),
         SubTakeoverParser(),
