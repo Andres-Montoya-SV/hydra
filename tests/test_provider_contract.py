@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from config.settings import Settings
+from core.capabilities import Capability
 from core.dependencies.models import ToolDefinition, ToolHealth
 from core.dependencies.registry import known_incompatible_version
 from core.dependencies.service import DependencyService
@@ -17,6 +18,7 @@ from core.provenance import record_observation
 from core.provider_contract import (
     AuthorizationRequirement,
     ConfinementLevel,
+    ProviderIntensity,
     execution_status_for_result,
     provider_inventory,
 )
@@ -233,3 +235,34 @@ def test_raw_artifact_stays_provenance_not_normalized_fact(tmp_path: Path) -> No
     assert observation.value == "nginx"
     assert observation.artifact_path == "provider_raw.json"
     assert str(tmp_path) not in observation.artifact_path
+
+
+class TestFase17CapabilityAndIntensityMetadata:
+    """Fase 17: the taxonomy/intensity layer added on top of Fase 09's
+    existing provider descriptors — additive fields, no existing field's
+    meaning changed."""
+
+    def test_every_provider_gets_a_capability_and_intensity(self) -> None:
+        for row in provider_inventory():
+            assert isinstance(row.capability, Capability)
+            assert isinstance(row.intensity, ProviderIntensity)
+
+    def test_httpx_is_categorized_as_http_and_active_standard(self) -> None:
+        rows = {row.provider: row for row in provider_inventory()}
+        assert rows["httpx"].capability is Capability.HTTP
+        assert rows["httpx"].intensity is ProviderIntensity.ACTIVE_STANDARD
+
+    def test_naabu_is_active_high_volume(self) -> None:
+        rows = {row.provider: row for row in provider_inventory()}
+        assert rows["naabu"].intensity is ProviderIntensity.ACTIVE_HIGH_VOLUME
+
+    def test_subfinder_is_passive_despite_being_a_real_discovery_provider(self) -> None:
+        rows = {row.provider: row for row in provider_inventory()}
+        assert rows["subfinder"].intensity is ProviderIntensity.PASSIVE
+        assert rows["subfinder"].capability is Capability.DOMAIN_DISCOVERY
+
+    def test_to_dict_serializes_the_new_fields_as_plain_strings(self) -> None:
+        rows = {row.provider: row for row in provider_inventory()}
+        payload = rows["httpx"].to_dict()
+        assert payload["capability"] == "http"
+        assert payload["intensity"] == "active_standard"

@@ -94,3 +94,19 @@ def test_heads_covers_registered_plugins(project_root: Path) -> None:
     assert "whois" in names
     assert "whois" in HEAD_BLURBS
     assert "param_fuzz" in HEAD_BLURBS
+
+
+def test_heads_table_shows_capability_and_status_columns(project_root: Path, capsys) -> None:
+    """Fase 17: `heads` must show capability and status per provider,
+    not just active/opt-in — existing columns keep working unchanged."""
+    from app import cmd_heads
+
+    settings = Settings(project_root=project_root)
+    assert cmd_heads(settings) == 0
+    output = capsys.readouterr().out
+    assert "Capability" in output
+    assert "Status" in output
+    # whatweb defaults to disabled -> its capability policy status is
+    # reported as "disabled", never conflated with a dependency-health
+    # "not runnable" for a tool that was never asked to run.
+    assert "disabled" in output

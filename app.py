@@ -786,23 +786,36 @@ def cmd_heads(settings: Settings) -> int:
     from rich.console import Console
     from rich.table import Table
 
+    from core.capabilities import capability_for
+
     console = Console()
     manager = ToolManager(settings)
 
     table = Table(title="Hydra Heads")
     table.add_column("Head")
+    table.add_column("Capability")
     table.add_column("Active")
     table.add_column("Opt-in")
+    table.add_column("Status")
     table.add_column("Role")
 
     for plugin in manager.get_all_plugins():
         enabled = plugin.is_enabled()
         opt_in = "no" if plugin.required else "yes"
         blurb = HEAD_BLURBS.get(plugin.name, plugin.display_name)
+        capability = capability_for(plugin.capability)
+        if not enabled:
+            status = "disabled"
+        elif manager.is_runnable(plugin.name):
+            status = "runnable"
+        else:
+            status = "not runnable"
         table.add_row(
             plugin.name,
+            capability.value,
             "yes" if enabled else "no",
             opt_in,
+            status,
             f"{plugin.name} — {blurb}",
         )
 
