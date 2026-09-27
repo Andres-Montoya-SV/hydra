@@ -3693,6 +3693,36 @@ MongoDB deployment — fails the "acotado, testeable, mantenible" bar for
 a first cut); the adapter interface is documented for later. Full
 detail: [`docs/easm/11_importers.md`](easm/11_importers.md).
 
+## Fase 12 — Certificate Intelligence + RDAP (`api/certificate_events.py`, `api/certificate_backfill.py`, `core/collection/rdap_client.py`, `api/rdap_lookup.py`) — 2026-09-27
+
+No new "Certificate" asset type: `core/intel/engine.py` already emits
+`PRESENTS_CERTIFICATE`/`SAN_CONTAINS`/`SHARES_CERTIFICATE` relationships
+from real TLS captures, and Fase 07's relationship backfill already
+persists all of them into the EASM graph regardless of type — a shared
+certificate across domains was already visible as a relationship, never
+ownership, before this phase touched anything. What was missing was
+per-domain change classification: a new `OBSERVATION_TYPE_CERTIFICATE_PRESENT`
+observation (Fase 04's model, extended) carries a certificate's full
+shape as evidence, and `api/certificate_events.py`'s pure classifier
+labels each transition deterministically (`CERTIFICATE_FIRST_SEEN`,
+`RENEWED`, `CHANGED`, `SAN_ADDED`, `SAN_REMOVED`, citing concrete
+before/after values, never a bare label). A new `certificate_events`
+table + `api/certificate_backfill.py` record these idempotently. Also
+added `OBSERVATION_TYPE_DOMAIN_REGISTRATION_INFO` for `Host.registrar`/
+registration dates, a real pre-existing gap (WHOIS data was captured on
+`Host` but never reached the Evidence model).
+
+RDAP: `core/collection/rdap_client.py` is a new SSRF-hardened HTTP(S)
+client mirroring `core/collection/whois_client.py`'s own discipline —
+every hop validated via `core/collection/ssrf.py`, bounded to 3 hops, a
+pinned-IP-with-correct-SNI connection closing the DNS-rebind gap between
+check and connect. Bootstraps through the well-known `rdap.org`
+redirector. `api/rdap_lookup.py` feeds results through Fase 10's
+ingestion pipeline and **only ever enriches an already-known domain
+asset** — an RDAP result about a domain that isn't already a real asset
+records nothing (no candidate creation from RDAP in this cut). Full
+detail: [`docs/easm/12_certificate_and_rdap.md`](easm/12_certificate_and_rdap.md).
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
