@@ -215,10 +215,23 @@ CREATE TABLE IF NOT EXISTS observation_batches (
     source TEXT NOT NULL,
     confidence_class TEXT NOT NULL,
     imported_at TEXT NOT NULL,
-    raw_artifact_reference TEXT NOT NULL DEFAULT ''
+    raw_artifact_reference TEXT NOT NULL DEFAULT '',
+    -- Fase 11: sha256 of the raw uploaded artifact, when there is one
+    -- (file importers only — a single-fact RDAP-style ingest has no
+    -- file to hash and leaves this NULL). What makes "importing the
+    -- exact same Nmap/Masscan report twice never duplicates anything"
+    -- true: `create_observation_batch` reuses the SAME batch_id for a
+    -- repeat hash instead of minting a new one, and every downstream
+    -- write (`find_or_create_evidence`, `record_observation`,
+    -- `upsert_candidate_asset`) is already idempotent keyed off content,
+    -- not run_id — so replaying the identical batch_id a second time
+    -- produces zero new rows anywhere.
+    artifact_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_observation_batches_organization
     ON observation_batches(organization_id, imported_at);
+CREATE INDEX IF NOT EXISTS idx_observation_batches_artifact_hash
+    ON observation_batches(organization_id, source, artifact_hash);
 
 -- Fase 04: the normalized "what this run observed about this asset"
 -- projection the Fase 01 consolidation plan's glossary calls
@@ -1259,6 +1272,7 @@ class ObservationBatchRecord:
     confidence_class: str
     imported_at: str
     raw_artifact_reference: str
+    artifact_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1347,6 +1361,12 @@ _CANDIDATE_ASSETS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 _EVIDENCE_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("confidence_class", "TEXT NOT NULL DEFAULT 'DIRECT_CURRENT'"),
 )
+
+# Fase 11: an existing `observation_batches` table (every organization
+# created before file-based importers existed) needs this column added
+# the same way. Nullable — Fase 10's own non-file sources (RDAP lookups,
+# single-fact ingests) never have a raw artifact to hash.
+_OBSERVATION_BATCHES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("artifact_hash", "TEXT"),)
 
 
 def _migrate_table_columns(
@@ -1445,6 +1465,9 @@ class ControlDB:
             _migrate_table_columns(conn, "subscriptions", _SUBSCRIPTIONS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "candidate_assets", _CANDIDATE_ASSETS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "evidence", _EVIDENCE_MIGRATION_COLUMNS)
+            _migrate_table_columns(
+                conn, "observation_batches", _OBSERVATION_BATCHES_MIGRATION_COLUMNS
+            )
             for table in _ORGANIZATION_SCOPED_TABLES:
                 _migrate_table_columns(conn, table, _ORGANIZATION_ID_MIGRATION_COLUMNS)
             conn.executescript(_SCHEMA)
@@ -2878,20 +2901,44 @@ class ControlDB:
         source: str,
         confidence_class: str,
         raw_artifact_reference: str = "",
+        artifact_hash: str | None = None,
         imported_at: str | None = None,
     ) -> str:
         """One row per external import/lookup batch — the audit record
         `api/external_observation_ingest.py` creates once per call, before
         writing any of the batch's own facts into `evidence`/
         `observations`. Never itself a source of truth for the facts —
-        see this table's own schema comment."""
+        see this table's own schema comment.
+
+        Fase 11: when `artifact_hash` is given (a real uploaded file, not
+        a single-fact lookup) and a batch with that exact
+        (organization_id, source, artifact_hash) already exists, its
+        `batch_id` is reused instead of minting a new one. This is the
+        whole idempotency mechanism for "importing the same artifact
+        twice never duplicates anything" — every downstream write this
+        batch_id is used as `run_id` for (`find_or_create_evidence`,
+        `record_observation`, `upsert_candidate_asset`) is already
+        idempotent on its own content, not on `run_id` being fresh, so
+        replaying the identical batch_id a second time is a safe no-op
+        everywhere, not a special case this method has to implement
+        itself."""
+        if artifact_hash is not None:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT batch_id FROM observation_batches WHERE organization_id = ? "
+                    "AND source = ? AND artifact_hash = ?",
+                    (organization_id, source, artifact_hash),
+                ).fetchone()
+            if row is not None:
+                return row["batch_id"]
+
         imported_at = imported_at or _now_iso()
         batch_id = secrets.token_hex(16)
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO observation_batches (batch_id, organization_id, account_id, "
-                "source, confidence_class, imported_at, raw_artifact_reference) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "source, confidence_class, imported_at, raw_artifact_reference, artifact_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     batch_id,
                     organization_id,
@@ -2900,9 +2947,26 @@ class ControlDB:
                     confidence_class,
                     imported_at,
                     raw_artifact_reference,
+                    artifact_hash,
                 ),
             )
         return batch_id
+
+    def find_observation_batch_by_artifact_hash(
+        self, *, organization_id: str, source: str, artifact_hash: str
+    ) -> ObservationBatchRecord | None:
+        """Lets a caller (`api/nmap_masscan_import.py`) tell "this exact
+        artifact was already imported" apart from "this is new" BEFORE
+        deciding whether to report it as a fresh import, without
+        depending on `create_observation_batch`'s own internal reuse
+        behavior to answer that question."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM observation_batches WHERE organization_id = ? "
+                "AND source = ? AND artifact_hash = ?",
+                (organization_id, source, artifact_hash),
+            ).fetchone()
+        return None if row is None else _observation_batch_record_from_row(row)
 
     def list_observation_batches_for_organization(
         self, organization_id: str
@@ -4786,6 +4850,7 @@ def _observation_batch_record_from_row(row: sqlite3.Row) -> ObservationBatchReco
         confidence_class=row["confidence_class"],
         imported_at=row["imported_at"],
         raw_artifact_reference=row["raw_artifact_reference"],
+        artifact_hash=row["artifact_hash"],
     )
 
 

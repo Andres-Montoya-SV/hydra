@@ -6,6 +6,10 @@ rich==13.9.4
 # certifi: explicit Mozilla CA bundle for stdlib HTTPS (OSV.dev, crt.sh, …)
 # Do not rely on this arriving transitively — macOS venvs have no usable default store.
 certifi==2026.7.22
+# defusedxml: XXE/billion-laughs-safe XML parsing for untrusted uploaded files
+# (Nmap XML importer, Fase 11 EASM roadmap) — stdlib xml.etree is explicitly
+# unsafe for attacker-supplied XML.
+defusedxml==0.7.1
 
 # Development / QA (install with: pip install -r requirements-dev.txt)
 # See requirements-dev.txt
