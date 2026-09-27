@@ -37,6 +37,11 @@ from api.asset_identity import (
 )
 from api.candidate_assets import CandidateAssetDraft, candidate_signal_hash
 from api.exposure_identity import ExposureDraft
+from api.external_observation import (
+    ObservationConfidenceClass,
+    PrecedenceCandidate,
+    reconcile_precedence,
+)
 from api.observation_identity import EvidenceContent
 from api.relationship_identity import RelationshipDraft
 from core.store import connect_sqlite
@@ -180,12 +185,40 @@ CREATE TABLE IF NOT EXISTS evidence (
     source TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '',
     confidence_score INTEGER,
+    -- Fase 10 (EASM roadmap): which confidence CLASS (never a numeric
+    -- score) this evidence belongs to — see
+    -- `api/external_observation.py`'s own docstring for the full
+    -- precedence rule. Defaults to 'DIRECT_CURRENT' because every
+    -- pre-Fase-10 writer of this table is a real Hydra scan, which is
+    -- exactly what that class means.
+    confidence_class TEXT NOT NULL DEFAULT 'DIRECT_CURRENT',
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
     last_seen_run_id TEXT,
     UNIQUE (organization_id, asset_id, source, detail, confidence_score)
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_asset ON evidence(asset_id);
+
+-- Fase 10 (EASM roadmap): one row per external import/lookup batch —
+-- the "ObservationBatch" the phase's own spec names. Never a second
+-- observation pipeline: a batch's own facts are written into the SAME
+-- `evidence`/`observations` tables every other phase already uses
+-- (`api/external_observation_ingest.py`), tagged with this batch's
+-- `source`/`confidence_class`. This table exists purely so "which batch
+-- produced which facts, when, from what raw artifact" is answerable on
+-- its own — an audit/provenance record, not a second source of truth
+-- for the facts themselves.
+CREATE TABLE IF NOT EXISTS observation_batches (
+    batch_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    account_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    confidence_class TEXT NOT NULL,
+    imported_at TEXT NOT NULL,
+    raw_artifact_reference TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_observation_batches_organization
+    ON observation_batches(organization_id, imported_at);
 
 -- Fase 04: the normalized "what this run observed about this asset"
 -- projection the Fase 01 consolidation plan's glossary calls
@@ -1214,6 +1247,18 @@ class EvidenceRecord:
     first_seen_at: str
     last_seen_at: str
     last_seen_run_id: str | None
+    confidence_class: str = "DIRECT_CURRENT"
+
+
+@dataclass(frozen=True)
+class ObservationBatchRecord:
+    batch_id: str
+    organization_id: str
+    account_id: str
+    source: str
+    confidence_class: str
+    imported_at: str
+    raw_artifact_reference: str
 
 
 @dataclass(frozen=True)
@@ -1293,6 +1338,14 @@ _CANDIDATE_ASSETS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("review_status", "TEXT NOT NULL DEFAULT 'pending'"),
     ("discarded_signal_hash", "TEXT"),
     ("promoted_asset_id", "TEXT"),
+)
+
+# Fase 10: an existing `evidence` table (every organization created
+# before external-observation support existed) needs this column added
+# the same way. Defaults every pre-existing row to 'DIRECT_CURRENT' —
+# correct, since every one of them came from a real Hydra scan.
+_EVIDENCE_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("confidence_class", "TEXT NOT NULL DEFAULT 'DIRECT_CURRENT'"),
 )
 
 
@@ -1391,6 +1444,7 @@ class ControlDB:
             _migrate_table_columns(conn, "scans", _SCANS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "subscriptions", _SUBSCRIPTIONS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "candidate_assets", _CANDIDATE_ASSETS_MIGRATION_COLUMNS)
+            _migrate_table_columns(conn, "evidence", _EVIDENCE_MIGRATION_COLUMNS)
             for table in _ORGANIZATION_SCOPED_TABLES:
                 _migrate_table_columns(conn, table, _ORGANIZATION_ID_MIGRATION_COLUMNS)
             conn.executescript(_SCHEMA)
@@ -2730,8 +2784,8 @@ class ControlDB:
             evidence_id = secrets.token_hex(16)
             conn.execute(
                 "INSERT INTO evidence (evidence_id, organization_id, asset_id, source, detail, "
-                "confidence_score, first_seen_at, last_seen_at, last_seen_run_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "confidence_score, confidence_class, first_seen_at, last_seen_at, "
+                "last_seen_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     evidence_id,
                     organization_id,
@@ -2739,6 +2793,7 @@ class ControlDB:
                     content.source,
                     content.detail,
                     content.confidence_score,
+                    content.confidence_class,
                     observed_at,
                     observed_at,
                     run_id,
@@ -2805,12 +2860,94 @@ class ControlDB:
                 "e.source AS e_source, e.detail AS e_detail, "
                 "e.confidence_score AS e_confidence_score, e.first_seen_at AS e_first_seen_at, "
                 "e.last_seen_at AS e_last_seen_at, e.last_seen_run_id AS e_last_seen_run_id, "
-                "e.organization_id AS e_organization_id, e.asset_id AS e_asset_id "
+                "e.organization_id AS e_organization_id, e.asset_id AS e_asset_id, "
+                "e.confidence_class AS e_confidence_class "
                 "FROM observations o JOIN evidence e ON o.evidence_id = e.evidence_id "
                 "WHERE o.asset_id = ? ORDER BY o.observed_at",
                 (asset_id,),
             ).fetchall()
         return [_observation_with_evidence_from_row(row) for row in rows]
+
+    # --- external observations (Fase 10, EASM roadmap) -------------------
+
+    def create_observation_batch(
+        self,
+        *,
+        organization_id: str,
+        account_id: str,
+        source: str,
+        confidence_class: str,
+        raw_artifact_reference: str = "",
+        imported_at: str | None = None,
+    ) -> str:
+        """One row per external import/lookup batch — the audit record
+        `api/external_observation_ingest.py` creates once per call, before
+        writing any of the batch's own facts into `evidence`/
+        `observations`. Never itself a source of truth for the facts —
+        see this table's own schema comment."""
+        imported_at = imported_at or _now_iso()
+        batch_id = secrets.token_hex(16)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO observation_batches (batch_id, organization_id, account_id, "
+                "source, confidence_class, imported_at, raw_artifact_reference) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    organization_id,
+                    account_id,
+                    source,
+                    confidence_class,
+                    imported_at,
+                    raw_artifact_reference,
+                ),
+            )
+        return batch_id
+
+    def list_observation_batches_for_organization(
+        self, organization_id: str
+    ) -> list[ObservationBatchRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM observation_batches WHERE organization_id = ? "
+                "ORDER BY imported_at, batch_id",
+                (organization_id,),
+            ).fetchall()
+        return [_observation_batch_record_from_row(row) for row in rows]
+
+    def current_evidence_for_asset_and_type(
+        self, *, organization_id: str, asset_id: str, observation_type: str
+    ) -> EvidenceRecord | None:
+        """The phase's own required deterministic precedence, applied for
+        real: every distinct evidence row ever recorded for this
+        (asset, observation_type) — across every source that has ever
+        reported one — ranked by `api/external_observation.py::
+        reconcile_precedence`. Never deletes or hides a losing candidate;
+        this only answers "which one should a caller currently trust,"
+        the same non-destructive precedence guarantee that module's own
+        docstring commits to."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT e.* FROM observations o "
+                "JOIN evidence e ON o.evidence_id = e.evidence_id "
+                "WHERE o.organization_id = ? AND o.asset_id = ? AND o.observation_type = ?",
+                (organization_id, asset_id, observation_type),
+            ).fetchall()
+        if not rows:
+            return None
+        records = [_evidence_record_from_row(row) for row in rows]
+        candidates = [
+            PrecedenceCandidate(
+                evidence_id=record.evidence_id,
+                confidence_class=ObservationConfidenceClass(record.confidence_class),
+                last_seen_at=record.last_seen_at,
+            )
+            for record in records
+        ]
+        winner = reconcile_precedence(candidates)
+        if winner is None:
+            return None
+        return next(r for r in records if r.evidence_id == winner.evidence_id)
 
     def observation_digest_input_for_run(
         self, *, asset_id: str, run_id: str
@@ -4636,6 +4773,19 @@ def _evidence_record_from_row(row: sqlite3.Row) -> EvidenceRecord:
         first_seen_at=row["first_seen_at"],
         last_seen_at=row["last_seen_at"],
         last_seen_run_id=row["last_seen_run_id"],
+        confidence_class=row["confidence_class"],
+    )
+
+
+def _observation_batch_record_from_row(row: sqlite3.Row) -> ObservationBatchRecord:
+    return ObservationBatchRecord(
+        batch_id=row["batch_id"],
+        organization_id=row["organization_id"],
+        account_id=row["account_id"],
+        source=row["source"],
+        confidence_class=row["confidence_class"],
+        imported_at=row["imported_at"],
+        raw_artifact_reference=row["raw_artifact_reference"],
     )
 
 
@@ -4660,6 +4810,7 @@ def _observation_with_evidence_from_row(row: sqlite3.Row) -> ObservationWithEvid
         first_seen_at=row["e_first_seen_at"],
         last_seen_at=row["e_last_seen_at"],
         last_seen_run_id=row["e_last_seen_run_id"],
+        confidence_class=row["e_confidence_class"],
     )
     return ObservationWithEvidence(observation=observation, evidence=evidence)
 

@@ -75,11 +75,19 @@ class EvidenceContent:
     same fact — this equality IS the deduplication key
     `api/control_db.py::record_observation` uses, the same "exact value
     match, no heuristics" discipline `api/asset_identity.py` already
-    established for asset identity."""
+    established for asset identity.
+
+    `confidence_class` (Fase 10, EASM roadmap) defaults to
+    `"DIRECT_CURRENT"` — every existing caller of this dataclass
+    (`observations_for_host` below) is a real Hydra scan, which is
+    exactly what that class means; external/imported evidence
+    (`api/external_observation_ingest.py`) is the only place that ever
+    passes a different value."""
 
     source: str
     detail: str
     confidence_score: int | None
+    confidence_class: str = "DIRECT_CURRENT"
 
 
 @dataclass(frozen=True)
