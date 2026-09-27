@@ -3642,6 +3642,32 @@ for review, recorded as its own audited row. Full detail:
 [`docs/easm/06_candidate_assets.md`](easm/06_candidate_assets.md)'s
 "Promotion and discard" section.
 
+## Fase 10 — External observations ingestion (`api/external_observation.py`, `api/external_observation_ingest.py`) — 2026-09-26
+
+The next never-started phase in the roadmap's numeric order (07-09/13/15/16
+were already merged by other work, 06 completed above). Gives facts from
+outside Hydra's own scans — RDAP, a customer-supplied inventory, a
+third-party intelligence export — one narrow, audited door into the
+existing Fase 04 Observation/Evidence model, enforcing `Imported !=
+Authorized` and `Third-party != Direct observation`. A new pure precedence
+table (`ObservationConfidenceClass`/`CONFIDENCE_CLASS_RANK`,
+`reconcile_precedence()`) ranks DIRECT_CURRENT above CUSTOMER_SUPPLIED
+above THIRD_PARTY_CURRENT above INFERRED_RELATIONSHIP above HISTORICAL by a
+fixed table, never recency or heuristics alone — a stale third-party import
+can never outrank a live Hydra scan
+(`tests/test_external_observation_ingest.py::
+TestOldThirdPartyNeverBeatsNewerDirectObservation`). `EvidenceContent`
+gained a `confidence_class` field (default `DIRECT_CURRENT`, so every
+existing real-scan caller is unaffected). `ingest_external_observation_batch`
+does exactly one check per fact: does the identity already exist as a real
+asset? Yes → ordinary corroborating Evidence/Observation, through the exact
+same calls a real scan uses. No → a `candidate_assets` row, fail-closed
+(`authorization_status="DENY"`), reviewable only through Fase 06's existing
+promote/discard workflow — no import ever bypasses it
+(`tests/test_external_observation_ingest.py::
+TestImportedAssetIsNeverAuthorized`). Full detail:
+[`docs/easm/10_external_observations.md`](easm/10_external_observations.md).
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
