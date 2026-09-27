@@ -3723,6 +3723,28 @@ asset** — an RDAP result about a domain that isn't already a real asset
 records nothing (no candidate creation from RDAP in this cut). Full
 detail: [`docs/easm/12_certificate_and_rdap.md`](easm/12_certificate_and_rdap.md).
 
+## Fase 14 — Technology Intelligence (`api/technology_catalog.py`, `api/technology_events.py`, `api/technology_backfill.py`) — 2026-09-27
+
+A persistent, historical technology inventory built entirely on what
+already exists (httpx/`WhatWebParser`/`browser_probe` already produce
+`TechnologyFinding`s; Fase 06 already turns them into `technology_detected`
+observations). Found and fixed a real gap: httpx and WhatWeb can report
+the same real technology under different casing ("nginx" vs "Nginx"),
+which silently became two different facts before this phase — a new
+curated (never fuzzy) name-normalization table
+(`api/technology_catalog.py`) is applied once, at write time. A new pure
+classifier (`api/technology_events.py`) compares a domain's per-run
+`{technology: version}` snapshot to the previous run and reports
+`TECHNOLOGY_ADDED`/`REMOVED`/`VERSION_CHANGED`, each citing the concrete
+technology and version; `technology_events` table + backfill record
+these idempotently. New inventory queries answer the phase's own
+required questions directly: `list_current_technologies_for_asset`
+(caught and fixed a bug during development where a removed technology
+kept showing as "current" — now correctly scoped to the domain's most
+recent run only), `list_assets_running_technology`,
+`list_technology_events_for_organization`. Full detail:
+[`docs/easm/14_technology_intelligence.md`](easm/14_technology_intelligence.md).
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —

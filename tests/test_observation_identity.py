@@ -214,7 +214,9 @@ class TestObservationsForHost:
             for d in observations_for_host(host)
             if d.observation_type == OBSERVATION_TYPE_TECHNOLOGY_DETECTED
         ]
-        assert {d.evidence.detail for d in drafts} == {"nginx", "react"}
+        # Fase 14: names are canonicalized before being recorded --
+        # "react" normalizes to the canonical "React".
+        assert {d.evidence.detail for d in drafts} == {"nginx", "React"}
 
     def test_identical_evidence_content_is_equal_across_two_separately_built_hosts(self) -> None:
         """The exact equality `api/control_db.py::find_or_create_evidence`
