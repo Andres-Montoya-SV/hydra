@@ -55,6 +55,7 @@ from api.asset_identity import (
     port_identity_key,
     url_identity_key,
 )
+from api.certificate_events import certificate_snapshot_detail
 from core.assets import Host
 
 OBSERVATION_TYPE_DOMAIN_RESOLVED = "domain_resolved"
@@ -64,6 +65,13 @@ OBSERVATION_TYPE_DNS_POSTURE_TAG = "dns_posture_tag"
 OBSERVATION_TYPE_URL_DISCOVERED = "url_discovered"
 OBSERVATION_TYPE_TECHNOLOGY_DETECTED = "technology_detected"
 OBSERVATION_TYPE_SECURITY_HEADER_PRESENT = "security_header_present"
+# Fase 12: certificate/registration facts about a domain's HTTP/DNS
+# surface — same "attach to the domain asset, never a new asset type"
+# treatment Fase 06 already gave technology/header facts (see this
+# module's own docstring on why observation types beyond the four Fase 03
+# asset types exist here).
+OBSERVATION_TYPE_CERTIFICATE_PRESENT = "certificate_present"
+OBSERVATION_TYPE_DOMAIN_REGISTRATION_INFO = "domain_registration_info"
 
 
 @dataclass(frozen=True)
@@ -214,5 +222,44 @@ def observations_for_host(host: Host) -> list[ObservationDraft]:
                     ),
                 )
             )
+
+    if host.tls is not None and host.tls.fingerprint_sha256:
+        drafts.append(
+            ObservationDraft(
+                asset_type=ASSET_TYPE_DOMAIN,
+                identity_key=domain_key,
+                observation_type=OBSERVATION_TYPE_CERTIFICATE_PRESENT,
+                evidence=EvidenceContent(
+                    source=host.tls.source,
+                    detail=certificate_snapshot_detail(
+                        fingerprint_sha256=host.tls.fingerprint_sha256,
+                        subject=host.tls.subject,
+                        issuer=host.tls.issuer,
+                        not_before=host.tls.not_before,
+                        not_after=host.tls.not_after,
+                        sans=host.tls.sans,
+                    ),
+                    confidence_score=host.tls.confidence_score,
+                ),
+            )
+        )
+
+    if host.registrar or host.registration_created_at or host.registration_expires_at:
+        drafts.append(
+            ObservationDraft(
+                asset_type=ASSET_TYPE_DOMAIN,
+                identity_key=domain_key,
+                observation_type=OBSERVATION_TYPE_DOMAIN_REGISTRATION_INFO,
+                evidence=EvidenceContent(
+                    source="whois",
+                    detail=(
+                        f"registrar={host.registrar or ''}|"
+                        f"created={host.registration_created_at or ''}|"
+                        f"expires={host.registration_expires_at or ''}"
+                    ),
+                    confidence_score=None,
+                ),
+            )
+        )
 
     return drafts

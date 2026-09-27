@@ -288,6 +288,30 @@ CREATE TABLE IF NOT EXISTS change_events (
 CREATE INDEX IF NOT EXISTS idx_change_events_asset ON change_events(asset_id, detected_at);
 CREATE INDEX IF NOT EXISTS idx_change_events_run ON change_events(run_id);
 
+-- Fase 12 (EASM roadmap): certificate-specific change classification for
+-- a domain asset's OBSERVATION_TYPE_CERTIFICATE_PRESENT evidence history
+-- (api/certificate_events.py holds the deterministic classifier;
+-- api/certificate_backfill.py walks each domain's history and calls it).
+-- Deliberately NOT a "certificates" table of its own — a certificate is
+-- not a separate EASM asset here (see api/certificate_events.py's own
+-- docstring for why); asset_id below is always a DOMAIN asset.
+-- UNIQUE(asset_id, run_id, event_type, reason) is what makes replaying
+-- the backfill over the same runs idempotent -- Fase 03's own precedent.
+CREATE TABLE IF NOT EXISTS certificate_events (
+    certificate_event_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    run_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    previous_fingerprint TEXT,
+    new_fingerprint TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    UNIQUE (asset_id, run_id, event_type, reason)
+);
+CREATE INDEX IF NOT EXISTS idx_certificate_events_asset
+    ON certificate_events(asset_id, detected_at);
+
 -- Fase 08 (EASM roadmap): durable external exposures. A raw Finding remains
 -- a run-scoped detector result in the per-account AssetStore; this table is
 -- the cross-run EASM identity of a security-relevant condition on one durable
@@ -1309,6 +1333,19 @@ class ChangeEventRecord:
     reason: str
     previous_digest: str | None
     new_digest: str | None
+    detected_at: str
+
+
+@dataclass(frozen=True)
+class CertificateEventRecord:
+    certificate_event_id: str
+    organization_id: str
+    asset_id: str
+    run_id: str
+    event_type: str
+    reason: str
+    previous_fingerprint: str | None
+    new_fingerprint: str
     detected_at: str
 
 
@@ -3096,6 +3133,57 @@ class ControlDB:
                 (run_id,),
             ).fetchall()
         return [_change_event_record_from_row(row) for row in rows]
+
+    def record_certificate_event(
+        self,
+        *,
+        organization_id: str,
+        asset_id: str,
+        run_id: str,
+        event_type: str,
+        reason: str,
+        previous_fingerprint: str | None,
+        new_fingerprint: str,
+        detected_at: str | None = None,
+    ) -> str | None:
+        """Persists ONE `CertificateEvent`
+        `api/certificate_events.py::classify_certificate_transition`
+        already decided — this method makes no decision of its own.
+        `INSERT OR IGNORE` against `UNIQUE(asset_id, run_id, event_type,
+        reason)` makes replaying `api/certificate_backfill.py` a second
+        time over the same runs produce zero duplicate rows (Fase 03/04's
+        own idempotency precedent). Returns the new
+        `certificate_event_id`, or `None` if this exact event was already
+        recorded."""
+        detected_at = detected_at or _now_iso()
+        certificate_event_id = secrets.token_hex(16)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO certificate_events (certificate_event_id, "
+                "organization_id, asset_id, run_id, event_type, reason, "
+                "previous_fingerprint, new_fingerprint, detected_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    certificate_event_id,
+                    organization_id,
+                    asset_id,
+                    run_id,
+                    event_type,
+                    reason,
+                    previous_fingerprint,
+                    new_fingerprint,
+                    detected_at,
+                ),
+            )
+        return certificate_event_id if cursor.rowcount else None
+
+    def list_certificate_events_for_asset(self, asset_id: str) -> list[CertificateEventRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM certificate_events WHERE asset_id = ? ORDER BY detected_at",
+                (asset_id,),
+            ).fetchall()
+        return [_certificate_event_record_from_row(row) for row in rows]
 
     def get_current_lifecycle_state_for_asset(self, asset_id: str) -> str | None:
         """The most recent recorded transition's `new_state` — cheap
@@ -4891,6 +4979,20 @@ def _change_event_record_from_row(row: sqlite3.Row) -> ChangeEventRecord:
         reason=row["reason"],
         previous_digest=row["previous_digest"],
         new_digest=row["new_digest"],
+        detected_at=row["detected_at"],
+    )
+
+
+def _certificate_event_record_from_row(row: sqlite3.Row) -> CertificateEventRecord:
+    return CertificateEventRecord(
+        certificate_event_id=row["certificate_event_id"],
+        organization_id=row["organization_id"],
+        asset_id=row["asset_id"],
+        run_id=row["run_id"],
+        event_type=row["event_type"],
+        reason=row["reason"],
+        previous_fingerprint=row["previous_fingerprint"],
+        new_fingerprint=row["new_fingerprint"],
         detected_at=row["detected_at"],
     )
 
