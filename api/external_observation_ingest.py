@@ -68,6 +68,7 @@ def ingest_external_observation_batch(
     account_id: str,
     drafts: list[ExternalObservationDraft],
     raw_artifact_reference: str = "",
+    artifact_hash: str | None = None,
 ) -> ExternalIngestSummary:
     """Ingests one batch of `ExternalObservationDraft`s. Every draft in
     the batch shares one `source`/`confidence_class` pair by construction
@@ -75,7 +76,13 @@ def ingest_external_observation_batch(
     Nmap XML file, one RDAP lookup — is from a single source; a caller
     mixing sources in one call is calling this once per source, not a
     bug this function needs to guard against, since nothing here assumes
-    otherwise)."""
+    otherwise).
+
+    `artifact_hash` (Fase 11): pass the sha256 of a real uploaded file so
+    `create_observation_batch` can reuse the same `batch_id` on a repeat
+    import of the exact same artifact — see that method's own docstring
+    for why that alone makes replay idempotent everywhere downstream.
+    Left `None` for non-file sources (RDAP-style single-fact lookups)."""
     if not drafts:
         raise ValueError("a batch must contain at least one observation")
 
@@ -85,6 +92,7 @@ def ingest_external_observation_batch(
         source=drafts[0].source.value,
         confidence_class=drafts[0].confidence_class.value,
         raw_artifact_reference=raw_artifact_reference,
+        artifact_hash=artifact_hash,
     )
 
     drafts_processed = 0

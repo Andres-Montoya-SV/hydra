@@ -3668,6 +3668,31 @@ promote/discard workflow — no import ever bypasses it
 TestImportedAssetIsNeverAuthorized`). Full detail:
 [`docs/easm/10_external_observations.md`](easm/10_external_observations.md).
 
+## Fase 11 — Nmap/Masscan importers (`api/nmap_masscan_import.py`, `core/parsers/nmap_import.py`, `core/parsers/masscan_import.py`) — 2026-09-27
+
+Lets organizations import a previously-run Nmap XML or Masscan JSON
+report as evidence — never as a second active scanner (both tools are
+explicitly excluded from Hydra's own active-scanning set). Built
+entirely on Fase 10's ingestion pipeline: no second evidence/candidate
+pipeline. `core/parsers/nmap_import.py` uses `defusedxml` (new
+dependency, `requirements.txt`), never stdlib `xml.etree`, since an
+uploaded report is untrusted input — proven safe against entity-
+expansion/XML-bomb attacks by a dedicated test. Every imported host
+becomes an IP-type `candidate_assets` row, fail-closed
+(`authorization_status="DENY"`), regardless of how many open ports were
+reported; a resolved hostname is reported separately through Fase 10's
+existing DOMAIN route (corroborating evidence on a known asset, or its
+own candidate). A new `observation_batches.artifact_hash` column plus
+`ControlDB.find_observation_batch_by_artifact_hash()` make "importing
+the same artifact twice never duplicates anything" true end-to-end:
+`create_observation_batch` reuses the same `batch_id` for a repeat
+artifact hash, and every downstream write is already idempotent on
+content, not on a fresh `run_id`. IVRE was evaluated per the phase's own
+instruction and deliberately not implemented (would require its own
+MongoDB deployment — fails the "acotado, testeable, mantenible" bar for
+a first cut); the adapter interface is documented for later. Full
+detail: [`docs/easm/11_importers.md`](easm/11_importers.md).
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
