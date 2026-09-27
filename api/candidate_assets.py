@@ -18,6 +18,7 @@ Hard invariants:
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -46,6 +47,41 @@ class CandidateAssetDraft:
     source_entity_id: str
     parent_indicator_id: str | None
     lineage_reference: str
+
+
+def candidate_signal_hash(
+    *,
+    candidate_type: str,
+    normalized_value: str,
+    reason: str,
+    scope_status: str,
+    collection_status: str,
+    authorization_status: str,
+) -> str:
+    """Fase 06 completion: a deterministic fingerprint of "what a human
+    reviewer actually saw and discarded." A LATER re-observation of the
+    exact same candidate that produces this SAME hash again is, by
+    definition, not new information — the discard stands, silently,
+    exactly as the human intended. A re-observation whose reason/scope/
+    collection/authorization status differs from what was discarded
+    produces a DIFFERENT hash — that is what "una señal nueva" means
+    here: something a reviewer has not actually seen and judged yet, so
+    the candidate is reopened for review rather than staying silently
+    buried. Never a fuzzy/partial match — every one of these fields must
+    match exactly for the discard to still apply, the same "exact value
+    match, no heuristics" discipline `api/asset_identity.py` already
+    established for asset identity."""
+    canonical = "\n".join(
+        [
+            candidate_type,
+            normalized_value,
+            reason,
+            scope_status,
+            collection_status,
+            authorization_status,
+        ]
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def normalize_candidate_value(kind: str, value: str) -> str:
