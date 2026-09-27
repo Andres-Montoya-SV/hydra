@@ -27,8 +27,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-from api.asset_identity import ExistingAsset, ReconciliationDecision
-from api.candidate_assets import CandidateAssetDraft
+from api.asset_identity import (
+    ASSET_TYPE_DOMAIN,
+    ASSET_TYPE_URL,
+    ExistingAsset,
+    ReconciliationDecision,
+    domain_identity_key,
+    url_identity_key,
+)
+from api.candidate_assets import CandidateAssetDraft, candidate_signal_hash
 from api.exposure_identity import ExposureDraft
 from api.observation_identity import EvidenceContent
 from api.relationship_identity import RelationshipDraft
@@ -347,12 +354,54 @@ CREATE TABLE IF NOT EXISTS candidate_assets (
     source_entity_id TEXT NOT NULL DEFAULT '',
     parent_indicator_id TEXT,
     lineage_reference TEXT NOT NULL DEFAULT '',
+    -- Fase 06 completion (2026-09-26): the actual confirm/discard workflow
+    -- the phase's own spec required and the original merge silently
+    -- descoped. 'pending' (default) | 'promoted' | 'discarded'. A
+    -- candidate NEVER becomes an `assets` row except through
+    -- `promote_candidate_asset`, which requires an 'owner' role on this
+    -- organization — the exact same role check `resolve_exposure` already
+    -- uses, never a new authorization mechanism.
+    review_status TEXT NOT NULL DEFAULT 'pending',
+    -- A content hash of (candidate_type, normalized_value, reason,
+    -- scope_status, collection_status, authorization_status) taken at the
+    -- moment a human discarded this candidate. `upsert_candidate_asset`
+    -- compares this against each later re-observation's own hash: an
+    -- identical hash means "the exact same signal, seen again" and the
+    -- discard stands; a different hash means a genuinely NEW signal
+    -- arrived, and the candidate is reopened to 'pending' automatically
+    -- (recorded as its own audited 'reopened' review row) — this is what
+    -- makes "un candidato descartado no se vuelve a proponer... sin una
+    -- señal nueva" a real, checkable rule instead of a comment.
+    discarded_signal_hash TEXT,
+    -- Set only once, by `promote_candidate_asset`, on a successful
+    -- promotion — never mutated afterward.
+    promoted_asset_id TEXT REFERENCES assets(asset_id),
     UNIQUE (organization_id, candidate_type, normalized_value)
 );
 CREATE INDEX IF NOT EXISTS idx_candidate_assets_organization
     ON candidate_assets(organization_id, first_seen_at);
 CREATE INDEX IF NOT EXISTS idx_candidate_assets_value
     ON candidate_assets(organization_id, candidate_type, normalized_value);
+
+-- Fase 06 completion: the audit trail the phase's own spec required
+-- ("la promoción queda auditada: quién, cuándo, con qué justificación").
+-- One row per human review action — never mutated, never deleted; the
+-- full history of every promote/discard/reopen for a candidate is
+-- reconstructed by reading every row for it, oldest first.
+CREATE TABLE IF NOT EXISTS candidate_asset_reviews (
+    review_id TEXT PRIMARY KEY,
+    candidate_asset_id TEXT NOT NULL REFERENCES candidate_assets(candidate_asset_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    account_id TEXT,
+    action TEXT NOT NULL CHECK(action IN ('promoted', 'discarded', 'reopened')),
+    justification TEXT NOT NULL DEFAULT '',
+    resulting_asset_id TEXT REFERENCES assets(asset_id),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_asset_reviews_candidate
+    ON candidate_asset_reviews(candidate_asset_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_candidate_asset_reviews_organization
+    ON candidate_asset_reviews(organization_id, created_at);
 
 -- Fase 07 (EASM roadmap): the durable, organization-scoped projection of
 -- core.intel.model.Relationship. The run-scoped intel_relationships table
@@ -1095,6 +1144,21 @@ class CandidateAssetRecord:
     source_entity_id: str
     parent_indicator_id: str | None
     lineage_reference: str
+    review_status: str = "pending"
+    discarded_signal_hash: str | None = None
+    promoted_asset_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CandidateAssetReviewRecord:
+    review_id: str
+    candidate_asset_id: str
+    organization_id: str
+    account_id: str | None
+    action: str
+    justification: str
+    resulting_asset_id: str | None
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -1222,6 +1286,15 @@ _SUBSCRIPTIONS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 # `account_organization_roles` exist.
 _ORGANIZATION_ID_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("organization_id", "TEXT"),)
 
+# Fase 06 completion: an existing `candidate_assets` table (every
+# organization created before the confirm/discard workflow existed) needs
+# these three columns added the same way.
+_CANDIDATE_ASSETS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("review_status", "TEXT NOT NULL DEFAULT 'pending'"),
+    ("discarded_signal_hash", "TEXT"),
+    ("promoted_asset_id", "TEXT"),
+)
+
 
 def _migrate_table_columns(
     conn: sqlite3.Connection, table: str, columns: tuple[tuple[str, str], ...]
@@ -1317,6 +1390,7 @@ class ControlDB:
             _migrate_table_columns(conn, "accounts", _ACCOUNTS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "scans", _SCANS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "subscriptions", _SUBSCRIPTIONS_MIGRATION_COLUMNS)
+            _migrate_table_columns(conn, "candidate_assets", _CANDIDATE_ASSETS_MIGRATION_COLUMNS)
             for table in _ORGANIZATION_SCOPED_TABLES:
                 _migrate_table_columns(conn, table, _ORGANIZATION_ID_MIGRATION_COLUMNS)
             conn.executescript(_SCHEMA)
@@ -1767,23 +1841,47 @@ class ControlDB:
         original first-seen identity and receive the latest run's lifecycle
         metadata. This method never creates an `assets` row and never calls
         any authorization primitive.
-        """
+
+        Fase 06 completion: if the existing row was previously
+        `discarded`, re-observing the EXACT same signal (see
+        `api/candidate_assets.py::candidate_signal_hash`) leaves it
+        discarded, silently — that is the whole point of a discard. Only a
+        genuinely different signal reopens it to `pending`, recorded as
+        its own audited `reopened` row in `candidate_asset_reviews` (never
+        a promotion, never a deletion of the discard history — just a
+        fresh chance for a human to look at what's now a materially
+        different observation)."""
         observed_at = observed_at or _now_iso()
+        new_signal_hash = candidate_signal_hash(
+            candidate_type=draft.candidate_type,
+            normalized_value=draft.normalized_value,
+            reason=draft.reason,
+            scope_status=draft.scope_status,
+            collection_status=draft.collection_status,
+            authorization_status=draft.authorization_status,
+        )
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT candidate_asset_id FROM candidate_assets "
-                "WHERE organization_id = ? AND candidate_type = ? "
+                "SELECT candidate_asset_id, review_status, discarded_signal_hash "
+                "FROM candidate_assets WHERE organization_id = ? AND candidate_type = ? "
                 "AND normalized_value = ?",
                 (organization_id, draft.candidate_type, draft.normalized_value),
             ).fetchone()
             if row is not None:
                 candidate_asset_id = str(row["candidate_asset_id"])
+                reopening = (
+                    row["review_status"] == "discarded"
+                    and row["discarded_signal_hash"] != new_signal_hash
+                )
+                next_review_status = "pending" if reopening else row["review_status"]
+                next_discarded_hash = None if reopening else row["discarded_signal_hash"]
                 conn.execute(
                     "UPDATE candidate_assets SET display_value = ?, last_seen_at = ?, "
                     "last_seen_run_id = ?, scope_status = ?, collection_status = ?, "
                     "authorization_status = ?, reason = ?, depth = ?, priority = ?, "
                     "collector = ?, source_entity_id = ?, parent_indicator_id = ?, "
-                    "lineage_reference = ? WHERE candidate_asset_id = ?",
+                    "lineage_reference = ?, review_status = ?, discarded_signal_hash = ? "
+                    "WHERE candidate_asset_id = ?",
                     (
                         draft.display_value,
                         observed_at,
@@ -1798,9 +1896,26 @@ class ControlDB:
                         draft.source_entity_id,
                         draft.parent_indicator_id,
                         draft.lineage_reference,
+                        next_review_status,
+                        next_discarded_hash,
                         candidate_asset_id,
                     ),
                 )
+                if reopening:
+                    conn.execute(
+                        "INSERT INTO candidate_asset_reviews (review_id, candidate_asset_id, "
+                        "organization_id, account_id, action, justification, "
+                        "resulting_asset_id, created_at) VALUES (?, ?, ?, NULL, 'reopened', ?, "
+                        "NULL, ?)",
+                        (
+                            secrets.token_hex(16),
+                            candidate_asset_id,
+                            organization_id,
+                            "A new observation differs from the signal that was discarded "
+                            f"(run {run_id}) — automatically reopened for review.",
+                            observed_at,
+                        ),
+                    )
                 return candidate_asset_id, False
 
             candidate_asset_id = secrets.token_hex(16)
@@ -1867,6 +1982,176 @@ class ControlDB:
                 (organization_id, candidate_asset_id),
             ).fetchone()
         return None if row is None else _candidate_asset_record_from_row(row)
+
+    def promote_candidate_asset(
+        self,
+        *,
+        organization_id: str,
+        candidate_asset_id: str,
+        account_id: str,
+        justification: str,
+    ) -> str:
+        """Fase 06's actual core deliverable: a human, with an `owner`
+        role on this organization, explicitly confirms a candidate is
+        real, in-scope infrastructure and promotes it to a durable
+        `assets` row. This is the ONLY code path anywhere that can turn a
+        `candidate_assets` row into an `assets` row — `upsert_candidate_asset`
+        (the automated backfill path) never does this, by design.
+
+        The role check happens HERE, in the data layer, not deferred to a
+        future API router — no Fase 19 endpoint exists yet, so nothing
+        else would enforce it; this is belt-and-suspenders once one does.
+        Promotion creates ONLY an identity row (Fase 03's own `assets`
+        table already carries no scanning authorization by itself — that
+        is `domain_verifications`' job, via the pre-existing
+        `POST /domains/{domain}/verify` flow, completely untouched by
+        this). Promoting a candidate never grants it any new authority to
+        be actively scanned — this is precisely "no segunda vía de
+        autorización," not a loophole around the first one.
+
+        Only `DOMAIN` and `URL` candidates can be promoted today — Fase
+        03's asset model has no `ip`/`certificate` asset type yet (see
+        `api/asset_identity.py`); promoting either raises `ValueError`
+        rather than silently inventing a new, undesigned asset type.
+        """
+        role = self.get_role_for_account_organization(account_id, organization_id)
+        if not role_can_modify_scope(role):
+            raise PermissionError(
+                f"account {account_id!r} does not have an owner role on organization "
+                f"{organization_id!r} and cannot promote a candidate asset"
+            )
+        candidate = self.get_candidate_asset(organization_id, candidate_asset_id)
+        if candidate is None:
+            raise ValueError(f"no candidate asset {candidate_asset_id!r} in this organization")
+        if candidate.review_status == "promoted":
+            raise ValueError("this candidate asset has already been promoted")
+        if not justification.strip():
+            raise ValueError("promotion requires a justification")
+
+        if candidate.candidate_type == "DOMAIN":
+            asset_type = ASSET_TYPE_DOMAIN
+            identity_key = domain_identity_key(candidate.normalized_value)
+        elif candidate.candidate_type == "URL":
+            asset_type = ASSET_TYPE_URL
+            identity_key = url_identity_key(candidate.normalized_value)
+        else:
+            raise ValueError(
+                f"promoting a {candidate.candidate_type!r} candidate is not yet supported — "
+                "Fase 03's asset model has no matching asset type for it"
+            )
+
+        now = _now_iso()
+        promotion_run_id = f"candidate-promotion:{candidate_asset_id}"
+        existing = self.get_asset_by_identity(
+            organization_id=organization_id, asset_type=asset_type, identity_key=identity_key
+        )
+        decision = ReconciliationDecision(
+            asset_id=existing.asset_id if existing else secrets.token_hex(16),
+            asset_type=asset_type,
+            identity_key=identity_key,
+            is_new=existing is None,
+            identifiers=(),
+        )
+        self.apply_asset_reconciliation(
+            organization_id=organization_id,
+            run_id=promotion_run_id,
+            decisions=[decision],
+            observed_at=now,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE candidate_assets SET review_status = 'promoted', promoted_asset_id = ? "
+                "WHERE candidate_asset_id = ?",
+                (decision.asset_id, candidate_asset_id),
+            )
+            conn.execute(
+                "INSERT INTO candidate_asset_reviews (review_id, candidate_asset_id, "
+                "organization_id, account_id, action, justification, resulting_asset_id, "
+                "created_at) VALUES (?, ?, ?, ?, 'promoted', ?, ?, ?)",
+                (
+                    secrets.token_hex(16),
+                    candidate_asset_id,
+                    organization_id,
+                    account_id,
+                    justification.strip(),
+                    decision.asset_id,
+                    now,
+                ),
+            )
+        return decision.asset_id
+
+    def discard_candidate_asset(
+        self,
+        *,
+        organization_id: str,
+        candidate_asset_id: str,
+        account_id: str,
+        justification: str,
+    ) -> None:
+        """The other half of the confirmation flow: a human, with an
+        `owner` role, explicitly decides a candidate is NOT worth
+        investigating. Recorded with the exact signal that was discarded
+        (`api/candidate_assets.py::candidate_signal_hash`) so
+        `upsert_candidate_asset` can tell "the same thing, seen again"
+        (stays discarded, silently) from "something genuinely different"
+        (reopened for review) on the next backfill — see that method's
+        own docstring."""
+        role = self.get_role_for_account_organization(account_id, organization_id)
+        if not role_can_modify_scope(role):
+            raise PermissionError(
+                f"account {account_id!r} does not have an owner role on organization "
+                f"{organization_id!r} and cannot discard a candidate asset"
+            )
+        candidate = self.get_candidate_asset(organization_id, candidate_asset_id)
+        if candidate is None:
+            raise ValueError(f"no candidate asset {candidate_asset_id!r} in this organization")
+        if candidate.review_status == "promoted":
+            raise ValueError("an already-promoted candidate asset cannot be discarded")
+        if not justification.strip():
+            raise ValueError("discarding requires a justification")
+
+        signal_hash = candidate_signal_hash(
+            candidate_type=candidate.candidate_type,
+            normalized_value=candidate.normalized_value,
+            reason=candidate.reason,
+            scope_status=candidate.scope_status,
+            collection_status=candidate.collection_status,
+            authorization_status=candidate.authorization_status,
+        )
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE candidate_assets SET review_status = 'discarded', "
+                "discarded_signal_hash = ? WHERE candidate_asset_id = ?",
+                (signal_hash, candidate_asset_id),
+            )
+            conn.execute(
+                "INSERT INTO candidate_asset_reviews (review_id, candidate_asset_id, "
+                "organization_id, account_id, action, justification, resulting_asset_id, "
+                "created_at) VALUES (?, ?, ?, ?, 'discarded', ?, NULL, ?)",
+                (
+                    secrets.token_hex(16),
+                    candidate_asset_id,
+                    organization_id,
+                    account_id,
+                    justification.strip(),
+                    now,
+                ),
+            )
+
+    def list_candidate_asset_reviews(
+        self, organization_id: str, candidate_asset_id: str
+    ) -> list[CandidateAssetReviewRecord]:
+        """The full audit trail for one candidate — who, when, and why
+        for every promote/discard/reopen it has ever gone through, oldest
+        first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM candidate_asset_reviews WHERE organization_id = ? "
+                "AND candidate_asset_id = ? ORDER BY created_at, review_id",
+                (organization_id, candidate_asset_id),
+            ).fetchall()
+        return [_candidate_asset_review_record_from_row(row) for row in rows]
 
     # --- exposures (Fase 08, EASM roadmap) -----------------------------
 
@@ -4276,6 +4561,22 @@ def _candidate_asset_record_from_row(row: sqlite3.Row) -> CandidateAssetRecord:
         source_entity_id=row["source_entity_id"],
         parent_indicator_id=row["parent_indicator_id"],
         lineage_reference=row["lineage_reference"],
+        review_status=row["review_status"],
+        discarded_signal_hash=row["discarded_signal_hash"],
+        promoted_asset_id=row["promoted_asset_id"],
+    )
+
+
+def _candidate_asset_review_record_from_row(row: sqlite3.Row) -> CandidateAssetReviewRecord:
+    return CandidateAssetReviewRecord(
+        review_id=row["review_id"],
+        candidate_asset_id=row["candidate_asset_id"],
+        organization_id=row["organization_id"],
+        account_id=row["account_id"],
+        action=row["action"],
+        justification=row["justification"],
+        resulting_asset_id=row["resulting_asset_id"],
+        created_at=row["created_at"],
     )
 
 

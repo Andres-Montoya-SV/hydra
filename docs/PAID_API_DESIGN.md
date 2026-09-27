@@ -3620,6 +3620,28 @@ never built; `core/registry.py` never migrated off the legacy graph
 engine; Exposure's required three-nature distinction doesn't exist):
 [`docs/easm/audit_2026-09-26_main_state_review.md`](easm/audit_2026-09-26_main_state_review.md).
 
+## Fase 06 completion — Candidate Asset promotion, discard, and audit trail — 2026-09-26
+
+Closed the one flagged gap from the state review above: Fase 06's
+original merge (and its abandoned duplicate attempt) both silently
+descoped the confirm/discard workflow the phase's own spec required as
+a core deliverable, not an optional extra. Two new `ControlDB` methods
+(`promote_candidate_asset`, `discard_candidate_asset`, both requiring
+the `owner` role — the exact same check `resolve_exposure`'s router
+already uses, no new authorization mechanism) and one new audit table
+(`candidate_asset_reviews`). Promotion creates exactly one real `assets`
+row through the identical reconciliation path a genuine scan uses
+(`ReconciliationDecision`/`apply_asset_reconciliation`) — proven to
+never grant scanning authorization by itself
+(`tests/test_candidate_assets.py::
+TestCandidateNeverFeedsActiveScanningWithoutPromotion`, the phase's own
+required adversarial test). Discard is content-hash-anchored
+(`candidate_signal_hash`): the exact same later re-observation stays
+silently discarded; a materially different one reopens automatically
+for review, recorded as its own audited row. Full detail:
+[`docs/easm/06_candidate_assets.md`](easm/06_candidate_assets.md)'s
+"Promotion and discard" section.
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
