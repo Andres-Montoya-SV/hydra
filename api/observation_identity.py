@@ -56,6 +56,7 @@ from api.asset_identity import (
     url_identity_key,
 )
 from api.certificate_events import certificate_snapshot_detail
+from api.technology_catalog import normalize_technology_name, technology_detail
 from core.assets import Host
 
 OBSERVATION_TYPE_DOMAIN_RESOLVED = "domain_resolved"
@@ -202,9 +203,15 @@ def observations_for_host(host: Host) -> list[ObservationDraft]:
                         # as nginx 1.24 -> 1.26 visible to Fase 05's existing
                         # observation digest/change detector instead of
                         # collapsing both runs to the same "nginx" evidence.
-                        # Unversioned technologies retain the exact pre-Fase-06
-                        # representation for backwards compatibility.
-                        detail=f"{tech.name}@{tech.version}" if tech.version else tech.name,
+                        # Fase 14: the name itself is canonicalized before
+                        # being recorded — httpx and WhatWeb can report the
+                        # exact same real technology under different
+                        # casing/spelling (e.g. "nginx" vs "Nginx"), and
+                        # without this, those would silently become two
+                        # different facts about the same thing.
+                        detail=technology_detail(
+                            name=normalize_technology_name(tech.name), version=tech.version
+                        ),
                         confidence_score=tech.confidence,
                     ),
                 )

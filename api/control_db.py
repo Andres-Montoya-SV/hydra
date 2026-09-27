@@ -42,8 +42,12 @@ from api.external_observation import (
     PrecedenceCandidate,
     reconcile_precedence,
 )
-from api.observation_identity import EvidenceContent
+from api.observation_identity import (
+    OBSERVATION_TYPE_TECHNOLOGY_DETECTED,
+    EvidenceContent,
+)
 from api.relationship_identity import RelationshipDraft
+from api.technology_catalog import parse_technology_detail
 from core.store import connect_sqlite
 
 _SCHEMA = """
@@ -311,6 +315,28 @@ CREATE TABLE IF NOT EXISTS certificate_events (
 );
 CREATE INDEX IF NOT EXISTS idx_certificate_events_asset
     ON certificate_events(asset_id, detected_at);
+
+-- Fase 14 (EASM roadmap): technology-inventory change classification for
+-- a domain asset's OBSERVATION_TYPE_TECHNOLOGY_DETECTED evidence history
+-- (api/technology_events.py holds the deterministic classifier;
+-- api/technology_backfill.py walks each domain's per-run history and
+-- calls it). No new "technology" asset type -- a detected technology is
+-- a fact about the domain asset, exactly like Fase 06 already treats it.
+CREATE TABLE IF NOT EXISTS technology_events (
+    technology_event_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    run_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    technology_name TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    UNIQUE (asset_id, run_id, event_type, technology_name, reason)
+);
+CREATE INDEX IF NOT EXISTS idx_technology_events_asset
+    ON technology_events(asset_id, detected_at);
+CREATE INDEX IF NOT EXISTS idx_technology_events_organization
+    ON technology_events(organization_id, detected_at);
 
 -- Fase 08 (EASM roadmap): durable external exposures. A raw Finding remains
 -- a run-scoped detector result in the per-account AssetStore; this table is
@@ -1347,6 +1373,32 @@ class CertificateEventRecord:
     previous_fingerprint: str | None
     new_fingerprint: str
     detected_at: str
+
+
+@dataclass(frozen=True)
+class TechnologyEventRecord:
+    technology_event_id: str
+    organization_id: str
+    asset_id: str
+    run_id: str
+    event_type: str
+    technology_name: str
+    reason: str
+    detected_at: str
+
+
+@dataclass(frozen=True)
+class CurrentTechnologyRecord:
+    """The phase's own required inventory answer: the most recently
+    recorded fact about ONE distinct technology this asset has ever had
+    — not an event, just "what's true right now, as best Hydra knows."
+    """
+
+    asset_id: str
+    technology_name: str
+    version: str | None
+    source: str
+    last_seen_at: str
 
 
 _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -3185,6 +3237,130 @@ class ControlDB:
             ).fetchall()
         return [_certificate_event_record_from_row(row) for row in rows]
 
+    def record_technology_event(
+        self,
+        *,
+        organization_id: str,
+        asset_id: str,
+        run_id: str,
+        event_type: str,
+        technology_name: str,
+        reason: str,
+        detected_at: str | None = None,
+    ) -> str | None:
+        """Persists ONE `TechnologyEvent`
+        `api/technology_events.py::classify_technology_transition` already
+        decided. `INSERT OR IGNORE` against `UNIQUE(asset_id, run_id,
+        event_type, technology_name, reason)` makes replaying
+        `api/technology_backfill.py` a second time over the same runs
+        produce zero duplicate rows. Returns the new
+        `technology_event_id`, or `None` if this exact event was already
+        recorded."""
+        detected_at = detected_at or _now_iso()
+        technology_event_id = secrets.token_hex(16)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO technology_events (technology_event_id, "
+                "organization_id, asset_id, run_id, event_type, technology_name, "
+                "reason, detected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    technology_event_id,
+                    organization_id,
+                    asset_id,
+                    run_id,
+                    event_type,
+                    technology_name,
+                    reason,
+                    detected_at,
+                ),
+            )
+        return technology_event_id if cursor.rowcount else None
+
+    def list_technology_events_for_asset(self, asset_id: str) -> list[TechnologyEventRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM technology_events WHERE asset_id = ? ORDER BY detected_at",
+                (asset_id,),
+            ).fetchall()
+        return [_technology_event_record_from_row(row) for row in rows]
+
+    def list_technology_events_for_organization(
+        self, organization_id: str, *, since: str | None = None
+    ) -> list[TechnologyEventRecord]:
+        """Answers the phase's own "¿qué tecnología apareció esta
+        semana? ¿qué assets cambiaron de tecnología?" — `since` is an
+        ISO-8601 lower bound on `detected_at`, left `None` for the full
+        organization history."""
+        with self._connect() as conn:
+            if since is None:
+                rows = conn.execute(
+                    "SELECT * FROM technology_events WHERE organization_id = ? "
+                    "ORDER BY detected_at",
+                    (organization_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM technology_events WHERE organization_id = ? "
+                    "AND detected_at >= ? ORDER BY detected_at",
+                    (organization_id, since),
+                ).fetchall()
+        return [_technology_event_record_from_row(row) for row in rows]
+
+    def list_current_technologies_for_asset(self, asset_id: str) -> list[CurrentTechnologyRecord]:
+        """The phase's own required "¿qué tecnología corre este asset
+        ahora mismo?" — the technologies observed by this asset's most
+        RECENT run, never "every technology ever seen, whichever run it
+        came from": the latter would keep reporting a technology that a
+        later run actually stopped detecting (a real `TECHNOLOGY_REMOVED`
+        case) as if it were still present. Reuses
+        `list_observations_for_asset` (Fase 04) exactly, no second
+        technology-tracking table."""
+        tech_observations = [
+            entry
+            for entry in self.list_observations_for_asset(asset_id)
+            if entry.observation.observation_type == OBSERVATION_TYPE_TECHNOLOGY_DETECTED
+        ]
+        if not tech_observations:
+            return []
+
+        run_order_key: dict[str, str] = {}
+        for entry in tech_observations:
+            run_id = entry.observation.run_id
+            existing_key = run_order_key.get(run_id)
+            if existing_key is None or entry.observation.observed_at < existing_key:
+                run_order_key[run_id] = entry.observation.observed_at
+        latest_run_id = max(run_order_key, key=lambda run_id: (run_order_key[run_id], run_id))
+
+        results = []
+        for entry in tech_observations:
+            if entry.observation.run_id != latest_run_id:
+                continue
+            name, version = parse_technology_detail(entry.evidence.detail)
+            results.append(
+                CurrentTechnologyRecord(
+                    asset_id=asset_id,
+                    technology_name=name,
+                    version=version,
+                    source=entry.evidence.source,
+                    last_seen_at=entry.observation.observed_at,
+                )
+            )
+        return sorted(results, key=lambda record: record.technology_name)
+
+    def list_assets_running_technology(
+        self, organization_id: str, technology_name: str
+    ) -> list[AssetRecord]:
+        """Answers the phase's own "¿qué assets corren nginx/WordPress/
+        React?" directly. `technology_name` is matched exactly against
+        the same canonical names `api/technology_catalog.py` normalizes
+        to — never a substring/fuzzy match."""
+        matching: list[AssetRecord] = []
+        for asset in self.list_assets_for_organization(organization_id, asset_type="domain"):
+            current = self.list_current_technologies_for_asset(asset.asset_id)
+            if any(tech.technology_name == technology_name for tech in current):
+                matching.append(asset)
+        return matching
+
     def get_current_lifecycle_state_for_asset(self, asset_id: str) -> str | None:
         """The most recent recorded transition's `new_state` — cheap
         (same index as `list_change_events_for_asset`, `LIMIT 1`), and
@@ -4993,6 +5169,19 @@ def _certificate_event_record_from_row(row: sqlite3.Row) -> CertificateEventReco
         reason=row["reason"],
         previous_fingerprint=row["previous_fingerprint"],
         new_fingerprint=row["new_fingerprint"],
+        detected_at=row["detected_at"],
+    )
+
+
+def _technology_event_record_from_row(row: sqlite3.Row) -> TechnologyEventRecord:
+    return TechnologyEventRecord(
+        technology_event_id=row["technology_event_id"],
+        organization_id=row["organization_id"],
+        asset_id=row["asset_id"],
+        run_id=row["run_id"],
+        event_type=row["event_type"],
+        technology_name=row["technology_name"],
+        reason=row["reason"],
         detected_at=row["detected_at"],
     )
 
