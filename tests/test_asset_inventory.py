@@ -60,6 +60,20 @@ def _run_completed_scan(
     return scan_id
 
 
+def _tls_cert(
+    *, domain: str, issuer: str, fingerprint_char: str, year: str, sans: list[str]
+) -> TlsCertificate:
+    return TlsCertificate(
+        host=domain,
+        issuer=issuer,
+        subject=f"CN={domain}",
+        sans=sans,
+        not_before=f"{year}-01-01",
+        not_after=f"{year}-04-01",
+        fingerprint_sha256=fingerprint_char * 64,
+    )
+
+
 def _seed_organization_with_domains(
     control_db: ControlDB, api_settings: APISettings, *, domains: list[str], email: str
 ) -> str:
@@ -235,29 +249,20 @@ class TestCurrentCertificateForAsset:
 
         assert control_db.get_current_certificate_for_asset(asset.asset_id) is None
 
-    def test_returns_the_most_recent_runs_certificate_not_an_older_one(
-        self, control_db: ControlDB, api_settings: APISettings
-    ) -> None:
+    def _seed_two_certificate_runs(
+        self, control_db: ControlDB, api_settings: APISettings, *, domain: str
+    ) -> tuple[str, str]:
         account_id = control_db.create_account(email="cert@example.com")
         organization_id, _role = control_db.list_organizations_for_account(account_id)[0]
-        domain = "cert.example.com"
-        old_cert = TlsCertificate(
-            host=domain,
-            issuer="Old CA",
-            subject=f"CN={domain}",
-            sans=[domain],
-            not_before="2025-01-01",
-            not_after="2025-04-01",
-            fingerprint_sha256="a" * 64,
+        old_cert = _tls_cert(
+            domain=domain, issuer="Old CA", fingerprint_char="a", year="2025", sans=[domain]
         )
-        new_cert = TlsCertificate(
-            host=domain,
+        new_cert = _tls_cert(
+            domain=domain,
             issuer="New CA",
-            subject=f"CN={domain}",
+            fingerprint_char="b",
+            year="2026",
             sans=[domain, f"www.{domain}"],
-            not_before="2026-01-01",
-            not_after="2026-04-01",
-            fingerprint_sha256="b" * 64,
         )
         _run_completed_scan(
             control_db,
@@ -279,6 +284,15 @@ class TestCurrentCertificateForAsset:
         )
         backfill_assets_for_organization(
             control_db=control_db, api_settings=api_settings, organization_id=organization_id
+        )
+        return account_id, organization_id
+
+    def test_returns_the_most_recent_runs_certificate_not_an_older_one(
+        self, control_db: ControlDB, api_settings: APISettings
+    ) -> None:
+        domain = "cert.example.com"
+        _account_id, organization_id = self._seed_two_certificate_runs(
+            control_db, api_settings, domain=domain
         )
         asset = control_db.get_asset_by_identity(
             organization_id=organization_id, asset_type="domain", identity_key=f"domain:{domain}"
