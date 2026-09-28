@@ -603,6 +603,14 @@ CREATE TABLE IF NOT EXISTS scans (
     worker_id TEXT,
     heartbeat_at TEXT,
     trigger_source TEXT NOT NULL DEFAULT 'manual',
+    -- Productization Phase 01: client-chosen collection intensity for a
+    -- manually-triggered scan ('standard' = the account's own configured
+    -- enable_* flags, unchanged; 'passive' = the exact same narrowing
+    -- `api/monitoring.py::passive_monitoring_settings_overrides` already
+    -- applies to Speed 1 monitoring, reused rather than reinvented).
+    -- Monitoring-triggered scans ignore this column entirely — their own
+    -- trigger_source already decides passive vs. active.
+    collection_profile TEXT NOT NULL DEFAULT 'standard',
     -- Fase 02: nullable at the schema level only because SQLite cannot
     -- ALTER TABLE ADD a NOT NULL column with a per-row (not fixed)
     -- default onto a table that already has rows — every code path that
@@ -985,6 +993,12 @@ class DuplicateEmailError(Exception):
     account" requirement) — the router turns this into a 409."""
 
 
+class LastOwnerError(Exception):
+    """Raised by `ControlDB.remove_account_organization_role` when the
+    removal would leave an organization with zero owners — the router
+    turns this into a 409."""
+
+
 def role_can_modify_scope(role: str | None) -> bool:
     """Fase 02: whether `role` (as returned by
     `ControlDB.get_role_for_account_organization`) may change an
@@ -1046,6 +1060,7 @@ class ScanRecord:
     heartbeat_at: str | None
     trigger_source: str
     organization_id: str | None = None
+    collection_profile: str = "standard"
 
 
 @dataclass(frozen=True)
@@ -1424,6 +1439,7 @@ _SCANS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("worker_id", "TEXT"),
     ("heartbeat_at", "TEXT"),
     ("trigger_source", "TEXT NOT NULL DEFAULT 'manual'"),
+    ("collection_profile", "TEXT NOT NULL DEFAULT 'standard'"),
 )
 
 # White-label client report fix: an existing `subscriptions` table
@@ -1822,6 +1838,54 @@ class ControlDB:
                 (account_id,),
             ).fetchall()
         return [(row["organization_id"], row["role"]) for row in rows]
+
+    def list_members_for_organization(self, organization_id: str) -> list[tuple[str, str, str]]:
+        """`(account_id, role, created_at)` triples, oldest first — every
+        account currently granted a role on this organization, including
+        its own 1:1 owner from `create_account`/`_backfill_organizations`
+        provisioning. The router is responsible for confirming the
+        caller is themselves a member before calling this — this method
+        does not re-check, the same division of responsibility every
+        other `list_*_for_organization` method here already uses."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT account_id, role, created_at FROM account_organization_roles "
+                "WHERE organization_id = ? ORDER BY created_at",
+                (organization_id,),
+            ).fetchall()
+        return [(row["account_id"], row["role"], row["created_at"]) for row in rows]
+
+    def remove_account_organization_role(self, *, account_id: str, organization_id: str) -> None:
+        """Refuses to remove an organization's last remaining owner —
+        an organization with zero owners could never again verify a
+        domain, grant another role, or be administered at all, a dead
+        end no caller should be able to reach even by mistake. Removing
+        a viewer, or an owner when at least one other owner remains, is
+        always allowed. A no-op (not an error) if the account already
+        has no role on this organization."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT role FROM account_organization_roles "
+                "WHERE account_id = ? AND organization_id = ?",
+                (account_id, organization_id),
+            ).fetchone()
+            if row is None:
+                return
+            if row["role"] == "owner":
+                (owner_count,) = conn.execute(
+                    "SELECT COUNT(*) FROM account_organization_roles "
+                    "WHERE organization_id = ? AND role = 'owner'",
+                    (organization_id,),
+                ).fetchone()
+                if owner_count <= 1:
+                    raise LastOwnerError(
+                        f"organization {organization_id!r} would be left with no owner"
+                    )
+            conn.execute(
+                "DELETE FROM account_organization_roles "
+                "WHERE account_id = ? AND organization_id = ?",
+                (account_id, organization_id),
+            )
 
     def get_verified_domains_for_organization(
         self, organization_id: str, *, now: str | None = None
@@ -3658,19 +3722,34 @@ class ControlDB:
         db_path: str,
         trigger_source: str = "manual",
         organization_id: str | None = None,
+        collection_profile: str = "standard",
     ) -> None:
         """`organization_id` defaults to the account's own organization
         (Fase 02) when not given explicitly — every pre-existing caller
-        (every router, every test) keeps working unchanged."""
+        (every router, every test) keeps working unchanged.
+        `collection_profile` (Productization Phase 01) is caller-validated
+        upstream (`api/schemas.py::CreateScanRequest`'s `Literal` type) —
+        this method trusts it rather than re-validating, the same
+        division of responsibility `trigger_source` already has here."""
         organization_id = organization_id or self.default_organization_id_for_account(account_id)
         now = _now_iso()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO scans "
                 "(scan_id, account_id, domain, db_path, status, created_at, updated_at, "
-                "trigger_source, organization_id) "
-                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
-                (scan_id, account_id, domain, db_path, now, now, trigger_source, organization_id),
+                "trigger_source, organization_id, collection_profile) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+                (
+                    scan_id,
+                    account_id,
+                    domain,
+                    db_path,
+                    now,
+                    now,
+                    trigger_source,
+                    organization_id,
+                    collection_profile,
+                ),
             )
 
     def update_scan_status(
@@ -5101,6 +5180,7 @@ def _scan_record_from_row(row: sqlite3.Row) -> ScanRecord:
         heartbeat_at=row["heartbeat_at"],
         trigger_source=row["trigger_source"],
         organization_id=row["organization_id"],
+        collection_profile=row["collection_profile"],
     )
 
 

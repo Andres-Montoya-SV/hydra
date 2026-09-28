@@ -72,6 +72,11 @@ class RotateKeyResponse(BaseModel):
 
 class CreateScanRequest(BaseModel):
     domain: str = Field(min_length=1, description="Target domain, e.g. example.com")
+    # 'standard' = the account's own configured enable_* flags, unchanged.
+    # 'passive' = force off every active-collection plugin, reusing the
+    # exact same narrowing api/monitoring.py's Speed 1 monitoring already
+    # applies — never a second, differently-defined "passive" here.
+    profile: Literal["standard", "passive"] = "standard"
 
 
 class CreateScanResponse(BaseModel):
@@ -86,6 +91,7 @@ class ScanStatusResponse(BaseModel):
     created_at: str
     updated_at: str
     error_message: str | None = None
+    collection_profile: str = "standard"
 
 
 class ClientReportRequest(BaseModel):
@@ -422,6 +428,21 @@ class OrganizationResponse(BaseModel):
     role: str
     created_at: str
     updated_at: str
+
+
+class CreateOrganizationRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+class OrganizationMemberResponse(BaseModel):
+    account_id: str
+    role: str
+    created_at: str
+
+
+class AddOrganizationMemberRequest(BaseModel):
+    account_id: str = Field(min_length=1)
+    role: Literal["owner", "viewer"]
 
 
 class AssetResponse(BaseModel):
