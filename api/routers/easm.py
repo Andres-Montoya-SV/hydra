@@ -16,15 +16,26 @@ defined in the data layer, this router only translates it to HTTP.
 
 **Real pagination, one caveat documented rather than hidden**: like
 `api/routers/exposures.py`, every list endpoint takes `limit`/`offset`
-with the same bounds (1-500, default 100). Assets and candidate assets
-paginate at the SQL level, matching exposures. Observations, certificate
-events, and technology events paginate in Python over an already-fetched
-list — `list_observations_for_asset` and friends have many existing
-callers across Fases 04/12/14/18 (backfills, monitoring citations);
-adding LIMIT/OFFSET to their SQL would mean auditing every one of those
-callers for a scope this phase does not need to touch. Correct pagination
-behavior for the API contract either way; documented here rather than
-silently presented as identical to the SQL-level case.
+with the same bounds (1-500, default 100). Assets paginate at the SQL
+level, matching exposures — **fixed in Productization Phase 02**; before
+that this docstring's own claim was false for assets:
+`list_assets_for_organization` had no `LIMIT`/`OFFSET` at all, and this
+router's `_paginate` was Python-slicing an already-fully-fetched,
+unbounded result set on every single request. `list_assets_for_organization`
+now takes optional `limit`/`offset` (default `None`/no SQL LIMIT, so
+every pre-existing internal caller — certificate/technology/change
+backfills, `list_assets_running_technology` — keeps getting the complete,
+unbounded set it always has) while the router always passes an explicit
+`limit`. `list_candidate_assets_for_organization` still has the exact
+same bug this phase found and fixed for assets — out of scope here,
+flagged in docs/productization/02_asset_inventory.md. Observations,
+certificate events, and technology events paginate in Python over an
+already-fetched list — `list_observations_for_asset` and friends have
+many existing callers across Fases 04/12/14/18 (backfills, monitoring
+citations); adding LIMIT/OFFSET to their SQL would mean auditing every
+one of those callers for a scope this phase does not need to touch.
+Correct pagination behavior for the API contract either way; documented
+here rather than silently presented as identical to the SQL-level case.
 
 **No endpoint promotes a candidate outside Fase 06's own flow** — the
 promote/discard endpoints call `ControlDB.promote_candidate_asset`/
@@ -34,7 +45,7 @@ turn a candidate into a real asset.
 
 from __future__ import annotations
 
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -42,12 +53,14 @@ from api.auth import AuthContext, require_api_key
 from api.control_db import AssetRecord, ControlDB, LastOwnerError
 from api.schemas import (
     AddOrganizationMemberRequest,
+    AssetIdentifierResponse,
     AssetResponse,
     CandidateAssetResponse,
     CapabilityStatusResponse,
     CertificateEventResponse,
     ChangeEventResponse,
     CreateOrganizationRequest,
+    CurrentCertificateResponse,
     CurrentTechnologyResponse,
     DiscardCandidateAssetRequest,
     EvidenceResponse,
@@ -243,14 +256,27 @@ def list_assets(
     organization_id: str,
     request: Request,
     asset_type: str | None = None,
+    q: str | None = Query(
+        default=None, description="Case-insensitive substring match on identity_key"
+    ),
+    sort: Literal["first_seen_at", "last_seen_at"] = "first_seen_at",
+    order: Literal["asc", "desc"] = "asc",
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     auth: AuthContext = Depends(require_api_key),
 ) -> list[AssetResponse]:
     db = _db(request)
     _require_member(db, auth.account_id, organization_id)
-    rows = db.list_assets_for_organization(organization_id, asset_type=asset_type)
-    return [_asset_to_response(row) for row in _paginate(rows, limit=limit, offset=offset)]
+    rows = db.list_assets_for_organization(
+        organization_id,
+        asset_type=asset_type,
+        q=q,
+        sort=sort,
+        order=order,
+        limit=limit,
+        offset=offset,
+    )
+    return [_asset_to_response(row) for row in rows]
 
 
 @router.get("/{organization_id}/assets/{asset_id}", response_model=AssetResponse)
@@ -386,6 +412,71 @@ def list_asset_current_technologies(
             last_seen_at=row.last_seen_at,
         )
         for row in db.list_current_technologies_for_asset(asset_id)
+    ]
+
+
+@router.get(
+    "/{organization_id}/assets/{asset_id}/certificate",
+    response_model=CurrentCertificateResponse | None,
+)
+def get_asset_current_certificate(
+    organization_id: str,
+    asset_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> CurrentCertificateResponse | None:
+    """Productization Phase 02: the certificate-event history endpoint
+    above already answers "how did this asset's certificate change over
+    time"; this answers the simpler, more common "what certificate does
+    it have right now" — the same "current state, derived from the most
+    recent run" pattern `.../technologies` already established, over
+    `OBSERVATION_TYPE_CERTIFICATE_PRESENT` rather than
+    `OBSERVATION_TYPE_TECHNOLOGY_DETECTED`. `None` (not 404) for an
+    asset that exists but has never had a parseable certificate
+    observation — a domain asset with no HTTPS presence is a normal,
+    expected state, not an error."""
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    _require_asset(db, organization_id, asset_id)
+    record = db.get_current_certificate_for_asset(asset_id)
+    if record is None:
+        return None
+    return CurrentCertificateResponse(
+        fingerprint_sha256=record.fingerprint_sha256,
+        subject=record.subject,
+        issuer=record.issuer,
+        not_before=record.not_before,
+        not_after=record.not_after,
+        sans=record.sans,
+        observed_at=record.observed_at,
+    )
+
+
+@router.get(
+    "/{organization_id}/assets/{asset_id}/identifiers",
+    response_model=list[AssetIdentifierResponse],
+)
+def list_asset_identifiers(
+    organization_id: str,
+    asset_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> list[AssetIdentifierResponse]:
+    """Productization Phase 02's explicit "identifiers" requirement —
+    e.g. a domain asset's resolved IPs (`ControlDB.list_identifiers_for_asset`,
+    already written by Fase 03's own asset reconciliation on every real
+    scan; this is its first API surface)."""
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    _require_asset(db, organization_id, asset_id)
+    return [
+        AssetIdentifierResponse(
+            identifier_type=row.identifier_type,
+            identifier_value=row.identifier_value,
+            first_seen_at=row.first_seen_at,
+            last_seen_at=row.last_seen_at,
+        )
+        for row in db.list_identifiers_for_asset(asset_id)
     ]
 
 

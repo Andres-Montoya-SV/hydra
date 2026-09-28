@@ -19,6 +19,7 @@ used.
 from __future__ import annotations
 
 import io
+import zipfile
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -123,7 +124,39 @@ def render_docx(
 
     buffer = io.BytesIO()
     document.save(buffer)
-    return buffer.getvalue()
+    return _with_deterministic_zip_timestamps(buffer.getvalue())
+
+
+# A .docx file is a ZIP archive, and python-docx's own package writer
+# (docx/opc/phys_pkg.py) calls zipfile's `writestr(name, blob)` for every
+# part without ever passing an explicit `ZipInfo`/`date_time` — Python's
+# `zipfile` module then stamps each entry with `time.localtime()` AT THE
+# MOMENT OF THAT WRITE. Two back-to-back `render_docx()` calls with
+# byte-for-byte identical content (this module's own documented
+# guarantee for `branding=None`, see the docstring above) can therefore
+# still differ by a few bytes if the two calls straddle the 2-second
+# granularity boundary of ZIP's DOS-format timestamp field — confirmed
+# as the exact, reproducible cause of a real, if rare, CI failure
+# (byte index 10 of the output, which is precisely where a ZIP local
+# file header's `mod_time` field sits for the archive's first entry).
+# Fixing this here, once, for every caller, is more robust than either
+# tolerating an intermittently-flaky test or relying on both calls in a
+# comparison happening to land in the same 2-second window.
+_DETERMINISTIC_ZIP_DATE_TIME = (1980, 1, 1, 0, 0, 0)  # ZIP format's own epoch floor
+
+
+def _with_deterministic_zip_timestamps(docx_bytes: bytes) -> bytes:
+    """Rewrites every ZIP entry's embedded timestamp to a fixed constant,
+    leaving file names, content, and compression untouched — so
+    `render_docx`'s output is a pure function of its inputs, never of
+    the wall-clock moment it happened to run."""
+    source = zipfile.ZipFile(io.BytesIO(docx_bytes))
+    rewritten = io.BytesIO()
+    with zipfile.ZipFile(rewritten, "w", zipfile.ZIP_DEFLATED) as dest:
+        for info in source.infolist():
+            info.date_time = _DETERMINISTIC_ZIP_DATE_TIME
+            dest.writestr(info, source.read(info.filename))
+    return rewritten.getvalue()
 
 
 def _add_cover_page(document, data: RunReportData, language: str, align, pt, rgb, branding: str | None = None) -> None:  # type: ignore[no-untyped-def]

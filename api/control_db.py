@@ -36,6 +36,7 @@ from api.asset_identity import (
     url_identity_key,
 )
 from api.candidate_assets import CandidateAssetDraft, candidate_signal_hash
+from api.certificate_events import parse_certificate_snapshot
 from api.change_detection import host_for_asset
 from api.domain_verification import domain_is_covered
 from api.exposure_identity import ExposureDraft
@@ -45,6 +46,7 @@ from api.external_observation import (
     reconcile_precedence,
 )
 from api.observation_identity import (
+    OBSERVATION_TYPE_CERTIFICATE_PRESENT,
     OBSERVATION_TYPE_TECHNOLOGY_DETECTED,
     EvidenceContent,
 )
@@ -1020,6 +1022,29 @@ def role_can_manage_members(role: str | None) -> bool:
     return role == "owner"
 
 
+def _latest_run_id_among(entries: list[ObservationWithEvidence]) -> str | None:
+    """Shared by every "current state" derivation
+    (`list_current_technologies_for_asset`,
+    `get_current_certificate_for_asset`, and any future one): given a
+    list of observations of one specific type for one asset, which
+    `run_id` is the most recent — determined by that run's OWN earliest
+    observation of this type (never a single observation's timestamp
+    alone, since a run can log several observations of the same type a
+    few milliseconds apart and any of them individually resolving the
+    "latest run" would be a coincidence of iteration order, not a real
+    ordering guarantee). Returns `None` for an empty list — the correct
+    "no data yet" signal every caller already treats as such."""
+    if not entries:
+        return None
+    run_order_key: dict[str, str] = {}
+    for entry in entries:
+        run_id = entry.observation.run_id
+        existing_key = run_order_key.get(run_id)
+        if existing_key is None or entry.observation.observed_at < existing_key:
+            run_order_key[run_id] = entry.observation.observed_at
+    return max(run_order_key, key=lambda run_id: (run_order_key[run_id], run_id))
+
+
 @dataclass(frozen=True)
 class AccountRecord:
     account_id: str
@@ -1422,6 +1447,24 @@ class CurrentTechnologyRecord:
     version: str | None
     source: str
     last_seen_at: str
+
+
+@dataclass(frozen=True)
+class CurrentCertificateRecord:
+    """Productization Phase 02's asset-detail equivalent of
+    `CurrentTechnologyRecord` above: the certificate presented by this
+    asset's most recent run, never "the most recent certificate ever
+    observed, whichever run it came from" — a later run's real
+    replacement/renewal must not be shadowed by an earlier one."""
+
+    asset_id: str
+    fingerprint_sha256: str
+    subject: str
+    issuer: str
+    not_before: str
+    not_after: str
+    sans: tuple[str, ...]
+    observed_at: str
 
 
 _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -2052,21 +2095,68 @@ class ControlDB:
                         (observed_at, organization_id, identifier_type, identifier_value),
                     )
 
+    # Allowlisted sort columns for list_assets_for_organization — never
+    # interpolate a caller-supplied column name directly into ORDER BY,
+    # the same identifier-allowlist discipline this codebase already
+    # applies everywhere else user input could reach raw SQL.
+    _ASSET_SORT_COLUMNS = frozenset({"first_seen_at", "last_seen_at"})
+
     def list_assets_for_organization(
-        self, organization_id: str, *, asset_type: str | None = None
+        self,
+        organization_id: str,
+        *,
+        asset_type: str | None = None,
+        q: str | None = None,
+        sort: str = "first_seen_at",
+        order: str = "asc",
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[AssetRecord]:
+        """Productization Phase 02: `q`/`sort`/`order`/`limit`/`offset`
+        are new, additive, keyword-only parameters — every pre-existing
+        internal caller (certificate/technology/change backfills,
+        `list_assets_running_technology`) keeps calling this with only
+        `organization_id`/`asset_type` and, critically, keeps getting
+        EVERY matching row back unbounded: `limit=None` (the default)
+        means "no SQL LIMIT clause at all," never "0 rows" or some other
+        surprising default — those callers need the complete set to scan
+        for backfill purposes, not a product-facing page.
+
+        `GET /organizations/{id}/assets` (api/routers/easm.py) is the
+        only caller that passes an explicit `limit`, and does the real
+        SQL-level pagination this router's own docstring already claimed
+        it did — it did not, before this phase; `_paginate` was
+        Python-slicing an unbounded, fully-fetched result set on every
+        single request, the same bug `list_candidate_assets_for_organization`
+        below still has (out of scope for this phase's own asset-
+        inventory focus; flagged in docs/productization/02_asset_inventory.md).
+
+        `q` matches as a case-insensitive substring against `identity_key`
+        — simple, but real: a domain asset's identity_key IS its
+        hostname, so searching "example" finds "www.example.com" without
+        needing a second search index."""
+        if sort not in self._ASSET_SORT_COLUMNS:
+            raise ValueError(f"unsupported sort column: {sort!r}")
+        if order not in ("asc", "desc"):
+            raise ValueError(f"unsupported sort order: {order!r}")
+        clauses = ["organization_id = ?"]
+        params: list[object] = [organization_id]
+        if asset_type is not None:
+            clauses.append("asset_type = ?")
+            params.append(asset_type)
+        if q is not None:
+            clauses.append("identity_key LIKE ? ESCAPE '\\'")
+            escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            params.append(f"%{escaped}%")
+        where = " AND ".join(clauses)
+        # `sort`/`order` are validated against fixed allowlists above,
+        # never caller-supplied strings interpolated raw.
+        query = f"SELECT * FROM assets WHERE {where} ORDER BY {sort} {order}"  # nosec B608  # noqa: S608
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
         with self._connect() as conn:
-            if asset_type is None:
-                rows = conn.execute(
-                    "SELECT * FROM assets WHERE organization_id = ? ORDER BY first_seen_at",
-                    (organization_id,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM assets WHERE organization_id = ? AND asset_type = ? "
-                    "ORDER BY first_seen_at",
-                    (organization_id, asset_type),
-                ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [_asset_record_from_row(row) for row in rows]
 
     def list_identifiers_for_asset(self, asset_id: str) -> list[AssetIdentifierRecord]:
@@ -3520,16 +3610,9 @@ class ControlDB:
             for entry in self.list_observations_for_asset(asset_id)
             if entry.observation.observation_type == OBSERVATION_TYPE_TECHNOLOGY_DETECTED
         ]
-        if not tech_observations:
+        latest_run_id = _latest_run_id_among(tech_observations)
+        if latest_run_id is None:
             return []
-
-        run_order_key: dict[str, str] = {}
-        for entry in tech_observations:
-            run_id = entry.observation.run_id
-            existing_key = run_order_key.get(run_id)
-            if existing_key is None or entry.observation.observed_at < existing_key:
-                run_order_key[run_id] = entry.observation.observed_at
-        latest_run_id = max(run_order_key, key=lambda run_id: (run_order_key[run_id], run_id))
 
         results = []
         for entry in tech_observations:
@@ -3546,6 +3629,45 @@ class ControlDB:
                 )
             )
         return sorted(results, key=lambda record: record.technology_name)
+
+    def get_current_certificate_for_asset(self, asset_id: str) -> CurrentCertificateRecord | None:
+        """Productization Phase 02's asset-detail requirement: the TLS
+        certificate this asset's most recent run actually presented — the
+        exact same "latest run wins" derivation
+        `list_current_technologies_for_asset` above uses, over
+        `OBSERVATION_TYPE_CERTIFICATE_PRESENT` (already recorded by Fase
+        04 from real `Host.tls` captures — no new collection, no second
+        certificate-tracking table). `None` when this asset has never had
+        a parseable certificate observation, never a fabricated empty
+        record."""
+        cert_observations = [
+            entry
+            for entry in self.list_observations_for_asset(asset_id)
+            if entry.observation.observation_type == OBSERVATION_TYPE_CERTIFICATE_PRESENT
+        ]
+        latest_run_id = _latest_run_id_among(cert_observations)
+        if latest_run_id is None:
+            return None
+
+        same_run = [e for e in cert_observations if e.observation.run_id == latest_run_id]
+        # A run should record at most one certificate observation per
+        # asset in practice; if more than one somehow exists, the most
+        # recently observed one within that same run wins — the same
+        # "latest wins" principle applied one level down.
+        latest_entry = max(same_run, key=lambda e: e.observation.observed_at)
+        snapshot = parse_certificate_snapshot(latest_entry.evidence.detail)
+        if snapshot is None:
+            return None
+        return CurrentCertificateRecord(
+            asset_id=asset_id,
+            fingerprint_sha256=snapshot.fingerprint_sha256,
+            subject=snapshot.subject,
+            issuer=snapshot.issuer,
+            not_before=snapshot.not_before,
+            not_after=snapshot.not_after,
+            sans=snapshot.sans,
+            observed_at=latest_entry.observation.observed_at,
+        )
 
     def list_assets_running_technology(
         self, organization_id: str, technology_name: str
