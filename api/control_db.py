@@ -4526,6 +4526,79 @@ class ControlDB:
             rows = conn.execute("SELECT account_id FROM accounts").fetchall()
         return [row["account_id"] for row in rows]
 
+    def list_all_organization_ids(self) -> list[str]:
+        """Fase 20: every organization that exists, for jobs (the
+        observation-retention purge) that operate per-organization
+        rather than per-account."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT organization_id FROM organizations").fetchall()
+        return [row["organization_id"] for row in rows]
+
+    def purge_stale_observations_for_organization(
+        self, organization_id: str, *, cutoff: str, dry_run: bool = False
+    ) -> tuple[int, int]:
+        """Fase 20 (EASM roadmap): bounds the unbounded growth of raw
+        per-run `observations` from continuous monitoring, WITHOUT ever
+        touching `assets`/`evidence`-as-a-current-fact/`exposures` —
+        those persist for as long as the asset exists, per the phase's
+        own explicit requirement.
+
+        **The rule**: for each distinct (asset_id, evidence_id) pair —
+        "this one fact about this one asset" — the single most recent
+        `observations` row is ALWAYS kept, no matter how old it is
+        (deleting it would make the asset look like it has zero
+        observations of a fact it still currently holds). Any OTHER,
+        superseded observation row for that same pair, older than
+        `cutoff`, is what actually gets purged — pure "this run also
+        saw the same thing again" redundancy from repeated monitoring
+        cycles, never the asset's current state.
+
+        `evidence` rows are purged only as a follow-on: an evidence row
+        with literally zero remaining `observations` pointing to it (a
+        data anomaly this schema doesn't normally produce, since
+        `find_or_create_evidence` and `record_observation` are always
+        called together — a defensive safety net, not the primary
+        cleanup path) AND whose `last_seen_at` is also past `cutoff`.
+
+        Returns `(observations_purged, evidence_purged)` — both `0` in
+        dry-run mode (nothing is deleted; the caller logs the would-be
+        counts, matching `run_retention_purge_job`'s own dry-run
+        contract)."""
+        superseded_observations_sql = (
+            "SELECT o.observation_id FROM observations o WHERE o.organization_id = ? "
+            "AND o.observed_at < ? AND o.observed_at <> ("
+            "  SELECT MAX(o2.observed_at) FROM observations o2 "
+            "  WHERE o2.asset_id = o.asset_id AND o2.evidence_id = o.evidence_id"
+            ")"
+        )
+        orphaned_evidence_sql = (
+            "SELECT e.evidence_id FROM evidence e WHERE e.organization_id = ? "
+            "AND e.last_seen_at < ? AND NOT EXISTS ("
+            "  SELECT 1 FROM observations o WHERE o.evidence_id = e.evidence_id"
+            ")"
+        )
+        with self._connect() as conn:
+            if dry_run:
+                observations_candidates = len(
+                    conn.execute(superseded_observations_sql, (organization_id, cutoff)).fetchall()
+                )
+                evidence_candidates = len(
+                    conn.execute(orphaned_evidence_sql, (organization_id, cutoff)).fetchall()
+                )
+                return observations_candidates, evidence_candidates
+
+            cursor = conn.execute(
+                f"DELETE FROM observations WHERE observation_id IN ({superseded_observations_sql})",  # noqa: S608  # nosec B608
+                (organization_id, cutoff),
+            )
+            observations_purged = cursor.rowcount
+            cursor = conn.execute(
+                f"DELETE FROM evidence WHERE evidence_id IN ({orphaned_evidence_sql})",  # noqa: S608  # nosec B608
+                (organization_id, cutoff),
+            )
+            evidence_purged = cursor.rowcount
+        return observations_purged, evidence_purged
+
     def list_purgeable_scans_for_account(
         self, account_id: str, *, cutoff: str, limit: int
     ) -> list[ScanRecord]:

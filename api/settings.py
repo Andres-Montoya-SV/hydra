@@ -156,6 +156,17 @@ class APISettings:
     # logs what it WOULD delete.
     retention_purge_dry_run: bool = False
 
+    # Fase 20 (EASM roadmap): how long a superseded (not the most recent
+    # for its own asset+fact) `observations` row is kept before the
+    # EASM retention job purges it — raw per-run observation noise from
+    # continuous monitoring is what this bounds, never the `assets`/
+    # `evidence`/`exposures` rows themselves, which persist as long as
+    # the asset exists (see `api/reconciliation_worker.py::
+    # run_observation_retention_purge_job`'s own docstring for the exact
+    # rule). Six months by default — generous enough to keep a real
+    # historical trail, bounded enough to actually cap growth.
+    observation_retention_days: int = 180
+
     # Automated backups (docs/PAID_API_DESIGN.md's "Automated backups
     # and a real deployment target" section) — see
     # `api/backup_worker.py`'s own module docstring for the full
@@ -348,6 +359,9 @@ def load_api_settings() -> APISettings:
     settings.retention_purge_dry_run = os.getenv(
         "HYDRA_API_RETENTION_PURGE_DRY_RUN", ""
     ).strip().lower() in ("1", "true", "yes")
+    observation_retention_days = os.getenv("HYDRA_API_OBSERVATION_RETENTION_DAYS")
+    if observation_retention_days:
+        settings.observation_retention_days = int(observation_retention_days)
     backup_interval = os.getenv("HYDRA_API_BACKUP_INTERVAL_SECONDS")
     if backup_interval:
         settings.backup_interval_seconds = float(backup_interval)

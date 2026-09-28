@@ -3817,6 +3817,31 @@ only the HTTP wrapper is missing), DNS/visual/cloud per-asset views, and
 Relationships endpoints. Full detail:
 [`docs/easm/19_api_surface.md`](easm/19_api_surface.md).
 
+## Fase 20 — Retention, Backup/Restore, Idempotency (`api/restore_integrity.py`, `api/reconciliation_worker.py`, `api/control_db.py`) — 2026-09-28
+
+Extends the already-tested backup/restore infrastructure to the EASM
+domain model rather than rebuilding it. Verified with a real test (not
+assumed) that `backup_sqlite_file`'s whole-database `sqlite3.Connection.
+backup()` already covers every EASM table. New
+`api/restore_integrity.py::check_referential_integrity()` detects
+dangling references after a restore (SQLite never enforces its own
+declared `REFERENCES` constraints — confirmed, no connection anywhere
+turns `PRAGMA foreign_keys` on) — report-only, by explicit design:
+never silently discards an orphan, never blocks the restore itself,
+both judged worse than a loud, specific report. New third
+reconciliation job, `run_observation_retention_purge_job`, purges
+superseded (non-current) `observations` rows past a configurable
+retention window while `assets`/`evidence`-for-the-current-fact/
+`exposures` are never touched — verified that this can never break
+exposure evidence traceability, since `exposure_evidence` references raw
+per-run Findings in each account's own `recon.db`, a structurally
+separate lineage from `control_db.py`'s own `observations`/`evidence`
+tables. A real subtlety found while testing snapshot corruption: a
+`backup_sqlite_file` destination inherits WAL mode from its source, so
+directly editing a snapshot afterward needs an explicit
+`wal_checkpoint` before a plain file copy sees the change. Full detail:
+[`docs/easm/20_retention_and_recovery.md`](easm/20_retention_and_recovery.md).
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
