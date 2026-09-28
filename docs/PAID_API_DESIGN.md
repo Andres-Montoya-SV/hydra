@@ -3770,6 +3770,31 @@ documented reasoning: no cadence/scheduling engine (Fase 18's own
 domain). Full detail:
 [`docs/easm/17_capability_architecture.md`](easm/17_capability_architecture.md).
 
+## Fase 18 — Monitoring Integration (`api/easm_backfill.py`, `api/monitoring_worker.py`, `api/control_db.py`) — 2026-09-27
+
+Stop-and-report found before implementation: every EASM backfill
+function (Fases 03-14) had zero callers in the live pipeline, only ever
+invoked from tests — meaning `change_events`/`exposures`/etc. were never
+actually populated by a real scan. Andrés confirmed wiring backfill into
+scan completion first as necessary groundwork. New
+`api/easm_backfill.py::run_easm_backfill_for_organization()` runs all
+seven backfill functions in dependency order, called from
+`api/scan_orchestrator.py::execute_scan()` (the one function every scan
+trigger source — manual, Speed 1, Speed 2 — already runs through), in
+its own isolated try/except so a backfill bug never fails an otherwise-
+successful scan. Known, documented, pre-existing scaling caveat: these
+functions replay full scan history on every call, not incrementally —
+flagged for a future phase, not fixed here. `api/monitoring_worker.py`'s
+notification trigger now also fires on `change_events`/
+`certificate_events`/`technology_events`/`exposure_history` for the
+scan's own run, not just the raw hostname digest — a certificate
+renewal or new exposure with the exact same hostname set now correctly
+notifies. The outbox, webhooks, and scheduler were extended (one new
+column, one new dataclass field, both additive with empty defaults),
+never rewritten; all 109 pre-existing + new monitoring/webhook tests
+pass. Full detail:
+[`docs/easm/18_monitoring_integration.md`](easm/18_monitoring_integration.md).
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —

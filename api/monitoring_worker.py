@@ -132,6 +132,31 @@ def _wildcard_detected_for_scan(api_settings: APISettings, account_id: str, scan
     return False
 
 
+def _easm_citations_for_run(control_db: ControlDB, organization_id: str, run_id: str) -> list[str]:
+    """Fase 18 (EASM roadmap): "el disparador lee de change_events y
+    exposures... en vez de comparar snapshots crudos" — every EASM event
+    table this ONE scan's run actually wrote to (Fase 05's generic
+    `change_events`, Fase 12's `certificate_events`, Fase 14's
+    `technology_events`, Fase 08's `exposure_history`), turned into one
+    human-readable citation string per event. Never raises — a
+    lookup failure here is the caller's (`_harvest_one`'s) problem to
+    isolate, same as every other per-domain operation in this module."""
+    citations: list[str] = []
+    for event in control_db.list_change_events_for_run(run_id):
+        citations.append(f"{event.new_state.upper()}: {event.reason}")
+    for cert_event in control_db.list_certificate_events_for_run(run_id):
+        citations.append(f"{cert_event.event_type}: {cert_event.reason}")
+    for tech_event in control_db.list_technology_events_for_run(run_id):
+        citations.append(
+            f"{tech_event.event_type} ({tech_event.technology_name}): {tech_event.reason}"
+        )
+    for history in control_db.list_exposure_history_for_run(organization_id, run_id):
+        exposure = control_db.get_exposure(organization_id, history.exposure_id)
+        title = exposure.title if exposure is not None else history.exposure_id
+        citations.append(f"EXPOSURE_{history.event_type.upper()}: {title} -- {history.reason}")
+    return citations
+
+
 def _harvest_one(
     *,
     api_settings: APISettings,
@@ -202,6 +227,23 @@ def _harvest_one(
         wildcard_dns_detected=wildcard,
     )
 
+    # Fase 18 (EASM roadmap): a certificate renewal, a new exposure, or
+    # a technology change can be real, notification-worthy signal even
+    # when the raw hostname set didn't move at all — something the old
+    # digest-only trigger below could never see. `api/easm_backfill.py`
+    # runs synchronously inside `execute_scan` before a scan is ever
+    # marked "completed", so by the time this function runs, this scan's
+    # own `change_events`/`certificate_events`/`technology_events`/
+    # `exposure_history` rows already exist if they're going to exist at
+    # all. Never raises: a lookup error here is caught by this function's
+    # own caller (`run_monitoring_cycle`), the same per-domain isolation
+    # every other operation in this module already gets.
+    easm_citations: list[str] = (
+        _easm_citations_for_run(control_db, row.organization_id, scan_id)
+        if row.organization_id
+        else []
+    )
+
     # A domain's very first monitored run never itself triggers a
     # notification: `digest_changed` requires a prior digest to differ
     # from, and `classify_asset_jump` never flags `needs_review` when
@@ -209,7 +251,7 @@ def _harvest_one(
     # only a baseline being established.
     outcome: MonitoringRunOutcome | None = None
     digest_changed = row.last_asset_digest is not None and new_digest != row.last_asset_digest
-    if jump.needs_review or digest_changed:
+    if jump.needs_review or digest_changed or easm_citations:
         hosts_added: list[str] = []
         hosts_removed: list[str] = []
         previous_scan_id = (
@@ -220,7 +262,7 @@ def _harvest_one(
             current_hostnames = set(hostnames)
             hosts_added = sorted(current_hostnames - previous_hostnames)
             hosts_removed = sorted(previous_hostnames - current_hostnames)
-        if jump.needs_review or hosts_added or hosts_removed:
+        if jump.needs_review or hosts_added or hosts_removed or easm_citations:
             outcome = MonitoringRunOutcome(
                 monitoring_id=row.monitoring_id,
                 account_id=row.account_id,
@@ -233,6 +275,7 @@ def _harvest_one(
                 asset_digest=new_digest,
                 needs_review=jump.needs_review,
                 review_reason=jump.reason,
+                easm_citations=tuple(easm_citations),
             )
 
     # Sticky by design, per the task's own explicit requirement: once a
@@ -448,6 +491,7 @@ def _flush_pending_notifications(
                     asset_digest=r["asset_digest"],
                     needs_review=r["needs_review"],
                     review_reason=r["review_reason"],
+                    easm_citations=tuple(r.get("easm_citations", [])),
                 ),
                 r["notification_id"],
             )
@@ -496,7 +540,17 @@ def _render_outcome_line(outcome: MonitoringRunOutcome) -> str:
         parts.append(f"{len(outcome.hosts_added)} new host(s)")
     if outcome.hosts_removed:
         parts.append(f"{len(outcome.hosts_removed)} host(s) gone")
-    return f"- {outcome.domain}: {', '.join(parts)} (now {outcome.asset_count} total)"
+    if not parts and outcome.easm_citations:
+        # Fase 18: a hostname-set-stable change (certificate renewal, new
+        # exposure, technology change) still gets a real line, never a
+        # blank "0 changes" -- citing the first, most-specific fact
+        # rather than every one, matching the email's own "concise
+        # summary line, not a full report" shape.
+        return f"- {outcome.domain}: {outcome.easm_citations[0]}"
+    line = f"- {outcome.domain}: {', '.join(parts)} (now {outcome.asset_count} total)"
+    if outcome.easm_citations:
+        line += f"; also: {outcome.easm_citations[0]}"
+    return line
 
 
 def run_monitoring_cycle(
@@ -556,6 +610,7 @@ def run_monitoring_cycle(
                         "asset_digest": outcome.asset_digest,
                         "needs_review": outcome.needs_review,
                         "review_reason": outcome.review_reason,
+                        "easm_citations": list(outcome.easm_citations),
                     }
                 )
             if len(updates) >= api_settings.monitoring_batch_size:
