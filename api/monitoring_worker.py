@@ -151,7 +151,7 @@ def _easm_citations_for_run(control_db: ControlDB, organization_id: str, run_id:
             f"{tech_event.event_type} ({tech_event.technology_name}): {tech_event.reason}"
         )
     for history in control_db.list_exposure_history_for_run(organization_id, run_id):
-        exposure = control_db.get_exposure(organization_id, history.exposure_id)
+        exposure = control_db.get_exposure_for_organization(organization_id, history.exposure_id)
         title = exposure.title if exposure is not None else history.exposure_id
         citations.append(f"EXPOSURE_{history.event_type.upper()}: {title} -- {history.reason}")
     return citations

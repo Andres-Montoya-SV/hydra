@@ -374,3 +374,117 @@ class ExposureHistoryResponse(BaseModel):
 
 class ResolveExposureRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
+
+
+# Fase 19 (EASM roadmap) — API surface for the domain model Fases 02-18
+# built. Every response model here is a thin, explicit projection of an
+# existing `api/control_db.py` dataclass, never a raw `.__dict__` dump of
+# a table row a future column could silently leak through.
+
+
+class OrganizationResponse(BaseModel):
+    organization_id: str
+    name: str
+    role: str
+    created_at: str
+    updated_at: str
+
+
+class AssetResponse(BaseModel):
+    asset_id: str
+    organization_id: str
+    asset_type: str
+    identity_key: str
+    first_seen_at: str
+    last_seen_at: str
+    last_seen_run_id: str | None = None
+
+
+class CandidateAssetResponse(BaseModel):
+    candidate_asset_id: str
+    organization_id: str
+    candidate_type: str
+    normalized_value: str
+    display_value: str
+    first_seen_at: str
+    last_seen_at: str
+    scope_status: str
+    collection_status: str
+    authorization_status: str
+    reason: str
+    review_status: str
+    discarded_signal_hash: str | None = None
+    promoted_asset_id: str | None = None
+
+
+class PromoteCandidateAssetRequest(BaseModel):
+    justification: str = Field(min_length=1, max_length=1000)
+
+
+class DiscardCandidateAssetRequest(BaseModel):
+    justification: str = Field(min_length=1, max_length=1000)
+
+
+class EvidenceResponse(BaseModel):
+    evidence_id: str
+    source: str
+    detail: str
+    confidence_score: int | None = None
+    confidence_class: str
+    first_seen_at: str
+    last_seen_at: str
+
+
+class ObservationResponse(BaseModel):
+    observation_id: str
+    run_id: str
+    observation_type: str
+    observed_at: str
+    evidence: EvidenceResponse
+
+
+class ChangeEventResponse(BaseModel):
+    change_event_id: str
+    asset_id: str
+    run_id: str
+    previous_state: str | None = None
+    new_state: str
+    reason: str
+    detected_at: str
+
+
+class CertificateEventResponse(BaseModel):
+    certificate_event_id: str
+    asset_id: str
+    run_id: str
+    event_type: str
+    reason: str
+    previous_fingerprint: str | None = None
+    new_fingerprint: str
+    detected_at: str
+
+
+class TechnologyEventResponse(BaseModel):
+    technology_event_id: str
+    asset_id: str
+    run_id: str
+    event_type: str
+    technology_name: str
+    reason: str
+    detected_at: str
+
+
+class CurrentTechnologyResponse(BaseModel):
+    technology_name: str
+    version: str | None = None
+    source: str
+    last_seen_at: str
+
+
+class CapabilityStatusResponse(BaseModel):
+    provider: str
+    display_name: str
+    capability: str
+    intensity: str
+    active: bool
+    status: Literal["disabled", "runnable", "not_runnable"]

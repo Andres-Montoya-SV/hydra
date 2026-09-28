@@ -29,6 +29,7 @@ from api.reconciliation_worker import run_reconciliation_loop
 from api.routers import (
     accounts,
     domains,
+    easm,
     exposures,
     health,
     hypotheses,
@@ -247,6 +248,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(keys.router)
     app.include_router(domains.router)
     app.include_router(exposures.router)
+    app.include_router(easm.router)
     app.include_router(monitoring.router)
     app.include_router(scans.router)
     app.include_router(reportability.router)
