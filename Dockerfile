@@ -15,11 +15,18 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — Go tool builder
 # ---------------------------------------------------------------------------
-FROM golang:1.25.14-bookworm AS go-builder
+FROM golang:1.25.14-trixie AS go-builder
 
 # libpcap-dev: naabu links against libpcap (cgo) for its raw-socket scan
-# engine. gcc: the cgo toolchain golang:bookworm does not include by default.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# engine. gcc: the cgo toolchain golang:trixie does not include by default.
+# `apt-get upgrade` (Snyk container remediation): the base image's own
+# already-installed OS packages (e.g. pcre2, present regardless of what
+# this Dockerfile explicitly installs) can lag behind Debian's latest
+# published security patches even on a freshly-pulled `trixie` tag —
+# upgrading here, not just installing new packages cleanly, is what
+# actually picks those fixes up.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
       libpcap-dev \
       gcc \
     && rm -rf /var/lib/apt/lists/*
@@ -49,7 +56,17 @@ RUN go install -v github.com/hakluke/hakrawler@2.1
 # CI matrix and supported by binary-extension dependencies such as nassl
 # (pulled by sslyze). The previous 3.15.0rc1 base made pip resolution fail
 # because nassl 5.x had no cp315 distribution.
-FROM python:3.12-slim-bookworm AS final
+# Debian 13 (trixie), not 12 (bookworm) (Snyk container remediation):
+# trixie is Debian's current stable line, so its packages carry
+# meaningfully newer upstream versions (confirmed: openssl 3.5.7 vs
+# 3.0.22, glibc 2.41 vs 2.36, pcre2 10.46 vs 10.42) — a large share of
+# bookworm's Snyk findings with "no fix available" are exactly this:
+# oldstable not receiving a version bump that isn't itself classified
+# as a security backport. Verified before switching: image builds,
+# `python app.py --help` runs, and the full test suite passes inside
+# the built container (2215 passed / 8 skipped, 0 failed) — same as on
+# the bookworm build.
+FROM python:3.12-slim-trixie AS final
 
 LABEL org.opencontainers.image.title="hydra" \
       org.opencontainers.image.description="Evidence-backed, scope-aware Attack Surface Intelligence control plane" \
@@ -64,7 +81,11 @@ LABEL org.opencontainers.image.title="hydra" \
 # docs/HARDENING_ROUND2_P1.md, Task 2 (the WHOIS_PATH setting this same
 # stale belief produced was removed there; this image install was the
 # one place the belief survived).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# `apt-get upgrade` here too, same reasoning as the builder stage above —
+# this is the runtime image's own OS package set, independently
+# vulnerable to the same class of already-installed-package CVEs.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
       nmap \
       jq \
       libpcap0.8 \

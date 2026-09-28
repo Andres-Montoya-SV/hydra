@@ -29,6 +29,8 @@ from api.schemas import (
 )
 from api.settings import APISettings
 from api.tenancy import account_settings
+from core.exceptions import ValidationError
+from utils.security import confine_path, validate_run_id
 
 router = APIRouter(prefix="/scans", tags=["scans"])
 
@@ -184,7 +186,12 @@ def get_scan_report(
         raise HTTPException(status_code=409, detail=f"Scan is {scan.status!r}, not completed yet")
 
     settings = account_settings(_api_settings(request), auth.account_id)
-    summary_path = settings.project_root / settings.output_directory / scan_id / "summary.json"
+    output_root = settings.project_root / settings.output_directory
+    try:
+        validate_run_id(scan_id)
+        summary_path = confine_path(output_root / scan_id / "summary.json", output_root)
+    except ValidationError as exc:
+        raise HTTPException(status_code=404, detail="Scan not found") from exc
     if not summary_path.is_file():
         raise HTTPException(status_code=500, detail="Scan completed but summary.json is missing")
     return json.loads(summary_path.read_text(encoding="utf-8"))
@@ -212,6 +219,14 @@ def post_client_report(
     if scan.status != "completed":
         raise HTTPException(status_code=409, detail=f"Scan is {scan.status!r}, not completed yet")
 
+    settings = account_settings(_api_settings(request), auth.account_id)
+    output_root = settings.project_root / settings.output_directory
+    try:
+        validate_run_id(scan_id)
+        run_dir = confine_path(output_root / scan_id, output_root)
+    except ValidationError as exc:
+        raise HTTPException(status_code=404, detail="Scan not found") from exc
+
     branding: str | None = None
     if body.white_label:
         # Already confirmed Ultra-tier-eligible by check_report_options
@@ -228,14 +243,11 @@ def post_client_report(
                 "set one first via PUT /account/branding.",
             )
 
-    settings = account_settings(_api_settings(request), auth.account_id)
     rc = cmd_client_report(
         settings, scan_id, output_format=body.format, language=body.language, branding=branding
     )
     if rc != 0:
         raise HTTPException(status_code=500, detail="client-report generation failed")
-
-    run_dir = settings.project_root / settings.output_directory / scan_id
     content: str | bytes
     if body.format == "docx":
         content = (run_dir / "client_report.docx").read_bytes()

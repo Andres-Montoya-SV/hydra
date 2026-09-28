@@ -198,6 +198,80 @@ class TestScanLifecycle:
             assert resp.status_code == 404
 
 
+class TestPathTraversalDefense:
+    """Snyk Code flagged `get_scan_report`'s `summary_path` and
+    `post_client_report`'s `run_dir` (api/routers/scans.py) as built from
+    the `scan_id` path parameter without an explicit confinement check.
+
+    In normal operation `_owned_scan_or_404`'s DB lookup already blocks
+    this — real scan_ids are `secrets.token_hex(16)` strings, so a
+    traversal payload as scan_id simply won't match any row and 404s
+    before the path is ever built. These tests don't rely on that: they
+    insert a scan row whose `scan_id` IS a traversal payload directly via
+    `ControlDB.create_scan` (bypassing the token_hex-only creation path
+    entirely, standing in for a future bug or migration that lets a
+    caller pick its own scan_id), proving the router's own
+    `validate_run_id`/`confine_path` check — not just "attacker can't
+    guess a real id" — is what actually stops escape.
+    """
+
+    def _seed_malicious_scan(
+        self, client: TestClient, account_id: str, scan_id: str, *, domain: str = SEED
+    ) -> None:
+        control_db = client.app.state.control_db
+        control_db.create_scan(
+            scan_id=scan_id, account_id=account_id, domain=domain, db_path="unused.db"
+        )
+        control_db.update_scan_status(scan_id, "completed")
+
+    def test_report_rejects_a_traversal_scan_id_even_when_a_matching_row_exists(
+        self, tmp_path: Path
+    ) -> None:
+        with _client(tmp_path) as client:
+            body = client.post("/accounts", json={"email": unique_email()}).json()
+            client.app.state.control_db.mark_email_verified(body["account_id"])
+            seed_verified_domain(client, body["account_id"], SEED)
+            api_key = body["api_key"]
+
+            # A secret file living one directory above this account's own
+            # output_directory — never a real scan artifact.
+            secret_dir = tmp_path / "api_data" / "secret"
+            secret_dir.mkdir(parents=True)
+            (secret_dir / "summary.json").write_text('{"leaked": true}', encoding="utf-8")
+
+            malicious_id = ".."
+            self._seed_malicious_scan(client, body["account_id"], malicious_id)
+
+            # `%2e%2e` so the traversal survives client-side URL
+            # normalization and reaches the server as the literal `..`
+            # path segment (percent-decoding happens after routing).
+            resp = client.get("/scans/%2e%2e/report", headers={"X-API-Key": api_key})
+            assert resp.status_code in (404, 500)
+            assert "leaked" not in resp.text
+
+    def test_client_report_rejects_a_traversal_scan_id_even_when_a_matching_row_exists(
+        self, tmp_path: Path
+    ) -> None:
+        with _client(tmp_path) as client:
+            body = client.post("/accounts", json={"email": unique_email()}).json()
+            client.app.state.control_db.mark_email_verified(body["account_id"])
+            seed_verified_domain(client, body["account_id"], SEED)
+            api_key = body["api_key"]
+
+            malicious_id = ".."
+            self._seed_malicious_scan(client, body["account_id"], malicious_id)
+
+            resp = client.post(
+                "/scans/%2e%2e/client-report",
+                json={"format": "markdown"},
+                headers={"X-API-Key": api_key},
+            )
+            # Must never succeed in reading/writing outside the account's
+            # own output_directory — a clean error, not a 200 with
+            # cross-directory content.
+            assert resp.status_code != 200
+
+
 class TestMultiTenantIsolation:
     def test_account_b_cannot_read_account_as_scan_by_exact_id(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

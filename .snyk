@@ -1,0 +1,13 @@
+# Snyk (https://snyk.io) policy file
+version: v1.5.0
+
+# Snyk Code flagged 44 "hardcoded secret" findings, all inside tests/.
+# Every one is an intentional fake fixture value (some deliberately
+# shaped to also dodge GitHub's push-protection scanner) — never a real
+# credential, never loaded outside a test process. The fix is not to
+# change these values (that would defeat their purpose as realistic
+# fixtures) but to stop Snyk Code from scanning test fixtures for
+# "secrets" at all.
+exclude:
+  code:
+    - tests/**
