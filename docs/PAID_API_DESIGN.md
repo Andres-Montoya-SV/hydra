@@ -3745,6 +3745,31 @@ recent run only), `list_assets_running_technology`,
 `list_technology_events_for_organization`. Full detail:
 [`docs/easm/14_technology_intelligence.md`](easm/14_technology_intelligence.md).
 
+## Fase 17 — Capability Architecture (`core/capabilities.py`, `core/capability_policy.py`, `core/confidence_composition.py`) — 2026-09-27
+
+With every intelligence capability built (Fases 06-16), this phase adds
+the taxonomy/policy/metadata layer that makes Hydra read as "stable
+capabilities with replaceable providers" rather than "33 separate
+tools" — on top of Fase 09's existing provider contract, never a
+rewrite. `core/capabilities.py::Capability` is a stable enum every
+plugin's already-set `capability` string maps onto (verified: all 33
+modules already conform to Fase 09's contract fields — no per-plugin
+migration was needed, only this additive projection layer).
+`core/capability_policy.py` adds a capability-level enable/disable that
+can only narrow, never grant, past what ~30 existing per-tool flags
+already allow (kept deliberately unwired from `config/settings.py`/each
+plugin's `is_enabled()` in this cut — reasoning in the phase doc).
+`ProviderIntensity` adds cost/intensity metadata per real tool.
+`core/confidence_composition.py` is a new, additive, deterministic
+noisy-OR confidence combiner that treats httpx/WhatWeb/security-headers
+as one correlated cluster (not three independent confirmations) —
+existing `core/confidence.py` aggregation left untouched. `heads` CLI
+now shows capability and status per provider. A full redundancy audit
+found no near-zero-contribution tool to remove. Scoped down with
+documented reasoning: no cadence/scheduling engine (Fase 18's own
+domain). Full detail:
+[`docs/easm/17_capability_architecture.md`](easm/17_capability_architecture.md).
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —
