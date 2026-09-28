@@ -3795,6 +3795,28 @@ never rewritten; all 109 pre-existing + new monitoring/webhook tests
 pass. Full detail:
 [`docs/easm/18_monitoring_integration.md`](easm/18_monitoring_integration.md).
 
+## Fase 19 — API Surface (`api/routers/easm.py`) — 2026-09-27
+
+Read/confirm HTTP endpoints for the domain model Fases 02-18 built —
+organizations, assets (+ observations, change/certificate/technology
+event history, current technology inventory), candidate assets (read +
+Fase 06's own promote/discard flow, owner-gated), and Fase 17's
+capability status view. Follows `api/routers/exposures.py`'s own
+established convention exactly: `_require_member` returns 404 (never
+403) for tenancy mismatches, mutations call Fase 06's existing
+`ControlDB.promote_candidate_asset`/`discard_candidate_asset` directly
+with no second authorization path, pagination matches exposures' own
+limit/offset contract. Found and fixed a real duplicate:
+`ControlDB.get_exposure()` (added in Fase 18) was an exact copy of the
+already-existing `get_exposure_for_organization()` — removed. Every new
+endpoint has an explicit foreign-account 404 test (11 GET paths + 2 POST
+actions, checked individually) plus a read-only-role 403 test on both
+mutations. Deferred with documented reasoning: Nmap/Masscan import HTTP
+endpoints (the underlying import functions are fully built, Fase 11 —
+only the HTTP wrapper is missing), DNS/visual/cloud per-asset views, and
+Relationships endpoints. Full detail:
+[`docs/easm/19_api_surface.md`](easm/19_api_surface.md).
+
 ## Explicitly deferred beyond Round 3
 
 - Client-facing dashboard/frontend (built separately, Next.js/Firebase —

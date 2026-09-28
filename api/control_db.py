@@ -2610,14 +2610,6 @@ class ControlDB:
             ).fetchall()
         return [_exposure_history_record_from_row(row) for row in rows]
 
-    def get_exposure(self, organization_id: str, exposure_id: str) -> ExposureRecord | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM exposures WHERE organization_id = ? AND exposure_id = ?",
-                (organization_id, exposure_id),
-            ).fetchone()
-        return None if row is None else _exposure_record_from_row(row)
-
     def record_provider_run_outcomes(
         self,
         *,
