@@ -536,6 +536,23 @@ class CurrentTechnologyResponse(BaseModel):
     last_seen_at: str
 
 
+class CurrentCertificateResponse(BaseModel):
+    fingerprint_sha256: str
+    subject: str
+    issuer: str
+    not_before: str
+    not_after: str
+    sans: tuple[str, ...]
+    observed_at: str
+
+
+class AssetIdentifierResponse(BaseModel):
+    identifier_type: str
+    identifier_value: str
+    first_seen_at: str
+    last_seen_at: str
+
+
 class CapabilityStatusResponse(BaseModel):
     provider: str
     display_name: str

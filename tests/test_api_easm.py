@@ -348,6 +348,151 @@ class TestOrganizationCreationAndMembers:
             assert resp.status_code == 403
 
 
+class TestAssetListingSearchAndSort:
+    def test_q_filters_by_identity_key_substring(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            api_key, account_id, org, _ = _seed_account_with_domain_asset(
+                client, email="q-search@example.com", domain="www.searchable.example.com"
+            )
+            headers = {"X-API-Key": api_key}
+
+            hit = client.get(
+                f"/organizations/{org}/assets", headers=headers, params={"q": "SEARCHABLE"}
+            )
+            miss = client.get(
+                f"/organizations/{org}/assets", headers=headers, params={"q": "nomatch"}
+            )
+            assert len(hit.json()) == 1
+            assert miss.json() == []
+
+    def test_sort_and_order_params_are_accepted(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            api_key, _, org, _ = _seed_account_with_domain_asset(
+                client, email="sort-http@example.com"
+            )
+            headers = {"X-API-Key": api_key}
+
+            resp = client.get(
+                f"/organizations/{org}/assets",
+                headers=headers,
+                params={"sort": "last_seen_at", "order": "desc"},
+            )
+            assert resp.status_code == 200
+
+    def test_an_unsupported_sort_value_is_a_clean_422(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            api_key, _, org, _ = _seed_account_with_domain_asset(
+                client, email="badsort-http@example.com"
+            )
+            resp = client.get(
+                f"/organizations/{org}/assets",
+                headers={"X-API-Key": api_key},
+                params={"sort": "asset_type"},
+            )
+            assert resp.status_code == 422
+
+
+class TestAssetCurrentCertificateAndIdentifiers:
+    def test_current_certificate_reflects_the_seeded_tls_snapshot(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            api_key, _, org, asset_id = _seed_account_with_domain_asset(
+                client, email="cert-http@example.com"
+            )
+            headers = {"X-API-Key": api_key}
+
+            resp = client.get(
+                f"/organizations/{org}/assets/{asset_id}/certificate", headers=headers
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["fingerprint_sha256"] == "a" * 64
+            assert body["issuer"] == "Let's Encrypt"
+
+    def test_current_certificate_is_null_not_404_when_never_observed(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            account = client.post("/accounts", json={"email": "nocert-http@example.com"}).json()
+            api_key = account["api_key"]
+            db = client.app.state.control_db
+            api_settings: APISettings = client.app.state.api_settings
+            organization_id, _ = db.list_organizations_for_account(account["account_id"])[0]
+
+            scan_id = secrets.token_hex(16)
+            db.create_scan(
+                scan_id=scan_id,
+                account_id=account["account_id"],
+                domain="nohttps.example.com",
+                db_path=str(api_settings.data_dir),
+                organization_id=organization_id,
+            )
+            store = AssetStore(account_db_path(api_settings, account["account_id"]))
+            store.create_run(ScanRun(run_id=scan_id, started_at="2026-01-01T00:00:00+00:00"))
+            store.upsert_host(
+                scan_id, Host(domain="nohttps.example.com", discovery_sources=["dnsx"])
+            )
+            db.update_scan_status(scan_id, "completed")
+            run_easm_backfill_for_organization(
+                control_db=db, api_settings=api_settings, organization_id=organization_id
+            )
+            asset = db.get_asset_by_identity(
+                organization_id=organization_id,
+                asset_type="domain",
+                identity_key="domain:nohttps.example.com",
+            )
+
+            resp = client.get(
+                f"/organizations/{organization_id}/assets/{asset.asset_id}/certificate",
+                headers={"X-API-Key": api_key},
+            )
+            assert resp.status_code == 200
+            assert resp.json() is None
+
+    def test_identifiers_lists_the_assets_resolved_ips(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            account = client.post("/accounts", json={"email": "ip-http@example.com"}).json()
+            api_key = account["api_key"]
+            db = client.app.state.control_db
+            api_settings: APISettings = client.app.state.api_settings
+            organization_id, _ = db.list_organizations_for_account(account["account_id"])[0]
+
+            scan_id = secrets.token_hex(16)
+            db.create_scan(
+                scan_id=scan_id,
+                account_id=account["account_id"],
+                domain="withip.example.com",
+                db_path=str(api_settings.data_dir),
+                organization_id=organization_id,
+            )
+            store = AssetStore(account_db_path(api_settings, account["account_id"]))
+            store.create_run(ScanRun(run_id=scan_id, started_at="2026-01-01T00:00:00+00:00"))
+            store.upsert_host(
+                scan_id,
+                Host(
+                    domain="withip.example.com",
+                    discovery_sources=["dnsx"],
+                    ips=["198.51.100.7"],
+                ),
+            )
+            db.update_scan_status(scan_id, "completed")
+            run_easm_backfill_for_organization(
+                control_db=db, api_settings=api_settings, organization_id=organization_id
+            )
+            asset = db.get_asset_by_identity(
+                organization_id=organization_id,
+                asset_type="domain",
+                identity_key="domain:withip.example.com",
+            )
+
+            resp = client.get(
+                f"/organizations/{organization_id}/assets/{asset.asset_id}/identifiers",
+                headers={"X-API-Key": api_key},
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert len(body) == 1
+            assert body[0]["identifier_type"] == "ip"
+            assert body[0]["identifier_value"] == "198.51.100.7"
+
+
 class TestCandidateAssetPromotionFlow:
     def test_owner_can_promote_a_candidate_into_a_real_asset(self, tmp_path: Path) -> None:
         with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
@@ -456,6 +601,8 @@ class TestForeignAccountCannotProbeAnyEndpoint:
                 f"/organizations/{org}/assets/{asset_id}/certificate-events",
                 f"/organizations/{org}/assets/{asset_id}/technology-events",
                 f"/organizations/{org}/assets/{asset_id}/technologies",
+                f"/organizations/{org}/assets/{asset_id}/certificate",
+                f"/organizations/{org}/assets/{asset_id}/identifiers",
                 f"/organizations/{org}/candidate-assets",
                 f"/organizations/{org}/candidate-assets/{candidate_id}",
                 f"/organizations/{org}/capabilities",
