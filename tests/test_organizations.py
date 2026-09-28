@@ -27,6 +27,7 @@ import pytest
 
 from api.control_db import (
     ControlDB,
+    LastOwnerError,
     role_can_manage_members,
     role_can_modify_scope,
 )
@@ -192,6 +193,11 @@ class TestMigrationAgainstRealPreExistingData:
         scan = control_db.get_owned_scan("scan-legacy-1", account_id)
         assert scan is not None
         assert scan.domain == "legacy.example.com"
+        # Productization Phase 01: a scan row that predates
+        # `collection_profile` entirely (this raw fixture schema has no
+        # such column) must migrate in with the safe default, not NULL
+        # or a crash on the first read after upgrade.
+        assert scan.collection_profile == "standard"
 
         verified = control_db.get_verified_domains_for_account(account_id)
         assert [v.domain for v in verified] == ["legacy.example.com"]
@@ -442,3 +448,84 @@ class TestRolePermissions:
             control_db.add_account_organization_role(
                 account_id=account_id, organization_id=organization_id, role="admin"
             )
+
+
+class TestMemberListingAndRemoval:
+    """Productization Phase 01 — the first real callers of
+    `list_members_for_organization`/`remove_account_organization_role`,
+    the data-layer half of `api/routers/easm.py`'s new
+    `POST/GET/DELETE .../members` endpoints."""
+
+    def test_listing_includes_the_1to1_owner_and_every_added_member(self, tmp_path: Path) -> None:
+        control_db = ControlDB(tmp_path / "control.db")
+        owner_account = control_db.create_account(email="owner-list@example.com")
+        viewer_account = control_db.create_account(email="viewer-list@example.com")
+        organization_id, _role = control_db.list_organizations_for_account(owner_account)[0]
+        control_db.add_account_organization_role(
+            account_id=viewer_account, organization_id=organization_id, role="viewer"
+        )
+
+        members = control_db.list_members_for_organization(organization_id)
+        by_account = {account_id: role for account_id, role, _created_at in members}
+        assert by_account == {owner_account: "owner", viewer_account: "viewer"}
+
+    def test_removing_a_viewer_is_always_allowed(self, tmp_path: Path) -> None:
+        control_db = ControlDB(tmp_path / "control.db")
+        owner_account = control_db.create_account(email="owner-rm@example.com")
+        viewer_account = control_db.create_account(email="viewer-rm@example.com")
+        organization_id, _role = control_db.list_organizations_for_account(owner_account)[0]
+        control_db.add_account_organization_role(
+            account_id=viewer_account, organization_id=organization_id, role="viewer"
+        )
+
+        control_db.remove_account_organization_role(
+            account_id=viewer_account, organization_id=organization_id
+        )
+
+        assert control_db.get_role_for_account_organization(viewer_account, organization_id) is None
+
+    def test_removing_the_only_owner_is_refused(self, tmp_path: Path) -> None:
+        control_db = ControlDB(tmp_path / "control.db")
+        owner_account = control_db.create_account(email="only-owner@example.com")
+        organization_id, _role = control_db.list_organizations_for_account(owner_account)[0]
+
+        with pytest.raises(LastOwnerError):
+            control_db.remove_account_organization_role(
+                account_id=owner_account, organization_id=organization_id
+            )
+        # Refused, not partially applied — the owner is still there.
+        assert (
+            control_db.get_role_for_account_organization(owner_account, organization_id) == "owner"
+        )
+
+    def test_removing_one_of_two_owners_is_allowed(self, tmp_path: Path) -> None:
+        control_db = ControlDB(tmp_path / "control.db")
+        owner_account = control_db.create_account(email="owner-a@example.com")
+        second_owner = control_db.create_account(email="owner-b@example.com")
+        organization_id, _role = control_db.list_organizations_for_account(owner_account)[0]
+        control_db.add_account_organization_role(
+            account_id=second_owner, organization_id=organization_id, role="owner"
+        )
+
+        control_db.remove_account_organization_role(
+            account_id=owner_account, organization_id=organization_id
+        )
+
+        assert control_db.get_role_for_account_organization(owner_account, organization_id) is None
+        assert (
+            control_db.get_role_for_account_organization(second_owner, organization_id) == "owner"
+        )
+
+    def test_removing_an_account_with_no_role_is_a_harmless_no_op(self, tmp_path: Path) -> None:
+        control_db = ControlDB(tmp_path / "control.db")
+        owner_account = control_db.create_account(email="owner-noop@example.com")
+        outsider_account = control_db.create_account(email="outsider-noop@example.com")
+        organization_id, _role = control_db.list_organizations_for_account(owner_account)[0]
+
+        control_db.remove_account_organization_role(
+            account_id=outsider_account, organization_id=organization_id
+        )  # must not raise
+
+        assert (
+            control_db.get_role_for_account_organization(owner_account, organization_id) == "owner"
+        )

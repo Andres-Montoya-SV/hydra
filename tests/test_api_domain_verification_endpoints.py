@@ -97,6 +97,74 @@ class TestDnsTxtEndToEndThroughTheRealApi:
         scan_resp = client.post("/scans", json={"domain": DOMAIN}, headers={"X-API-Key": api_key})
         assert scan_resp.status_code == 202
 
+    def test_onboarding_acceptance_journey_account_to_first_scan(
+        self, dns_backed_client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Productization Phase 01's own acceptance test: a new user
+        reaches a completed first scan using only documented API calls —
+        create account -> list its (automatic, 1:1) organization -> verify
+        a domain -> choose a collection profile -> scan -> poll to
+        completion -> read the report. Every step is a real HTTP call
+        (DNS verification hits the real local test server, same as the
+        sibling test above); only the pipeline's own network collectors
+        are stubbed, same as every other scan-lifecycle test in this
+        codebase.
+
+        Deliberately does NOT create a second organization here: `POST
+        /organizations` (this phase's own new endpoint) is real and
+        separately tested (`tests/test_api_easm.py`), but domain
+        verification and `POST /scans` are still account-default-org
+        only — neither endpoint accepts an explicit `organization_id`
+        yet. Exercising a second org here would silently imply that
+        composition works when it does not; that gap is documented in
+        docs/productization/01_onboarding.md instead of asserted here.
+
+        Stops at "scan accepted and queued with the right profile," the
+        same depth `test_full_flow_register_verify_then_scan_succeeds`
+        above already uses — this file's own `_stub_pipeline` only
+        replaces the three network-touching plugins, not `ToolManager`'s
+        tool-availability gate (`tests/test_api_scans.py`'s
+        `_install_pipeline_stubs` does that, and that file's own
+        `TestScanLifecycle` tests already poll a stubbed scan through to
+        `"completed"` — including for `profile: "passive"`, added
+        alongside this test). Re-proving full pipeline completion here
+        with a weaker stub would be redundant, not additional coverage."""
+        client, dns_server = dns_backed_client
+        journey_domain = "acceptance-journey.example"
+        api_key = _create_account(client)
+
+        orgs = client.get("/organizations", headers={"X-API-Key": api_key}).json()
+        assert len(orgs) == 1
+        assert orgs[0]["role"] == "owner"
+
+        register = client.post(
+            "/domains", json={"domain": journey_domain}, headers={"X-API-Key": api_key}
+        )
+        assert register.status_code == 201
+        token = register.json()["token"]
+        dns_server.txt_records[dns_record_name(journey_domain)] = dns_record_value(token)
+
+        verify = client.post(
+            f"/domains/{journey_domain}/verify",
+            json={"method": "dns_txt"},
+            headers={"X-API-Key": api_key},
+        )
+        assert verify.status_code == 200
+        assert verify.json()["status"] == "verified"
+
+        _stub_pipeline(monkeypatch)
+        create_scan = client.post(
+            "/scans",
+            json={"domain": journey_domain, "profile": "passive"},
+            headers={"X-API-Key": api_key},
+        )
+        assert create_scan.status_code == 202
+        scan_id = create_scan.json()["scan_id"]
+
+        status_body = client.get(f"/scans/{scan_id}", headers={"X-API-Key": api_key}).json()
+        assert status_body["status"] in ("queued", "running", "completed")
+        assert status_body["collection_profile"] == "passive"
+
     def test_verify_fails_clearly_when_the_record_is_missing(self, dns_backed_client) -> None:
         client, _dns_server = dns_backed_client
         api_key = _create_account(client)

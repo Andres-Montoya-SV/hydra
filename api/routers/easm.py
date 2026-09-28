@@ -39,17 +39,20 @@ from typing import TypeVar
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from api.auth import AuthContext, require_api_key
-from api.control_db import AssetRecord, ControlDB
+from api.control_db import AssetRecord, ControlDB, LastOwnerError
 from api.schemas import (
+    AddOrganizationMemberRequest,
     AssetResponse,
     CandidateAssetResponse,
     CapabilityStatusResponse,
     CertificateEventResponse,
     ChangeEventResponse,
+    CreateOrganizationRequest,
     CurrentTechnologyResponse,
     DiscardCandidateAssetRequest,
     EvidenceResponse,
     ObservationResponse,
+    OrganizationMemberResponse,
     OrganizationResponse,
     PromoteCandidateAssetRequest,
     TechnologyEventResponse,
@@ -76,6 +79,21 @@ def _require_owner(db: ControlDB, account_id: str, organization_id: str) -> None
     from api.control_db import role_can_modify_scope
 
     if not role_can_modify_scope(role):
+        raise HTTPException(status_code=403, detail="Owner role required")
+
+
+def _require_member_manager(db: ControlDB, account_id: str, organization_id: str) -> None:
+    """Fase 02 built `role_can_manage_members` specifically for this —
+    a distinct check from `role_can_modify_scope`'s "can change
+    authorized scope," even though both happen to be owner-only today.
+    Using the semantically-correct one here (rather than reusing
+    `_require_owner`) means a future role split (e.g., an admin role
+    that can manage members but not scope) needs no change at this call
+    site."""
+    role = _require_member(db, account_id, organization_id)
+    from api.control_db import role_can_manage_members
+
+    if not role_can_manage_members(role):
         raise HTTPException(status_code=403, detail="Owner role required")
 
 
@@ -117,6 +135,107 @@ def list_organizations(
             )
         )
     return responses
+
+
+@router.post("", response_model=OrganizationResponse, status_code=201)
+def create_organization(
+    body: CreateOrganizationRequest,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> OrganizationResponse:
+    """A SECOND (or later) organization for the calling account — its own
+    1:1 default organization already exists from account creation
+    (Fase 02), this is the "consultant onboarding a new client" case.
+    Reuses `ControlDB.create_organization`/`add_account_organization_role`
+    exactly as `_backfill_organizations`/`create_account` already do
+    internally — no new persistence, this endpoint is the first HTTP
+    surface over logic Fase 02 already built and tested."""
+    db = _db(request)
+    organization_id = db.create_organization(name=body.name)
+    db.add_account_organization_role(
+        account_id=auth.account_id, organization_id=organization_id, role="owner"
+    )
+    org = db.get_organization(organization_id)
+    if org is None:
+        # Unreachable in practice (just inserted, same request, same
+        # connection) — a real exception rather than `assert` so this
+        # isn't stripped under `python -O` and reads clearly as a defensive
+        # check, not a static rule to silence.
+        raise RuntimeError(f"organization {organization_id!r} vanished immediately after creation")
+    return OrganizationResponse(
+        organization_id=org.organization_id,
+        name=org.name,
+        role="owner",
+        created_at=org.created_at,
+        updated_at=org.updated_at,
+    )
+
+
+@router.get("/{organization_id}/members", response_model=list[OrganizationMemberResponse])
+def list_organization_members(
+    organization_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> list[OrganizationMemberResponse]:
+    """Any member (owner or viewer) can see who else has access — this is
+    read visibility, not a mutation, so `_require_member` (not
+    `_require_owner`) is the right gate."""
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    return [
+        OrganizationMemberResponse(account_id=account_id, role=role, created_at=created_at)
+        for account_id, role, created_at in db.list_members_for_organization(organization_id)
+    ]
+
+
+@router.post("/{organization_id}/members", response_model=OrganizationMemberResponse)
+def add_organization_member(
+    organization_id: str,
+    body: AddOrganizationMemberRequest,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> OrganizationMemberResponse:
+    """Owner-only, via `role_can_manage_members` (Fase 02 built this
+    exact check; this is its first real caller). Grants a role by
+    `account_id`, not by email/invite — there is no invite-by-email flow
+    in this system yet; the caller must already know the target
+    account's id (e.g. from their own `POST /accounts` response). A real
+    invite flow is a reasonable future addition, not built here to keep
+    this change small and additive rather than inventing a new
+    onboarding concept."""
+    db = _db(request)
+    _require_member_manager(db, auth.account_id, organization_id)
+    if not db.account_exists(body.account_id):
+        raise HTTPException(status_code=404, detail="Account not found")
+    db.add_account_organization_role(
+        account_id=body.account_id, organization_id=organization_id, role=body.role
+    )
+    role, created_at = next(
+        (r, c)
+        for a, r, c in db.list_members_for_organization(organization_id)
+        if a == body.account_id
+    )
+    return OrganizationMemberResponse(account_id=body.account_id, role=role, created_at=created_at)
+
+
+@router.delete("/{organization_id}/members/{account_id}", status_code=204)
+def remove_organization_member(
+    organization_id: str,
+    account_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> None:
+    """Owner-only (`role_can_manage_members`), and refuses to remove an
+    organization's last owner (`ControlDB.remove_account_organization_role`
+    raises `LastOwnerError`, translated to a 409 here) — an organization
+    with zero owners could never be administered again. An owner may
+    remove themselves as long as at least one other owner remains."""
+    db = _db(request)
+    _require_member_manager(db, auth.account_id, organization_id)
+    try:
+        db.remove_account_organization_role(account_id=account_id, organization_id=organization_id)
+    except LastOwnerError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/{organization_id}/assets", response_model=list[AssetResponse])

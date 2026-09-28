@@ -141,7 +141,11 @@ async def create_scan(
     scan_id = secrets.token_hex(16)
     db_path = str(account_settings(api_settings, auth.account_id).project_root)
     control_db.create_scan(
-        scan_id=scan_id, account_id=auth.account_id, domain=domain, db_path=db_path
+        scan_id=scan_id,
+        account_id=auth.account_id,
+        domain=domain,
+        db_path=db_path,
+        collection_profile=body.profile,
     )
     control_db.increment_scan_usage(auth.account_id, subscriptions.current_period_key())
 
@@ -171,6 +175,7 @@ def get_scan_status(
         created_at=scan.created_at,
         updated_at=scan.updated_at,
         error_message=scan.error_message,
+        collection_profile=scan.collection_profile,
     )
 
 

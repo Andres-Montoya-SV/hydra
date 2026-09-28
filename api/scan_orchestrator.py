@@ -99,6 +99,7 @@ async def execute_scan(
     scan_id: str,
     domain: str,
     trigger_source: str = "manual",
+    collection_profile: str = "standard",
 ) -> None:
     import app as hydra_app  # deferred: heavy import graph (ToolManager, plugins, …)
 
@@ -106,7 +107,11 @@ async def execute_scan(
         settings = account_settings(api_settings, account_id)
         settings.validate_or_raise()
 
-        if trigger_source == "scheduled_passive":
+        # Productization Phase 01: a client-chosen 'passive' profile on a
+        # manually-triggered scan gets the EXACT SAME narrowing Speed 1
+        # monitoring already applies — one definition of "passive" for
+        # this whole service, not a second one invented here.
+        if trigger_source == "scheduled_passive" or collection_profile == "passive":
             from api.monitoring import passive_monitoring_settings_overrides
 
             enable_flags = {k: v for k, v in vars(settings).items() if k.startswith("enable_")}

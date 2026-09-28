@@ -195,6 +195,159 @@ class TestPagination:
             )
 
 
+class TestOrganizationCreationAndMembers:
+    """Productization Phase 01 — the first HTTP surface over Fase 02's
+    already-tested `create_organization`/`add_account_organization_role`/
+    `role_can_manage_members` data-layer logic (`tests/test_organizations.py`
+    covers those directly; this covers the router wiring on top)."""
+
+    def test_create_organization_makes_the_caller_its_owner(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            account = client.post("/accounts", json={"email": "consultant@example.com"}).json()
+            headers = {"X-API-Key": account["api_key"]}
+
+            resp = client.post("/organizations", headers=headers, json={"name": "Client B Inc"})
+            assert resp.status_code == 201
+            body = resp.json()
+            assert body["name"] == "Client B Inc"
+            assert body["role"] == "owner"
+
+            orgs = client.get("/organizations", headers=headers).json()
+            org_ids = {o["organization_id"] for o in orgs}
+            assert body["organization_id"] in org_ids
+            assert len(org_ids) == 2  # the account's own 1:1 org, plus this new one
+
+    def test_owner_can_add_and_list_a_viewer_member(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            owner = client.post("/accounts", json={"email": "member-owner@example.com"}).json()
+            viewer = client.post("/accounts", json={"email": "member-viewer@example.com"}).json()
+            owner_headers = {"X-API-Key": owner["api_key"]}
+            org_id = client.get("/organizations", headers=owner_headers).json()[0][
+                "organization_id"
+            ]
+
+            add = client.post(
+                f"/organizations/{org_id}/members",
+                headers=owner_headers,
+                json={"account_id": viewer["account_id"], "role": "viewer"},
+            )
+            assert add.status_code == 200
+            assert add.json() == {
+                "account_id": viewer["account_id"],
+                "role": "viewer",
+                "created_at": add.json()["created_at"],
+            }
+
+            members = client.get(f"/organizations/{org_id}/members", headers=owner_headers).json()
+            by_account = {m["account_id"]: m["role"] for m in members}
+            assert by_account == {owner["account_id"]: "owner", viewer["account_id"]: "viewer"}
+
+            # The viewer can now see this organization via GET /organizations
+            # (real access, not just a row that exists in the DB).
+            viewer_orgs = client.get(
+                "/organizations", headers={"X-API-Key": viewer["api_key"]}
+            ).json()
+            assert any(
+                o["organization_id"] == org_id and o["role"] == "viewer" for o in viewer_orgs
+            )
+
+    def test_viewer_cannot_add_a_member(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            owner = client.post("/accounts", json={"email": "v-owner@example.com"}).json()
+            viewer = client.post("/accounts", json={"email": "v-viewer@example.com"}).json()
+            third = client.post("/accounts", json={"email": "v-third@example.com"}).json()
+            owner_headers = {"X-API-Key": owner["api_key"]}
+            org_id = client.get("/organizations", headers=owner_headers).json()[0][
+                "organization_id"
+            ]
+            client.post(
+                f"/organizations/{org_id}/members",
+                headers=owner_headers,
+                json={"account_id": viewer["account_id"], "role": "viewer"},
+            )
+
+            resp = client.post(
+                f"/organizations/{org_id}/members",
+                headers={"X-API-Key": viewer["api_key"]},
+                json={"account_id": third["account_id"], "role": "viewer"},
+            )
+            assert resp.status_code == 403
+
+    def test_adding_a_nonexistent_account_id_is_a_clean_404(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            owner = client.post("/accounts", json={"email": "nx-owner@example.com"}).json()
+            owner_headers = {"X-API-Key": owner["api_key"]}
+            org_id = client.get("/organizations", headers=owner_headers).json()[0][
+                "organization_id"
+            ]
+
+            resp = client.post(
+                f"/organizations/{org_id}/members",
+                headers=owner_headers,
+                json={"account_id": "does-not-exist", "role": "viewer"},
+            )
+            assert resp.status_code == 404
+
+    def test_owner_can_remove_a_viewer(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            owner = client.post("/accounts", json={"email": "rm-owner@example.com"}).json()
+            viewer = client.post("/accounts", json={"email": "rm-viewer@example.com"}).json()
+            owner_headers = {"X-API-Key": owner["api_key"]}
+            org_id = client.get("/organizations", headers=owner_headers).json()[0][
+                "organization_id"
+            ]
+            client.post(
+                f"/organizations/{org_id}/members",
+                headers=owner_headers,
+                json={"account_id": viewer["account_id"], "role": "viewer"},
+            )
+
+            resp = client.delete(
+                f"/organizations/{org_id}/members/{viewer['account_id']}", headers=owner_headers
+            )
+            assert resp.status_code == 204
+
+            members = client.get(f"/organizations/{org_id}/members", headers=owner_headers).json()
+            assert viewer["account_id"] not in {m["account_id"] for m in members}
+
+    def test_removing_the_only_owner_is_a_clean_409_not_a_500(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            owner = client.post("/accounts", json={"email": "self-rm@example.com"}).json()
+            owner_headers = {"X-API-Key": owner["api_key"]}
+            org_id = client.get("/organizations", headers=owner_headers).json()[0][
+                "organization_id"
+            ]
+
+            resp = client.delete(
+                f"/organizations/{org_id}/members/{owner['account_id']}", headers=owner_headers
+            )
+            assert resp.status_code == 409
+
+            # Refused, not partially applied.
+            members = client.get(f"/organizations/{org_id}/members", headers=owner_headers).json()
+            assert owner["account_id"] in {m["account_id"] for m in members}
+
+    def test_viewer_cannot_remove_a_member(self, tmp_path: Path) -> None:
+        with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+            owner = client.post("/accounts", json={"email": "vrm-owner@example.com"}).json()
+            viewer = client.post("/accounts", json={"email": "vrm-viewer@example.com"}).json()
+            owner_headers = {"X-API-Key": owner["api_key"]}
+            org_id = client.get("/organizations", headers=owner_headers).json()[0][
+                "organization_id"
+            ]
+            client.post(
+                f"/organizations/{org_id}/members",
+                headers=owner_headers,
+                json={"account_id": viewer["account_id"], "role": "viewer"},
+            )
+
+            resp = client.delete(
+                f"/organizations/{org_id}/members/{owner['account_id']}",
+                headers={"X-API-Key": viewer["api_key"]},
+            )
+            assert resp.status_code == 403
+
+
 class TestCandidateAssetPromotionFlow:
     def test_owner_can_promote_a_candidate_into_a_real_asset(self, tmp_path: Path) -> None:
         with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
@@ -306,6 +459,7 @@ class TestForeignAccountCannotProbeAnyEndpoint:
                 f"/organizations/{org}/candidate-assets",
                 f"/organizations/{org}/candidate-assets/{candidate_id}",
                 f"/organizations/{org}/capabilities",
+                f"/organizations/{org}/members",
             ]
             for path in get_paths:
                 response = client.get(path, headers=headers)
@@ -325,6 +479,18 @@ class TestForeignAccountCannotProbeAnyEndpoint:
                     json={"justification": "attempted by an outsider"},
                 )
                 assert response.status_code == 404
+
+            add_member = client.post(
+                f"/organizations/{org}/members",
+                headers=headers,
+                json={"account_id": owner_account_id, "role": "viewer"},
+            )
+            assert add_member.status_code == 404
+
+            remove_member = client.delete(
+                f"/organizations/{org}/members/{owner_account_id}", headers=headers
+            )
+            assert remove_member.status_code == 404
 
     def test_a_nonexistent_asset_and_candidate_id_also_404_for_a_real_member(
         self, tmp_path: Path
