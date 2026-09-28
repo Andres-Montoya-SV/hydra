@@ -63,6 +63,14 @@ def _fake_external_mode_preflight(args, settings) -> bool:
     return True
 
 
+def _capturing_pipeline(captured: list):
+    async def _run(settings, *, domain, targets_file, run_id):
+        captured.append(settings)
+        return 0, PipelineContext(errors=[])
+
+    return _run
+
+
 class TestExecuteScanTriggersEasmBackfill:
     async def test_a_successful_scan_populates_easm_tables(
         self,
@@ -117,3 +125,83 @@ class TestExecuteScanTriggersEasmBackfill:
         scan = control_db.get_owned_scan(scan_id, account_id)
         assert scan is not None
         assert scan.status == "completed"
+
+
+class TestExecuteScanCollectionProfile:
+    """Productization Phase 01 — `collection_profile="passive"` on a
+    manually-triggered scan must apply the EXACT SAME narrowing
+    `api/monitoring.py::passive_monitoring_settings_overrides` already
+    applies to Speed 1 monitoring, never a second definition of
+    "passive". `trigger_source` stays `"manual"` throughout — this is
+    about the NEW `collection_profile` parameter, not the pre-existing
+    `scheduled_passive` trigger-source path `TestExecuteScanTriggersEasmBackfill`'s
+    siblings already cover."""
+
+    async def test_passive_profile_forces_off_an_active_collection_plugin(
+        self,
+        control_db: ControlDB,
+        api_settings: APISettings,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from config.settings import Settings
+
+        account_id, _organization_id, scan_id = _prepare_account_and_queued_scan(
+            control_db, api_settings, domain="example.com"
+        )
+        # Simulates this account having an active-collection plugin
+        # (katana) turned on — the override must force it off for a
+        # passive-profile scan regardless of the account's own baseline.
+        account_settings_obj = Settings(project_root=tmp_path / "acct", enable_katana=True)
+        account_settings_obj.ensure_directories()
+        monkeypatch.setattr(
+            "api.scan_orchestrator.account_settings", lambda *a, **k: account_settings_obj
+        )
+        monkeypatch.setattr("app._external_mode_preflight", _fake_external_mode_preflight)
+        captured: list = []
+        monkeypatch.setattr("app._run_headless_pipeline", _capturing_pipeline(captured))
+
+        await execute_scan(
+            api_settings=api_settings,
+            control_db=control_db,
+            account_id=account_id,
+            scan_id=scan_id,
+            domain="example.com",
+            collection_profile="passive",
+        )
+
+        assert len(captured) == 1
+        assert captured[0].enable_katana is False
+
+    async def test_standard_profile_leaves_the_accounts_own_flags_unchanged(
+        self,
+        control_db: ControlDB,
+        api_settings: APISettings,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from config.settings import Settings
+
+        account_id, _organization_id, scan_id = _prepare_account_and_queued_scan(
+            control_db, api_settings, domain="example.com"
+        )
+        account_settings_obj = Settings(project_root=tmp_path / "acct", enable_katana=True)
+        account_settings_obj.ensure_directories()
+        monkeypatch.setattr(
+            "api.scan_orchestrator.account_settings", lambda *a, **k: account_settings_obj
+        )
+        monkeypatch.setattr("app._external_mode_preflight", _fake_external_mode_preflight)
+        captured: list = []
+        monkeypatch.setattr("app._run_headless_pipeline", _capturing_pipeline(captured))
+
+        await execute_scan(
+            api_settings=api_settings,
+            control_db=control_db,
+            account_id=account_id,
+            scan_id=scan_id,
+            domain="example.com",
+            collection_profile="standard",
+        )
+
+        assert len(captured) == 1
+        assert captured[0].enable_katana is True

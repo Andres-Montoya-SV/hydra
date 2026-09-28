@@ -169,6 +169,49 @@ class TestScanLifecycle:
             assert report["resolved_count"] == 1
             assert report["alive_count"] == 1
 
+    def test_default_profile_is_standard_and_is_echoed_on_status(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install_pipeline_stubs(monkeypatch)
+        with _client(tmp_path) as client:
+            api_key = _create_account(client)
+            scan_id = client.post(
+                "/scans", json={"domain": SEED}, headers={"X-API-Key": api_key}
+            ).json()["scan_id"]
+
+            status = client.get(f"/scans/{scan_id}", headers={"X-API-Key": api_key}).json()
+            assert status["collection_profile"] == "standard"
+
+    def test_passive_profile_is_accepted_and_echoed_on_status(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install_pipeline_stubs(monkeypatch)
+        with _client(tmp_path) as client:
+            api_key = _create_account(client)
+            create_resp = client.post(
+                "/scans",
+                json={"domain": SEED, "profile": "passive"},
+                headers={"X-API-Key": api_key},
+            )
+            assert create_resp.status_code == 202
+            scan_id = create_resp.json()["scan_id"]
+
+            status = client.get(f"/scans/{scan_id}", headers={"X-API-Key": api_key}).json()
+            assert status["collection_profile"] == "passive"
+
+            final = _wait_for_terminal_status(client, api_key, scan_id)
+            assert final["status"] == "completed"
+
+    def test_an_unknown_profile_value_is_a_clean_422(self, tmp_path: Path) -> None:
+        with _client(tmp_path) as client:
+            api_key = _create_account(client)
+            resp = client.post(
+                "/scans",
+                json={"domain": SEED, "profile": "aggressive"},
+                headers={"X-API-Key": api_key},
+            )
+            assert resp.status_code == 422
+
     def test_report_is_409_before_the_scan_completes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

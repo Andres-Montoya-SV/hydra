@@ -122,6 +122,7 @@ async def _run_claimed_scan(
             scan_id=scan.scan_id,
             domain=scan.domain,
             trigger_source=scan.trigger_source,
+            collection_profile=scan.collection_profile,
         )
     finally:
         heartbeat_task.cancel()
