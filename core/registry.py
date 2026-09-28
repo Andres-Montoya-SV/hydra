@@ -1,11 +1,34 @@
-"""In-memory host registry — intelligence hub during pipeline execution."""
+"""In-memory host registry — intelligence hub during pipeline execution.
+
+**DEPRECATED, 2026-09-28 (Fase 21 EASM roadmap cleanup)**:
+`core.intelligence.engine.IntelligenceEngine` (imported below,
+`self._engine`) is the legacy clustering/graph engine Fase 01's own
+consolidation plan (`docs/easm/00_consolidation_plan.md`) marked
+"absorb with migration" into `core.intel.engine`/Fase 07's persisted
+`relationships` table. That migration was never completed: this class
+still runs the legacy engine unconditionally on every scan
+(`finalize()` below), and its `clusters`/`graph` output is silently
+discarded (overwritten) whenever `intel_config` is set and the newer
+`core.intel.engine.build_intel` also runs — meaning real, live
+deployments pay for a full legacy clustering pass whose result nothing
+downstream actually uses. Not removed in this pass: `core/store.py`
+still persists its output into `clusters`/`graph_nodes`/`graph_edges`
+every run, and this cleanup phase's own "no reescribir salvo necesario"
+discipline argues against silently deleting a code path without first
+confirming what, if anything, still reads those tables — that
+confirmation and the actual removal belongs to a future phase's own
+reconnaissance, the same way every phase in this roadmap starts its own
+audit rather than assuming the terrain is unchanged.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 from core.assets import AssetCollection, Host, InfrastructureCluster, InfrastructureGraph
-from core.intelligence.engine import IntelligenceEngine
+from core.intelligence.engine import (
+    IntelligenceEngine,  # deprecated 2026-09-28, see module docstring
+)
 from core.parsers.registry import parse_tool_output
 
 

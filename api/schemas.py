@@ -376,6 +376,40 @@ class ResolveExposureRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
 
 
+class ExposureReportHistoryEventResponse(BaseModel):
+    event_type: Literal["observed", "reopened", "resolved"]
+    happened_at: str
+    run_id: str | None = None
+    reason: str
+
+
+class ExposureReportEntryResponse(BaseModel):
+    """Fase 21: one exposure with its FULL cross-run history and risk
+    classification — the report-facing shape, never just a current-run
+    snapshot."""
+
+    exposure_id: str
+    asset_id: str
+    title: str
+    severity: str
+    status: str
+    first_seen_at: str
+    last_seen_at: str
+    history: list[ExposureReportHistoryEventResponse]
+    risk_level: str
+    risk_reasons: list[str]
+
+
+class ExposureRiskResponse(BaseModel):
+    """Fase 21: deterministic, explainable risk/criticality — `level` is
+    never returned without `reasons`, the phase's own explicit
+    requirement that a classification always cites what produced it."""
+
+    exposure_id: str
+    level: Literal["low", "medium", "high", "critical"]
+    reasons: list[str]
+
+
 # Fase 19 (EASM roadmap) — API surface for the domain model Fases 02-18
 # built. Every response model here is a thin, explicit projection of an
 # existing `api/control_db.py` dataclass, never a raw `.__dict__` dump of

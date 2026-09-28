@@ -120,3 +120,37 @@ def test_foreign_account_cannot_probe_exposure_ids(tmp_path: Path) -> None:
             json={"reason": "should never be allowed"},
         )
         assert resolve.status_code == 404
+
+        # Fase 21's new endpoints get the exact same tenant-isolation check.
+        risk = client.get(f"/organizations/{org}/exposures/{exposure_id}/risk", headers=headers)
+        assert risk.status_code == 404
+        report = client.get(f"/organizations/{org}/reports/exposures", headers=headers)
+        assert report.status_code == 404
+
+
+def test_owner_can_read_risk_classification(tmp_path: Path) -> None:
+    with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+        api_key, _, org, exposure_id = _seed_exposure(client, email="exposure-api-risk@example.com")
+        headers = {"X-API-Key": api_key}
+
+        risk = client.get(f"/organizations/{org}/exposures/{exposure_id}/risk", headers=headers)
+        assert risk.status_code == 200
+        body = risk.json()
+        assert body["exposure_id"] == exposure_id
+        assert body["level"] in {"low", "medium", "high", "critical"}
+        assert body["reasons"]  # never a bare label with no citable explanation
+
+
+def test_owner_can_read_the_exposure_report_with_history(tmp_path: Path) -> None:
+    with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
+        api_key, _, org, exposure_id = _seed_exposure(
+            client, email="exposure-api-report@example.com"
+        )
+        headers = {"X-API-Key": api_key}
+
+        report = client.get(f"/organizations/{org}/reports/exposures", headers=headers)
+        assert report.status_code == 200
+        entries = report.json()
+        assert [e["exposure_id"] for e in entries] == [exposure_id]
+        assert entries[0]["history"][0]["event_type"] == "observed"
+        assert entries[0]["risk_level"] in {"low", "medium", "high", "critical"}

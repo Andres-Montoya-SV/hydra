@@ -11,14 +11,22 @@ reference (an `exposures.asset_id` pointing at an `asset_id` that
 doesn't exist) — everything in the file was consistent when it was
 copied.
 
-SQLite does not enforce the `REFERENCES` constraints already declared in
-`api/control_db.py`'s own `CREATE TABLE` statements unless
-`PRAGMA foreign_keys = ON` is set per-connection — verified: no
-connection anywhere in this codebase sets it. This module exists for the
-genuinely possible cases outside that "an ordinary backup/restore never
-breaks it" guarantee: a hand-edited or corrupted snapshot, or a partial/
-mixed restore an operator assembled by hand from files out of different
-snapshots.
+**Correction (Fase 21 cleanup, 2026-09-28)**: this module's own original
+docstring claimed no connection anywhere enables SQLite's `REFERENCES`
+enforcement — that was wrong, found and fixed while writing the Fase 21
+README/architecture-doc updates. `core/store.py::configure_sqlite()`
+(used by every connection `connect_sqlite()` returns — both
+`api/control_db.py::ControlDB._connect()` and every per-account
+`AssetStore`) DOES call `PRAGMA foreign_keys=ON`. An ordinary write
+through Hydra's own code therefore already gets real, enforced
+referential integrity; SQLite itself would reject a `DELETE` that left a
+dangling reference. This module exists for cases OUTSIDE that
+protection: a snapshot opened and hand-edited with a bare `sqlite3`
+connection or an external tool that never enables the pragma (SQLite's
+own default is OFF per-connection, regardless of what any other
+connection to the same file does), byte-level file corruption, or a
+partial/mixed restore an operator assembled by hand from files out of
+different snapshots.
 
 **The explicit decision this phase requires**: neither silently discard
 an orphaned row (destroys history/evidence without an operator ever

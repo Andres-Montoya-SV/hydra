@@ -3824,9 +3824,12 @@ domain model rather than rebuilding it. Verified with a real test (not
 assumed) that `backup_sqlite_file`'s whole-database `sqlite3.Connection.
 backup()` already covers every EASM table. New
 `api/restore_integrity.py::check_referential_integrity()` detects
-dangling references after a restore (SQLite never enforces its own
-declared `REFERENCES` constraints — confirmed, no connection anywhere
-turns `PRAGMA foreign_keys` on) — report-only, by explicit design:
+dangling references after a restore — guarding against a hand-edited
+snapshot or external tool that skips SQLite's FK enforcement (which
+`core/store.py::configure_sqlite` DOES enable for every ordinary
+connection Hydra's own code makes; corrected from this section's earlier,
+wrong claim otherwise — see Fase 21's cleanup) — report-only, by explicit
+design:
 never silently discards an orphan, never blocks the restore itself,
 both judged worse than a loud, specific report. New third
 reconciliation job, `run_observation_retention_purge_job`, purges
@@ -3841,6 +3844,39 @@ tables. A real subtlety found while testing snapshot corruption: a
 directly editing a snapshot afterward needs an explicit
 `wal_checkpoint` before a plain file copy sees the change. Full detail:
 [`docs/easm/20_retention_and_recovery.md`](easm/20_retention_and_recovery.md).
+
+## Fase 21 — Risk/Reports, Cleanup, Final Audit (`core/risk_scoring.py`, `core/client_report/exposure_report.py`) — 2026-09-28
+
+**The closing phase of the 21-phase EASM roadmap.** New
+`core/risk_scoring.py::classify_exposure_risk()` is a deterministic, no-ML
+risk classifier combining severity, confirmed-scope status, days open, and
+relationship-to-critical-asset (Fase 07's graph) — every result cites
+concrete reasons, served via `GET /organizations/{id}/exposures/{id}/risk`.
+Verified (not assumed) that neither the existing reportability nor
+hypotheses orchestrators nor `core/client_report/`'s own rendering
+pipeline ever queried `exposures`/`exposure_history` — new
+`core/client_report/exposure_report.py` is the missing connection,
+additive alongside the existing per-run pipeline, served via `GET
+/organizations/{id}/reports/exposures`; proven to show a full multi-run
+history (`observed → resolved → reopened`), not a current-run snapshot.
+
+Cleanup: `core/intel/model.py`'s absorption (Fase 01) confirmed complete;
+`core/intelligence/`'s (legacy graph engine) was NOT — marked deprecated
+with today's date rather than silently left undocumented, since real code
+still calls it. Found the same gap in `core/diff.py::ScanDiff`, marked
+likewise. Three real doc-naming collisions fixed (`docs/easm/08_*`/`09_*`
+were mislabeled Fase 13/16 content, renamed with redirect stubs). A real,
+unrelated factual error caught and corrected: Fase 20's own docs claimed
+no connection enables SQLite FK enforcement — wrong, `core/store.py::
+configure_sqlite` does, confirmed with a real `IntegrityError`. A full
+12-question adversarial audit against Fases 06-20's real merged code
+found no credible security regression; one real open risk named rather
+than claimed solved (provider version updates can silently change
+semantics — Fase 09's contract doesn't yet verify this). README and this
+document now describe the full EASM domain model; a real, generated
+(not hand-maintained) provider capability matrix is in
+[`docs/easm/21_risk_reports_and_final_audit.md`](easm/21_risk_reports_and_final_audit.md),
+the roadmap's closing document.
 
 ## Explicitly deferred beyond Round 3
 

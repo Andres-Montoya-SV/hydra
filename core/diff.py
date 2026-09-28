@@ -1,4 +1,17 @@
-"""Historical scan comparison — host-set and field-level changes."""
+"""Historical scan comparison — host-set and field-level changes.
+
+**DEPRECATED, 2026-09-28 (Fase 21 EASM roadmap cleanup)**: Fase 01's
+consolidation plan (`docs/easm/00_consolidation_plan.md`) marked this
+module's `ScanDiff` for absorption into the durable, cross-run Change
+Event model Fase 05 later built (`api/change_detection.py`/
+`api/change_backfill.py`). That migration was never done: this module
+still has no deprecation notice of its own before now, and is still
+actively imported by `core/runner.py`, `core/intel/cli.py`, and
+`core/verification/grounding.py`. Not migrated in this pass — confirming
+those three callers can be safely repointed at the EASM change-event
+model is its own reconnaissance task, not something to attempt blind in
+this roadmap's closing phase.
+"""
 
 from __future__ import annotations
 

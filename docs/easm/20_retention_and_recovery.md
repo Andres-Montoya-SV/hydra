@@ -39,14 +39,22 @@ tests (`tests/test_nmap_masscan_import.py`) already cover the
 ## 3. Referential integrity after restore
 
 **New**: `api/restore_integrity.py::check_referential_integrity()`.
-SQLite does not enforce the `REFERENCES` constraints already declared
-in `api/control_db.py`'s schema (`PRAGMA foreign_keys` is never turned
-on by any connection in this codebase — confirmed) so, while an
-*ordinary* backup/restore cycle can never produce a dangling reference
-(the whole database is copied atomically, in one consistent instant), a
-hand-edited or corrupted snapshot could. `restore_backup()` now runs
-this check against the just-restored file and prints every dangling
-reference found, specifically (table, row, missing reference).
+**Correction (Fase 21 cleanup)**: this section originally claimed no
+connection anywhere enables SQLite's FK enforcement — wrong.
+`core/store.py::configure_sqlite()` (used by every `connect_sqlite()`
+connection, including `ControlDB`'s own) DOES set `PRAGMA
+foreign_keys=ON`, so an ordinary write through Hydra's own code already
+gets real, enforced referential integrity — SQLite itself would reject a
+`DELETE` that left a dangling reference. This check exists for cases
+OUTSIDE that protection: a snapshot hand-edited with a bare `sqlite3`
+connection or external tool that never enables the pragma (SQLite's own
+default, regardless of what other connections do), byte-level file
+corruption, or a partial/mixed restore assembled by hand from different
+snapshots. An *ordinary* backup/restore cycle can never produce a
+dangling reference on its own (the whole database is copied atomically).
+`restore_backup()` now runs this check against the just-restored file
+and prints every dangling reference found, specifically (table, row,
+missing reference).
 
 **The explicit decision this phase required**: neither silently discard
 an orphaned row nor block the restore outright. Both would be worse

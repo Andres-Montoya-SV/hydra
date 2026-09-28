@@ -117,6 +117,34 @@ gates it, the three intelligence layers, known architectural gaps):
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Security-specific call-path
 detail: [`docs/NETWORK_CONFINEMENT.md`](docs/NETWORK_CONFINEMENT.md).
 
+### EASM domain model
+
+On top of the scan pipeline above, Hydra's paid API layer (`api/`) builds
+a full External Attack Surface Management data model — organizations,
+durable cross-run assets, observations and evidence, a relationship
+graph, and exposures with complete history — rather than treating each
+scan as a disposable, disconnected report:
+
+```text
+Organization → Asset → Observation → Evidence → Relationship
+            → Intelligence (Technology / DNS / TLS / Cloud / Visual)
+            → Exposure (with cross-run history) → Change Event → Risk
+```
+
+A few invariants this model enforces everywhere: `Observed != Owned`
+(something discovered by correlation is a candidate, never
+authorization, until a human explicitly promotes it), `Imported !=
+Authorized` (an Nmap/Masscan/RDAP import only ever enriches an
+already-known asset or creates a candidate — never a scan target), and
+full organization isolation on every query. External tools are exposed
+as product-level **capabilities** (Technology Intelligence, DNS Posture,
+Cloud Discovery, ...), never named directly in product language — see
+`GET /organizations/{id}/capabilities`. Every phase of this model's
+build-out, its invariants, its test coverage, and a full adversarial
+self-audit are documented under [`docs/easm/`](docs/easm/) —
+[`docs/easm/21_risk_reports_and_final_audit.md`](docs/easm/21_risk_reports_and_final_audit.md)
+is the closing summary and provider capability matrix.
+
 ## Quickstart
 
 **Docker is the recommended path** — it's the only way to guarantee every
