@@ -187,6 +187,14 @@ class MonitoringRunOutcome:
     asset_digest: str
     needs_review: bool
     review_reason: str | None
+    # Fase 18 (EASM roadmap): human-readable citations of the exact
+    # change_event/certificate_event/technology_event/exposure that
+    # motivated this notification, built by
+    # `api/monitoring_worker.py::_easm_citations_for_run` from the new
+    # model (Fases 05/08/12/14) rather than only the raw hostname digest
+    # this dataclass already tracked. Defaults to `()` for the outbox's
+    # own pre-Fase-18 rows (read back with no citations, never an error).
+    easm_citations: tuple[str, ...] = ()
 
 
 # NOTE on hostname diffing: `monitored_domains` persists only a DIGEST
@@ -220,7 +228,11 @@ def significance_rank(outcome: MonitoringRunOutcome) -> tuple[int, str]:
     3. Hosts disappeared (still worth surfacing — decommissioned
        infrastructure, or a monitoring blind spot forming — but lower
        urgency than growth).
-    4. No change (never actually included in a notification at all —
+    4. `easm_citations` only (Fase 18: a certificate renewal, a new
+       exposure, a technology change — real signal, but the raw hostname
+       set didn't change, so it ranks below an actual attack-surface
+       change).
+    5. No change (never actually included in a notification at all —
        `api/monitoring_worker.py` only calls this for domains WITH
        something to report; listed here only so the ordering rule is
        total and testable in isolation).
@@ -235,6 +247,8 @@ def significance_rank(outcome: MonitoringRunOutcome) -> tuple[int, str]:
         rank = 1
     elif outcome.hosts_removed:
         rank = 2
-    else:
+    elif outcome.easm_citations:
         rank = 3
+    else:
+        rank = 4
     return rank, outcome.domain

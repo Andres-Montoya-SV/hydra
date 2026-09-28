@@ -204,6 +204,12 @@ def event_for_monitoring_outcome(outcome: MonitoringRunOutcome) -> WebhookEvent:
     }
     if outcome.review_reason:
         payload["review_reason"] = outcome.review_reason
+    if outcome.easm_citations:
+        # Fase 18: the exact change_event/certificate_event/
+        # technology_event/exposure that motivated this notification,
+        # not just the raw hostname diff — same content the email
+        # summary line cites (`api/monitoring_worker.py::_render_outcome_line`).
+        payload["easm_citations"] = list(outcome.easm_citations)
     return WebhookEvent(event_type=event_type, payload=payload)
 
 

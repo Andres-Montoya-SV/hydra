@@ -799,7 +799,12 @@ CREATE TABLE IF NOT EXISTS monitoring_pending_notifications (
     needs_review INTEGER NOT NULL,
     review_reason TEXT,
     created_at TEXT NOT NULL,
-    sent_at TEXT
+    sent_at TEXT,
+    -- Fase 18: human-readable citations of the exact change_event/
+    -- certificate_event/technology_event/exposure that motivated this
+    -- notification (JSON array of strings; '[]' when there is none,
+    -- e.g. a plain hostname-only change from before this phase).
+    easm_citations_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_monitoring_pending_notifications_unsent
     ON monitoring_pending_notifications(sent_at);
@@ -1457,6 +1462,15 @@ _EVIDENCE_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 # single-fact ingests) never have a raw artifact to hash.
 _OBSERVATION_BATCHES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("artifact_hash", "TEXT"),)
 
+# Fase 18: an existing `monitoring_pending_notifications` table (every
+# account created before EASM-aware monitoring existed) needs this
+# column added the same way. Defaults every pre-existing unsent row to
+# an empty citation list -- correct, since no EASM backfill had run yet
+# when those rows were written.
+_MONITORING_PENDING_NOTIFICATIONS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("easm_citations_json", "TEXT NOT NULL DEFAULT '[]'"),
+)
+
 
 def _migrate_table_columns(
     conn: sqlite3.Connection, table: str, columns: tuple[tuple[str, str], ...]
@@ -1556,6 +1570,11 @@ class ControlDB:
             _migrate_table_columns(conn, "evidence", _EVIDENCE_MIGRATION_COLUMNS)
             _migrate_table_columns(
                 conn, "observation_batches", _OBSERVATION_BATCHES_MIGRATION_COLUMNS
+            )
+            _migrate_table_columns(
+                conn,
+                "monitoring_pending_notifications",
+                _MONITORING_PENDING_NOTIFICATIONS_MIGRATION_COLUMNS,
             )
             for table in _ORGANIZATION_SCOPED_TABLES:
                 _migrate_table_columns(conn, table, _ORGANIZATION_ID_MIGRATION_COLUMNS)
@@ -2577,6 +2596,28 @@ class ControlDB:
             ).fetchall()
         return [_exposure_history_record_from_row(row) for row in rows]
 
+    def list_exposure_history_for_run(
+        self, organization_id: str, run_id: str
+    ) -> list[ExposureHistoryRecord]:
+        """Fase 18: "todos los cambios detectados en este run," the
+        exposure half — `exposure_history.run_id` already exists (Fase
+        08), this is simply the first by-run query against it."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM exposure_history WHERE organization_id = ? AND run_id = ? "
+                "ORDER BY happened_at, event_id",
+                (organization_id, run_id),
+            ).fetchall()
+        return [_exposure_history_record_from_row(row) for row in rows]
+
+    def get_exposure(self, organization_id: str, exposure_id: str) -> ExposureRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM exposures WHERE organization_id = ? AND exposure_id = ?",
+                (organization_id, exposure_id),
+            ).fetchone()
+        return None if row is None else _exposure_record_from_row(row)
+
     def record_provider_run_outcomes(
         self,
         *,
@@ -3237,6 +3278,18 @@ class ControlDB:
             ).fetchall()
         return [_certificate_event_record_from_row(row) for row in rows]
 
+    def list_certificate_events_for_run(self, run_id: str) -> list[CertificateEventRecord]:
+        """Fase 18: the certificate-specific half of "todos los cambios
+        detectados en este run" — `list_change_events_for_run` only
+        covers the generic Fase 05 table; certificate transitions live
+        in their own table (Fase 12) and need their own by-run query."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM certificate_events WHERE run_id = ? ORDER BY detected_at",
+                (run_id,),
+            ).fetchall()
+        return [_certificate_event_record_from_row(row) for row in rows]
+
     def record_technology_event(
         self,
         *,
@@ -3281,6 +3334,16 @@ class ControlDB:
             rows = conn.execute(
                 "SELECT * FROM technology_events WHERE asset_id = ? ORDER BY detected_at",
                 (asset_id,),
+            ).fetchall()
+        return [_technology_event_record_from_row(row) for row in rows]
+
+    def list_technology_events_for_run(self, run_id: str) -> list[TechnologyEventRecord]:
+        """Fase 18: same reasoning as `list_certificate_events_for_run`
+        — technology transitions live in their own Fase 14 table."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM technology_events WHERE run_id = ? ORDER BY detected_at",
+                (run_id,),
             ).fetchall()
         return [_technology_event_record_from_row(row) for row in rows]
 
@@ -4144,7 +4207,8 @@ class ControlDB:
                     "INSERT INTO monitoring_pending_notifications "
                     "(notification_id, account_id, domain, speed, scan_id, hosts_added_json, "
                     "hosts_removed_json, asset_count, asset_digest, needs_review, "
-                    "review_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "review_reason, created_at, easm_citations_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             secrets.token_hex(16),
@@ -4159,6 +4223,7 @@ class ControlDB:
                             int(n["needs_review"]),
                             n["review_reason"],
                             now,
+                            json.dumps(n.get("easm_citations", [])),
                         )
                         for n in notifications
                     ],
@@ -4192,6 +4257,7 @@ class ControlDB:
                 "asset_digest": row["asset_digest"],
                 "needs_review": bool(row["needs_review"]),
                 "review_reason": row["review_reason"],
+                "easm_citations": json.loads(row["easm_citations_json"]),
             }
             for row in rows
         ]

@@ -35,6 +35,7 @@ configuration — there is nothing to restore afterward. `"manual"` and
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -140,6 +141,25 @@ async def execute_scan(
                         (name, info.status.value, info.output_lines)
                         for name, info in sorted(context.tool_states.items())
                     ],
+                )
+                # Fase 18 (EASM roadmap): the missing wiring found while
+                # building monitoring integration -- without this call,
+                # `assets`/`observations`/`change_events`/`exposures`/
+                # etc. are never populated by a real scan (only ever by
+                # tests), which would make the new EASM-aware monitoring
+                # trigger silently see nothing. Runs in a thread (this is
+                # synchronous DB work, replaying full scan history per
+                # organization -- see api/easm_backfill.py's own
+                # docstring for the known scaling caveat) and in its own
+                # try/except: a backfill bug must never retroactively
+                # fail an already-completed scan.
+                from api.easm_backfill import run_easm_backfill_for_organization_safely
+
+                await asyncio.to_thread(
+                    run_easm_backfill_for_organization_safely,
+                    control_db=control_db,
+                    api_settings=api_settings,
+                    organization_id=scan_record.organization_id,
                 )
             # Deliberately its OWN try/except, never inside the same
             # scope as the scan's own status transition above: a bug or
