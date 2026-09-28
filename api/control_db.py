@@ -36,6 +36,8 @@ from api.asset_identity import (
     url_identity_key,
 )
 from api.candidate_assets import CandidateAssetDraft, candidate_signal_hash
+from api.change_detection import host_for_asset
+from api.domain_verification import domain_is_covered
 from api.exposure_identity import ExposureDraft
 from api.external_observation import (
     ObservationConfidenceClass,
@@ -48,6 +50,7 @@ from api.observation_identity import (
 )
 from api.relationship_identity import RelationshipDraft
 from api.technology_catalog import parse_technology_detail
+from core.risk_scoring import RiskFactors
 from core.store import connect_sqlite
 
 _SCHEMA = """
@@ -2540,6 +2543,84 @@ class ControlDB:
                 (organization_id, exposure_id),
             ).fetchone()
         return None if row is None else _exposure_record_from_row(row)
+
+    def risk_factors_for_exposure(
+        self, organization_id: str, exposure_id: str, *, now: str | None = None
+    ) -> RiskFactors | None:
+        """Fase 21 (EASM roadmap): reduces one real, persisted exposure
+        down to `core/risk_scoring.py::RiskFactors` — the DB-free shape
+        `classify_exposure_risk` needs. Returns `None` for an unknown
+        (or cross-tenant) exposure id, the same tenant-safety discipline
+        `get_exposure_for_organization` already established."""
+        exposure = self.get_exposure_for_organization(organization_id, exposure_id)
+        if exposure is None:
+            return None
+        now = now or _now_iso()
+
+        asset = self.get_asset(organization_id, exposure.asset_id)
+        domain_verified = False
+        if asset is not None:
+            try:
+                host = host_for_asset(asset_type=asset.asset_type, identity_key=asset.identity_key)
+            except ValueError:
+                host = None
+            if host is not None:
+                domain_verified = any(
+                    domain_is_covered(host, record.domain)
+                    for record in self.get_verified_domains_for_organization(
+                        organization_id, now=now
+                    )
+                )
+
+        if exposure.status == "resolved":
+            days_open = 0
+        else:
+            days_open = max(
+                0,
+                (datetime.fromisoformat(now) - datetime.fromisoformat(exposure.first_seen_at)).days,
+            )
+
+        related_to_critical_asset = False
+        related_reason: str | None = None
+        if asset is not None:
+            edges, _truncated = self.relationship_neighborhood(
+                organization_id, exposure.asset_id, max_depth=1
+            )
+            neighbor_asset_ids = {
+                (
+                    edge.target_asset_id
+                    if edge.source_asset_id == exposure.asset_id
+                    else edge.source_asset_id
+                )
+                for edge in edges
+            } - {exposure.asset_id, None}
+            for neighbor_asset_id in sorted(a for a in neighbor_asset_ids if a):
+                neighbor_exposures = self.list_exposures_for_organization(
+                    organization_id, asset_id=neighbor_asset_id, status=None
+                )
+                critical_neighbor = next(
+                    (
+                        e
+                        for e in neighbor_exposures
+                        if e.status in ("open", "reopened") and e.severity in ("high", "critical")
+                    ),
+                    None,
+                )
+                if critical_neighbor is not None:
+                    related_to_critical_asset = True
+                    related_reason = (
+                        f"related to asset {neighbor_asset_id} which has its own open "
+                        f"{critical_neighbor.severity} exposure ({critical_neighbor.title})"
+                    )
+                    break
+
+        return RiskFactors(
+            severity=exposure.severity,
+            domain_verified=domain_verified,
+            days_open=days_open,
+            related_to_critical_asset=related_to_critical_asset,
+            related_critical_asset_reason=related_reason,
+        )
 
     def list_exposures_for_organization(
         self,

@@ -200,6 +200,12 @@ class TestRestoreReferentialIntegrityCheck:
         # Simulate a hand-edited/corrupted snapshot: delete the asset row
         # directly (bypassing ControlDB entirely), leaving its
         # certificate_events/technology_events/observations dangling.
+        # Deliberately a bare sqlite3.connect(), never
+        # core.store.connect_sqlite() -- ControlDB's own connections DO
+        # enforce PRAGMA foreign_keys=ON (Fase 21 correction) and would
+        # reject this exact DELETE; this test is specifically about the
+        # external-tool-without-the-pragma scenario
+        # check_referential_integrity() exists for.
         conn = sqlite3.connect(backup_dest)
         conn.execute("DELETE FROM assets WHERE asset_id = ?", (asset.asset_id,))
         conn.commit()

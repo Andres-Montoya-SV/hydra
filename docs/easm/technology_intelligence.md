@@ -2,6 +2,17 @@
 
 Status: merged capability. This document is intentionally not phase-numbered; the official EASM roadmap reserves Fase 06 for Candidate Assets.
 
+> Superseded, not duplicated: this document describes the foundation
+> (httpx/WhatWeb → `technology_detected` observation → cross-run Asset
+> history) that already existed before Fase 14. Fase 14's own additions
+> on top of that foundation — canonical name normalization, per-run
+> ADDED/REMOVED/VERSION_CHANGED classification, and the current-
+> technology inventory queries — are documented separately in
+> [`14_technology_intelligence.md`](14_technology_intelligence.md), the
+> authoritative doc for anything built after this one. Kept as-is
+> (Fase 21 cleanup) rather than merged, since its own content remains
+> accurate and distinct.
+
 ## Decision
 
 Technology is a **neutral observation about an asset**, not an Asset type and not
