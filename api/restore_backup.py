@@ -33,6 +33,8 @@ import shutil
 import sys
 from pathlib import Path
 
+from api.restore_integrity import IntegrityReport, check_referential_integrity
+
 
 class RestoreTargetExistsError(RuntimeError):
     """Raised when `target_data_dir` already has a `control.db` and
@@ -40,7 +42,9 @@ class RestoreTargetExistsError(RuntimeError):
     wrong directory, or meant to pass `--force`."""
 
 
-def restore_backup(snapshot_dir: Path, target_data_dir: Path, *, force: bool = False) -> None:
+def restore_backup(
+    snapshot_dir: Path, target_data_dir: Path, *, force: bool = False
+) -> IntegrityReport:
     if not snapshot_dir.is_dir():
         raise FileNotFoundError(f"Backup snapshot directory not found: {snapshot_dir}")
 
@@ -76,6 +80,28 @@ def restore_backup(snapshot_dir: Path, target_data_dir: Path, *, force: bool = F
         f"Restored control.db and {restored_accounts} account recon.db file(s) from "
         f"{snapshot_dir} into {target_data_dir}."
     )
+
+    # Fase 20 (EASM roadmap): report-only, never destructive or
+    # restore-blocking — see this module's own docstring and
+    # api/restore_integrity.py's for the full reasoning behind that
+    # choice. Runs against the just-restored file, never the source
+    # snapshot, so it reflects exactly what the target will actually see.
+    report = check_referential_integrity(target_control_db)
+    if report.is_clean:
+        print("Referential integrity check: clean (no dangling references found).")
+    else:
+        print(
+            f"Referential integrity check: {len(report.orphaned_rows)} dangling "
+            "reference(s) found. Nothing was modified -- review before relying on "
+            "this data:"
+        )
+        for orphan in report.orphaned_rows:
+            print(
+                f"  - {orphan.table}.{orphan.row_id} references "
+                f"{orphan.referenced_table}.{orphan.missing_referenced_id} "
+                f"(via {orphan.reference_column}), which does not exist."
+            )
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:

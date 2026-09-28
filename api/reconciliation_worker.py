@@ -199,6 +199,50 @@ def run_retention_purge_job(*, api_settings: APISettings, control_db: ControlDB)
     return purged
 
 
+def run_observation_retention_purge_job(
+    *, api_settings: APISettings, control_db: ControlDB
+) -> tuple[int, int]:
+    """Job 3 (Fase 20, EASM roadmap): bounds the unbounded growth of raw
+    `observations` rows from continuous monitoring — the "observaciones
+    crudas... pueden crecer sin límite" the phase names explicitly.
+
+    Deliberately a THIRD, separate job from `run_retention_purge_job`
+    above, never folded into it: that job deletes whole `scans` rows and
+    their on-disk artifacts once a SCAN is old enough for its owning
+    account's tier; this one deletes SUPERSEDED per-run observation rows
+    within `control_db.py` while the asset/evidence/exposure they're
+    about persists indefinitely, for as long as the asset exists — a
+    completely different retention unit and a completely different
+    "what survives" guarantee. See
+    `ControlDB.purge_stale_observations_for_organization`'s own
+    docstring for the exact non-destructive rule (the single most recent
+    observation per asset+fact is never purged, `evidence`/`assets`/
+    `exposures` are never touched by this job at all).
+
+    One fixed retention window (`api_settings.observation_retention_days`)
+    applies to every organization — unlike scan/artifact retention, this
+    isn't a billing-tier concept; every organization's own raw
+    observation history is bounded the same way.
+
+    Reuses the exact same dry-run contract
+    `run_retention_purge_job` already established
+    (`api_settings.retention_purge_dry_run`): logs would-be counts, purges
+    nothing.
+
+    Returns `(observations_purged, evidence_purged)`, summed across every
+    organization — both `0` in dry-run mode."""
+    cutoff = _retention_cutoff(api_settings.observation_retention_days)
+    total_observations_purged = 0
+    total_evidence_purged = 0
+    for organization_id in control_db.list_all_organization_ids():
+        observations_purged, evidence_purged = control_db.purge_stale_observations_for_organization(
+            organization_id, cutoff=cutoff, dry_run=api_settings.retention_purge_dry_run
+        )
+        total_observations_purged += observations_purged
+        total_evidence_purged += evidence_purged
+    return total_observations_purged, total_evidence_purged
+
+
 async def run_reconciliation_loop(
     *,
     api_settings: APISettings,
@@ -225,11 +269,16 @@ async def run_reconciliation_loop(
         heartbeats.mark_alive("reconciliation")  # GET /health's liveness signal, api/health.py
         suspended_count = run_grace_period_job(control_db=control_db, email_sender=email_sender)
         purged_count = run_retention_purge_job(api_settings=api_settings, control_db=control_db)
+        observations_purged, evidence_purged = run_observation_retention_purge_job(
+            api_settings=api_settings, control_db=control_db
+        )
         logger.info(
             "Reconciliation cycle complete: %d account(s) suspended (grace period "
-            "expired), %d scan(s) purged%s.",
+            "expired), %d scan(s) purged, %d observation(s)/%d evidence row(s) purged%s.",
             suspended_count,
             purged_count,
+            observations_purged,
+            evidence_purged,
             " [DRY RUN — nothing actually deleted]" if api_settings.retention_purge_dry_run else "",
         )
         # `asyncio.TimeoutError`, never the bare builtin `TimeoutError` —
