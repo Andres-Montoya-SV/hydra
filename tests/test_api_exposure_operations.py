@@ -255,3 +255,28 @@ class TestLifecycleAuthorizationAndInput:
             reopen = client.post(f"{base}/reopen", headers=headers, json={"reason": "  "})
 
             assert (resolve.status_code, reopen.status_code) == (422, 422)
+
+
+class TestEvidencePagingAndCoercion:
+    def test_evidence_pages_at_the_sql_level_and_none_stays_unbounded(self, tmp_path: Path) -> None:
+        with _client(tmp_path) as client:
+            _, account_id, org = _account(client, "ev-sql@example.com")
+            exposure_id = _seed_exposure(client, account_id, org, run_id="run-1")
+            _seed_exposure(client, account_id, org, run_id="run-2")
+            db = client.app.state.control_db
+
+            everything = db.list_exposure_evidence(org, exposure_id)
+            page = db.list_exposure_evidence(org, exposure_id, limit=1, offset=1)
+
+            assert len(everything) == 2
+            assert [row.run_id for row in page] == [everything[1].run_id]
+
+    def test_non_integer_confidence_is_dropped_not_coerced(self) -> None:
+        from api.routers.exposures import _opt_int, _opt_str
+
+        assert _opt_int(80) == 80
+        assert _opt_int("80") is None
+        assert _opt_int(True) is None
+        assert _opt_int(None) is None
+        assert _opt_str(None) is None
+        assert _opt_str("x") == "x"

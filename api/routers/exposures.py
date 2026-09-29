@@ -78,15 +78,25 @@ def _finding_lookup(
             return None
         return ExposureFindingResponse(
             host=str(finding["host"]),
-            url=finding.get("url"),  # type: ignore[arg-type]
-            name=finding.get("name"),  # type: ignore[arg-type]
-            severity=finding.get("severity"),  # type: ignore[arg-type]
-            description=finding.get("description"),  # type: ignore[arg-type]
-            confidence_score=finding.get("confidence_score"),  # type: ignore[arg-type]
-            discovered_at=finding.get("discovered_at"),  # type: ignore[arg-type]
+            url=_opt_str(finding.get("url")),
+            name=_opt_str(finding.get("name")),
+            severity=_opt_str(finding.get("severity")),
+            description=_opt_str(finding.get("description")),
+            confidence_score=_opt_int(finding.get("confidence_score")),
+            discovered_at=_opt_str(finding.get("discovered_at")),
         )
 
     return lookup
+
+
+def _opt_str(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+def _opt_int(value: object) -> int | None:
+    """A raw SQLite value that isn't a real integer is dropped, not coerced
+    into a misleading number."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 @router.get("/{organization_id}/exposures", response_model=list[ExposureResponse])
@@ -148,7 +158,7 @@ def list_evidence(
     _require_member(db, auth.account_id, organization_id)
     if db.get_exposure_for_organization(organization_id, exposure_id) is None:
         raise HTTPException(status_code=404, detail="Exposure not found")
-    rows = db.list_exposure_evidence(organization_id, exposure_id)[offset : offset + limit]
+    rows = db.list_exposure_evidence(organization_id, exposure_id, limit=limit, offset=offset)
     lookup = _finding_lookup(request.app.state.api_settings)
     return [
         ExposureEvidenceResponse(

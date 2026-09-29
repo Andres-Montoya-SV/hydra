@@ -2843,14 +2843,25 @@ class ControlDB:
         return [_exposure_record_from_row(row) for row in rows]
 
     def list_exposure_evidence(
-        self, organization_id: str, exposure_id: str
+        self,
+        organization_id: str,
+        exposure_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[ExposureEvidenceRecord]:
+        """`limit=None` (the default) returns every row with no SQL LIMIT,
+        as internal callers expect; the API passes an explicit page."""
+        query = (
+            "SELECT * FROM exposure_evidence WHERE organization_id = ? "
+            "AND exposure_id = ? ORDER BY observed_at, exposure_evidence_id"
+        )
+        params: list[object] = [organization_id, exposure_id]
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM exposure_evidence WHERE organization_id = ? "
-                "AND exposure_id = ? ORDER BY observed_at, exposure_evidence_id",
-                (organization_id, exposure_id),
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [_exposure_evidence_record_from_row(row) for row in rows]
 
     def list_exposure_history(
