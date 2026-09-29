@@ -2409,17 +2409,13 @@ class ControlDB:
     ) -> list[CandidateAssetRecord]:
         """`limit=None` returns every row (internal callers); the API always
         passes an explicit page, applied in SQL."""
-        query = "SELECT * FROM candidate_assets WHERE organization_id = ?"
-        params: list[object] = [organization_id]
-        if candidate_type is not None:
-            query += " AND candidate_type = ?"
-            params.append(candidate_type)
-        query += " ORDER BY first_seen_at, candidate_asset_id"
-        if limit is not None:
-            query += " LIMIT ? OFFSET ?"
-            params.extend([limit, offset])
         with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM candidate_assets WHERE organization_id = ? "
+                "AND (? IS NULL OR candidate_type = ?) "
+                "ORDER BY first_seen_at, candidate_asset_id LIMIT ? OFFSET ?",
+                (organization_id, candidate_type, candidate_type, _sql_limit(limit), offset),
+            ).fetchall()
         return [_candidate_asset_record_from_row(row) for row in rows]
 
     def list_pending_candidates_first_seen_in_run(
@@ -3367,16 +3363,13 @@ class ControlDB:
         own `(organization_id, exposure_id)` scoping; this method
         originally took only `relationship_id`, a latent cross-tenant IDOR
         unreachable only because no Relationships API router exists yet."""
-        query = (
-            "SELECT * FROM relationship_evidence WHERE organization_id = ? "
-            "AND relationship_id = ? ORDER BY observed_at, relationship_evidence_id"
-        )
-        params: list[object] = [organization_id, relationship_id]
-        if limit is not None:
-            query += " LIMIT ? OFFSET ?"
-            params.extend([limit, offset])
         with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM relationship_evidence WHERE organization_id = ? "
+                "AND relationship_id = ? ORDER BY observed_at, relationship_evidence_id "
+                "LIMIT ? OFFSET ?",
+                (organization_id, relationship_id, _sql_limit(limit), offset),
+            ).fetchall()
         return [_relationship_evidence_record_from_row(row) for row in rows]
 
     def count_relationship_evidence(self, organization_id: str, relationship_id: str) -> int:
@@ -3505,10 +3498,6 @@ class ControlDB:
         in `core/store.py`.
 
         `newest=N` returns only the N most recent (still oldest first)."""
-        order = (
-            "ORDER BY o.observed_at" if newest is None else "ORDER BY o.observed_at DESC LIMIT ?"
-        )
-        params: tuple[object, ...] = (asset_id,) if newest is None else (asset_id, newest)
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT o.*, "
@@ -3518,11 +3507,12 @@ class ControlDB:
                 "e.organization_id AS e_organization_id, e.asset_id AS e_asset_id, "
                 "e.confidence_class AS e_confidence_class "
                 "FROM observations o JOIN evidence e ON o.evidence_id = e.evidence_id "
-                "WHERE o.asset_id = ? " + order,
-                params,
+                "WHERE o.asset_id = ? ORDER BY o.observed_at DESC, o.observation_id DESC "
+                "LIMIT ?",
+                # SQLite: a negative LIMIT means no limit.
+                (asset_id, -1 if newest is None else newest),
             ).fetchall()
-        records = [_observation_with_evidence_from_row(row) for row in rows]
-        return records if newest is None else records[::-1]
+        return [_observation_with_evidence_from_row(row) for row in reversed(rows)]
 
     def observation_summary(self, asset_id: str) -> tuple[int, int, list[str]]:
         """(observation count, distinct scans, distinct confidence classes)."""
@@ -4310,12 +4300,13 @@ class ControlDB:
     def list_scope_exclusions(
         self, organization_id: str, *, include_removed: bool = False
     ) -> list[ScopeExclusionRecord]:
-        query = "SELECT * FROM organization_scope_exclusions WHERE organization_id = ?"
-        if not include_removed:
-            query += " AND removed_at IS NULL"
         with self._connect() as conn:
-            rows = conn.execute(query + " ORDER BY pattern, created_at", (organization_id,))
-            return [ScopeExclusionRecord(**dict(row)) for row in rows.fetchall()]
+            rows = conn.execute(
+                "SELECT * FROM organization_scope_exclusions WHERE organization_id = ? "
+                "AND (? OR removed_at IS NULL) ORDER BY pattern, created_at",
+                (organization_id, include_removed),
+            ).fetchall()
+        return [ScopeExclusionRecord(**dict(row)) for row in rows]
 
     def active_exclusion_patterns(self, organization_id: str) -> list[str]:
         return [record.pattern for record in self.list_scope_exclusions(organization_id)]
@@ -5802,6 +5793,11 @@ def _scan_record_from_row(row: sqlite3.Row) -> ScanRecord:
 
 def _json_tuple(raw: str | None) -> tuple[str, ...] | None:
     return None if raw is None else tuple(json.loads(raw))
+
+
+def _sql_limit(limit: int | None) -> int:
+    """A LIMIT value for a literal `LIMIT ?`: SQLite reads -1 as "no limit"."""
+    return -1 if limit is None else limit
 
 
 def _audit_scan_override(

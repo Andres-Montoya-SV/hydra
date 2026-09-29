@@ -18,11 +18,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from api.auth import AuthContext, require_api_key
 from api.control_db import (
-    ControlDB,
     DuplicateExclusionError,
     ScopeExclusionRecord,
-    role_can_modify_scope,
 )
+from api.routers.org_access import control_db as _db
+from api.routers.org_access import require_member as _require_member
+from api.routers.org_access import require_owner as _require_owner
 from api.schemas import (
     AddScopeExclusionRequest,
     RemoveScopeExclusionRequest,
@@ -34,22 +35,6 @@ from core.assets import normalize_domain
 from core.scope import normalize_exclusion_pattern
 
 router = APIRouter(prefix="/organizations", tags=["scope"])
-
-
-def _db(request: Request) -> ControlDB:
-    return request.app.state.control_db  # type: ignore[no-any-return]
-
-
-def _require_role(db: ControlDB, account_id: str, organization_id: str) -> str:
-    role = db.get_role_for_account_organization(account_id, organization_id)
-    if role is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
-    return role
-
-
-def _require_owner(db: ControlDB, account_id: str, organization_id: str) -> None:
-    if not role_can_modify_scope(_require_role(db, account_id, organization_id)):
-        raise HTTPException(status_code=403, detail="Owner role required")
 
 
 def _response(record: ScopeExclusionRecord) -> ScopeExclusionResponse:
@@ -66,7 +51,7 @@ def list_exclusions(
     auth: AuthContext = Depends(require_api_key),
 ) -> list[ScopeExclusionResponse]:
     db = _db(request)
-    _require_role(db, auth.account_id, organization_id)
+    _require_member(db, auth.account_id, organization_id)
     records = db.list_scope_exclusions(organization_id, include_removed=include_removed)
     return [_response(record) for record in records]
 
@@ -131,7 +116,7 @@ def classify(
     auth: AuthContext = Depends(require_api_key),
 ) -> ScopeClassificationResponse:
     db = _db(request)
-    _require_role(db, auth.account_id, organization_id)
+    _require_member(db, auth.account_id, organization_id)
     normalized = normalize_domain(host)
     if not normalized:
         raise HTTPException(status_code=422, detail="Not a valid hostname")

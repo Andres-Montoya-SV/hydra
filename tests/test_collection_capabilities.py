@@ -8,9 +8,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from _org_helpers import api_client, verified_owner
 from _verified_account import create_verified_account
 from _verified_domain import seed_verified_domain
-from fastapi.testclient import TestClient
 
 from api.collection_capabilities import (
     CapabilityRequestError,
@@ -20,7 +20,6 @@ from api.collection_capabilities import (
     tier_ceiling,
     validate_requested,
 )
-from api.main import create_app
 from api.settings import APISettings
 
 DOMAIN = "caps.example"
@@ -60,20 +59,10 @@ class TestCatalogAndCeilings:
         assert resolved == {"ctlogs"}
 
 
-def _client(tmp_path: Path) -> TestClient:
-    return TestClient(create_app(APISettings(data_dir=tmp_path / "api", max_concurrent_scans=0)))
-
-
-def _owner(client: TestClient) -> tuple[dict[str, str], str, str]:
-    api_key, account_id = create_verified_account(client)
-    org = client.app.state.control_db.list_organizations_for_account(account_id)[0][0]
-    return {"X-API-Key": api_key}, account_id, org
-
-
 class TestOrganizationDefault:
     def test_a_new_org_reports_the_builtin_default(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            headers, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, _, org = verified_owner(client)
 
             body = client.get(f"/organizations/{org}/collection-settings", headers=headers).json()
 
@@ -84,8 +73,8 @@ class TestOrganizationDefault:
             assert naabu["entitled"] is False
 
     def test_owner_saves_a_default_and_it_is_audited_once(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            headers, account_id, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, account_id, org = verified_owner(client)
             url = f"/organizations/{org}/collection-settings"
 
             saved = client.put(url, headers=headers, json={"enabled_providers": ["ctlogs"]})
@@ -104,8 +93,8 @@ class TestOrganizationDefault:
             assert audit[0]["after"] == ["ctlogs"]
 
     def test_a_higher_tier_provider_is_a_typed_403_not_a_silent_drop(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            headers, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, _, org = verified_owner(client)
             url = f"/organizations/{org}/collection-settings"
 
             resp = client.put(url, headers=headers, json={"enabled_providers": ["ctlogs", "naabu"]})
@@ -117,8 +106,8 @@ class TestOrganizationDefault:
             assert client.get(f"{url}/audit", headers=headers).json() == []
 
     def test_unknown_or_always_on_provider_is_422(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            headers, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, _, org = verified_owner(client)
             url = f"/organizations/{org}/collection-settings"
 
             unknown = client.put(url, headers=headers, json={"enabled_providers": ["nope"]})
@@ -127,8 +116,8 @@ class TestOrganizationDefault:
             assert (unknown.status_code, required.status_code) == (422, 422)
 
     def test_a_downgrade_shows_saved_providers_as_not_entitled(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            headers, account_id, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, account_id, org = verified_owner(client)
             db = client.app.state.control_db
             db.set_tier(account_id, "pro")
             url = f"/organizations/{org}/collection-settings"
@@ -143,8 +132,8 @@ class TestOrganizationDefault:
 
 class TestRolesAndTenancy:
     def test_viewer_can_read_but_not_change(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            owner_headers, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            owner_headers, _, org = verified_owner(client)
             viewer_key, viewer_id = create_verified_account(client)
             client.app.state.control_db.add_account_organization_role(
                 account_id=viewer_id, organization_id=org, role="viewer"
@@ -159,8 +148,8 @@ class TestRolesAndTenancy:
             assert client.get(url, headers=owner_headers).json()["source"] == "default"
 
     def test_foreign_account_gets_404_everywhere(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            _, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            _, _, org = verified_owner(client)
             foreign_key, _ = create_verified_account(client)
             foreign = {"X-API-Key": foreign_key}
             url = f"/organizations/{org}/collection-settings"
@@ -176,8 +165,8 @@ class TestRolesAndTenancy:
 
 class TestScanOverride:
     def test_override_is_stored_on_the_scan_and_audited(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            headers, account_id, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, account_id, org = verified_owner(client)
             seed_verified_domain(client, account_id, DOMAIN)
 
             created = client.post(
@@ -201,8 +190,8 @@ class TestScanOverride:
     def test_override_above_the_tier_creates_no_scan_and_spends_no_quota(
         self, tmp_path: Path
     ) -> None:
-        with _client(tmp_path) as client:
-            headers, account_id, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, account_id, org = verified_owner(client)
             seed_verified_domain(client, account_id, DOMAIN)
             db = client.app.state.control_db
 
@@ -216,8 +205,8 @@ class TestScanOverride:
             assert db.list_capability_audit(org) == []
 
     def test_scan_without_override_has_none(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            headers, account_id, _ = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, account_id, _ = verified_owner(client)
             seed_verified_domain(client, account_id, DOMAIN)
 
             scan_id = client.post("/scans", headers=headers, json={"domain": DOMAIN}).json()[

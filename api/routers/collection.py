@@ -24,6 +24,8 @@ from api.collection_capabilities import (
     validate_requested,
 )
 from api.control_db import ControlDB, role_can_modify_scope
+from api.routers.org_access import control_db as _db
+from api.routers.org_access import require_member as _require_member
 from api.schemas import (
     CapabilityAuditResponse,
     CollectionSettingsResponse,
@@ -32,17 +34,6 @@ from api.schemas import (
 )
 
 router = APIRouter(prefix="/organizations", tags=["collection"])
-
-
-def _db(request: Request) -> ControlDB:
-    return request.app.state.control_db  # type: ignore[no-any-return]
-
-
-def _require_role(db: ControlDB, account_id: str, organization_id: str) -> str:
-    role = db.get_role_for_account_organization(account_id, organization_id)
-    if role is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
-    return role
 
 
 def account_tier(db: ControlDB, account_id: str) -> str:
@@ -104,7 +95,7 @@ def get_collection_settings(
     organization_id: str, request: Request, auth: AuthContext = Depends(require_api_key)
 ) -> CollectionSettingsResponse:
     db = _db(request)
-    _require_role(db, auth.account_id, organization_id)
+    _require_member(db, auth.account_id, organization_id)
     return _settings_response(db, organization_id, account_tier(db, auth.account_id))
 
 
@@ -120,7 +111,7 @@ def update_collection_settings(
     silently. Saving the same set again changes nothing and adds no audit
     entry."""
     db = _db(request)
-    if not role_can_modify_scope(_require_role(db, auth.account_id, organization_id)):
+    if not role_can_modify_scope(_require_member(db, auth.account_id, organization_id)):
         raise HTTPException(status_code=403, detail="Owner role required")
     try:
         requested = validate_requested(body.enabled_providers)
@@ -153,7 +144,7 @@ def list_collection_audit(
 ) -> list[CapabilityAuditResponse]:
     """Every default change and per-scan override, newest first."""
     db = _db(request)
-    _require_role(db, auth.account_id, organization_id)
+    _require_member(db, auth.account_id, organization_id)
     return [
         CapabilityAuditResponse(
             audit_id=row.audit_id,

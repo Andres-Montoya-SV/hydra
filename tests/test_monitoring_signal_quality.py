@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from _org_helpers import RecordingSender
 from fastapi.testclient import TestClient
 
 from api.control_db import ControlDB
@@ -29,16 +30,6 @@ from core.store import AssetStore
 DOMAIN = "example.com"
 HEALTHY = [("subfinder", "success_with_results", 2), ("ctlogs", "success_with_results", 2)]
 CTLOGS_FAILED = [("subfinder", "success_with_results", 1), ("ctlogs", "failed", 0)]
-
-
-class _Sender:
-    def __init__(self) -> None:
-        self.alerts: list[list[str]] = []
-
-    def send_monitoring_alert(
-        self, *, to, account_id, summary_lines, truncated_count
-    ):  # noqa: ANN001
-        self.alerts.append(summary_lines)
 
 
 @pytest.fixture
@@ -77,7 +68,7 @@ def _monitored_account(control_db: ControlDB, api_settings: APISettings) -> tupl
 def _run_cycle(
     control_db: ControlDB,
     api_settings: APISettings,
-    sender: _Sender,
+    sender: RecordingSender,
     ids: tuple[str, str],
     *,
     hosts: list[str],
@@ -138,7 +129,7 @@ class TestCollectorFailureIsNotAHostRemoval:
     def test_failed_collector_run_alerts_nothing_and_keeps_the_baseline(
         self, control_db: ControlDB, api_settings: APISettings
     ) -> None:
-        sender = _Sender()
+        sender = RecordingSender()
         ids = _monitored_account(control_db, api_settings)
         baseline_scan = _run_cycle(
             control_db,
@@ -160,7 +151,7 @@ class TestCollectorFailureIsNotAHostRemoval:
     def test_the_next_healthy_run_does_not_report_everything_as_added(
         self, control_db: ControlDB, api_settings: APISettings
     ) -> None:
-        sender = _Sender()
+        sender = RecordingSender()
         ids = _monitored_account(control_db, api_settings)
         both = ["a.example.com", "b.example.com"]
         _run_cycle(control_db, api_settings, sender, ids, hosts=both, outcomes=HEALTHY)
@@ -179,7 +170,7 @@ class TestCollectorFailureIsNotAHostRemoval:
     def test_a_genuine_removal_with_healthy_collectors_still_alerts(
         self, control_db: ControlDB, api_settings: APISettings
     ) -> None:
-        sender = _Sender()
+        sender = RecordingSender()
         ids = _monitored_account(control_db, api_settings)
         _run_cycle(
             control_db,
@@ -287,7 +278,7 @@ class TestDegradedRunsAreLoggedOncePerCycle:
     def test_one_aggregated_warning_not_one_per_domain(
         self, control_db: ControlDB, api_settings: APISettings, caplog: pytest.LogCaptureFixture
     ) -> None:
-        sender = _Sender()
+        sender = RecordingSender()
         ids = _monitored_account(control_db, api_settings)
         _run_cycle(
             control_db,
@@ -325,7 +316,7 @@ class TestOnlyHostnameCollectorsCanSuppressRemovals:
     def test_a_failed_vulnerability_scanner_does_not_hide_a_real_removal(
         self, control_db: ControlDB, api_settings: APISettings
     ) -> None:
-        sender = _Sender()
+        sender = RecordingSender()
         ids = _monitored_account(control_db, api_settings)
         with_nuclei = [*HEALTHY, ("nuclei", "success_with_results", 3)]
         nuclei_failed = [*HEALTHY, ("nuclei", "failed", 0)]

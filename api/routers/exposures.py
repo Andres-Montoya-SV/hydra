@@ -13,6 +13,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, ExposureEvidenceRecord, ExposureRecord
+from api.routers.org_access import control_db as _db
+from api.routers.org_access import require_member as _require_member
 from api.schemas import (
     ExposureEvidenceResponse,
     ExposureFindingResponse,
@@ -31,15 +33,6 @@ from core.risk_scoring import classify_exposure_risk
 from core.store import AssetStore
 
 router = APIRouter(prefix="/organizations", tags=["exposures"])
-
-
-def _db(request: Request) -> ControlDB:
-    return request.app.state.control_db  # type: ignore[no-any-return]
-
-
-def _require_member(db: ControlDB, account_id: str, organization_id: str) -> None:
-    if db.get_role_for_account_organization(account_id, organization_id) is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
 
 
 def _require_owner_and_exposure(

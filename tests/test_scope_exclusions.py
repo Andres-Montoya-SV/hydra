@@ -11,13 +11,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from _org_helpers import api_client, verified_owner
 from _verified_account import create_verified_account
 from _verified_domain import seed_verified_domain
 from fastapi.testclient import TestClient
 
 from api.candidate_assets import CandidateAssetDraft
-from api.main import create_app
-from api.settings import APISettings
 from config.settings import Settings
 from core.exceptions import ConfigurationError
 from core.intel.scope import CollectionScope, allows_active_collection
@@ -79,16 +78,6 @@ class TestEnforcement:
         PipelineRunner(settings)._enforce_scope([DomainTarget(domain="acme.example")])
 
 
-def _client(tmp_path: Path) -> TestClient:
-    return TestClient(create_app(APISettings(data_dir=tmp_path / "api", max_concurrent_scans=0)))
-
-
-def _owner(client: TestClient) -> tuple[dict[str, str], str, str]:
-    api_key, account_id = create_verified_account(client)
-    org = client.app.state.control_db.list_organizations_for_account(account_id)[0][0]
-    return {"X-API-Key": api_key}, account_id, org
-
-
 def _add(client: TestClient, headers: dict[str, str], org: str, pattern: str):  # noqa: ANN202
     return client.post(
         f"/organizations/{org}/scope/exclusions",
@@ -99,8 +88,8 @@ def _add(client: TestClient, headers: dict[str, str], org: str, pattern: str):  
 
 class TestExclusionEndpoints:
     def test_owner_adds_lists_and_removes_with_history_kept(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            headers, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, _, org = verified_owner(client)
             created = _add(client, headers, org, "Legacy.acme.example").json()
             url = f"/organizations/{org}/scope/exclusions"
 
@@ -121,8 +110,8 @@ class TestExclusionEndpoints:
     def test_duplicates_invalid_patterns_and_blank_reasons_are_rejected(
         self, tmp_path: Path
     ) -> None:
-        with _client(tmp_path) as client:
-            headers, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, _, org = verified_owner(client)
             _add(client, headers, org, "legacy.acme.example")
 
             blank = client.post(
@@ -136,8 +125,8 @@ class TestExclusionEndpoints:
             assert blank.status_code == 422
 
     def test_viewer_can_read_but_not_change(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            owner, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            owner, _, org = verified_owner(client)
             created = _add(client, owner, org, "legacy.acme.example").json()
             viewer_key, viewer_id = create_verified_account(client)
             client.app.state.control_db.add_account_organization_role(
@@ -158,10 +147,10 @@ class TestExclusionEndpoints:
             assert delete.status_code == 403
 
     def test_a_foreign_account_gets_404_everywhere(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            owner, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            owner, _, org = verified_owner(client)
             created = _add(client, owner, org, "legacy.acme.example").json()
-            foreign, _, _ = _owner(client)
+            foreign, _, _ = verified_owner(client)
             url = f"/organizations/{org}/scope"
 
             responses = [
@@ -180,10 +169,10 @@ class TestExclusionEndpoints:
             assert client.get(f"{url}/exclusions", headers=owner).json()[0]["removed_at"] is None
 
     def test_removing_another_orgs_exclusion_is_404(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            owner, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            owner, _, org = verified_owner(client)
             created = _add(client, owner, org, "legacy.acme.example").json()
-            other_owner, _, other_org = _owner(client)
+            other_owner, _, other_org = verified_owner(client)
 
             resp = client.request(
                 "DELETE",
@@ -199,8 +188,8 @@ class TestScanCreation:
     def test_a_scan_of_an_excluded_target_is_refused_without_spending_quota(
         self, tmp_path: Path
     ) -> None:
-        with _client(tmp_path) as client:
-            headers, account_id, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, account_id, org = verified_owner(client)
             seed_verified_domain(client, account_id, DOMAIN)
             _add(client, headers, org, "legacy.acme.example")
 
@@ -246,8 +235,8 @@ def _candidate(client: TestClient, org: str, value: str, scope_status: str) -> N
 
 class TestClassification:
     def test_each_class_with_its_reason(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            headers, account_id, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, account_id, org = verified_owner(client)
             seed_verified_domain(client, account_id, DOMAIN)
             _candidate(client, org, "new.acme.example", "IN_SCOPE")
             _candidate(client, org, "cdn.partner.example", "OUT_OF_SCOPE")
@@ -277,8 +266,8 @@ class TestClassification:
             )
 
     def test_an_exclusion_wins_over_a_candidate(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            headers, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, _, org = verified_owner(client)
             _candidate(client, org, "new.acme.example", "IN_SCOPE")
             created = _add(client, headers, org, "*.acme.example").json()
 
@@ -294,8 +283,8 @@ class TestOrchestratorHandOff:
     def test_api_scans_carry_the_organizations_active_exclusions(self, tmp_path: Path) -> None:
         from api.scan_orchestrator import _scan_settings
 
-        with _client(tmp_path) as client:
-            headers, account_id, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, account_id, org = verified_owner(client)
             seed_verified_domain(client, account_id, DOMAIN)
             _add(client, headers, org, "legacy.acme.example")
             removed = _add(client, headers, org, "old.acme.example").json()
@@ -322,8 +311,8 @@ class TestOrchestratorHandOff:
 
 class TestCandidatePagination:
     def test_candidate_list_pages_in_sql_with_type_filter(self, tmp_path: Path) -> None:
-        with _client(tmp_path) as client:
-            headers, _, org = _owner(client)
+        with api_client(tmp_path) as client:
+            headers, _, org = verified_owner(client)
             for i in range(5):
                 _candidate(client, org, f"c{i}.acme.example", "IN_SCOPE")
             url = f"/organizations/{org}/candidate-assets"

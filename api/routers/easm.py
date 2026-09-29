@@ -52,6 +52,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from api.auth import AuthContext, require_api_key
 from api.control_db import AssetRecord, ControlDB, LastOwnerError, RelationshipRecord
+from api.routers.org_access import control_db as _db
+from api.routers.org_access import require_member as _require_member
+from api.routers.org_access import require_owner as _require_owner
 from api.schemas import (
     AddOrganizationMemberRequest,
     AnalystProvenanceResponse,
@@ -86,25 +89,6 @@ from core.assets import HttpService
 router = APIRouter(prefix="/organizations", tags=["easm"])
 
 _T = TypeVar("_T")
-
-
-def _db(request: Request) -> ControlDB:
-    return request.app.state.control_db  # type: ignore[no-any-return]
-
-
-def _require_member(db: ControlDB, account_id: str, organization_id: str) -> str:
-    role = db.get_role_for_account_organization(account_id, organization_id)
-    if role is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
-    return role
-
-
-def _require_owner(db: ControlDB, account_id: str, organization_id: str) -> None:
-    role = _require_member(db, account_id, organization_id)
-    from api.control_db import role_can_modify_scope
-
-    if not role_can_modify_scope(role):
-        raise HTTPException(status_code=403, detail="Owner role required")
 
 
 def _require_member_manager(db: ControlDB, account_id: str, organization_id: str) -> None:

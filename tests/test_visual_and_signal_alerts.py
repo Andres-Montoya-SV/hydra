@@ -12,6 +12,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from _org_helpers import RecordingSender
 from fastapi.testclient import TestClient
 
 from api.asset_identity import ReconciliationDecision
@@ -298,16 +299,6 @@ class TestRiskChangeAlerts:
         assert _risk_change_citations(db, org, "run-2") == []
 
 
-class _Sender:
-    def __init__(self) -> None:
-        self.alerts: list[list[str]] = []
-
-    def send_monitoring_alert(
-        self, *, to, account_id, summary_lines, truncated_count
-    ):  # noqa: ANN001, ANN201
-        self.alerts.append(summary_lines)
-
-
 def _monitored(db: ControlDB, settings: APISettings) -> tuple[str, str]:
     account_id = db.create_account(email=f"mon-{secrets.token_hex(4)}@x.test")
     db.create_default_subscription(account_id, tier="pro")
@@ -339,7 +330,7 @@ def _cycle(db: ControlDB, settings: APISettings, ids: tuple[str, str], svc: Http
             "UPDATE monitored_domains SET next_passive_due_at = ? " "WHERE monitoring_id = ?",
             (past, monitoring_id),
         )
-    sender = _Sender()
+    sender = RecordingSender()
     run_monitoring_cycle(api_settings=settings, control_db=db, email_sender=sender)
     scan_id = db.get_monitored_domain(account_id, DOMAIN).pending_passive_scan_id
     store = AssetStore(account_db_path(settings, account_id))
@@ -349,15 +340,22 @@ def _cycle(db: ControlDB, settings: APISettings, ids: tuple[str, str], svc: Http
     run_monitoring_cycle(api_settings=settings, control_db=db, email_sender=sender)
 
 
+def _notifications_after_two_cycles(
+    tmp_path: Path, first: HttpService, second: HttpService
+):  # noqa: ANN202
+    settings = APISettings(data_dir=tmp_path / "api", monitoring_asset_count_ceiling=1000)
+    db = ControlDB(settings.control_db_path)
+    ids = _monitored(db, settings)
+    _cycle(db, settings, ids, first)
+    _cycle(db, settings, ids, second)
+    return db.list_monitoring_notifications(ids[0], DOMAIN)
+
+
 class TestVisualChangeReachesMonitoringAlerts:
     def test_a_favicon_swap_alone_fires_an_explained_alert(self, tmp_path: Path) -> None:
-        settings = APISettings(data_dir=tmp_path / "api", monitoring_asset_count_ceiling=1000)
-        db = ControlDB(settings.control_db_path)
-        ids = _monitored(db, settings)
-        _cycle(db, settings, ids, _svc())
-        _cycle(db, settings, ids, _svc(favicon="999", body_hash="changed-every-time"))
-
-        notifications = db.list_monitoring_notifications(ids[0], DOMAIN)
+        notifications = _notifications_after_two_cycles(
+            tmp_path, _svc(), _svc(favicon="999", body_hash="changed-every-time")
+        )
 
         assert len(notifications) == 1
         assert notifications[0].citations == (
@@ -365,10 +363,7 @@ class TestVisualChangeReachesMonitoringAlerts:
         )
 
     def test_body_only_churn_never_alerts(self, tmp_path: Path) -> None:
-        settings = APISettings(data_dir=tmp_path / "api", monitoring_asset_count_ceiling=1000)
-        db = ControlDB(settings.control_db_path)
-        ids = _monitored(db, settings)
-        _cycle(db, settings, ids, _svc(body_hash="a"))
-        _cycle(db, settings, ids, _svc(body_hash="b"))
-
-        assert db.list_monitoring_notifications(ids[0], DOMAIN) == []
+        assert (
+            _notifications_after_two_cycles(tmp_path, _svc(body_hash="a"), _svc(body_hash="b"))
+            == []
+        )
