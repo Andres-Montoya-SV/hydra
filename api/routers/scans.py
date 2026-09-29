@@ -21,10 +21,14 @@ from api import subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, DomainVerificationRecord, ScanRecord
 from api.domain_verification import classify_scan_gate, normalize_domain
+from api.monitoring import DEGRADED_OUTCOMES
 from api.schemas import (
     ClientReportRequest,
     CreateScanRequest,
     CreateScanResponse,
+    ProviderOutcome,
+    ProviderRunOutcomeResponse,
+    ScanCollectionResponse,
     ScanStatusResponse,
 )
 from api.settings import APISettings
@@ -176,6 +180,47 @@ def get_scan_status(
         updated_at=scan.updated_at,
         error_message=scan.error_message,
         collection_profile=scan.collection_profile,
+    )
+
+
+@router.get("/{scan_id}/collection", response_model=ScanCollectionResponse)
+def get_scan_collection(
+    scan_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> ScanCollectionResponse:
+    """How each collector actually did on this scan. A scan's own status
+    only says the pipeline finished; this says whether every collector
+    ran cleanly, so a failed collector is never mistaken for "nothing
+    found". Empty (and not degraded) for a scan that hasn't completed,
+    since outcomes are recorded only once a scan finishes."""
+    import modules  # noqa: F401 - registers every plugin for the inventory
+    from core.provider_contract import provider_inventory
+
+    control_db = _control_db(request)
+    scan = _owned_scan_or_404(control_db, scan_id, auth.account_id)
+    rows = (
+        control_db.list_provider_run_outcomes(scan.organization_id, scan_id)
+        if scan.organization_id
+        else []
+    )
+    capability_of = {d.provider: d.capability.value for d in provider_inventory()}
+    outcomes = [
+        ProviderRunOutcomeResponse(
+            provider=row.provider,
+            capability=capability_of.get(row.provider, "uncategorized"),
+            # record_provider_run_outcomes rejects anything outside this
+            # Literal's values at write time, so the stored value is one of them.
+            outcome=cast(ProviderOutcome, row.outcome),
+            output_lines=row.output_lines,
+            recorded_at=row.recorded_at,
+        )
+        for row in rows
+    ]
+    return ScanCollectionResponse(
+        scan_id=scan_id,
+        degraded=any(o.outcome in DEGRADED_OUTCOMES for o in outcomes),
+        outcomes=outcomes,
     )
 
 

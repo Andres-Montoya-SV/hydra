@@ -8,13 +8,19 @@ router adds no second authorization system.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from typing import Literal, cast
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from api import subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB
 from api.domain_verification import classify_scan_gate, normalize_domain
-from api.schemas import MonitoringStatusResponse, SetMonitoringRequest
+from api.schemas import (
+    MonitoringNotificationResponse,
+    MonitoringStatusResponse,
+    SetMonitoringRequest,
+)
 from api.settings import APISettings
 
 router = APIRouter(prefix="/domains", tags=["monitoring"])
@@ -98,6 +104,44 @@ def get_monitoring(
     if record is None:
         raise HTTPException(status_code=404, detail=f"{domain!r} is not being monitored")
     return _to_response(record)
+
+
+@router.get(
+    "/{domain}/monitoring/notifications",
+    response_model=list[MonitoringNotificationResponse],
+)
+def list_monitoring_notifications(
+    domain: str,
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    auth: AuthContext = Depends(require_api_key),
+) -> list[MonitoringNotificationResponse]:
+    """Alert history for one monitored domain, newest first: what changed
+    (hosts added/removed), whether it needs review and why, and the exact
+    change/certificate/technology/exposure events behind it."""
+    domain = normalize_domain(domain)
+    control_db = _control_db(request)
+    if control_db.get_monitored_domain(auth.account_id, domain) is None:
+        raise HTTPException(status_code=404, detail=f"{domain!r} is not being monitored")
+    return [
+        MonitoringNotificationResponse(
+            notification_id=row.notification_id,
+            speed=cast(Literal["passive", "active"], row.speed),
+            scan_id=row.scan_id,
+            hosts_added=list(row.hosts_added),
+            hosts_removed=list(row.hosts_removed),
+            asset_count=row.asset_count,
+            needs_review=row.needs_review,
+            review_reason=row.review_reason,
+            citations=list(row.citations),
+            created_at=row.created_at,
+            sent_at=row.sent_at,
+        )
+        for row in control_db.list_monitoring_notifications(
+            auth.account_id, domain, limit=limit, offset=offset
+        )
+    ]
 
 
 @router.post("/{domain}/monitoring/acknowledge", response_model=MonitoringStatusResponse)

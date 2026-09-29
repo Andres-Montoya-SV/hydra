@@ -127,6 +127,30 @@ class AssetJumpClassification:
     reason: str | None
 
 
+# A collector that produced results in the baseline run and ended in one of
+# these states this run can no longer vouch for what it found last time.
+DEGRADED_OUTCOMES = frozenset({"failed", "unavailable", "partial"})
+
+
+def regressed_providers(
+    *, previous_outcomes: dict[str, str], current_outcomes: dict[str, str]
+) -> list[str]:
+    """Collectors that returned results in the baseline run but failed,
+    were unavailable, or only partially ran this time — sorted, so the same
+    inputs always give the same answer.
+
+    Used to keep a collector FAILURE from being reported as hostnames being
+    REMOVED. A collector that was already failing in the baseline run (e.g.
+    never installed) doesn't count: it wasn't contributing hostnames, so its
+    absence can't make any disappear."""
+    return sorted(
+        provider
+        for provider, previous in previous_outcomes.items()
+        if previous == "success_with_results"
+        and current_outcomes.get(provider) in DEGRADED_OUTCOMES
+    )
+
+
 def classify_asset_jump(
     *,
     previous_count: int | None,

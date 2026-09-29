@@ -1257,6 +1257,21 @@ class ExposureHistoryRecord:
 
 
 @dataclass(frozen=True)
+class MonitoringNotificationRecord:
+    notification_id: str
+    speed: str
+    scan_id: str
+    hosts_added: tuple[str, ...]
+    hosts_removed: tuple[str, ...]
+    asset_count: int
+    needs_review: bool
+    review_reason: str | None
+    citations: tuple[str, ...]
+    created_at: str
+    sent_at: str | None
+
+
+@dataclass(frozen=True)
 class ProviderRunOutcomeRecord:
     organization_id: str
     account_id: str
@@ -4603,6 +4618,38 @@ class ControlDB:
                 "review_reason": row["review_reason"],
                 "easm_citations": json.loads(row["easm_citations_json"]),
             }
+            for row in rows
+        ]
+
+    def list_monitoring_notifications(
+        self, account_id: str, domain: str, *, limit: int = 100, offset: int = 0
+    ) -> list[MonitoringNotificationRecord]:
+        """One domain's alert history, newest first, sent or not — the same
+        rows the email/webhook outbox delivers, so a client can read back
+        exactly what fired and why. Always scoped to `account_id`."""
+        limit = max(1, min(500, int(limit)))
+        offset = max(0, int(offset))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM monitoring_pending_notifications "
+                "WHERE account_id = ? AND domain = ? "
+                "ORDER BY created_at DESC, notification_id LIMIT ? OFFSET ?",
+                (account_id, domain, limit, offset),
+            ).fetchall()
+        return [
+            MonitoringNotificationRecord(
+                notification_id=row["notification_id"],
+                speed=row["speed"],
+                scan_id=row["scan_id"],
+                hosts_added=tuple(json.loads(row["hosts_added_json"])),
+                hosts_removed=tuple(json.loads(row["hosts_removed_json"])),
+                asset_count=row["asset_count"],
+                needs_review=bool(row["needs_review"]),
+                review_reason=row["review_reason"],
+                citations=tuple(json.loads(row["easm_citations_json"])),
+                created_at=row["created_at"],
+                sent_at=row["sent_at"],
+            )
             for row in rows
         ]
 

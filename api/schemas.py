@@ -166,6 +166,51 @@ class MonitoringStatusResponse(BaseModel):
     needs_review: bool
 
 
+ProviderOutcome = Literal[
+    "success_with_results",
+    "success_no_results",
+    "partial",
+    "blocked_by_scope",
+    "skipped",
+    "unavailable",
+    "failed",
+]
+
+
+class ProviderRunOutcomeResponse(BaseModel):
+    provider: str
+    # Product-facing capability (e.g. "dns", "domain_discovery"); `provider`
+    # is the underlying tool, kept for debugging.
+    capability: str
+    outcome: ProviderOutcome
+    output_lines: int
+    recorded_at: str
+
+
+class ScanCollectionResponse(BaseModel):
+    scan_id: str
+    # True when any collector failed, was unavailable, or only partially
+    # ran — a completed scan is not necessarily a clean one.
+    degraded: bool
+    outcomes: list[ProviderRunOutcomeResponse]
+
+
+class MonitoringNotificationResponse(BaseModel):
+    notification_id: str
+    speed: Literal["passive", "active"]
+    scan_id: str
+    hosts_added: list[str]
+    hosts_removed: list[str]
+    asset_count: int
+    needs_review: bool
+    review_reason: str | None = None
+    # Why this alert fired beyond the hostname diff: the exact change,
+    # certificate, technology, or exposure event(s) behind it.
+    citations: list[str]
+    created_at: str
+    sent_at: str | None = None
+
+
 class RegisterWebhookRequest(BaseModel):
     url: str = Field(min_length=1, description="Must be https:// and not a private/loopback host.")
     event_types: list[str] = Field(
