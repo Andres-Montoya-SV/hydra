@@ -2682,6 +2682,39 @@ class ControlDB:
                 )
         return bool(cursor.rowcount)
 
+    def reopen_exposure(
+        self,
+        *,
+        organization_id: str,
+        exposure_id: str,
+        reopened_at: str,
+        reason: str,
+    ) -> bool:
+        """Explicitly reopen one resolved exposure (e.g. a resolution that
+        turned out to be wrong). Without this, a mistaken resolve could only
+        be undone by a later scan happening to re-observe the condition.
+
+        Clears the resolution fields on the row, which always describes the
+        CURRENT state; the prior resolution itself stays in
+        `exposure_history`, which is append-only, so nothing is erased."""
+        if not reason.strip():
+            raise ValueError("reopening requires a reason")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE exposures SET status = 'reopened', resolved_at = NULL, "
+                "resolved_run_id = NULL, resolution_reason = NULL "
+                "WHERE exposure_id = ? AND organization_id = ? AND status = 'resolved'",
+                (exposure_id, organization_id),
+            )
+            if cursor.rowcount:
+                conn.execute(
+                    "INSERT INTO exposure_history "
+                    "(event_id, exposure_id, organization_id, event_type, happened_at, run_id, reason) "
+                    "VALUES (?, ?, ?, 'reopened', ?, NULL, ?)",
+                    (secrets.token_hex(16), exposure_id, organization_id, reopened_at, reason),
+                )
+        return bool(cursor.rowcount)
+
     def get_exposure_for_organization(
         self, organization_id: str, exposure_id: str
     ) -> ExposureRecord | None:
@@ -2810,14 +2843,25 @@ class ControlDB:
         return [_exposure_record_from_row(row) for row in rows]
 
     def list_exposure_evidence(
-        self, organization_id: str, exposure_id: str
+        self,
+        organization_id: str,
+        exposure_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[ExposureEvidenceRecord]:
+        """`limit=None` (the default) returns every row with no SQL LIMIT,
+        as internal callers expect; the API passes an explicit page."""
+        query = (
+            "SELECT * FROM exposure_evidence WHERE organization_id = ? "
+            "AND exposure_id = ? ORDER BY observed_at, exposure_evidence_id"
+        )
+        params: list[object] = [organization_id, exposure_id]
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM exposure_evidence WHERE organization_id = ? "
-                "AND exposure_id = ? ORDER BY observed_at, exposure_evidence_id",
-                (organization_id, exposure_id),
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [_exposure_evidence_record_from_row(row) for row in rows]
 
     def list_exposure_history(

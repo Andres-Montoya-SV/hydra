@@ -361,12 +361,48 @@ class ExposureResponse(BaseModel):
     resolution_reason: str | None = None
 
 
+class ExposureFindingResponse(BaseModel):
+    """The detector result behind one piece of exposure evidence — what
+    was actually matched, where, and how confidently."""
+
+    host: str
+    url: str | None = None
+    name: str | None = None
+    severity: str | None = None
+    description: str | None = None
+    confidence_score: int | None = None
+    discovered_at: str | None = None
+
+
 class ExposureEvidenceResponse(BaseModel):
     exposure_evidence_id: str
     exposure_id: str
     run_id: str
     finding_id: int
     observed_at: str
+    # `None` only when the underlying finding row can no longer be read
+    # (e.g. the run's data is gone) — never fabricated.
+    finding: ExposureFindingResponse | None = None
+
+
+class ReasonedExposureRequest(BaseModel):
+    """Shared by every audited exposure lifecycle transition, so the reason
+    rules can't drift between them."""
+
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        # min_length alone accepts "   ", which the router strips to "" and
+        # the data layer then rejects with a ValueError -> a 500, not a 422.
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value
+
+
+class ReopenExposureRequest(ReasonedExposureRequest):
+    pass
 
 
 class ExposureHistoryResponse(BaseModel):
@@ -378,8 +414,8 @@ class ExposureHistoryResponse(BaseModel):
     reason: str
 
 
-class ResolveExposureRequest(BaseModel):
-    reason: str = Field(min_length=1, max_length=1000)
+class ResolveExposureRequest(ReasonedExposureRequest):
+    pass
 
 
 class ExposureReportHistoryEventResponse(BaseModel):

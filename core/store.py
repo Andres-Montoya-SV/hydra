@@ -1357,6 +1357,16 @@ class AssetStore:
             rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
+    def get_finding(self, run_id: str, finding_id: int) -> dict[str, object] | None:
+        """One `findings` row, matched on BOTH `id` and `run_id` — the same
+        (id, run_id) pairing the table's own UNIQUE constraint exists for,
+        so a finding id can never be dereferenced under a different run."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM findings WHERE id = ? AND run_id = ?", (finding_id, run_id)
+            ).fetchone()
+        return None if row is None else dict(row)
+
     def record_reportability_assessments(self, run_id: str, assessments: list) -> list[int]:
         """Persist reportability-agent eligibility annotations for a run.
 
