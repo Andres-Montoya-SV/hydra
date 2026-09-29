@@ -578,6 +578,32 @@ class TestCandidateAssetPromotionFlow:
             assert unchanged.json()["review_status"] == "pending"
 
 
+def _org_scoped_get_paths(org: str, asset_id: str, candidate_id: str) -> list[str]:
+    return [
+        "/organizations",  # not org-scoped, but must never leak the target's org
+        f"/organizations/{org}/assets",
+        f"/organizations/{org}/assets/{asset_id}",
+        f"/organizations/{org}/assets/{asset_id}/observations",
+        f"/organizations/{org}/assets/{asset_id}/change-events",
+        f"/organizations/{org}/assets/{asset_id}/certificate-events",
+        f"/organizations/{org}/assets/{asset_id}/technology-events",
+        f"/organizations/{org}/assets/{asset_id}/technologies",
+        f"/organizations/{org}/assets/{asset_id}/certificate",
+        f"/organizations/{org}/assets/{asset_id}/identifiers",
+        f"/organizations/{org}/assets/{asset_id}/relationships",
+        f"/organizations/{org}/assets/{asset_id}/network",
+        f"/organizations/{org}/assets/{asset_id}/visual",
+        f"/organizations/{org}/analyst/assets/{asset_id}/provenance",
+        f"/organizations/{org}/explanations/asset/{asset_id}",
+        f"/organizations/{org}/scope/exclusions",
+        f"/organizations/{org}/relationships",
+        f"/organizations/{org}/candidate-assets",
+        f"/organizations/{org}/candidate-assets/{candidate_id}",
+        f"/organizations/{org}/capabilities",
+        f"/organizations/{org}/members",
+    ]
+
+
 class TestForeignAccountCannotProbeAnyEndpoint:
     def test_every_read_and_write_endpoint_returns_404_for_a_non_member(
         self, tmp_path: Path
@@ -592,29 +618,7 @@ class TestForeignAccountCannotProbeAnyEndpoint:
             ).json()
             headers = {"X-API-Key": foreign["api_key"]}
 
-            get_paths = [
-                "/organizations",  # not org-scoped, but must never leak the target's org
-                f"/organizations/{org}/assets",
-                f"/organizations/{org}/assets/{asset_id}",
-                f"/organizations/{org}/assets/{asset_id}/observations",
-                f"/organizations/{org}/assets/{asset_id}/change-events",
-                f"/organizations/{org}/assets/{asset_id}/certificate-events",
-                f"/organizations/{org}/assets/{asset_id}/technology-events",
-                f"/organizations/{org}/assets/{asset_id}/technologies",
-                f"/organizations/{org}/assets/{asset_id}/certificate",
-                f"/organizations/{org}/assets/{asset_id}/identifiers",
-                f"/organizations/{org}/assets/{asset_id}/relationships",
-                f"/organizations/{org}/assets/{asset_id}/network",
-                f"/organizations/{org}/assets/{asset_id}/visual",
-                f"/organizations/{org}/analyst/assets/{asset_id}/provenance",
-                f"/organizations/{org}/explanations/asset/{asset_id}",
-                f"/organizations/{org}/scope/exclusions",
-                f"/organizations/{org}/relationships",
-                f"/organizations/{org}/candidate-assets",
-                f"/organizations/{org}/candidate-assets/{candidate_id}",
-                f"/organizations/{org}/capabilities",
-                f"/organizations/{org}/members",
-            ]
+            get_paths = _org_scoped_get_paths(org, asset_id, candidate_id)
             for path in get_paths:
                 response = client.get(path, headers=headers)
                 if path == "/organizations":

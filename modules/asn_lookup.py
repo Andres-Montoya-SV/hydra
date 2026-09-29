@@ -79,20 +79,7 @@ class AsnLookupPlugin(BaseToolPlugin):
                     f"(TCP whois.cymru.com:43 and DNS IP-to-ASN)"
                 ),
             )
-            context.add_warning(f"ASN Lookup unavailable: {detail}")
-            self.update_status(
-                context,
-                ToolStatus.COMPLETED,
-                output_lines=0,
-                error_message=detail,
-            )
-            write_jsonl(output_path, [], base_dir=context.output_dir)
-            return PluginResult(
-                success=True,
-                output_path=output_path,
-                message="ASN service unavailable; scan continued",
-                unavailable=True,
-            )
+            return self._unavailable(context, output_path, detail)
 
         records = _add_geo(records, self.settings.geoip_db_path)
         count = write_jsonl(output_path, records, base_dir=context.output_dir)
@@ -102,6 +89,21 @@ class AsnLookupPlugin(BaseToolPlugin):
             output_path=output_path,
             lines_produced=count,
             message=f"Enriched {count} IP address(es)",
+        )
+
+    def _unavailable(
+        self, context: PipelineContext, output_path: Path, detail: str
+    ) -> PluginResult:
+        """Team Cymru unreachable: the scan continues, and the outcome says
+        UNAVAILABLE rather than a clean run with no results."""
+        context.add_warning(f"ASN Lookup unavailable: {detail}")
+        self.update_status(context, ToolStatus.COMPLETED, output_lines=0, error_message=detail)
+        write_jsonl(output_path, [], base_dir=context.output_dir)
+        return PluginResult(
+            success=True,
+            output_path=output_path,
+            message="ASN service unavailable; scan continued",
+            unavailable=True,
         )
 
 
