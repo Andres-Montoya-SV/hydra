@@ -21,6 +21,7 @@ from api import subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, DomainVerificationRecord, ScanRecord
 from api.domain_verification import classify_scan_gate, normalize_domain
+from api.monitoring import DEGRADED_OUTCOMES
 from api.schemas import (
     ClientReportRequest,
     CreateScanRequest,
@@ -182,9 +183,6 @@ def get_scan_status(
     )
 
 
-_DEGRADED_OUTCOMES = frozenset({"failed", "unavailable", "partial"})
-
-
 @router.get("/{scan_id}/collection", response_model=ScanCollectionResponse)
 def get_scan_collection(
     scan_id: str,
@@ -221,7 +219,7 @@ def get_scan_collection(
     ]
     return ScanCollectionResponse(
         scan_id=scan_id,
-        degraded=any(o.outcome in _DEGRADED_OUTCOMES for o in outcomes),
+        degraded=any(o.outcome in DEGRADED_OUTCOMES for o in outcomes),
         outcomes=outcomes,
     )
 

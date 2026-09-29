@@ -129,7 +129,7 @@ class AssetJumpClassification:
 
 # A collector that produced results in the baseline run and ended in one of
 # these states this run can no longer vouch for what it found last time.
-_DEGRADED_OUTCOMES = frozenset({"failed", "unavailable", "partial"})
+DEGRADED_OUTCOMES = frozenset({"failed", "unavailable", "partial"})
 
 
 def regressed_providers(
@@ -147,7 +147,7 @@ def regressed_providers(
         provider
         for provider, previous in previous_outcomes.items()
         if previous == "success_with_results"
-        and current_outcomes.get(provider) in _DEGRADED_OUTCOMES
+        and current_outcomes.get(provider) in DEGRADED_OUTCOMES
     )
 
 

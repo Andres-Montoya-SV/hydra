@@ -281,3 +281,41 @@ class TestNotificationHistoryEndpoint:
                 (["new.example.com"], ["CERTIFICATE_REPLACED"])
             ]
             assert theirs.status_code == 404
+
+
+class TestDegradedRunsAreLoggedOncePerCycle:
+    def test_one_aggregated_warning_not_one_per_domain(
+        self, control_db: ControlDB, api_settings: APISettings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sender = _Sender()
+        ids = _monitored_account(control_db, api_settings)
+        _run_cycle(
+            control_db,
+            api_settings,
+            sender,
+            ids,
+            hosts=["a.example.com", "b.example.com"],
+            outcomes=HEALTHY,
+        )
+        caplog.clear()
+
+        with caplog.at_level("DEBUG", logger="hydra.api.monitoring"):
+            _run_cycle(
+                control_db,
+                api_settings,
+                sender,
+                ids,
+                hosts=["a.example.com"],
+                outcomes=CTLOGS_FAILED,
+            )
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        degraded_warnings = [m for m in warnings if "degraded" in m]
+        assert degraded_warnings == [
+            "1 monitored domain(s) had a degraded scan this cycle; hostname diffs "
+            "skipped and baselines kept. Failing collectors: ctlogs (1)."
+        ]
+        per_domain = [
+            r for r in caplog.records if "Degraded passive monitoring scan" in r.getMessage()
+        ]
+        assert per_domain and all(r.levelname == "DEBUG" for r in per_domain)

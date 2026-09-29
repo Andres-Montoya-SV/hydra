@@ -547,7 +547,13 @@ class TestErrorIsolationAndIdempotency:
             api_settings=api_settings, control_db=control_db, email_sender=sender
         )
 
-        assert first == {"harvested": 0, "enqueued": 0, "skipped_errors": 0, "notified_accounts": 0}
+        assert first == {
+            "harvested": 0,
+            "enqueued": 0,
+            "skipped_errors": 0,
+            "notified_accounts": 0,
+            "degraded_domains": 0,
+        }
         assert second == first
 
     def test_a_domain_stuck_pending_with_no_matching_scan_row_is_never_reprocessed_forever(

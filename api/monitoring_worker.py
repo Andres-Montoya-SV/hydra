@@ -62,7 +62,8 @@ import asyncio
 import contextlib
 import logging
 import time
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Literal
 
@@ -178,12 +179,26 @@ def _degraded_providers(
     )
 
 
+@dataclass
+class _DegradedTally:
+    """Degraded runs seen in one monitoring cycle, summarized into a single
+    log line instead of one warning per domain."""
+
+    domains: int = 0
+    providers: Counter[str] = field(default_factory=Counter)
+
+    def record(self, providers: list[str]) -> None:
+        self.domains += 1
+        self.providers.update(providers)
+
+
 def _harvest_one(
     *,
     api_settings: APISettings,
     control_db: ControlDB,
     row: MonitoredDomainRecord,
     speed: Speed,
+    degraded_tally: _DegradedTally | None = None,
 ) -> tuple[dict | None, MonitoringRunOutcome | None]:
     """Returns `(batched_update, outcome_for_notification)` — either may
     be `None`: `batched_update` is `None` when the scan is still
@@ -279,14 +294,18 @@ def _harvest_one(
     # no hostname diff, and the last good baseline is kept (below).
     degraded = _degraded_providers(control_db, row, scan_id, previous_scan_id)
     if degraded:
-        logger.warning(
-            "Scheduled %s monitoring scan %s for domain %s was degraded (%s) — "
-            "skipping the hostname diff and keeping the previous baseline.",
+        # Per-domain detail at DEBUG only: a widespread collector outage
+        # would otherwise log one warning per monitored domain (300k+ at
+        # tested scale). The cycle logs a single aggregated WARNING instead.
+        logger.debug(
+            "Degraded %s monitoring scan %s for %s (%s): hostname diff skipped, baseline kept.",
             speed,
             scan_id,
             row.domain,
             ", ".join(degraded),
         )
+        if degraded_tally is not None:
+            degraded_tally.record(degraded)
     digest_changed = (
         not degraded and row.last_asset_digest is not None and new_digest != row.last_asset_digest
     )
@@ -600,6 +619,7 @@ def run_monitoring_cycle(
     cycle's own control flow, not in any one account's data."""
     budget = _CycleBudget.start(api_settings.monitoring_cycle_time_budget_seconds)
     stats = {"harvested": 0, "enqueued": 0, "skipped_errors": 0, "notified_accounts": 0}
+    degraded_tally = _DegradedTally()
 
     for speed in _SPEEDS:
         pending_rows = control_db.list_pending_monitoring_harvest(speed=speed)
@@ -610,7 +630,11 @@ def run_monitoring_cycle(
                 break
             try:
                 update, outcome = _harvest_one(
-                    api_settings=api_settings, control_db=control_db, row=row, speed=speed
+                    api_settings=api_settings,
+                    control_db=control_db,
+                    row=row,
+                    speed=speed,
+                    degraded_tally=degraded_tally,
                 )
             except Exception:
                 logger.exception(
@@ -655,6 +679,17 @@ def run_monitoring_cycle(
                 notifications = []
         if updates or notifications:
             control_db.batch_record_monitoring_progress(updates, notifications=notifications)
+
+    stats["degraded_domains"] = degraded_tally.domains
+    if degraded_tally.domains:
+        logger.warning(
+            "%d monitored domain(s) had a degraded scan this cycle; hostname diffs "
+            "skipped and baselines kept. Failing collectors: %s.",
+            degraded_tally.domains,
+            ", ".join(
+                f"{name} ({count})" for name, count in degraded_tally.providers.most_common()
+            ),
+        )
 
     now_iso = _now_iso()
     for speed in _SPEEDS:
