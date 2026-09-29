@@ -73,6 +73,7 @@ from api.monitoring import (
     classify_asset_jump,
     compute_asset_digest,
     next_due_at,
+    regressed_providers,
     significance_rank,
 )
 from api.tenancy import account_db_path, account_settings
@@ -155,6 +156,26 @@ def _easm_citations_for_run(control_db: ControlDB, organization_id: str, run_id:
         title = exposure.title if exposure is not None else history.exposure_id
         citations.append(f"EXPOSURE_{history.event_type.upper()}: {title} -- {history.reason}")
     return citations
+
+
+def _degraded_providers(
+    control_db: ControlDB, row: MonitoredDomainRecord, scan_id: str, previous_scan_id: str | None
+) -> list[str]:
+    """Collectors that contributed results to the baseline run but failed,
+    were unavailable, or ran only partially in this one. Empty when there's
+    no baseline yet or the row predates organizations (no outcomes to read)."""
+    if previous_scan_id is None or not row.organization_id:
+        return []
+
+    def outcomes(run_id: str) -> dict[str, str]:
+        return {
+            o.provider: o.outcome
+            for o in control_db.list_provider_run_outcomes(row.organization_id or "", run_id)
+        }
+
+    return regressed_providers(
+        previous_outcomes=outcomes(previous_scan_id), current_outcomes=outcomes(scan_id)
+    )
 
 
 def _harvest_one(
@@ -250,13 +271,28 @@ def _harvest_one(
     # `previous_count is None` — there is no "change" to report yet,
     # only a baseline being established.
     outcome: MonitoringRunOutcome | None = None
-    digest_changed = row.last_asset_digest is not None and new_digest != row.last_asset_digest
+    previous_scan_id = row.last_passive_scan_id if speed == "passive" else row.last_active_scan_id
+    # A collector that returned results last time but failed this time
+    # makes the hostname set untrustworthy: diffing it would report the
+    # failure as hosts being REMOVED, and saving it as the baseline would
+    # make the next healthy run report them all as ADDED. Neither happens:
+    # no hostname diff, and the last good baseline is kept (below).
+    degraded = _degraded_providers(control_db, row, scan_id, previous_scan_id)
+    if degraded:
+        logger.warning(
+            "Scheduled %s monitoring scan %s for domain %s was degraded (%s) — "
+            "skipping the hostname diff and keeping the previous baseline.",
+            speed,
+            scan_id,
+            row.domain,
+            ", ".join(degraded),
+        )
+    digest_changed = (
+        not degraded and row.last_asset_digest is not None and new_digest != row.last_asset_digest
+    )
     if jump.needs_review or digest_changed or easm_citations:
         hosts_added: list[str] = []
         hosts_removed: list[str] = []
-        previous_scan_id = (
-            row.last_passive_scan_id if speed == "passive" else row.last_active_scan_id
-        )
         if digest_changed and previous_scan_id:
             previous_hostnames = set(store.get_host_domains(previous_scan_id))
             current_hostnames = set(hostnames)
@@ -294,11 +330,11 @@ def _harvest_one(
     update = {
         "monitoring_id": row.monitoring_id,
         "speed": speed,
-        "scan_id": scan_id,
+        "scan_id": previous_scan_id if degraded else scan_id,
         "ran_at": _now_iso(),
         "next_due_at": next_at,
-        "asset_digest": new_digest,
-        "asset_count": new_count,
+        "asset_digest": row.last_asset_digest if degraded else new_digest,
+        "asset_count": row.last_asset_count if degraded else new_count,
         "needs_review": still_needs_review,
         "status": "needs_review" if still_needs_review else "active",
     }
