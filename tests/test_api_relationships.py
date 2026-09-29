@@ -32,45 +32,20 @@ from core.intel.model import (
 from core.store import AssetStore, ScanRun
 
 
-def _relationship_scan(
-    control_db: ControlDB,
-    api_settings: APISettings,
-    *,
-    account_id: str,
-    organization_id: str,
-    source: str = "domain:a.example.com",
-    target: str = "domain:b.example.com",
-    relationship_type: RelationshipType = RelationshipType.SHARES_IPV4,
-) -> str:
-    scan_id = secrets.token_hex(16)
-    control_db.create_scan(
-        scan_id=scan_id,
-        account_id=account_id,
-        domain="example.com",
-        db_path=str(api_settings.data_dir),
-        organization_id=organization_id,
+def _intel_entity(entity_id: str) -> IntelEntity:
+    entity_type = EntityType.DOMAIN if entity_id.startswith("domain:") else EntityType.CERTIFICATE
+    return IntelEntity(
+        entity_id=entity_id,
+        entity_type=entity_type,
+        key=entity_id.split(":", 1)[1],
+        scope_status=ScopeStatus.IN_SCOPE,
+        collection_status=CollectionStatus.COLLECTED,
     )
-    store = AssetStore(account_db_path(api_settings, account_id))
-    store.create_run(ScanRun(run_id=scan_id, started_at="2026-01-01T00:00:00+00:00"))
 
-    source_type = EntityType.DOMAIN if source.startswith("domain:") else EntityType.CERTIFICATE
-    target_type = EntityType.DOMAIN if target.startswith("domain:") else EntityType.CERTIFICATE
-    entities = {
-        source: IntelEntity(
-            entity_id=source,
-            entity_type=source_type,
-            key=source.split(":", 1)[1],
-            scope_status=ScopeStatus.IN_SCOPE,
-            collection_status=CollectionStatus.COLLECTED,
-        ),
-        target: IntelEntity(
-            entity_id=target,
-            entity_type=target_type,
-            key=target.split(":", 1)[1],
-            scope_status=ScopeStatus.IN_SCOPE,
-            collection_status=CollectionStatus.COLLECTED,
-        ),
-    }
+
+def _relationship_snapshot(
+    *, scan_id: str, source: str, target: str, relationship_type: RelationshipType
+):
     observation = Observation(
         observation_id=f"obs-{scan_id}",
         entity_id=source,
@@ -80,17 +55,15 @@ def _relationship_scan(
         observed_at="2026-01-01T00:00:00+00:00",
     )
     evidence_id = f"evidence-{scan_id}"
-    evidence = {
-        evidence_id: Evidence(
-            evidence_id=evidence_id,
-            source="fixture",
-            collector="fixture",
-            observation_id=observation.observation_id,
-            reason="shared signal",
-            metadata={"signal": "203.0.113.9"},
-            observed_at="2026-01-01T00:00:00+00:00",
-        )
-    }
+    evidence = Evidence(
+        evidence_id=evidence_id,
+        source="fixture",
+        collector="fixture",
+        observation_id=observation.observation_id,
+        reason="shared signal",
+        metadata={"signal": "203.0.113.9"},
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
     relationship = Relationship(
         relationship_id=f"rel-{scan_id}",
         source_entity=source,
@@ -111,11 +84,37 @@ def _relationship_scan(
         collection_attempts: list = []
 
         def __init__(self) -> None:
-            self.entities = entities
-            self.evidence = evidence
+            self.entities = {source: _intel_entity(source), target: _intel_entity(target)}
+            self.evidence = {evidence_id: evidence}
             self.relationships = {relationship.relationship_id: relationship}
 
-    store.persist_registry(scan_id, {}, intel=Snapshot())
+    return Snapshot()
+
+
+def _relationship_scan(
+    control_db: ControlDB,
+    api_settings: APISettings,
+    *,
+    account_id: str,
+    organization_id: str,
+    source: str = "domain:a.example.com",
+    target: str = "domain:b.example.com",
+    relationship_type: RelationshipType = RelationshipType.SHARES_IPV4,
+) -> str:
+    scan_id = secrets.token_hex(16)
+    control_db.create_scan(
+        scan_id=scan_id,
+        account_id=account_id,
+        domain="example.com",
+        db_path=str(api_settings.data_dir),
+        organization_id=organization_id,
+    )
+    store = AssetStore(account_db_path(api_settings, account_id))
+    store.create_run(ScanRun(run_id=scan_id, started_at="2026-01-01T00:00:00+00:00"))
+    snapshot = _relationship_snapshot(
+        scan_id=scan_id, source=source, target=target, relationship_type=relationship_type
+    )
+    store.persist_registry(scan_id, {}, intel=snapshot)
     control_db.update_scan_status(scan_id, "completed")
     return scan_id
 
