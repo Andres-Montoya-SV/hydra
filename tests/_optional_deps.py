@@ -17,7 +17,6 @@ not affected; this only concerns Python packages.
 from __future__ import annotations
 
 import functools
-import importlib
 import importlib.util
 import os
 from typing import Any
@@ -37,7 +36,9 @@ def install_strict_importorskip() -> None:
 
     @functools.wraps(original)
     def import_or_fail(modname: str, *args: Any, **kwargs: Any) -> Any:
-        importlib.import_module(modname)  # ImportError here fails loudly
+        # Only checks presence (find_spec loads no code); pytest's own
+        # importorskip still does the actual import.
+        _raise_if_missing(modname)
         return original(modname, *args, **kwargs)
 
     setattr(pytest, "importorskip", import_or_fail)  # noqa: B010 - patching pytest's own function
@@ -53,7 +54,23 @@ def unpatched_importorskip() -> Any:
 def requires_modules(*names: str) -> pytest.MarkDecorator:
     """A skip marker for tests that need `names` installed; in strict mode,
     a missing one raises at collection instead."""
-    missing = [name for name in names if importlib.util.find_spec(name) is None]
+    missing = _missing(names)
     if missing and STRICT:
-        raise ImportError(f"HYDRA_REQUIRE_OPTIONAL_DEPS=1 but not installed: {', '.join(missing)}")
+        raise _strict_error(missing)
     return pytest.mark.skipif(bool(missing), reason=f"not installed: {', '.join(missing)}")
+
+
+def _missing(names: tuple[str, ...]) -> list[str]:
+    return [name for name in names if importlib.util.find_spec(name) is None]
+
+
+def _raise_if_missing(name: str) -> None:
+    if _missing((name,)):
+        raise _strict_error([name])
+
+
+def _strict_error(missing: list[str]) -> ModuleNotFoundError:
+    return ModuleNotFoundError(
+        f"HYDRA_REQUIRE_OPTIONAL_DEPS=1 but not installed: {', '.join(missing)}",
+        name=missing[0],
+    )
