@@ -432,6 +432,21 @@ CREATE TABLE IF NOT EXISTS capability_audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_capability_audit_org
     ON capability_audit_log(organization_id, created_at);
+-- Roadmap v2 (risk-change signals): an exposure's deterministic risk level
+-- as classified when a run observed it. Risk is computed on read, so this
+-- is what a later run's level is compared against. One row per exposure
+-- per run, so re-harvesting the same run rewrites its row, never a second.
+CREATE TABLE IF NOT EXISTS exposure_risk_snapshots (
+    exposure_id TEXT NOT NULL REFERENCES exposures(exposure_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    run_id TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    reasons_json TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    PRIMARY KEY (exposure_id, run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_exposure_risk_snapshots
+    ON exposure_risk_snapshots(organization_id, exposure_id, computed_at);
 CREATE TABLE IF NOT EXISTS provider_run_outcomes (
     organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
     account_id TEXT NOT NULL,
@@ -2369,6 +2384,26 @@ class ControlDB:
                 ).fetchall()
         return [_candidate_asset_record_from_row(row) for row in rows]
 
+    def list_pending_candidates_first_seen_in_run(
+        self, organization_id: str, run_id: str, *, limit: int
+    ) -> tuple[list[CandidateAssetRecord], int]:
+        """Candidates this run discovered that still await review: up to
+        `limit` of them, plus the total count."""
+        params = (organization_id, run_id)
+        with self._connect() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM candidate_assets WHERE organization_id = ? "
+                "AND first_seen_run_id = ? AND review_status = 'pending'",
+                params,
+            ).fetchone()[0]
+            rows = conn.execute(
+                "SELECT * FROM candidate_assets WHERE organization_id = ? "
+                "AND first_seen_run_id = ? AND review_status = 'pending' "
+                "ORDER BY display_value, candidate_asset_id LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [_candidate_asset_record_from_row(row) for row in rows], int(total)
+
     def get_candidate_asset(
         self, organization_id: str, candidate_asset_id: str
     ) -> CandidateAssetRecord | None:
@@ -2933,6 +2968,33 @@ class ControlDB:
                 (organization_id, exposure_id),
             ).fetchall()
         return [_exposure_history_record_from_row(row) for row in rows]
+
+    def record_exposure_risk_snapshot(
+        self,
+        *,
+        organization_id: str,
+        exposure_id: str,
+        run_id: str,
+        risk_level: str,
+        reasons: tuple[str, ...],
+    ) -> str | None:
+        """Stores this run's risk level for the exposure and returns the
+        level recorded by the most recent OTHER run (None if none), so a
+        retried harvest of the same run always compares the same pair."""
+        with self._connect() as conn:
+            previous = conn.execute(
+                "SELECT risk_level FROM exposure_risk_snapshots "
+                "WHERE organization_id = ? AND exposure_id = ? AND run_id != ? "
+                "ORDER BY computed_at DESC LIMIT 1",
+                (organization_id, exposure_id, run_id),
+            ).fetchone()
+            conn.execute(
+                "INSERT OR REPLACE INTO exposure_risk_snapshots "
+                "(exposure_id, organization_id, run_id, risk_level, reasons_json, computed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (exposure_id, organization_id, run_id, risk_level, json.dumps(reasons), _now_iso()),
+            )
+        return None if previous is None else str(previous["risk_level"])
 
     def list_exposure_history_for_run(
         self, organization_id: str, run_id: str

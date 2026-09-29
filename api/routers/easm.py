@@ -46,6 +46,7 @@ turn a candidate into a real asset.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from typing import Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -74,7 +75,11 @@ from api.schemas import (
     RelationshipEvidenceResponse,
     RelationshipResponse,
     TechnologyEventResponse,
+    VisualChangeResponse,
+    VisualIntelligenceResponse,
+    VisualReferenceResponse,
 )
+from core.assets import HttpService
 
 router = APIRouter(prefix="/organizations", tags=["easm"])
 
@@ -513,15 +518,14 @@ def list_asset_identifiers(
     ]
 
 
-def _latest_host(request: Request, organization_id: str, asset: AssetRecord):  # noqa: ANN202
-    """The host as the asset's most recent run recorded it, read from the
-    recon.db of the account whose scan produced that run. `None` when there
-    is nothing to read (non-host asset, no run, db missing). Never creates
-    a database as a side effect of a read."""
+def _asset_run_store(request: Request, organization_id: str, asset: AssetRecord):  # noqa: ANN202
+    """`(store, domain, run_id)` for a host asset's most recent run: the
+    recon.db of the account whose scan produced that run. `None` when
+    there is nothing to read (non-host asset, no run, db missing). Never
+    creates a database as a side effect of a read."""
     if asset.asset_type != "domain" or not asset.last_seen_run_id:
         return None
-    db = _db(request)
-    account_id = db.account_for_run(organization_id, asset.last_seen_run_id)
+    account_id = _db(request).account_for_run(organization_id, asset.last_seen_run_id)
     if account_id is None:
         return None
     from api.tenancy import account_db_path
@@ -531,7 +535,16 @@ def _latest_host(request: Request, organization_id: str, asset: AssetRecord):  #
     if not path.exists():
         return None
     domain = asset.identity_key.split(":", 1)[1]
-    return AssetStore(path).get_host(asset.last_seen_run_id, domain)
+    return AssetStore(path), domain, asset.last_seen_run_id
+
+
+def _latest_host(request: Request, organization_id: str, asset: AssetRecord):  # noqa: ANN202
+    """The host as the asset's most recent run recorded it, or `None`."""
+    located = _asset_run_store(request, organization_id, asset)
+    if located is None:
+        return None
+    store, domain, run_id = located
+    return store.get_host(run_id, domain)
 
 
 @router.get(
@@ -576,6 +589,60 @@ def get_asset_network(
         network_cidr=host.cidr if host is not None else None,
         hosting_provider=host.provider if host is not None else None,
         geo=geo,
+    )
+
+
+@router.get(
+    "/{organization_id}/assets/{asset_id}/visual",
+    response_model=VisualIntelligenceResponse,
+)
+def get_asset_visual(
+    organization_id: str,
+    asset_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> VisualIntelligenceResponse:
+    """Visual Intelligence: what the asset's web pages looked like on its
+    most recent run (title, favicon hash, screenshot reference) and the
+    significant visual changes since this organization's previous run of
+    the same target. See `core/visual.py` for what counts as a change."""
+    from core.visual import SIGNIFICANCE_RULES, visual_changes
+
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    asset = _require_asset(db, organization_id, asset_id)
+    response = VisualIntelligenceResponse(
+        asset_id=asset_id,
+        run_id=asset.last_seen_run_id,
+        references=[],
+        changes=[],
+        significance_rules=list(SIGNIFICANCE_RULES),
+    )
+    located = _asset_run_store(request, organization_id, asset)
+    if located is None:
+        return response
+    store, domain, run_id = located
+    current = store.get_http_services(run_id, host=domain)
+    response.references = [_visual_reference(service) for service in current]
+    previous_run_id = store.find_previous_run(run_id)
+    # The account's recon.db may hold runs of its other organizations.
+    if previous_run_id and db.account_for_run(organization_id, previous_run_id):
+        response.previous_run_id = previous_run_id
+        previous = store.get_http_services(previous_run_id, host=domain)
+        response.changes = [
+            VisualChangeResponse(**asdict(change), reason=change.reason())
+            for change in visual_changes(previous, current)
+        ]
+    return response
+
+
+def _visual_reference(service: HttpService) -> VisualReferenceResponse:
+    return VisualReferenceResponse(
+        url=service.url,
+        status_code=service.status_code,
+        title=service.title,
+        favicon_hash=service.favicon_hash,
+        screenshot_artifact=service.screenshot_path,
     )
 
 

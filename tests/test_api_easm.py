@@ -605,6 +605,7 @@ class TestForeignAccountCannotProbeAnyEndpoint:
                 f"/organizations/{org}/assets/{asset_id}/identifiers",
                 f"/organizations/{org}/assets/{asset_id}/relationships",
                 f"/organizations/{org}/assets/{asset_id}/network",
+                f"/organizations/{org}/assets/{asset_id}/visual",
                 f"/organizations/{org}/relationships",
                 f"/organizations/{org}/candidate-assets",
                 f"/organizations/{org}/candidate-assets/{candidate_id}",

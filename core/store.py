@@ -2175,6 +2175,17 @@ class AssetStore:
             ).fetchone()
         return None if row is None else self._row_to_host(row)
 
+    def get_http_services(self, run_id: str, *, host: str | None = None) -> list[HttpService]:
+        """A run's HTTP services (optionally one host's), ordered by URL."""
+        query = "SELECT * FROM http_services WHERE run_id = ?"
+        params: tuple[str, ...] = (run_id,)
+        if host is not None:
+            query += " AND host = ?"
+            params = (run_id, host)
+        with self._connect() as conn:
+            rows = conn.execute(query + " ORDER BY url", params).fetchall()
+        return [self._row_to_http(row) for row in rows]
+
     def _row_to_host(self, row: sqlite3.Row) -> Host:
         from core.assets import HostCategory, HostProfile
 

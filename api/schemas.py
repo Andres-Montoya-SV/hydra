@@ -708,6 +708,37 @@ class NetworkIntelligenceResponse(BaseModel):
     geo: GeoLocationResponse | None = None
 
 
+class VisualReferenceResponse(BaseModel):
+    url: str
+    status_code: int | None = None
+    title: str | None = None
+    favicon_hash: str | None = None
+    # Run-relative path of the viewport screenshot artifact; a reference,
+    # never the image itself. None when no screenshot was captured.
+    screenshot_artifact: str | None = None
+
+
+class VisualChangeResponse(BaseModel):
+    url: str
+    signal: Literal["favicon", "title"]
+    before: str
+    after: str
+    reason: str
+
+
+class VisualIntelligenceResponse(BaseModel):
+    asset_id: str
+    run_id: str | None = None
+    # The earlier run of this organization the changes are measured
+    # against; None when there is none, and then `changes` is empty.
+    previous_run_id: str | None = None
+    references: list[VisualReferenceResponse]
+    changes: list[VisualChangeResponse]
+    # The fixed rules deciding what counts as a visual change, so a client
+    # can show why something was (or was not) reported.
+    significance_rules: list[str]
+
+
 class RelationshipResponse(BaseModel):
     relationship_id: str
     source_entity: str
