@@ -73,7 +73,10 @@ jobs:
       - name: Build image
         run: docker build -t hydra:ci .
       - name: pytest inside container
-        run: docker run --rm hydra:ci pytest tests/ -q
+        # The image installs requirements-optional.txt, so a missing optional
+        # package here is a broken image: fail instead of skipping
+        # (tests/_optional_deps.py).
+        run: docker run --rm -e HYDRA_REQUIRE_OPTIONAL_DEPS=1 hydra:ci pytest tests/ -q
       - name: ruff inside container
         run: docker run --rm hydra:ci ruff check .
       - name: black inside container
@@ -84,7 +87,7 @@ jobs:
         run: docker run --rm hydra:ci bandit -c pyproject.toml -r .
       - name: Network-confinement verification inside container
         run: |
-          docker run --rm hydra:ci pytest -v \
+          docker run --rm -e HYDRA_REQUIRE_OPTIONAL_DEPS=1 hydra:ci pytest -v \
             tests/test_httpx_confinement_live.py \
             tests/test_browser_confinement_live.py \
             tests/test_crawler_confinement_live.py
