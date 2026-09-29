@@ -2186,6 +2186,29 @@ class AssetStore:
             rows = conn.execute(query + " ORDER BY url", params).fetchall()
         return [self._row_to_http(row) for row in rows]
 
+    def get_provenance(self, run_id: str, host: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Raw per-tool observations recorded for one host in one run,
+        oldest first. `artifact_path` is reduced to its file name: the
+        server's directory layout is not evidence."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tool, field, value, confidence, discovered_at, verified_by_json, "
+                "artifact_path FROM provenance WHERE run_id = ? AND host = ? ORDER BY id LIMIT ?",
+                (run_id, host, limit),
+            ).fetchall()
+        return [
+            {
+                "tool": row["tool"],
+                "field": row["field"],
+                "value": row["value"],
+                "confidence": row["confidence"],
+                "discovered_at": row["discovered_at"],
+                "verified_by": json.loads(row["verified_by_json"] or "[]"),
+                "artifact": Path(row["artifact_path"]).name if row["artifact_path"] else None,
+            }
+            for row in rows
+        ]
+
     def _row_to_host(self, row: sqlite3.Row) -> Host:
         from core.assets import HostCategory, HostProfile
 

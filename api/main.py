@@ -31,6 +31,7 @@ from api.routers import (
     collection,
     domains,
     easm,
+    explanations,
     exposures,
     health,
     hypotheses,
@@ -251,6 +252,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(domains.router)
     app.include_router(exposures.router)
     app.include_router(easm.router)
+    app.include_router(explanations.router)
     app.include_router(collection.router)
     app.include_router(scope.router)
     app.include_router(monitoring.router)

@@ -3003,6 +3003,15 @@ class ControlDB:
             rows = conn.execute(query, params).fetchall()
         return [_exposure_evidence_record_from_row(row) for row in rows]
 
+    def count_exposure_evidence(self, organization_id: str, exposure_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM exposure_evidence WHERE organization_id = ? "
+                "AND exposure_id = ?",
+                (organization_id, exposure_id),
+            ).fetchone()
+        return int(row[0])
+
     def list_exposure_history(
         self, organization_id: str, exposure_id: str
     ) -> list[ExposureHistoryRecord]:
@@ -3343,19 +3352,37 @@ class ControlDB:
         return list(found.values()), False
 
     def list_relationship_evidence(
-        self, organization_id: str, relationship_id: str
+        self,
+        organization_id: str,
+        relationship_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[RelationshipEvidenceRecord]:
         """Tenant-safe by construction — mirrors `list_exposure_evidence`'s
         own `(organization_id, exposure_id)` scoping; this method
         originally took only `relationship_id`, a latent cross-tenant IDOR
         unreachable only because no Relationships API router exists yet."""
+        query = (
+            "SELECT * FROM relationship_evidence WHERE organization_id = ? "
+            "AND relationship_id = ? ORDER BY observed_at, relationship_evidence_id"
+        )
+        params: list[object] = [organization_id, relationship_id]
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM relationship_evidence WHERE organization_id = ? "
-                "AND relationship_id = ? ORDER BY observed_at, relationship_evidence_id",
-                (organization_id, relationship_id),
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [_relationship_evidence_record_from_row(row) for row in rows]
+
+    def count_relationship_evidence(self, organization_id: str, relationship_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM relationship_evidence "
+                "WHERE organization_id = ? AND relationship_id = ?",
+                (organization_id, relationship_id),
+            ).fetchone()
+        return int(row[0])
 
     # --- observations and evidence (Fase 04, EASM roadmap) --------------
 
@@ -3462,14 +3489,22 @@ class ControlDB:
             )
         return observation_id if cursor.rowcount else None
 
-    def list_observations_for_asset(self, asset_id: str) -> list[ObservationWithEvidence]:
+    def list_observations_for_asset(
+        self, asset_id: str, *, newest: int | None = None
+    ) -> list[ObservationWithEvidence]:
         """The phase's own required "one query, no manual joins against
         the raw tables" traceability: every observation this asset has
         ever had, each one already carrying its own `run_id` (where it
         came from) and its full, resolved `EvidenceRecord` (what backs
         it) — a real SQL join against `evidence` (an already-normalized,
         Fase-04-owned table), never against any run_id-scoped raw table
-        in `core/store.py`."""
+        in `core/store.py`.
+
+        `newest=N` returns only the N most recent (still oldest first)."""
+        order = (
+            "ORDER BY o.observed_at" if newest is None else "ORDER BY o.observed_at DESC LIMIT ?"
+        )
+        params: tuple[object, ...] = (asset_id,) if newest is None else (asset_id, newest)
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT o.*, "
@@ -3479,10 +3514,26 @@ class ControlDB:
                 "e.organization_id AS e_organization_id, e.asset_id AS e_asset_id, "
                 "e.confidence_class AS e_confidence_class "
                 "FROM observations o JOIN evidence e ON o.evidence_id = e.evidence_id "
-                "WHERE o.asset_id = ? ORDER BY o.observed_at",
+                "WHERE o.asset_id = ? " + order,
+                params,
+            ).fetchall()
+        records = [_observation_with_evidence_from_row(row) for row in rows]
+        return records if newest is None else records[::-1]
+
+    def observation_summary(self, asset_id: str) -> tuple[int, int, list[str]]:
+        """(observation count, distinct scans, distinct confidence classes)."""
+        with self._connect() as conn:
+            total, runs = conn.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT run_id) FROM observations WHERE asset_id = ?",
+                (asset_id,),
+            ).fetchone()
+            classes = conn.execute(
+                "SELECT DISTINCT e.confidence_class FROM observations o "
+                "JOIN evidence e ON o.evidence_id = e.evidence_id WHERE o.asset_id = ? "
+                "ORDER BY e.confidence_class",
                 (asset_id,),
             ).fetchall()
-        return [_observation_with_evidence_from_row(row) for row in rows]
+        return int(total), int(runs), [str(row[0]) for row in classes]
 
     # --- external observations (Fase 10, EASM roadmap) -------------------
 

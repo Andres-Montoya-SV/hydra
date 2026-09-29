@@ -55,6 +55,7 @@ from api.auth import AuthContext, require_api_key
 from api.control_db import AssetRecord, ControlDB, LastOwnerError, RelationshipRecord
 from api.schemas import (
     AddOrganizationMemberRequest,
+    AnalystProvenanceResponse,
     AssetIdentifierResponse,
     AssetResponse,
     CandidateAssetResponse,
@@ -72,6 +73,8 @@ from api.schemas import (
     OrganizationMemberResponse,
     OrganizationResponse,
     PromoteCandidateAssetRequest,
+    RawObservationResponse,
+    RawToolProvenanceResponse,
     RelationshipEvidenceResponse,
     RelationshipResponse,
     TechnologyEventResponse,
@@ -643,6 +646,53 @@ def _visual_reference(service: HttpService) -> VisualReferenceResponse:
         title=service.title,
         favicon_hash=service.favicon_hash,
         screenshot_artifact=service.screenshot_path,
+    )
+
+
+@router.get(
+    "/{organization_id}/analyst/assets/{asset_id}/provenance",
+    response_model=AnalystProvenanceResponse,
+)
+def get_asset_raw_provenance(
+    organization_id: str,
+    asset_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=1000),
+    auth: AuthContext = Depends(require_api_key),
+) -> AnalystProvenanceResponse:
+    """Analyst/debug namespace: every observation with its raw provider
+    name and evidence detail, plus the per-tool provenance the asset's most
+    recent run recorded. The product-facing explanation of the same asset
+    is `GET .../explanations/asset/{asset_id}`."""
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    asset = _require_asset(db, organization_id, asset_id)
+    observations = [
+        RawObservationResponse(
+            observation_id=o.observation.observation_id,
+            observation_type=o.observation.observation_type,
+            run_id=o.observation.run_id,
+            observed_at=o.observation.observed_at,
+            source=o.evidence.source,
+            detail=o.evidence.detail,
+            confidence_score=o.evidence.confidence_score,
+            confidence_class=o.evidence.confidence_class,
+        )
+        for o in db.list_observations_for_asset(asset_id, newest=limit)
+    ]
+    located = _asset_run_store(request, organization_id, asset)
+    tool_provenance = []
+    if located is not None:
+        store, domain, run_id = located
+        tool_provenance = [
+            RawToolProvenanceResponse(**row)
+            for row in store.get_provenance(run_id, domain, limit=limit)
+        ]
+    return AnalystProvenanceResponse(
+        asset_id=asset_id,
+        observations=observations,
+        run_id=located[2] if located is not None else None,
+        tool_provenance=tool_provenance,
     )
 
 

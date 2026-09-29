@@ -807,3 +807,60 @@ class ScopeClassificationResponse(BaseModel):
     asset_id: str | None = None
     candidate_asset_id: str | None = None
     exclusion_id: str | None = None
+
+
+class ExplanationEvidenceResponse(BaseModel):
+    # The Hydra capability that produced this evidence — never a tool name.
+    capability: str
+    observed_at: str
+    run_id: str | None = None
+    summary: str
+
+
+class ExplanationResponse(BaseModel):
+    """The one explanation shape shared by assets, exposures and
+    relationships (`api/explanations.py`)."""
+
+    subject_type: Literal["asset", "exposure", "relationship"]
+    subject_id: str
+    claim: str
+    status: str
+    confidence: str | None = None
+    first_observed_at: str
+    last_observed_at: str
+    reasons: list[str]
+    # Newest first, at most 20; `evidence_total` is the full count.
+    evidence: list[ExplanationEvidenceResponse]
+    evidence_total: int
+
+
+class RawObservationResponse(BaseModel):
+    observation_id: str
+    observation_type: str
+    run_id: str
+    observed_at: str
+    source: str
+    detail: str
+    confidence_score: int | None = None
+    confidence_class: str
+
+
+class RawToolProvenanceResponse(BaseModel):
+    tool: str
+    field: str
+    value: str | None = None
+    confidence: int | None = None
+    discovered_at: str | None = None
+    verified_by: list[str]
+    artifact: str | None = None
+
+
+class AnalystProvenanceResponse(BaseModel):
+    """Analyst/debug namespace: raw provider names and records, deliberately
+    kept out of the product-facing responses."""
+
+    asset_id: str
+    observations: list[RawObservationResponse]
+    # Per-tool observations from the asset's most recent run (hosts only).
+    run_id: str | None = None
+    tool_provenance: list[RawToolProvenanceResponse]
