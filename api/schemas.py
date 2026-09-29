@@ -77,6 +77,10 @@ class CreateScanRequest(BaseModel):
     # exact same narrowing api/monitoring.py's Speed 1 monitoring already
     # applies — never a second, differently-defined "passive" here.
     profile: Literal["standard", "passive"] = "standard"
+    # Optional override of the organization's default provider set for this
+    # scan only (the complete set, not a delta). Never saved as the new
+    # default; must be within the tier's ceiling or the request is rejected.
+    providers: list[str] | None = Field(default=None, max_length=100)
 
 
 class CreateScanResponse(BaseModel):
@@ -92,6 +96,10 @@ class ScanStatusResponse(BaseModel):
     updated_at: str
     error_message: str | None = None
     collection_profile: str = "standard"
+    # The explicit per-scan override, if the scan had one.
+    capability_override: list[str] | None = None
+    # The optional providers that actually ran (set once execution starts).
+    effective_providers: list[str] | None = None
 
 
 class ClientReportRequest(BaseModel):
@@ -175,6 +183,45 @@ ProviderOutcome = Literal[
     "unavailable",
     "failed",
 ]
+
+
+class ProviderCapabilityInfo(BaseModel):
+    provider: str
+    capability: str
+    intensity: str
+    # Always-on base pipeline (subdomains, DNS, HTTP); can't be toggled.
+    required: bool
+    # Allowed by the organization's tier (always True for required providers).
+    entitled: bool
+
+
+class CollectionSettingsResponse(BaseModel):
+    organization_id: str
+    # "organization" once a default has been saved, "default" before that.
+    source: Literal["organization", "default"]
+    tier: str
+    enabled_providers: list[str]
+    # What scans actually run with: enabled_providers limited to the tier.
+    effective_providers: list[str]
+    # Saved as enabled but above the current tier (e.g. after a downgrade);
+    # they don't run until the tier allows them again.
+    not_entitled: list[str]
+    providers: list[ProviderCapabilityInfo]
+
+
+class UpdateCollectionSettingsRequest(BaseModel):
+    # The complete set of optional providers to enable (not a delta).
+    enabled_providers: list[str] = Field(max_length=100)
+
+
+class CapabilityAuditResponse(BaseModel):
+    audit_id: str
+    actor_account_id: str
+    scan_id: str | None = None
+    action: Literal["org_default_updated", "scan_override"]
+    before: list[str] | None = None
+    after: list[str]
+    created_at: str
 
 
 class ProviderRunOutcomeResponse(BaseModel):
@@ -430,9 +477,9 @@ class ExposureEvidenceResponse(BaseModel):
     finding: ExposureFindingResponse | None = None
 
 
-class ReasonedExposureRequest(BaseModel):
-    """Shared by every audited exposure lifecycle transition, so the reason
-    rules can't drift between them."""
+class ReasonedRequest(BaseModel):
+    """Shared by every audited, reasoned change (exposure lifecycle, scope
+    exclusions), so the reason rules can't drift between them."""
 
     reason: str = Field(min_length=1, max_length=1000)
 
@@ -446,7 +493,7 @@ class ReasonedExposureRequest(BaseModel):
         return value
 
 
-class ReopenExposureRequest(ReasonedExposureRequest):
+class ReopenExposureRequest(ReasonedRequest):
     pass
 
 
@@ -459,7 +506,7 @@ class ExposureHistoryResponse(BaseModel):
     reason: str
 
 
-class ResolveExposureRequest(ReasonedExposureRequest):
+class ResolveExposureRequest(ReasonedRequest):
     pass
 
 
@@ -634,6 +681,64 @@ class AssetIdentifierResponse(BaseModel):
     last_seen_at: str
 
 
+class GeoLocationResponse(BaseModel):
+    country: str | None = None
+    region: str | None = None
+    city: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    # The offline database this came from (edition@build date) and its age
+    # when the lookup ran. A stale database is degraded evidence.
+    source: str
+    database_age_days: int | None = None
+    stale: bool
+
+
+class NetworkIntelligenceResponse(BaseModel):
+    asset_id: str
+    # The scan the network data comes from (the asset's most recent run).
+    run_id: str | None = None
+    ips: list[str]
+    asn: str | None = None
+    asn_org: str | None = None
+    network_cidr: str | None = None
+    hosting_provider: str | None = None
+    # None when no geo enrichment ran for this asset (no database configured,
+    # or no location for its IPs) — never a guessed location.
+    geo: GeoLocationResponse | None = None
+
+
+class VisualReferenceResponse(BaseModel):
+    url: str
+    status_code: int | None = None
+    title: str | None = None
+    favicon_hash: str | None = None
+    # Run-relative path of the viewport screenshot artifact; a reference,
+    # never the image itself. None when no screenshot was captured.
+    screenshot_artifact: str | None = None
+
+
+class VisualChangeResponse(BaseModel):
+    url: str
+    signal: Literal["favicon", "title"]
+    before: str
+    after: str
+    reason: str
+
+
+class VisualIntelligenceResponse(BaseModel):
+    asset_id: str
+    run_id: str | None = None
+    # The earlier run of this organization the changes are measured
+    # against; None when there is none, and then `changes` is empty.
+    previous_run_id: str | None = None
+    references: list[VisualReferenceResponse]
+    changes: list[VisualChangeResponse]
+    # The fixed rules deciding what counts as a visual change, so a client
+    # can show why something was (or was not) reported.
+    significance_rules: list[str]
+
+
 class RelationshipResponse(BaseModel):
     relationship_id: str
     source_entity: str
@@ -670,3 +775,92 @@ class CapabilityStatusResponse(BaseModel):
     intensity: str
     active: bool
     status: Literal["disabled", "runnable", "not_runnable"]
+
+
+class AddScopeExclusionRequest(ReasonedRequest):
+    # `host`, `*.host`, or `host/path-glob` — validated by the router with
+    # `core/scope.py::normalize_exclusion_pattern`.
+    pattern: str = Field(min_length=1, max_length=300)
+
+
+class RemoveScopeExclusionRequest(ReasonedRequest):
+    pass
+
+
+class ScopeExclusionResponse(BaseModel):
+    exclusion_id: str
+    pattern: str
+    reason: str
+    created_by_account_id: str
+    created_at: str
+    removed_at: str | None = None
+    removed_by_account_id: str | None = None
+    removal_reason: str | None = None
+
+
+class ScopeClassificationResponse(BaseModel):
+    host: str
+    classification: Literal[
+        "excluded", "known_asset", "candidate", "observed_related", "authorized_scope", "unknown"
+    ]
+    reason: str
+    asset_id: str | None = None
+    candidate_asset_id: str | None = None
+    exclusion_id: str | None = None
+
+
+class ExplanationEvidenceResponse(BaseModel):
+    # The Hydra capability that produced this evidence — never a tool name.
+    capability: str
+    observed_at: str
+    run_id: str | None = None
+    summary: str
+
+
+class ExplanationResponse(BaseModel):
+    """The one explanation shape shared by assets, exposures and
+    relationships (`api/explanations.py`)."""
+
+    subject_type: Literal["asset", "exposure", "relationship"]
+    subject_id: str
+    claim: str
+    status: str
+    confidence: str | None = None
+    first_observed_at: str
+    last_observed_at: str
+    reasons: list[str]
+    # Newest first, at most 20; `evidence_total` is the full count.
+    evidence: list[ExplanationEvidenceResponse]
+    evidence_total: int
+
+
+class RawObservationResponse(BaseModel):
+    observation_id: str
+    observation_type: str
+    run_id: str
+    observed_at: str
+    source: str
+    detail: str
+    confidence_score: int | None = None
+    confidence_class: str
+
+
+class RawToolProvenanceResponse(BaseModel):
+    tool: str
+    field: str
+    value: str | None = None
+    confidence: int | None = None
+    discovered_at: str | None = None
+    verified_by: list[str]
+    artifact: str | None = None
+
+
+class AnalystProvenanceResponse(BaseModel):
+    """Analyst/debug namespace: raw provider names and records, deliberately
+    kept out of the product-facing responses."""
+
+    asset_id: str
+    observations: list[RawObservationResponse]
+    # Per-tool observations from the asset's most recent run (hosts only).
+    run_id: str | None = None
+    tool_provenance: list[RawToolProvenanceResponse]

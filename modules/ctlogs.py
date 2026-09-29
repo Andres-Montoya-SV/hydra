@@ -6,6 +6,7 @@ import asyncio
 import json
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable
 from pathlib import Path
 
 from core.assets import normalize_domain
@@ -83,17 +84,12 @@ class CtlogsPlugin(BaseToolPlugin):
         if warnings:
             context.add_warning("Certificate Transparency: " + "; ".join(warnings[:3]))
         self.update_status(context, ToolStatus.COMPLETED, output_lines=domain_count)
-        from core.intel.plugin import StructuredEmission
-        from core.intel.tls import extract_certificate_names
-
-        observed: list[str] = []
-        for record in all_certs.values():
-            observed.extend(extract_certificate_names(record.get("name_value")))
-        emission = StructuredEmission(
-            produces=["Domain", "Certificate"],
-            domains=sorted(set(observed)),
-            followups=[{"kind": "DOMAIN", "reason": "CERTIFICATE_SAN"}],
-        )
+        # Each failed crt.sh query adds exactly one warning. Every query
+        # failing means the source was unreachable, not that there were no
+        # certificates; some failing means the result is incomplete. Either
+        # way the outcome must say so — monitoring relies on it to avoid
+        # reporting hosts only CT logs knows about as removed.
+        failed = len(warnings)
         return PluginResult(
             success=True,
             output_path=domains_path,
@@ -102,8 +98,26 @@ class CtlogsPlugin(BaseToolPlugin):
                 f"Discovered {domain_count} hostnames from "
                 f"{len(all_certs)} certificate record(s)"
             ),
-            data={"intel": emission.to_dict()},
+            data={"intel": _certificate_emission(all_certs.values())},
+            unavailable=bool(targets) and failed == len(targets),
+            partial=0 < failed < len(targets),
         )
+
+
+def _certificate_emission(certs: Iterable[dict]) -> dict:
+    """Every certificate name (including off-root SANs) for the
+    intelligence engine to ingest as observations."""
+    from core.intel.plugin import StructuredEmission
+    from core.intel.tls import extract_certificate_names
+
+    observed: list[str] = []
+    for record in certs:
+        observed.extend(extract_certificate_names(record.get("name_value")))
+    return StructuredEmission(
+        produces=["Domain", "Certificate"],
+        domains=sorted(set(observed)),
+        followups=[{"kind": "DOMAIN", "reason": "CERTIFICATE_SAN"}],
+    ).to_dict()
 
 
 def _fetch_crtsh(

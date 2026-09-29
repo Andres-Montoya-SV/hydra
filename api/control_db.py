@@ -409,6 +409,61 @@ CREATE INDEX IF NOT EXISTS idx_exposure_history
 -- Provider execution outcomes are operational evidence for exposure lifecycle.
 -- They intentionally do NOT resolve an exposure by themselves: a run-level
 -- provider success does not prove exhaustive coverage of every asset.
+-- Productization Roadmap v2 ("Capability & Tool Access"): an organization's
+-- saved default set of optional providers. No row = built-in defaults,
+-- exactly what every organization ran with before this table existed.
+CREATE TABLE IF NOT EXISTS organization_collection_settings (
+    organization_id TEXT PRIMARY KEY REFERENCES organizations(organization_id),
+    enabled_providers_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_account_id TEXT NOT NULL
+);
+-- Append-only: every change to an organization's default provider set and
+-- every per-scan override — who, which org, which scan, before/after, when.
+CREATE TABLE IF NOT EXISTS capability_audit_log (
+    audit_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    actor_account_id TEXT NOT NULL,
+    scan_id TEXT,
+    action TEXT NOT NULL CHECK(action IN ('org_default_updated', 'scan_override')),
+    before_json TEXT,
+    after_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_capability_audit_org
+    ON capability_audit_log(organization_id, created_at);
+-- Roadmap v2: targets an organization never wants collected against, in
+-- SCOPE_FILE `!pattern` syntax. Removal is a soft delete (removed_at/by and
+-- the reason stay), so the exclusion history is never lost. At most one
+-- ACTIVE row per pattern (partial unique index below).
+CREATE TABLE IF NOT EXISTS organization_scope_exclusions (
+    exclusion_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    pattern TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_by_account_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    removed_at TEXT,
+    removed_by_account_id TEXT,
+    removal_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scope_exclusions_active
+    ON organization_scope_exclusions(organization_id, pattern) WHERE removed_at IS NULL;
+-- Roadmap v2 (risk-change signals): an exposure's deterministic risk level
+-- as classified when a run observed it. Risk is computed on read, so this
+-- is what a later run's level is compared against. One row per exposure
+-- per run, so re-harvesting the same run rewrites its row, never a second.
+CREATE TABLE IF NOT EXISTS exposure_risk_snapshots (
+    exposure_id TEXT NOT NULL REFERENCES exposures(exposure_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    run_id TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    reasons_json TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    PRIMARY KEY (exposure_id, run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_exposure_risk_snapshots
+    ON exposure_risk_snapshots(organization_id, exposure_id, computed_at);
 CREATE TABLE IF NOT EXISTS provider_run_outcomes (
     organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
     account_id TEXT NOT NULL,
@@ -613,6 +668,12 @@ CREATE TABLE IF NOT EXISTS scans (
     -- Monitoring-triggered scans ignore this column entirely — their own
     -- trigger_source already decides passive vs. active.
     collection_profile TEXT NOT NULL DEFAULT 'standard',
+    -- Roadmap v2 capability toggle: the explicit per-scan provider set, if
+    -- the caller overrode the org default (NULL otherwise), and the set that
+    -- actually ran, recorded at execution so a scan stays explainable
+    -- regardless of later org-default or tier changes.
+    capability_override_json TEXT,
+    effective_providers_json TEXT,
     -- Fase 02: nullable at the schema level only because SQLite cannot
     -- ALTER TABLE ADD a NOT NULL column with a per-row (not fixed)
     -- default onto a table that already has rows — every code path that
@@ -1086,6 +1147,8 @@ class ScanRecord:
     trigger_source: str
     organization_id: str | None = None
     collection_profile: str = "standard"
+    capability_override: tuple[str, ...] | None = None
+    effective_providers: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1254,6 +1317,34 @@ class ExposureHistoryRecord:
     happened_at: str
     run_id: str | None
     reason: str
+
+
+@dataclass(frozen=True)
+class CapabilityAuditRecord:
+    audit_id: str
+    actor_account_id: str
+    scan_id: str | None
+    action: str
+    before: tuple[str, ...] | None
+    after: tuple[str, ...]
+    created_at: str
+
+
+@dataclass(frozen=True)
+class ScopeExclusionRecord:
+    exclusion_id: str
+    organization_id: str
+    pattern: str
+    reason: str
+    created_by_account_id: str
+    created_at: str
+    removed_at: str | None
+    removed_by_account_id: str | None
+    removal_reason: str | None
+
+
+class DuplicateExclusionError(Exception):
+    """The organization already has an active exclusion for this pattern."""
 
 
 @dataclass(frozen=True)
@@ -1498,6 +1589,8 @@ _SCANS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("heartbeat_at", "TEXT"),
     ("trigger_source", "TEXT NOT NULL DEFAULT 'manual'"),
     ("collection_profile", "TEXT NOT NULL DEFAULT 'standard'"),
+    ("capability_override_json", "TEXT"),
+    ("effective_providers_json", "TEXT"),
 )
 
 # White-label client report fix: an existing `subscriptions` table
@@ -2142,9 +2235,8 @@ class ControlDB:
         SQL-level pagination this router's own docstring already claimed
         it did — it did not, before this phase; `_paginate` was
         Python-slicing an unbounded, fully-fetched result set on every
-        single request, the same bug `list_candidate_assets_for_organization`
-        below still has (out of scope for this phase's own asset-
-        inventory focus; flagged in docs/productization/02_asset_inventory.md).
+        single request (`list_candidate_assets_for_organization` had the
+        same bug until Roadmap v2).
 
         `q` matches as a case-insensitive substring against `identity_key`
         — simple, but real: a domain asset's identity_key IS its
@@ -2308,22 +2400,54 @@ class ControlDB:
         return candidate_asset_id, True
 
     def list_candidate_assets_for_organization(
-        self, organization_id: str, *, candidate_type: str | None = None
+        self,
+        organization_id: str,
+        *,
+        candidate_type: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[CandidateAssetRecord]:
+        """`limit=None` returns every row (internal callers); the API always
+        passes an explicit page, applied in SQL."""
         with self._connect() as conn:
-            if candidate_type is None:
-                rows = conn.execute(
-                    "SELECT * FROM candidate_assets WHERE organization_id = ? "
-                    "ORDER BY first_seen_at, candidate_asset_id",
-                    (organization_id,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM candidate_assets WHERE organization_id = ? "
-                    "AND candidate_type = ? ORDER BY first_seen_at, candidate_asset_id",
-                    (organization_id, candidate_type),
-                ).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM candidate_assets WHERE organization_id = ? "
+                "AND (? IS NULL OR candidate_type = ?) "
+                "ORDER BY first_seen_at, candidate_asset_id LIMIT ? OFFSET ?",
+                (organization_id, candidate_type, candidate_type, _sql_limit(limit), offset),
+            ).fetchall()
         return [_candidate_asset_record_from_row(row) for row in rows]
+
+    def list_pending_candidates_first_seen_in_run(
+        self, organization_id: str, run_id: str, *, limit: int
+    ) -> tuple[list[CandidateAssetRecord], int]:
+        """Candidates this run discovered that still await review: up to
+        `limit` of them, plus the total count."""
+        params = (organization_id, run_id)
+        with self._connect() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM candidate_assets WHERE organization_id = ? "
+                "AND first_seen_run_id = ? AND review_status = 'pending'",
+                params,
+            ).fetchone()[0]
+            rows = conn.execute(
+                "SELECT * FROM candidate_assets WHERE organization_id = ? "
+                "AND first_seen_run_id = ? AND review_status = 'pending' "
+                "ORDER BY display_value, candidate_asset_id LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [_candidate_asset_record_from_row(row) for row in rows], int(total)
+
+    def find_candidate_by_value(
+        self, organization_id: str, normalized_value: str
+    ) -> CandidateAssetRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM candidate_assets WHERE organization_id = ? "
+                "AND normalized_value = ? ORDER BY first_seen_at LIMIT 1",
+                (organization_id, normalized_value),
+            ).fetchone()
+        return None if row is None else _candidate_asset_record_from_row(row)
 
     def get_candidate_asset(
         self, organization_id: str, candidate_asset_id: str
@@ -2879,6 +3003,15 @@ class ControlDB:
             rows = conn.execute(query, params).fetchall()
         return [_exposure_evidence_record_from_row(row) for row in rows]
 
+    def count_exposure_evidence(self, organization_id: str, exposure_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM exposure_evidence WHERE organization_id = ? "
+                "AND exposure_id = ?",
+                (organization_id, exposure_id),
+            ).fetchone()
+        return int(row[0])
+
     def list_exposure_history(
         self, organization_id: str, exposure_id: str
     ) -> list[ExposureHistoryRecord]:
@@ -2889,6 +3022,33 @@ class ControlDB:
                 (organization_id, exposure_id),
             ).fetchall()
         return [_exposure_history_record_from_row(row) for row in rows]
+
+    def record_exposure_risk_snapshot(
+        self,
+        *,
+        organization_id: str,
+        exposure_id: str,
+        run_id: str,
+        risk_level: str,
+        reasons: tuple[str, ...],
+    ) -> str | None:
+        """Stores this run's risk level for the exposure and returns the
+        level recorded by the most recent OTHER run (None if none), so a
+        retried harvest of the same run always compares the same pair."""
+        with self._connect() as conn:
+            previous = conn.execute(
+                "SELECT risk_level FROM exposure_risk_snapshots "
+                "WHERE organization_id = ? AND exposure_id = ? AND run_id != ? "
+                "ORDER BY computed_at DESC LIMIT 1",
+                (organization_id, exposure_id, run_id),
+            ).fetchone()
+            conn.execute(
+                "INSERT OR REPLACE INTO exposure_risk_snapshots "
+                "(exposure_id, organization_id, run_id, risk_level, reasons_json, computed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (exposure_id, organization_id, run_id, risk_level, json.dumps(reasons), _now_iso()),
+            )
+        return None if previous is None else str(previous["risk_level"])
 
     def list_exposure_history_for_run(
         self, organization_id: str, run_id: str
@@ -3192,7 +3352,12 @@ class ControlDB:
         return list(found.values()), False
 
     def list_relationship_evidence(
-        self, organization_id: str, relationship_id: str
+        self,
+        organization_id: str,
+        relationship_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[RelationshipEvidenceRecord]:
         """Tenant-safe by construction — mirrors `list_exposure_evidence`'s
         own `(organization_id, exposure_id)` scoping; this method
@@ -3201,10 +3366,20 @@ class ControlDB:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM relationship_evidence WHERE organization_id = ? "
-                "AND relationship_id = ? ORDER BY observed_at, relationship_evidence_id",
-                (organization_id, relationship_id),
+                "AND relationship_id = ? ORDER BY observed_at, relationship_evidence_id "
+                "LIMIT ? OFFSET ?",
+                (organization_id, relationship_id, _sql_limit(limit), offset),
             ).fetchall()
         return [_relationship_evidence_record_from_row(row) for row in rows]
+
+    def count_relationship_evidence(self, organization_id: str, relationship_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM relationship_evidence "
+                "WHERE organization_id = ? AND relationship_id = ?",
+                (organization_id, relationship_id),
+            ).fetchone()
+        return int(row[0])
 
     # --- observations and evidence (Fase 04, EASM roadmap) --------------
 
@@ -3311,14 +3486,18 @@ class ControlDB:
             )
         return observation_id if cursor.rowcount else None
 
-    def list_observations_for_asset(self, asset_id: str) -> list[ObservationWithEvidence]:
+    def list_observations_for_asset(
+        self, asset_id: str, *, newest: int | None = None
+    ) -> list[ObservationWithEvidence]:
         """The phase's own required "one query, no manual joins against
         the raw tables" traceability: every observation this asset has
         ever had, each one already carrying its own `run_id` (where it
         came from) and its full, resolved `EvidenceRecord` (what backs
         it) — a real SQL join against `evidence` (an already-normalized,
         Fase-04-owned table), never against any run_id-scoped raw table
-        in `core/store.py`."""
+        in `core/store.py`.
+
+        `newest=N` returns only the N most recent (still oldest first)."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT o.*, "
@@ -3328,10 +3507,27 @@ class ControlDB:
                 "e.organization_id AS e_organization_id, e.asset_id AS e_asset_id, "
                 "e.confidence_class AS e_confidence_class "
                 "FROM observations o JOIN evidence e ON o.evidence_id = e.evidence_id "
-                "WHERE o.asset_id = ? ORDER BY o.observed_at",
+                "WHERE o.asset_id = ? ORDER BY o.observed_at DESC, o.observation_id DESC "
+                "LIMIT ?",
+                # SQLite: a negative LIMIT means no limit.
+                (asset_id, -1 if newest is None else newest),
+            ).fetchall()
+        return [_observation_with_evidence_from_row(row) for row in reversed(rows)]
+
+    def observation_summary(self, asset_id: str) -> tuple[int, int, list[str]]:
+        """(observation count, distinct scans, distinct confidence classes)."""
+        with self._connect() as conn:
+            total, runs = conn.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT run_id) FROM observations WHERE asset_id = ?",
+                (asset_id,),
+            ).fetchone()
+            classes = conn.execute(
+                "SELECT DISTINCT e.confidence_class FROM observations o "
+                "JOIN evidence e ON o.evidence_id = e.evidence_id WHERE o.asset_id = ? "
+                "ORDER BY e.confidence_class",
                 (asset_id,),
             ).fetchall()
-        return [_observation_with_evidence_from_row(row) for row in rows]
+        return int(total), int(runs), [str(row[0]) for row in classes]
 
     # --- external observations (Fase 10, EASM roadmap) -------------------
 
@@ -3930,22 +4126,24 @@ class ControlDB:
         trigger_source: str = "manual",
         organization_id: str | None = None,
         collection_profile: str = "standard",
+        capability_override: frozenset[str] | None = None,
     ) -> None:
         """`organization_id` defaults to the account's own organization
-        (Fase 02) when not given explicitly — every pre-existing caller
-        (every router, every test) keeps working unchanged.
-        `collection_profile` (Productization Phase 01) is caller-validated
-        upstream (`api/schemas.py::CreateScanRequest`'s `Literal` type) —
-        this method trusts it rather than re-validating, the same
-        division of responsibility `trigger_source` already has here."""
+        (Fase 02). `collection_profile` (Productization Phase 01) and
+        `capability_override` (Roadmap v2) are caller-validated upstream;
+        the override's audit entry is written in the same transaction, so
+        an override can never exist without its audit trail."""
         organization_id = organization_id or self.default_organization_id_for_account(account_id)
         now = _now_iso()
+        override_json = (
+            None if capability_override is None else json.dumps(sorted(capability_override))
+        )
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO scans "
                 "(scan_id, account_id, domain, db_path, status, created_at, updated_at, "
-                "trigger_source, organization_id, collection_profile) "
-                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+                "trigger_source, organization_id, collection_profile, capability_override_json) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
                 (
                     scan_id,
                     account_id,
@@ -3956,8 +4154,176 @@ class ControlDB:
                     trigger_source,
                     organization_id,
                     collection_profile,
+                    override_json,
                 ),
             )
+            if override_json is not None:
+                _audit_scan_override(conn, organization_id, account_id, scan_id, override_json, now)
+
+    def account_for_run(self, organization_id: str, run_id: str) -> str | None:
+        """Which account's scan produced `run_id` — only if that scan belongs
+        to `organization_id` (a foreign run is indistinguishable from none).
+        Used to open the right per-account recon.db for a durable asset."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT account_id FROM scans WHERE scan_id = ? AND organization_id = ?",
+                (run_id, organization_id),
+            ).fetchone()
+        return None if row is None else str(row["account_id"])
+
+    def set_scan_effective_providers(self, scan_id: str, providers: frozenset[str]) -> None:
+        """What actually ran for this scan, recorded at execution start."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE scans SET effective_providers_json = ? WHERE scan_id = ?",
+                (json.dumps(sorted(providers)), scan_id),
+            )
+
+    def get_org_collection_settings(self, organization_id: str) -> frozenset[str] | None:
+        """The organization's saved default provider set, or `None` if it
+        has never saved one (built-in defaults apply)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT enabled_providers_json FROM organization_collection_settings "
+                "WHERE organization_id = ?",
+                (organization_id,),
+            ).fetchone()
+        return None if row is None else frozenset(json.loads(row["enabled_providers_json"]))
+
+    def set_org_collection_settings(
+        self,
+        *,
+        organization_id: str,
+        actor_account_id: str,
+        providers: frozenset[str],
+        previous: frozenset[str],
+    ) -> bool:
+        """Saves the org default and audits it in one transaction. `previous`
+        is the effective default before the change (saved or built-in), so
+        the audit entry always shows a real before/after. Returns False —
+        and writes nothing, not even an audit row — when nothing changed."""
+        if providers == previous:
+            return False
+        now = _now_iso()
+        after_json = json.dumps(sorted(providers))
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO organization_collection_settings "
+                "(organization_id, enabled_providers_json, updated_at, updated_by_account_id) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(organization_id) DO UPDATE SET "
+                "enabled_providers_json = excluded.enabled_providers_json, "
+                "updated_at = excluded.updated_at, "
+                "updated_by_account_id = excluded.updated_by_account_id",
+                (organization_id, after_json, now, actor_account_id),
+            )
+            _insert_capability_audit(
+                conn,
+                organization_id=organization_id,
+                actor_account_id=actor_account_id,
+                scan_id=None,
+                action="org_default_updated",
+                before=previous,
+                after_json=after_json,
+                created_at=now,
+            )
+        return True
+
+    def list_capability_audit(
+        self, organization_id: str, *, limit: int = 100, offset: int = 0
+    ) -> list[CapabilityAuditRecord]:
+        limit = max(1, min(500, int(limit)))
+        offset = max(0, int(offset))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM capability_audit_log WHERE organization_id = ? "
+                "ORDER BY created_at DESC, audit_id LIMIT ? OFFSET ?",
+                (organization_id, limit, offset),
+            ).fetchall()
+        return [
+            CapabilityAuditRecord(
+                audit_id=row["audit_id"],
+                actor_account_id=row["actor_account_id"],
+                scan_id=row["scan_id"],
+                action=row["action"],
+                before=_json_tuple(row["before_json"]),
+                after=_json_tuple(row["after_json"]) or (),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def add_scope_exclusion(
+        self, *, organization_id: str, account_id: str, pattern: str, reason: str
+    ) -> ScopeExclusionRecord:
+        """`pattern` must already be normalized
+        (`core/scope.py::normalize_exclusion_pattern`)."""
+        record = ScopeExclusionRecord(
+            exclusion_id=secrets.token_hex(16),
+            organization_id=organization_id,
+            pattern=pattern,
+            reason=reason,
+            created_by_account_id=account_id,
+            created_at=_now_iso(),
+            removed_at=None,
+            removed_by_account_id=None,
+            removal_reason=None,
+        )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO organization_scope_exclusions (exclusion_id, organization_id, "
+                    "pattern, reason, created_by_account_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        record.exclusion_id,
+                        organization_id,
+                        pattern,
+                        reason,
+                        account_id,
+                        record.created_at,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateExclusionError(pattern) from exc
+        return record
+
+    def get_scope_exclusion(
+        self, organization_id: str, exclusion_id: str
+    ) -> ScopeExclusionRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM organization_scope_exclusions "
+                "WHERE organization_id = ? AND exclusion_id = ?",
+                (organization_id, exclusion_id),
+            ).fetchone()
+        return None if row is None else ScopeExclusionRecord(**dict(row))
+
+    def list_scope_exclusions(
+        self, organization_id: str, *, include_removed: bool = False
+    ) -> list[ScopeExclusionRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM organization_scope_exclusions WHERE organization_id = ? "
+                "AND (? OR removed_at IS NULL) ORDER BY pattern, created_at",
+                (organization_id, include_removed),
+            ).fetchall()
+        return [ScopeExclusionRecord(**dict(row)) for row in rows]
+
+    def active_exclusion_patterns(self, organization_id: str) -> list[str]:
+        return [record.pattern for record in self.list_scope_exclusions(organization_id)]
+
+    def remove_scope_exclusion(
+        self, *, organization_id: str, exclusion_id: str, account_id: str, reason: str
+    ) -> bool:
+        """Soft delete. False when the exclusion doesn't exist in this
+        organization or was already removed."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE organization_scope_exclusions SET removed_at = ?, "
+                "removed_by_account_id = ?, removal_reason = ? "
+                "WHERE organization_id = ? AND exclusion_id = ? AND removed_at IS NULL",
+                (_now_iso(), account_id, reason, organization_id, exclusion_id),
+            )
+        return bool(cursor.rowcount)
 
     def update_scan_status(
         self, scan_id: str, status: str, *, error_message: str | None = None
@@ -5420,6 +5786,64 @@ def _scan_record_from_row(row: sqlite3.Row) -> ScanRecord:
         trigger_source=row["trigger_source"],
         organization_id=row["organization_id"],
         collection_profile=row["collection_profile"],
+        capability_override=_json_tuple(row["capability_override_json"]),
+        effective_providers=_json_tuple(row["effective_providers_json"]),
+    )
+
+
+def _json_tuple(raw: str | None) -> tuple[str, ...] | None:
+    return None if raw is None else tuple(json.loads(raw))
+
+
+def _sql_limit(limit: int | None) -> int:
+    """A LIMIT value for a literal `LIMIT ?`: SQLite reads -1 as "no limit"."""
+    return -1 if limit is None else limit
+
+
+def _audit_scan_override(
+    conn: sqlite3.Connection,
+    organization_id: str,
+    account_id: str,
+    scan_id: str,
+    override_json: str,
+    created_at: str,
+) -> None:
+    _insert_capability_audit(
+        conn,
+        organization_id=organization_id,
+        actor_account_id=account_id,
+        scan_id=scan_id,
+        action="scan_override",
+        before=None,
+        after_json=override_json,
+        created_at=created_at,
+    )
+
+
+def _insert_capability_audit(
+    conn: sqlite3.Connection,
+    *,
+    organization_id: str,
+    actor_account_id: str,
+    scan_id: str | None,
+    action: str,
+    before: frozenset[str] | None,
+    after_json: str,
+    created_at: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO capability_audit_log (audit_id, organization_id, actor_account_id, "
+        "scan_id, action, before_json, after_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            secrets.token_hex(16),
+            organization_id,
+            actor_account_id,
+            scan_id,
+            action,
+            None if before is None else json.dumps(sorted(before)),
+            after_json,
+            created_at,
+        ),
     )
 
 

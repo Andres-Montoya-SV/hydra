@@ -26,9 +26,8 @@ now takes optional `limit`/`offset` (default `None`/no SQL LIMIT, so
 every pre-existing internal caller — certificate/technology/change
 backfills, `list_assets_running_technology` — keeps getting the complete,
 unbounded set it always has) while the router always passes an explicit
-`limit`. `list_candidate_assets_for_organization` still has the exact
-same bug this phase found and fixed for assets — out of scope here,
-flagged in docs/productization/02_asset_inventory.md. Observations,
+`limit`; `list_candidate_assets_for_organization` got the same fix in
+Roadmap v2. Observations,
 certificate events, and technology events paginate in Python over an
 already-fetched list — `list_observations_for_asset` and friends have
 many existing callers across Fases 04/12/14/18 (backfills, monitoring
@@ -46,14 +45,19 @@ turn a candidate into a real asset.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from typing import Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from api.auth import AuthContext, require_api_key
 from api.control_db import AssetRecord, ControlDB, LastOwnerError, RelationshipRecord
+from api.routers.org_access import control_db as _db
+from api.routers.org_access import require_member as _require_member
+from api.routers.org_access import require_owner as _require_owner
 from api.schemas import (
     AddOrganizationMemberRequest,
+    AnalystProvenanceResponse,
     AssetIdentifierResponse,
     AssetResponse,
     CandidateAssetResponse,
@@ -65,37 +69,26 @@ from api.schemas import (
     CurrentTechnologyResponse,
     DiscardCandidateAssetRequest,
     EvidenceResponse,
+    GeoLocationResponse,
+    NetworkIntelligenceResponse,
     ObservationResponse,
     OrganizationMemberResponse,
     OrganizationResponse,
     PromoteCandidateAssetRequest,
+    RawObservationResponse,
+    RawToolProvenanceResponse,
     RelationshipEvidenceResponse,
     RelationshipResponse,
     TechnologyEventResponse,
+    VisualChangeResponse,
+    VisualIntelligenceResponse,
+    VisualReferenceResponse,
 )
+from core.assets import HttpService
 
 router = APIRouter(prefix="/organizations", tags=["easm"])
 
 _T = TypeVar("_T")
-
-
-def _db(request: Request) -> ControlDB:
-    return request.app.state.control_db  # type: ignore[no-any-return]
-
-
-def _require_member(db: ControlDB, account_id: str, organization_id: str) -> str:
-    role = db.get_role_for_account_organization(account_id, organization_id)
-    if role is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
-    return role
-
-
-def _require_owner(db: ControlDB, account_id: str, organization_id: str) -> None:
-    role = _require_member(db, account_id, organization_id)
-    from api.control_db import role_can_modify_scope
-
-    if not role_can_modify_scope(role):
-        raise HTTPException(status_code=403, detail="Owner role required")
 
 
 def _require_member_manager(db: ControlDB, account_id: str, organization_id: str) -> None:
@@ -511,6 +504,181 @@ def list_asset_identifiers(
     ]
 
 
+def _asset_run_store(request: Request, organization_id: str, asset: AssetRecord):  # noqa: ANN202
+    """`(store, domain, run_id)` for a host asset's most recent run: the
+    recon.db of the account whose scan produced that run. `None` when
+    there is nothing to read (non-host asset, no run, db missing). Never
+    creates a database as a side effect of a read."""
+    if asset.asset_type != "domain" or not asset.last_seen_run_id:
+        return None
+    account_id = _db(request).account_for_run(organization_id, asset.last_seen_run_id)
+    if account_id is None:
+        return None
+    from api.tenancy import account_db_path
+    from core.store import AssetStore
+
+    path = account_db_path(request.app.state.api_settings, account_id)
+    if not path.exists():
+        return None
+    domain = asset.identity_key.split(":", 1)[1]
+    return AssetStore(path), domain, asset.last_seen_run_id
+
+
+def _latest_host(request: Request, organization_id: str, asset: AssetRecord):  # noqa: ANN202
+    """The host as the asset's most recent run recorded it, or `None`."""
+    located = _asset_run_store(request, organization_id, asset)
+    if located is None:
+        return None
+    store, domain, run_id = located
+    return store.get_host(run_id, domain)
+
+
+@router.get(
+    "/{organization_id}/assets/{asset_id}/network",
+    response_model=NetworkIntelligenceResponse,
+)
+def get_asset_network(
+    organization_id: str,
+    asset_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> NetworkIntelligenceResponse:
+    """Network & Geo Intelligence: who owns the asset's IPs (ASN, BGP
+    prefix, hosting provider, via Team Cymru) and where they are (offline
+    geo lookup — no IP ever leaves the machine), with the geo database's
+    freshness so stale data is visible."""
+    from core.geoip import GEOIP_MAX_AGE_DAYS
+
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    asset = _require_asset(db, organization_id, asset_id)
+    host = _latest_host(request, organization_id, asset)
+    geo = None
+    if host is not None and host.geo_source:
+        age = host.geo_db_age_days
+        geo = GeoLocationResponse(
+            country=host.country,
+            region=host.region,
+            city=host.city,
+            latitude=host.latitude,
+            longitude=host.longitude,
+            source=host.geo_source,
+            database_age_days=age,
+            stale=age is None or age > GEOIP_MAX_AGE_DAYS,
+        )
+    return NetworkIntelligenceResponse(
+        asset_id=asset_id,
+        run_id=asset.last_seen_run_id,
+        ips=list(host.ips) if host is not None else [],
+        asn=host.asn if host is not None else None,
+        asn_org=host.asn_org if host is not None else None,
+        network_cidr=host.cidr if host is not None else None,
+        hosting_provider=host.provider if host is not None else None,
+        geo=geo,
+    )
+
+
+@router.get(
+    "/{organization_id}/assets/{asset_id}/visual",
+    response_model=VisualIntelligenceResponse,
+)
+def get_asset_visual(
+    organization_id: str,
+    asset_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> VisualIntelligenceResponse:
+    """Visual Intelligence: what the asset's web pages looked like on its
+    most recent run (title, favicon hash, screenshot reference) and the
+    significant visual changes since this organization's previous run of
+    the same target. See `core/visual.py` for what counts as a change."""
+    from core.visual import SIGNIFICANCE_RULES, visual_changes
+
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    asset = _require_asset(db, organization_id, asset_id)
+    response = VisualIntelligenceResponse(
+        asset_id=asset_id,
+        run_id=asset.last_seen_run_id,
+        references=[],
+        changes=[],
+        significance_rules=list(SIGNIFICANCE_RULES),
+    )
+    located = _asset_run_store(request, organization_id, asset)
+    if located is None:
+        return response
+    store, domain, run_id = located
+    current = store.get_http_services(run_id, host=domain)
+    response.references = [_visual_reference(service) for service in current]
+    previous_run_id = store.find_previous_run(run_id)
+    # The account's recon.db may hold runs of its other organizations.
+    if previous_run_id and db.account_for_run(organization_id, previous_run_id):
+        response.previous_run_id = previous_run_id
+        previous = store.get_http_services(previous_run_id, host=domain)
+        response.changes = [
+            VisualChangeResponse(**asdict(change), reason=change.reason())
+            for change in visual_changes(previous, current)
+        ]
+    return response
+
+
+def _visual_reference(service: HttpService) -> VisualReferenceResponse:
+    return VisualReferenceResponse(
+        url=service.url,
+        status_code=service.status_code,
+        title=service.title,
+        favicon_hash=service.favicon_hash,
+        screenshot_artifact=service.screenshot_path,
+    )
+
+
+@router.get(
+    "/{organization_id}/analyst/assets/{asset_id}/provenance",
+    response_model=AnalystProvenanceResponse,
+)
+def get_asset_raw_provenance(
+    organization_id: str,
+    asset_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=1000),
+    auth: AuthContext = Depends(require_api_key),
+) -> AnalystProvenanceResponse:
+    """Analyst/debug namespace: every observation with its raw provider
+    name and evidence detail, plus the per-tool provenance the asset's most
+    recent run recorded. The product-facing explanation of the same asset
+    is `GET .../explanations/asset/{asset_id}`."""
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    asset = _require_asset(db, organization_id, asset_id)
+    observations = [
+        RawObservationResponse(
+            observation_id=o.observation.observation_id,
+            observation_type=o.observation.observation_type,
+            run_id=o.observation.run_id,
+            observed_at=o.observation.observed_at,
+            source=o.evidence.source,
+            detail=o.evidence.detail,
+            confidence_score=o.evidence.confidence_score,
+            confidence_class=o.evidence.confidence_class,
+        )
+        for o in db.list_observations_for_asset(asset_id, newest=limit)
+    ]
+    located = _asset_run_store(request, organization_id, asset)
+    tool_provenance = []
+    if located is not None:
+        store, domain, run_id = located
+        tool_provenance = [
+            RawToolProvenanceResponse(**row)
+            for row in store.get_provenance(run_id, domain, limit=limit)
+        ]
+    return AnalystProvenanceResponse(
+        asset_id=asset_id,
+        observations=observations,
+        run_id=located[2] if located is not None else None,
+        tool_provenance=tool_provenance,
+    )
+
+
 @router.get("/{organization_id}/relationships", response_model=list[RelationshipResponse])
 def list_relationships(
     organization_id: str,
@@ -601,11 +769,10 @@ def list_candidate_assets(
 ) -> list[CandidateAssetResponse]:
     db = _db(request)
     _require_member(db, auth.account_id, organization_id)
-    rows = db.list_candidate_assets_for_organization(organization_id, candidate_type=candidate_type)
-    return [
-        CandidateAssetResponse(**row.__dict__)
-        for row in _paginate(rows, limit=limit, offset=offset)
-    ]
+    rows = db.list_candidate_assets_for_organization(
+        organization_id, candidate_type=candidate_type, limit=limit, offset=offset
+    )
+    return [CandidateAssetResponse(**row.__dict__) for row in rows]
 
 
 @router.get(

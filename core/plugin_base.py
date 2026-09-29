@@ -29,6 +29,11 @@ class PluginResult:
     # without pretending it was a clean run.
     partial: bool = False
     blocked_by_scope: bool = False
+    # The provider ran but its upstream source (a third-party service it
+    # depends on) couldn't be reached. Orthogonal to `success` so the scan
+    # can continue while the outcome is still recorded as UNAVAILABLE —
+    # never as a clean empty run.
+    unavailable: bool = False
 
 
 class ReconPlugin(ABC):

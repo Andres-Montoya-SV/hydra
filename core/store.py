@@ -55,9 +55,12 @@ CREATE TABLE IF NOT EXISTS hosts (
     asn_org TEXT,
     cidr TEXT,
     country TEXT,
+    region TEXT,
     city TEXT,
     latitude REAL,
     longitude REAL,
+    geo_source TEXT,
+    geo_db_age_days INTEGER,
     provider TEXT,
     cloud_provider TEXT,
     cloud_region TEXT,
@@ -770,6 +773,9 @@ class AssetStore:
                 "city": "ALTER TABLE hosts ADD COLUMN city TEXT",
                 "latitude": "ALTER TABLE hosts ADD COLUMN latitude REAL",
                 "longitude": "ALTER TABLE hosts ADD COLUMN longitude REAL",
+                "region": "ALTER TABLE hosts ADD COLUMN region TEXT",
+                "geo_source": "ALTER TABLE hosts ADD COLUMN geo_source TEXT",
+                "geo_db_age_days": "ALTER TABLE hosts ADD COLUMN geo_db_age_days INTEGER",
                 "provider": "ALTER TABLE hosts ADD COLUMN provider TEXT",
                 "cloud_provider": "ALTER TABLE hosts ADD COLUMN cloud_provider TEXT",
                 "cloud_region": "ALTER TABLE hosts ADD COLUMN cloud_region TEXT",
@@ -1819,7 +1825,8 @@ class AssetStore:
         conn.execute(
             """INSERT OR REPLACE INTO hosts
                (run_id, domain, hostname, root_domain, subdomain, ips_json,
-                asn, asn_org, cidr, country, city, latitude, longitude, provider,
+                asn, asn_org, cidr, country, region, city, latitude, longitude,
+                geo_source, geo_db_age_days, provider,
                 cloud_provider, cloud_region, registrar, registration_created_at,
                 registration_expires_at, nameservers_json, is_cdn, cdn_provider, waf_provider,
                 dns_resolved, dns_wildcard, tarpit_suspected, tarpit_canary_ports_json,
@@ -1827,7 +1834,7 @@ class AssetStore:
                 risk_level, risk_score, risk_reasons_json, discovery_sources_json,
                 warnings_json, cluster_ids_json, profile_json,
                 first_seen, last_seen, scan_timestamp)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 host.domain,
@@ -1839,9 +1846,12 @@ class AssetStore:
                 host.asn_org,
                 host.cidr,
                 host.country,
+                host.region,
                 host.city,
                 host.latitude,
                 host.longitude,
+                host.geo_source,
+                host.geo_db_age_days,
                 host.provider,
                 host.cloud_provider,
                 host.cloud_region,
@@ -2157,6 +2167,47 @@ class AssetStore:
                     )
                 )
 
+    def get_host(self, run_id: str, domain: str) -> Host | None:
+        """One host as a specific run recorded it, or `None`."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM hosts WHERE run_id = ? AND domain = ?", (run_id, domain)
+            ).fetchone()
+        return None if row is None else self._row_to_host(row)
+
+    def get_http_services(self, run_id: str, *, host: str | None = None) -> list[HttpService]:
+        """A run's HTTP services (optionally one host's), ordered by URL."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM http_services WHERE run_id = ? AND (? IS NULL OR host = ?) "
+                "ORDER BY url",
+                (run_id, host, host),
+            ).fetchall()
+        return [self._row_to_http(row) for row in rows]
+
+    def get_provenance(self, run_id: str, host: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Raw per-tool observations recorded for one host in one run,
+        oldest first. `artifact_path` is reduced to its file name: the
+        server's directory layout is not evidence."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tool, field, value, confidence, discovered_at, verified_by_json, "
+                "artifact_path FROM provenance WHERE run_id = ? AND host = ? ORDER BY id LIMIT ?",
+                (run_id, host, limit),
+            ).fetchall()
+        return [
+            {
+                "tool": row["tool"],
+                "field": row["field"],
+                "value": row["value"],
+                "confidence": row["confidence"],
+                "discovered_at": row["discovered_at"],
+                "verified_by": json.loads(row["verified_by_json"] or "[]"),
+                "artifact": Path(row["artifact_path"]).name if row["artifact_path"] else None,
+            }
+            for row in rows
+        ]
+
     def _row_to_host(self, row: sqlite3.Row) -> Host:
         from core.assets import HostCategory, HostProfile
 
@@ -2193,7 +2244,10 @@ class AssetStore:
             asn_org=row["asn_org"],
             cidr=row["cidr"],
             country=row["country"],
+            region=row["region"] if "region" in row.keys() else None,
             city=row["city"] if "city" in row.keys() else None,
+            geo_source=row["geo_source"] if "geo_source" in row.keys() else None,
+            geo_db_age_days=row["geo_db_age_days"] if "geo_db_age_days" in row.keys() else None,
             latitude=row["latitude"] if "latitude" in row.keys() else None,
             longitude=row["longitude"] if "longitude" in row.keys() else None,
             provider=row["provider"],

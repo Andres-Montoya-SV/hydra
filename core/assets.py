@@ -276,9 +276,14 @@ class Host:
     asn_org: str | None = None
     cidr: str | None = None
     country: str | None = None
+    region: str | None = None
     city: str | None = None
     latitude: float | None = None
     longitude: float | None = None
+    # Offline geo provenance (core/geoip.py): database edition@build date,
+    # and its age in days when the lookup ran — stale data is visible.
+    geo_source: str | None = None
+    geo_db_age_days: int | None = None
     provider: str | None = None
     cloud_provider: str | None = None
     cloud_region: str | None = None
@@ -381,14 +386,7 @@ class Host:
             if ip not in self.ips:
                 self.ips.append(ip)
 
-        if other.asn:
-            self.asn = other.asn
-        if other.asn_org:
-            self.asn_org = other.asn_org
-        if other.cidr:
-            self.cidr = other.cidr
-        if other.country:
-            self.country = other.country
+        self._merge_network(other)
         if other.provider:
             self.provider = other.provider
         if other.registrar:
@@ -439,6 +437,25 @@ class Host:
 
         if other.confidence_score > self.confidence_score:
             self.confidence_score = other.confidence_score
+
+    def _merge_network(self, other: Host) -> None:
+        if other.asn:
+            self.asn = other.asn
+        if other.asn_org:
+            self.asn_org = other.asn_org
+        if other.cidr:
+            self.cidr = other.cidr
+        if other.country:
+            self.country = other.country
+        # Geo fields travel together: a lookup's location and the database
+        # it came from must never be mixed across sources.
+        if other.geo_source:
+            self.region = other.region
+            self.city = other.city
+            self.latitude = other.latitude
+            self.longitude = other.longitude
+            self.geo_source = other.geo_source
+            self.geo_db_age_days = other.geo_db_age_days
 
     def _merge_ports(self, ports: list[Port]) -> None:
         existing = {(p.host, p.port, p.protocol): p for p in self.ports}
@@ -550,9 +567,12 @@ class Host:
             "asn_org": self.asn_org,
             "cidr": self.cidr,
             "country": self.country,
+            "region": self.region,
             "city": self.city,
             "latitude": self.latitude,
             "longitude": self.longitude,
+            "geo_source": self.geo_source,
+            "geo_db_age_days": self.geo_db_age_days,
             "provider": self.provider,
             "cloud_provider": self.cloud_provider,
             "cloud_region": self.cloud_region,

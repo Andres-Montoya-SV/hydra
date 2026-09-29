@@ -213,6 +213,9 @@ class Settings:
     cache_ttl_seconds: int = 86400
     # Covers TCP WHOIS attempt (may idle ~5s on broken :43 paths) + DNS fallback.
     asn_lookup_timeout: int = 20
+    # Local MaxMind-format database for offline geo enrichment (core/geoip.py);
+    # unset = no geo. Lookups never leave the machine.
+    geoip_db_path: str | None = None
     ctlogs_timeout: int = 15
     ctlogs_delay_seconds: int = 2
     port_verify_timeout: int = 120
@@ -379,6 +382,10 @@ class Settings:
     vuln_match_timeout: int = 15
     wpscan_api_token: str | None = None
     scope_file: Path | None = None
+    # Exclusions saved on the scan's organization (API scans only), in
+    # SCOPE_FILE `!pattern` syntax without the `!`. Applied on top of
+    # SCOPE_FILE; exclusions always win over any positive scope match.
+    scope_exclusions: list[str] = field(default_factory=list)
     # Bounded iterative discovery. Conservative defaults — observe freely,
     # collect only in-scope indicators up to depth 1.
     max_discovery_depth: int = 1
@@ -561,6 +568,7 @@ class Settings:
                 os.getenv("CACHE_TTL_SECONDS"), 86400, "CACHE_TTL_SECONDS", maximum=604_800
             ),
             asn_lookup_timeout=_int(os.getenv("ASN_LOOKUP_TIMEOUT"), 20, "ASN_LOOKUP_TIMEOUT"),
+            geoip_db_path=os.getenv("GEOIP_DB_PATH") or None,
             ctlogs_timeout=_int(os.getenv("CTLOGS_TIMEOUT"), 15, "CTLOGS_TIMEOUT"),
             ctlogs_delay_seconds=_int(os.getenv("CTLOGS_DELAY_SECONDS"), 2, "CTLOGS_DELAY_SECONDS"),
             port_verify_timeout=_int(os.getenv("PORT_VERIFY_TIMEOUT"), 120, "PORT_VERIFY_TIMEOUT"),

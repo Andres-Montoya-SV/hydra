@@ -250,6 +250,9 @@ class APISettings:
     # 50,000-host diff or silently dropping monitoring for a domain that
     # legitimately grew.
     monitoring_asset_count_ceiling: int = 5000
+    # Offline geo database handed to every API scan (core/geoip.py). Per-
+    # account scan settings don't read .env, so it's passed through here.
+    geoip_db_path: str | None = None
     # Real per-cycle time/work budget — a SINGLE call to
     # `run_monitoring_cycle` stops claiming new pages of due domains once
     # this many seconds have elapsed since it started (already-started
@@ -317,6 +320,7 @@ def load_api_settings() -> APISettings:
     if dev_dns_port:
         settings.dev_dns_port = int(dev_dns_port)
     settings.dev_well_known_base_url = os.getenv("HYDRA_API_DEV_WELL_KNOWN_BASE_URL") or None
+    settings.geoip_db_path = os.getenv("GEOIP_DB_PATH") or None
     settings.wompi_client_id = os.getenv("WOMPI_CLIENT_ID") or None
     settings.wompi_client_secret = os.getenv("WOMPI_CLIENT_SECRET") or None
     settings.dev_wompi_id_base_url = os.getenv("HYDRA_API_DEV_WOMPI_ID_BASE_URL") or None

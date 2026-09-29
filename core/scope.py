@@ -31,6 +31,29 @@ def load_scope_patterns(path: Path) -> list[str]:
     return patterns
 
 
+def normalize_exclusion_pattern(raw: str) -> str:
+    """Validates one organization exclusion: `host`, `*.host`, or
+    `host/path-glob` (the SCOPE_FILE `!` syntax, without the `!`). Returns
+    it with the host part lowercased; raises ValueError when it isn't one
+    of those shapes."""
+    text = (raw or "").strip()
+    if not text or "://" in text or any(ch.isspace() for ch in text) or text.startswith("!"):
+        raise ValueError("exclusion must be a host, *.host, or host/path pattern")
+    host_part, slash, path_part = text.partition("/")
+    host = host_part.lower().rstrip(".")
+    bare = host[2:] if host.startswith("*.") else host
+    if "." not in bare or "*" in bare or not normalize_domain(bare):
+        raise ValueError(f"not a valid host pattern: {host_part!r}")
+    return host + (slash + path_part if slash else "")
+
+
+def configured_scope_patterns(scope_file: Path | None, exclusions: list[str]) -> list[str]:
+    """SCOPE_FILE lines plus the organization's exclusions as `!` lines —
+    the one list every CollectionScope for a run is built from."""
+    patterns = load_scope_patterns(scope_file) if scope_file else []
+    return [*patterns, *(f"!{pattern}" for pattern in exclusions)]
+
+
 def split_scope_patterns(patterns: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
     """Split raw scope lines into (positive domain patterns, path exclusions).
 

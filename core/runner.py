@@ -64,13 +64,11 @@ def intel_config_for_pipeline(context: PipelineContext, settings: Settings) -> I
     from core.intel.bounds import DiscoveryBounds
     from core.intel.engine import IntelRunConfig
     from core.intel.scope import CollectionScope, allows_active_collection
-    from core.scope import load_scope_patterns
+    from core.scope import configured_scope_patterns
 
     scope = context.collection_scope
     if scope is None:
-        patterns: list[str] = []
-        if settings.scope_file:
-            patterns = load_scope_patterns(settings.scope_file)
+        patterns = configured_scope_patterns(settings.scope_file, settings.scope_exclusions)
         scope = CollectionScope.from_seeds(
             [t.domain for t in context.targets],
             patterns=patterns,
@@ -155,29 +153,41 @@ class PipelineRunner:
             raise PipelineInterruptedError("Pipeline interrupted by user")
 
     def _enforce_scope(self, targets: list) -> None:
-        """Fail closed when SCOPE_FILE is set and a target is outside it."""
-        scope_path = self.settings.scope_file
-        if not scope_path:
-            return
-        from core.scope import load_scope_patterns, out_of_scope_targets, split_scope_patterns
+        """Fail closed when a target is outside SCOPE_FILE (if set) or is
+        wholly excluded by a SCOPE_FILE `!` line or an organization
+        exclusion."""
+        from core.scope import (
+            configured_scope_patterns,
+            host_fully_excluded,
+            out_of_scope_targets,
+            split_scope_patterns,
+        )
 
-        patterns, _path_exclusions = split_scope_patterns(load_scope_patterns(scope_path))
+        scope_path = self.settings.scope_file
+        patterns, exclusions = split_scope_patterns(
+            configured_scope_patterns(scope_path, self.settings.scope_exclusions)
+        )
         names = [t.domain for t in targets if getattr(t, "domain", None)]
-        rejected = out_of_scope_targets(names, patterns)
+        rejected = out_of_scope_targets(names, patterns) if scope_path else []
         if rejected:
             raise ConfigurationError(
                 "Target(s) outside SCOPE_FILE: " + ", ".join(rejected) + f" (file: {scope_path})"
             )
+        excluded = [name for name in names if host_fully_excluded(name, exclusions)]
+        if excluded:
+            raise ConfigurationError(
+                "Target(s) explicitly excluded from scope: " + ", ".join(excluded)
+            )
 
     def _collection_scope_for(self, context: PipelineContext):
         from core.intel.scope import CollectionScope
-        from core.scope import load_scope_patterns
+        from core.scope import configured_scope_patterns
 
         if context.collection_scope is not None:
             return context.collection_scope
-        patterns: list[str] = []
-        if self.settings.scope_file:
-            patterns = load_scope_patterns(self.settings.scope_file)
+        patterns = configured_scope_patterns(
+            self.settings.scope_file, self.settings.scope_exclusions
+        )
         return CollectionScope.from_seeds(
             [t.domain for t in context.targets],
             patterns=patterns,

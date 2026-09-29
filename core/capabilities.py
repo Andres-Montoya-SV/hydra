@@ -42,6 +42,9 @@ class Capability(str, Enum):
     CLOUD = "cloud"
     EXPOSURE_DETECTION = "exposure_detection"
     EXTERNAL_INTELLIGENCE = "external_intelligence"
+    # Productization Roadmap v2 "Network & Geo Intelligence": who owns an IP
+    # (ASN/BGP prefix/hosting provider) and where it is (offline geo lookup).
+    NETWORK_GEO = "network_geo"
     IMPORT = "import"
     UNCATEGORIZED = "uncategorized"
 
@@ -60,7 +63,7 @@ _CAPABILITY_MAP: dict[str, Capability] = {
     "wildcard_dns": Capability.DNS,
     "passive_dns": Capability.DNS,
     # Network discovery
-    "asn": Capability.NETWORK_DISCOVERY,
+    "asn": Capability.NETWORK_GEO,
     "port_scan": Capability.NETWORK_DISCOVERY,
     "port_verify": Capability.NETWORK_DISCOVERY,
     # HTTP surface

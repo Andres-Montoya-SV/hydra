@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from core.assets import (
@@ -1183,6 +1184,26 @@ class TarpitCheckParser(ToolParser):
         return hosts, warnings
 
 
+def _apply_ownership(host: Host, record: dict[str, Any]) -> None:
+    """Team Cymru ownership plus, when present, the offline geo lookup."""
+    host.asn = _optional_str(record.get("asn"))
+    host.asn_org = _optional_str(record.get("as_name"))
+    host.cidr = _optional_str(record.get("bgp_prefix"))
+    # The offline geo country (where the IP is) wins over Team Cymru's
+    # registry country (where the block was allocated).
+    host.country = _optional_str(record.get("geo_country")) or _optional_str(record.get("country"))
+    host.provider = host.asn_org
+    if not record.get("geo_source"):
+        return
+    host.region = _optional_str(record.get("region"))
+    host.city = _optional_str(record.get("city"))
+    host.latitude = _optional_float(record.get("latitude"))
+    host.longitude = _optional_float(record.get("longitude"))
+    host.geo_source = _optional_str(record.get("geo_source"))
+    age = record.get("geo_db_age_days")
+    host.geo_db_age_days = age if isinstance(age, int) else None
+
+
 class ASNParser(ToolParser):
     """Apply Team Cymru ownership data to hosts sharing each IP."""
 
@@ -1212,11 +1233,7 @@ class ASNParser(ToolParser):
             record = matches[0]
             host = by_domain.setdefault(source_host.domain, Host(domain=source_host.domain))
             host.ips = list(dict.fromkeys([*host.ips, *source_host.ips]))
-            host.asn = _optional_str(record.get("asn"))
-            host.asn_org = _optional_str(record.get("as_name"))
-            host.cidr = _optional_str(record.get("bgp_prefix"))
-            host.country = _optional_str(record.get("country"))
-            host.provider = host.asn_org
+            _apply_ownership(host, record)
             host.add_provenance(
                 record_observation(
                     tool="asn_lookup",
@@ -1827,6 +1844,10 @@ def _parse_int(raw: object) -> int | None:
 def _optional_str(raw: object) -> str | None:
     value = str(raw).strip() if raw is not None else ""
     return value or None
+
+
+def _optional_float(raw: object) -> float | None:
+    return float(raw) if isinstance(raw, int | float) and not isinstance(raw, bool) else None
 
 
 def _extract_tls_value(record: dict, key: str) -> str | None:

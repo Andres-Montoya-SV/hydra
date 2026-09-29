@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from api.email_sender import EmailSender
     from api.health import LoopHeartbeats
     from api.settings import APISettings
+    from core.store import AssetStore
 
 logger = logging.getLogger("hydra.api.monitoring")
 
@@ -159,19 +160,116 @@ def _easm_citations_for_run(control_db: ControlDB, organization_id: str, run_id:
     return citations
 
 
+# Candidate-review citations per run: beyond this, one summary line says how
+# many more are waiting, so a noisy discovery run can't flood an alert.
+CANDIDATE_CITATION_LIMIT = 20
+
+
+def _signal_citations(
+    control_db: ControlDB,
+    store: AssetStore,
+    row: MonitoredDomainRecord,
+    scan_id: str,
+    previous_scan_id: str | None,
+) -> list[str]:
+    """Every reason this run is worth notifying about beyond the hostname
+    diff: the EASM event citations, significant visual changes since the
+    previous monitored run, new candidates awaiting review, and exposures
+    whose deterministic risk level moved."""
+    citations = _visual_change_citations(store, scan_id, previous_scan_id)
+    if row.organization_id:
+        citations = [
+            *_easm_citations_for_run(control_db, row.organization_id, scan_id),
+            *citations,
+            *_candidate_review_citations(control_db, row.organization_id, scan_id),
+            *_risk_change_citations(control_db, row.organization_id, scan_id),
+        ]
+    return citations
+
+
+def _visual_change_citations(
+    store: AssetStore, scan_id: str, previous_scan_id: str | None
+) -> list[str]:
+    """Title/favicon changes only (`core/visual.py`) — never pixel or HTML
+    diffs, which would alert on every rotating banner."""
+    from core.visual import visual_changes
+
+    if not previous_scan_id:
+        return []
+    changes = visual_changes(
+        store.get_http_services(previous_scan_id), store.get_http_services(scan_id)
+    )
+    return [f"VISUAL_CHANGED: {change.reason()}" for change in changes]
+
+
+def _candidate_review_citations(
+    control_db: ControlDB, organization_id: str, run_id: str
+) -> list[str]:
+    candidates, total = control_db.list_pending_candidates_first_seen_in_run(
+        organization_id, run_id, limit=CANDIDATE_CITATION_LIMIT
+    )
+    citations = [
+        f"CANDIDATE_REVIEW: {c.display_value} ({c.candidate_type}) awaits review -- {c.reason}"
+        for c in candidates
+    ]
+    if total > len(candidates):
+        citations.append(
+            f"CANDIDATE_REVIEW: {total - len(candidates)} more candidate(s) await review"
+        )
+    return citations
+
+
+def _risk_change_citations(control_db: ControlDB, organization_id: str, run_id: str) -> list[str]:
+    """Re-classifies each exposure this run observed and cites the ones
+    whose level differs from the last run that observed them. An
+    exposure's first classification is covered by its own OBSERVED
+    citation, so it never produces a risk-change line."""
+    from core.risk_scoring import classify_exposure_risk
+
+    citations: list[str] = []
+    history = control_db.list_exposure_history_for_run(organization_id, run_id)
+    touched = {h.exposure_id for h in history if h.event_type in ("observed", "reopened")}
+    for exposure_id in sorted(touched):
+        factors = control_db.risk_factors_for_exposure(organization_id, exposure_id)
+        exposure = control_db.get_exposure_for_organization(organization_id, exposure_id)
+        if factors is None or exposure is None:
+            continue
+        risk = classify_exposure_risk(factors)
+        previous = control_db.record_exposure_risk_snapshot(
+            organization_id=organization_id,
+            exposure_id=exposure_id,
+            run_id=run_id,
+            risk_level=risk.level.value,
+            reasons=risk.reasons,
+        )
+        if previous is not None and previous != risk.level.value:
+            citations.append(
+                f"RISK_CHANGED: {exposure.title} {previous} -> {risk.level.value} -- "
+                + "; ".join(risk.reasons)
+            )
+    return citations
+
+
 def _degraded_providers(
     control_db: ControlDB, row: MonitoredDomainRecord, scan_id: str, previous_scan_id: str | None
 ) -> list[str]:
-    """Collectors that contributed results to the baseline run but failed,
-    were unavailable, or ran only partially in this one. Empty when there's
-    no baseline yet or the row predates organizations (no outcomes to read)."""
+    """Hostname-producing collectors that contributed results to the baseline
+    run but failed, were unavailable, or ran only partially in this one.
+    Only providers whose output includes hostnames count: a failed
+    vulnerability scanner or ASN lookup can't make hosts disappear, so it
+    must not suppress a genuine removal alert. Empty when there's no
+    baseline yet or the row predates organizations (no outcomes to read)."""
     if previous_scan_id is None or not row.organization_id:
         return []
+    from api.collection_capabilities import hostname_producers
+
+    relevant = hostname_producers()
 
     def outcomes(run_id: str) -> dict[str, str]:
         return {
             o.provider: o.outcome
             for o in control_db.list_provider_run_outcomes(row.organization_id or "", run_id)
+            if o.provider in relevant
         }
 
     return regressed_providers(
@@ -274,11 +372,8 @@ def _harvest_one(
     # all. Never raises: a lookup error here is caught by this function's
     # own caller (`run_monitoring_cycle`), the same per-domain isolation
     # every other operation in this module already gets.
-    easm_citations: list[str] = (
-        _easm_citations_for_run(control_db, row.organization_id, scan_id)
-        if row.organization_id
-        else []
-    )
+    previous_scan_id = row.last_passive_scan_id if speed == "passive" else row.last_active_scan_id
+    easm_citations = _signal_citations(control_db, store, row, scan_id, previous_scan_id)
 
     # A domain's very first monitored run never itself triggers a
     # notification: `digest_changed` requires a prior digest to differ
@@ -286,7 +381,6 @@ def _harvest_one(
     # `previous_count is None` — there is no "change" to report yet,
     # only a baseline being established.
     outcome: MonitoringRunOutcome | None = None
-    previous_scan_id = row.last_passive_scan_id if speed == "passive" else row.last_active_scan_id
     # A collector that returned results last time but failed this time
     # makes the hostname set untrustworthy: diffing it would report the
     # failure as hosts being REMOVED, and saving it as the baseline would
