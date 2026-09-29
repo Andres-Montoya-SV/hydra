@@ -553,6 +553,35 @@ class AssetIdentifierResponse(BaseModel):
     last_seen_at: str
 
 
+class RelationshipResponse(BaseModel):
+    relationship_id: str
+    source_entity: str
+    relationship_type: str
+    target_entity: str
+    source_asset_id: str | None = None
+    target_asset_id: str | None = None
+    confidence: str
+    strength: str
+    # Parsed from the stored data_json (e.g. the shared certificate
+    # fingerprint or IP a SHARED_CERTIFICATE/SHARED_IP relationship
+    # cites) — never the raw JSON string; empty dict, never null, when
+    # nothing was recorded.
+    data: dict[str, object] = {}
+    first_seen_at: str
+    last_seen_at: str
+    last_seen_run_id: str
+
+
+class RelationshipEvidenceResponse(BaseModel):
+    relationship_evidence_id: str
+    run_id: str
+    source: str
+    collector: str
+    reason: str
+    metadata: dict[str, object] = {}
+    observed_at: str
+
+
 class CapabilityStatusResponse(BaseModel):
     provider: str
     display_name: str

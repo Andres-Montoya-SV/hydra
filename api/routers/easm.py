@@ -45,12 +45,13 @@ turn a candidate into a real asset.
 
 from __future__ import annotations
 
+import json
 from typing import Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from api.auth import AuthContext, require_api_key
-from api.control_db import AssetRecord, ControlDB, LastOwnerError
+from api.control_db import AssetRecord, ControlDB, LastOwnerError, RelationshipRecord
 from api.schemas import (
     AddOrganizationMemberRequest,
     AssetIdentifierResponse,
@@ -68,6 +69,8 @@ from api.schemas import (
     OrganizationMemberResponse,
     OrganizationResponse,
     PromoteCandidateAssetRequest,
+    RelationshipEvidenceResponse,
+    RelationshipResponse,
     TechnologyEventResponse,
 )
 
@@ -123,6 +126,34 @@ def _paginate(items: list[_T], *, limit: int, offset: int) -> list[_T]:
 
 def _asset_to_response(row: AssetRecord) -> AssetResponse:
     return AssetResponse(**row.__dict__)
+
+
+def _parse_json_object(raw: str) -> dict[str, object]:
+    """Defensive against a stray malformed/non-object JSON string ending
+    up in a stored `data_json`/`metadata_json` column — returns `{}`
+    rather than ever raising a 500 for a product-facing read endpoint."""
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _relationship_to_response(row: RelationshipRecord) -> RelationshipResponse:
+    return RelationshipResponse(
+        relationship_id=row.relationship_id,
+        source_entity=row.source_entity,
+        relationship_type=row.relationship_type,
+        target_entity=row.target_entity,
+        source_asset_id=row.source_asset_id,
+        target_asset_id=row.target_asset_id,
+        confidence=row.confidence,
+        strength=row.strength,
+        data=_parse_json_object(row.data_json),
+        first_seen_at=row.first_seen_at,
+        last_seen_at=row.last_seen_at,
+        last_seen_run_id=row.last_seen_run_id,
+    )
 
 
 @router.get("", response_model=list[OrganizationResponse])
@@ -478,6 +509,85 @@ def list_asset_identifiers(
         )
         for row in db.list_identifiers_for_asset(asset_id)
     ]
+
+
+@router.get("/{organization_id}/relationships", response_model=list[RelationshipResponse])
+def list_relationships(
+    organization_id: str,
+    request: Request,
+    relationship_type: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    auth: AuthContext = Depends(require_api_key),
+) -> list[RelationshipResponse]:
+    """Productization Phase 03: the first API surface over Fase 07's
+    relationship graph — real SQL-level pagination from the start (see
+    `ControlDB.list_relationships_for_organization`'s own docstring for
+    why this one didn't need the `limit=None` backward-compatibility
+    case `list_assets_for_organization` needed in Phase 02)."""
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    rows = db.list_relationships_for_organization(
+        organization_id, relationship_type=relationship_type, limit=limit, offset=offset
+    )
+    return [_relationship_to_response(row) for row in rows]
+
+
+@router.get(
+    "/{organization_id}/relationships/{relationship_id}/evidence",
+    response_model=list[RelationshipEvidenceResponse],
+)
+def list_relationship_evidence(
+    organization_id: str,
+    relationship_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> list[RelationshipEvidenceResponse]:
+    """The "why are these two entities related" answer — every piece of
+    mechanically-resolved evidence behind this one relationship, each
+    with its own human-readable `reason` and structured `metadata`
+    (e.g. the shared certificate fingerprint or IP address that produced
+    it), never a raw database row."""
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    if db.get_relationship(organization_id, relationship_id) is None:
+        raise HTTPException(status_code=404, detail="Relationship not found")
+    return [
+        RelationshipEvidenceResponse(
+            relationship_evidence_id=row.relationship_evidence_id,
+            run_id=row.run_id,
+            source=row.source,
+            collector=row.collector,
+            reason=row.reason,
+            metadata=_parse_json_object(row.metadata_json),
+            observed_at=row.observed_at,
+        )
+        for row in db.list_relationship_evidence(organization_id, relationship_id)
+    ]
+
+
+@router.get(
+    "/{organization_id}/assets/{asset_id}/relationships", response_model=list[RelationshipResponse]
+)
+def list_asset_relationships(
+    organization_id: str,
+    asset_id: str,
+    request: Request,
+    depth: int = Query(default=1, ge=1, le=8),
+    auth: AuthContext = Depends(require_api_key),
+) -> list[RelationshipResponse]:
+    """The asset-centric view of the same graph: every relationship
+    reachable from this one asset within `depth` hops — reuses
+    `ControlDB.relationship_neighborhood` exactly (already bounded,
+    already tenant-scoped, already tested as of Fase 07; this is its
+    first API surface). Silently caps at that method's own `max_edges`
+    ceiling rather than erroring — a very densely connected asset
+    returns a large-but-bounded page, never an unbounded one."""
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    _require_asset(db, organization_id, asset_id)
+    edges, _truncated = db.relationship_neighborhood(organization_id, asset_id, max_depth=depth)
+    return [_relationship_to_response(row) for row in edges]
 
 
 @router.get("/{organization_id}/candidate-assets", response_model=list[CandidateAssetResponse])
