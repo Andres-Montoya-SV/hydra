@@ -204,6 +204,8 @@ def execution_status_for_result(result: PluginResult) -> ToolStatus:
         return ToolStatus.BLOCKED_BY_SCOPE
     if result.skipped:
         return ToolStatus.SKIPPED
+    if result.unavailable:
+        return ToolStatus.UNAVAILABLE
     if result.partial:
         return ToolStatus.PARTIAL
     if not result.success:

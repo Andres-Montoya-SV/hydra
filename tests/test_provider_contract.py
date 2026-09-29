@@ -60,6 +60,8 @@ def test_optional_enrichment_provider_is_described_without_becoming_authority() 
             ToolStatus.BLOCKED_BY_SCOPE,
         ),
         (PluginResult(success=False), ToolStatus.FAILED),
+        # Upstream unreachable but the scan continued: never a clean empty run.
+        (PluginResult(success=True, unavailable=True), ToolStatus.UNAVAILABLE),
     ],
 )
 def test_execution_outcome_is_unambiguous(result: PluginResult, expected: ToolStatus) -> None:

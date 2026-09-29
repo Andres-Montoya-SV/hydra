@@ -91,6 +91,7 @@ class AsnLookupPlugin(BaseToolPlugin):
                 success=True,
                 output_path=output_path,
                 message="ASN service unavailable; scan continued",
+                unavailable=True,
             )
 
         count = write_jsonl(output_path, records, base_dir=context.output_dir)

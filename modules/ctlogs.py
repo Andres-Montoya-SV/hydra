@@ -94,6 +94,12 @@ class CtlogsPlugin(BaseToolPlugin):
             domains=sorted(set(observed)),
             followups=[{"kind": "DOMAIN", "reason": "CERTIFICATE_SAN"}],
         )
+        # Each failed crt.sh query adds exactly one warning. Every query
+        # failing means the source was unreachable, not that there were no
+        # certificates; some failing means the result is incomplete. Either
+        # way the outcome must say so — monitoring relies on it to avoid
+        # reporting hosts only CT logs knows about as removed.
+        failed = len(warnings)
         return PluginResult(
             success=True,
             output_path=domains_path,
@@ -103,6 +109,8 @@ class CtlogsPlugin(BaseToolPlugin):
                 f"{len(all_certs)} certificate record(s)"
             ),
             data={"intel": emission.to_dict()},
+            unavailable=bool(targets) and failed == len(targets),
+            partial=0 < failed < len(targets),
         )
 
 
