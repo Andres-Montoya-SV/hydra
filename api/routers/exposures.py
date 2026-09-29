@@ -1,25 +1,34 @@
-"""Read-only tenant-scoped Exposure API."""
+"""Tenant-scoped Exposure API: inventory, evidence, history, risk, and the
+two explicit, audited lifecycle transitions (resolve, reopen). Absence of
+a finding in a later scan never resolves anything — see
+`ControlDB.upsert_exposure`'s docstring."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from api.auth import AuthContext, require_api_key
-from api.control_db import ControlDB, ExposureRecord
+from api.control_db import ControlDB, ExposureEvidenceRecord, ExposureRecord
 from api.schemas import (
     ExposureEvidenceResponse,
+    ExposureFindingResponse,
     ExposureHistoryResponse,
     ExposureReportEntryResponse,
     ExposureReportHistoryEventResponse,
     ExposureResponse,
     ExposureRiskResponse,
+    ReopenExposureRequest,
     ResolveExposureRequest,
 )
+from api.settings import APISettings
+from api.tenancy import account_db_path
 from core.client_report.exposure_report import exposure_history_report_data
 from core.risk_scoring import classify_exposure_risk
+from core.store import AssetStore
 
 router = APIRouter(prefix="/organizations", tags=["exposures"])
 
@@ -33,8 +42,51 @@ def _require_member(db: ControlDB, account_id: str, organization_id: str) -> Non
         raise HTTPException(status_code=404, detail="Organization not found")
 
 
+def _require_owner_and_exposure(
+    db: ControlDB, account_id: str, organization_id: str, exposure_id: str
+) -> None:
+    """Lifecycle mutations are owner-only; a non-member and an unknown
+    exposure are both a 404, so neither reveals what exists."""
+    role = db.get_role_for_account_organization(account_id, organization_id)
+    if role is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if role != "owner":
+        raise HTTPException(status_code=403, detail="Owner role required")
+    if db.get_exposure_for_organization(organization_id, exposure_id) is None:
+        raise HTTPException(status_code=404, detail="Exposure not found")
+
+
 def _to_response(row: ExposureRecord) -> ExposureResponse:
     return ExposureResponse(**row.__dict__)
+
+
+def _finding_lookup(
+    api_settings: APISettings,
+) -> Callable[[ExposureEvidenceRecord], ExposureFindingResponse | None]:
+    """Resolves each evidence row's `finding_id` against the recon.db of the
+    account whose scan produced it. Opens each account's store at most once,
+    and never creates a database that doesn't already exist."""
+    stores: dict[str, AssetStore | None] = {}
+
+    def lookup(row: ExposureEvidenceRecord) -> ExposureFindingResponse | None:
+        if row.account_id not in stores:
+            path = account_db_path(api_settings, row.account_id)
+            stores[row.account_id] = AssetStore(path) if path.exists() else None
+        store = stores[row.account_id]
+        finding = None if store is None else store.get_finding(row.run_id, row.finding_id)
+        if finding is None:
+            return None
+        return ExposureFindingResponse(
+            host=str(finding["host"]),
+            url=finding.get("url"),  # type: ignore[arg-type]
+            name=finding.get("name"),  # type: ignore[arg-type]
+            severity=finding.get("severity"),  # type: ignore[arg-type]
+            description=finding.get("description"),  # type: ignore[arg-type]
+            confidence_score=finding.get("confidence_score"),  # type: ignore[arg-type]
+            discovered_at=finding.get("discovered_at"),  # type: ignore[arg-type]
+        )
+
+    return lookup
 
 
 @router.get("/{organization_id}/exposures", response_model=list[ExposureResponse])
@@ -86,12 +138,18 @@ def list_evidence(
     organization_id: str,
     exposure_id: str,
     request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     auth: AuthContext = Depends(require_api_key),
 ) -> list[ExposureEvidenceResponse]:
+    """Why this exposure exists: each run that observed it, plus the actual
+    detector result (what matched, where) — not just an opaque finding id."""
     db = _db(request)
     _require_member(db, auth.account_id, organization_id)
     if db.get_exposure_for_organization(organization_id, exposure_id) is None:
         raise HTTPException(status_code=404, detail="Exposure not found")
+    rows = db.list_exposure_evidence(organization_id, exposure_id)[offset : offset + limit]
+    lookup = _finding_lookup(request.app.state.api_settings)
     return [
         ExposureEvidenceResponse(
             exposure_evidence_id=row.exposure_evidence_id,
@@ -99,8 +157,9 @@ def list_evidence(
             run_id=row.run_id,
             finding_id=row.finding_id,
             observed_at=row.observed_at,
+            finding=lookup(row),
         )
-        for row in db.list_exposure_evidence(organization_id, exposure_id)
+        for row in rows
     ]
 
 
@@ -212,13 +271,7 @@ def resolve_exposure(
     auth: AuthContext = Depends(require_api_key),
 ) -> ExposureResponse:
     db = _db(request)
-    role = db.get_role_for_account_organization(auth.account_id, organization_id)
-    if role is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
-    if role != "owner":
-        raise HTTPException(status_code=403, detail="Owner role required")
-    if db.get_exposure_for_organization(organization_id, exposure_id) is None:
-        raise HTTPException(status_code=404, detail="Exposure not found")
+    _require_owner_and_exposure(db, auth.account_id, organization_id, exposure_id)
 
     changed = db.resolve_exposure(
         organization_id=organization_id,
@@ -228,6 +281,38 @@ def resolve_exposure(
     )
     if not changed:
         raise HTTPException(status_code=409, detail="Exposure is already resolved")
+
+    row = db.get_exposure_for_organization(organization_id, exposure_id)
+    if row is None:
+        raise HTTPException(status_code=500, detail="Exposure disappeared")
+    return _to_response(row)
+
+
+@router.post(
+    "/{organization_id}/exposures/{exposure_id}/reopen",
+    response_model=ExposureResponse,
+)
+def reopen_exposure(
+    organization_id: str,
+    exposure_id: str,
+    body: ReopenExposureRequest,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> ExposureResponse:
+    """Undo a resolution that turned out to be wrong. Same owner-only gate
+    as resolve; the reason is recorded as a 'reopened' history event, and
+    the earlier 'resolved' event stays in history untouched."""
+    db = _db(request)
+    _require_owner_and_exposure(db, auth.account_id, organization_id, exposure_id)
+
+    changed = db.reopen_exposure(
+        organization_id=organization_id,
+        exposure_id=exposure_id,
+        reopened_at=datetime.now(timezone.utc).isoformat(),
+        reason=body.reason.strip(),
+    )
+    if not changed:
+        raise HTTPException(status_code=409, detail="Only a resolved exposure can be reopened")
 
     row = db.get_exposure_for_organization(organization_id, exposure_id)
     if row is None:

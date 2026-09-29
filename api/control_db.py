@@ -2682,6 +2682,39 @@ class ControlDB:
                 )
         return bool(cursor.rowcount)
 
+    def reopen_exposure(
+        self,
+        *,
+        organization_id: str,
+        exposure_id: str,
+        reopened_at: str,
+        reason: str,
+    ) -> bool:
+        """Explicitly reopen one resolved exposure (e.g. a resolution that
+        turned out to be wrong). Without this, a mistaken resolve could only
+        be undone by a later scan happening to re-observe the condition.
+
+        Clears the resolution fields on the row, which always describes the
+        CURRENT state; the prior resolution itself stays in
+        `exposure_history`, which is append-only, so nothing is erased."""
+        if not reason.strip():
+            raise ValueError("reopening requires a reason")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE exposures SET status = 'reopened', resolved_at = NULL, "
+                "resolved_run_id = NULL, resolution_reason = NULL "
+                "WHERE exposure_id = ? AND organization_id = ? AND status = 'resolved'",
+                (exposure_id, organization_id),
+            )
+            if cursor.rowcount:
+                conn.execute(
+                    "INSERT INTO exposure_history "
+                    "(event_id, exposure_id, organization_id, event_type, happened_at, run_id, reason) "
+                    "VALUES (?, ?, ?, 'reopened', ?, NULL, ?)",
+                    (secrets.token_hex(16), exposure_id, organization_id, reopened_at, reason),
+                )
+        return bool(cursor.rowcount)
+
     def get_exposure_for_organization(
         self, organization_id: str, exposure_id: str
     ) -> ExposureRecord | None:
