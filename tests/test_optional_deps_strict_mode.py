@@ -32,11 +32,13 @@ def _restore_module_state():  # noqa: ANN202
 
 
 class TestDefaultMode:
-    def test_a_missing_package_skips(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_missing_package_or_old_version_skips(self, monkeypatch: pytest.MonkeyPatch) -> None:
         module = _reload(monkeypatch, strict=False)
 
         with pytest.raises(pytest.skip.Exception):
             pytest.importorskip(MISSING)
+        with pytest.raises(pytest.skip.Exception):
+            pytest.importorskip("pytest", minversion="999.0")
         assert module.requires_modules(MISSING).args[0] is True
 
 
@@ -44,8 +46,16 @@ class TestStrictMode:
     def test_importorskip_fails_instead_of_skipping(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _reload(monkeypatch, strict=True)
 
-        with pytest.raises(ModuleNotFoundError):
+        with pytest.raises(ImportError, match=MISSING):
             pytest.importorskip(MISSING)
+
+    def test_a_too_old_version_fails_instead_of_skipping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _reload(monkeypatch, strict=True)
+
+        with pytest.raises(ImportError, match="required is: .999.0."):
+            pytest.importorskip("pytest", minversion="999.0")
 
     def test_requires_modules_fails_instead_of_skipping(
         self, monkeypatch: pytest.MonkeyPatch

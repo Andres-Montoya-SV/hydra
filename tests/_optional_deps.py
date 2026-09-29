@@ -27,19 +27,24 @@ STRICT = os.environ.get("HYDRA_REQUIRE_OPTIONAL_DEPS") == "1"
 
 
 def install_strict_importorskip() -> None:
-    """In strict mode, make `pytest.importorskip` import for real, so a
-    missing package fails the module instead of skipping it. Called once
-    from conftest.py, before any test module is imported."""
+    """In strict mode, wrap `pytest.importorskip` so every skip it would
+    raise (missing package, version below `minversion`, import failure)
+    fails the module instead. pytest still performs the import itself.
+    Called once from conftest.py, before any test module is imported."""
     if not STRICT:
         return
     original = unpatched_importorskip()
 
     @functools.wraps(original)
     def import_or_fail(modname: str, *args: Any, **kwargs: Any) -> Any:
-        # Only checks presence (find_spec loads no code); pytest's own
-        # importorskip still does the actual import.
-        _raise_if_missing(modname)
-        return original(modname, *args, **kwargs)
+        # Any reason pytest would skip — package missing, older than
+        # `minversion`, or failing to import — becomes a failure.
+        try:
+            return original(modname, *args, **kwargs)
+        except pytest.skip.Exception as exc:
+            raise ImportError(
+                f"HYDRA_REQUIRE_OPTIONAL_DEPS=1 but {modname!r} would be skipped: {exc}"
+            ) from exc
 
     setattr(pytest, "importorskip", import_or_fail)  # noqa: B010 - patching pytest's own function
 
@@ -62,11 +67,6 @@ def requires_modules(*names: str) -> pytest.MarkDecorator:
 
 def _missing(names: tuple[str, ...]) -> list[str]:
     return [name for name in names if importlib.util.find_spec(name) is None]
-
-
-def _raise_if_missing(name: str) -> None:
-    if _missing((name,)):
-        raise _strict_error([name])
 
 
 def _strict_error(missing: list[str]) -> ModuleNotFoundError:
