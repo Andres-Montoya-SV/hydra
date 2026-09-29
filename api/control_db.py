@@ -3037,21 +3037,47 @@ class ControlDB:
         organization_id: str,
         *,
         relationship_type: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
     ) -> list[RelationshipRecord]:
+        """Productization Phase 03: real SQL-level pagination from the
+        start — unlike `list_assets_for_organization` before Phase 02
+        fixed it, this method has no pre-existing internal callers
+        expecting an unbounded result set (confirmed: this is the first
+        product-facing consumer), so there's no `limit=None` backward-
+        compatibility case to preserve here."""
+        limit = max(1, min(500, int(limit)))
+        offset = max(0, int(offset))
         with self._connect() as conn:
             if relationship_type is None:
                 rows = conn.execute(
                     "SELECT * FROM relationships WHERE organization_id = ? "
-                    "ORDER BY first_seen_at, relationship_id",
-                    (organization_id,),
+                    "ORDER BY first_seen_at, relationship_id LIMIT ? OFFSET ?",
+                    (organization_id, limit, offset),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     "SELECT * FROM relationships WHERE organization_id = ? "
-                    "AND relationship_type = ? ORDER BY first_seen_at, relationship_id",
-                    (organization_id, relationship_type),
+                    "AND relationship_type = ? "
+                    "ORDER BY first_seen_at, relationship_id LIMIT ? OFFSET ?",
+                    (organization_id, relationship_type, limit, offset),
                 ).fetchall()
         return [_relationship_record_from_row(row) for row in rows]
+
+    def get_relationship(
+        self, organization_id: str, relationship_id: str
+    ) -> RelationshipRecord | None:
+        """Productization Phase 03: tenant-scoped single-relationship
+        lookup, the same `(organization_id, relationship_id)` shape
+        `get_asset`/`get_candidate_asset` already use — the router's
+        `404`-not-`403` ownership gate for `.../relationships/{id}/...`
+        sub-resources."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM relationships WHERE organization_id = ? AND relationship_id = ?",
+                (organization_id, relationship_id),
+            ).fetchone()
+        return None if row is None else _relationship_record_from_row(row)
 
     def relationship_neighborhood(
         self,
