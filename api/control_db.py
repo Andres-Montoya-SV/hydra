@@ -2235,9 +2235,8 @@ class ControlDB:
         SQL-level pagination this router's own docstring already claimed
         it did — it did not, before this phase; `_paginate` was
         Python-slicing an unbounded, fully-fetched result set on every
-        single request, the same bug `list_candidate_assets_for_organization`
-        below still has (out of scope for this phase's own asset-
-        inventory focus; flagged in docs/productization/02_asset_inventory.md).
+        single request (`list_candidate_assets_for_organization` had the
+        same bug until Roadmap v2).
 
         `q` matches as a case-insensitive substring against `identity_key`
         — simple, but real: a domain asset's identity_key IS its
@@ -2401,21 +2400,26 @@ class ControlDB:
         return candidate_asset_id, True
 
     def list_candidate_assets_for_organization(
-        self, organization_id: str, *, candidate_type: str | None = None
+        self,
+        organization_id: str,
+        *,
+        candidate_type: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[CandidateAssetRecord]:
+        """`limit=None` returns every row (internal callers); the API always
+        passes an explicit page, applied in SQL."""
+        query = "SELECT * FROM candidate_assets WHERE organization_id = ?"
+        params: list[object] = [organization_id]
+        if candidate_type is not None:
+            query += " AND candidate_type = ?"
+            params.append(candidate_type)
+        query += " ORDER BY first_seen_at, candidate_asset_id"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
         with self._connect() as conn:
-            if candidate_type is None:
-                rows = conn.execute(
-                    "SELECT * FROM candidate_assets WHERE organization_id = ? "
-                    "ORDER BY first_seen_at, candidate_asset_id",
-                    (organization_id,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM candidate_assets WHERE organization_id = ? "
-                    "AND candidate_type = ? ORDER BY first_seen_at, candidate_asset_id",
-                    (organization_id, candidate_type),
-                ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [_candidate_asset_record_from_row(row) for row in rows]
 
     def list_pending_candidates_first_seen_in_run(

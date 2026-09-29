@@ -318,3 +318,23 @@ class TestOrchestratorHandOff:
             )
 
             assert settings.scope_exclusions == ["legacy.acme.example"]
+
+
+class TestCandidatePagination:
+    def test_candidate_list_pages_in_sql_with_type_filter(self, tmp_path: Path) -> None:
+        with _client(tmp_path) as client:
+            headers, _, org = _owner(client)
+            for i in range(5):
+                _candidate(client, org, f"c{i}.acme.example", "IN_SCOPE")
+            url = f"/organizations/{org}/candidate-assets"
+
+            pages = [
+                client.get(url, headers=headers, params={"limit": 2, "offset": offset}).json()
+                for offset in (0, 2, 4)
+            ]
+            none = client.get(url, headers=headers, params={"candidate_type": "IP"}).json()
+
+            values = [row["normalized_value"] for page in pages for row in page]
+            assert [len(page) for page in pages] == [2, 2, 1]
+            assert sorted(values) == [f"c{i}.acme.example" for i in range(5)]
+            assert none == []

@@ -26,9 +26,8 @@ now takes optional `limit`/`offset` (default `None`/no SQL LIMIT, so
 every pre-existing internal caller — certificate/technology/change
 backfills, `list_assets_running_technology` — keeps getting the complete,
 unbounded set it always has) while the router always passes an explicit
-`limit`. `list_candidate_assets_for_organization` still has the exact
-same bug this phase found and fixed for assets — out of scope here,
-flagged in docs/productization/02_asset_inventory.md. Observations,
+`limit`; `list_candidate_assets_for_organization` got the same fix in
+Roadmap v2. Observations,
 certificate events, and technology events paginate in Python over an
 already-fetched list — `list_observations_for_asset` and friends have
 many existing callers across Fases 04/12/14/18 (backfills, monitoring
@@ -786,11 +785,10 @@ def list_candidate_assets(
 ) -> list[CandidateAssetResponse]:
     db = _db(request)
     _require_member(db, auth.account_id, organization_id)
-    rows = db.list_candidate_assets_for_organization(organization_id, candidate_type=candidate_type)
-    return [
-        CandidateAssetResponse(**row.__dict__)
-        for row in _paginate(rows, limit=limit, offset=offset)
-    ]
+    rows = db.list_candidate_assets_for_organization(
+        organization_id, candidate_type=candidate_type, limit=limit, offset=offset
+    )
+    return [CandidateAssetResponse(**row.__dict__) for row in rows]
 
 
 @router.get(
