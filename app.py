@@ -448,6 +448,7 @@ def _external_mode_preflight(args: argparse.Namespace, settings: Settings) -> bo
         format_scope_summary,
     )
     from core.intel.scope import CollectionScope
+    from core.scope import configured_scope_patterns
     from utils.validators import load_targets
 
     if getattr(args, "external", False):
@@ -461,7 +462,7 @@ def _external_mode_preflight(args: argparse.Namespace, settings: Settings) -> bo
     changes = settings.apply_external_target_mode_defaults()
     scope = CollectionScope.from_seeds(
         domain_names,
-        scope_file=settings.scope_file,
+        patterns=configured_scope_patterns(settings.scope_file, settings.scope_exclusions),
         cloud_collection_allowed=settings.cloud_bucket_enum_authorize_derived,
     )
     print(f"\n{'=' * 70}")

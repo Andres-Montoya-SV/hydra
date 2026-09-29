@@ -158,6 +158,27 @@ def _validated_capability_override(
     return requested
 
 
+def _require_not_excluded(control_db: ControlDB, account_id: str, domain: str) -> None:
+    """A target the organization explicitly excluded is refused up front
+    (the pipeline would refuse it too), before any quota is spent."""
+    from api.scope_classification import excluding_pattern
+
+    organization_id = control_db.default_organization_id_for_account(account_id)
+    exclusions = {
+        e.pattern: e.exclusion_id for e in control_db.list_scope_exclusions(organization_id)
+    }
+    exclusion_id = excluding_pattern(domain, exclusions)
+    if exclusion_id is not None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "target_excluded",
+                "exclusion_id": exclusion_id,
+                "message": f"{domain} is excluded from this organization's scope.",
+            },
+        )
+
+
 @router.post("", response_model=CreateScanResponse, status_code=202)
 async def create_scan(
     body: CreateScanRequest,
@@ -171,6 +192,7 @@ async def create_scan(
     _require_billing_and_quota_ok(control_db, auth.account_id)
     domain = normalize_domain(body.domain)
     _require_verified_domain_or_403(control_db, auth.account_id, domain)
+    _require_not_excluded(control_db, auth.account_id, domain)
     override = (
         None
         if body.providers is None

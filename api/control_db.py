@@ -432,6 +432,23 @@ CREATE TABLE IF NOT EXISTS capability_audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_capability_audit_org
     ON capability_audit_log(organization_id, created_at);
+-- Roadmap v2: targets an organization never wants collected against, in
+-- SCOPE_FILE `!pattern` syntax. Removal is a soft delete (removed_at/by and
+-- the reason stay), so the exclusion history is never lost. At most one
+-- ACTIVE row per pattern (partial unique index below).
+CREATE TABLE IF NOT EXISTS organization_scope_exclusions (
+    exclusion_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    pattern TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_by_account_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    removed_at TEXT,
+    removed_by_account_id TEXT,
+    removal_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scope_exclusions_active
+    ON organization_scope_exclusions(organization_id, pattern) WHERE removed_at IS NULL;
 -- Roadmap v2 (risk-change signals): an exposure's deterministic risk level
 -- as classified when a run observed it. Risk is computed on read, so this
 -- is what a later run's level is compared against. One row per exposure
@@ -1311,6 +1328,23 @@ class CapabilityAuditRecord:
     before: tuple[str, ...] | None
     after: tuple[str, ...]
     created_at: str
+
+
+@dataclass(frozen=True)
+class ScopeExclusionRecord:
+    exclusion_id: str
+    organization_id: str
+    pattern: str
+    reason: str
+    created_by_account_id: str
+    created_at: str
+    removed_at: str | None
+    removed_by_account_id: str | None
+    removal_reason: str | None
+
+
+class DuplicateExclusionError(Exception):
+    """The organization already has an active exclusion for this pattern."""
 
 
 @dataclass(frozen=True)
@@ -2403,6 +2437,17 @@ class ControlDB:
                 (*params, limit),
             ).fetchall()
         return [_candidate_asset_record_from_row(row) for row in rows], int(total)
+
+    def find_candidate_by_value(
+        self, organization_id: str, normalized_value: str
+    ) -> CandidateAssetRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM candidate_assets WHERE organization_id = ? "
+                "AND normalized_value = ? ORDER BY first_seen_at LIMIT 1",
+                (organization_id, normalized_value),
+            ).fetchone()
+        return None if row is None else _candidate_asset_record_from_row(row)
 
     def get_candidate_asset(
         self, organization_id: str, candidate_asset_id: str
@@ -4161,6 +4206,78 @@ class ControlDB:
             )
             for row in rows
         ]
+
+    def add_scope_exclusion(
+        self, *, organization_id: str, account_id: str, pattern: str, reason: str
+    ) -> ScopeExclusionRecord:
+        """`pattern` must already be normalized
+        (`core/scope.py::normalize_exclusion_pattern`)."""
+        record = ScopeExclusionRecord(
+            exclusion_id=secrets.token_hex(16),
+            organization_id=organization_id,
+            pattern=pattern,
+            reason=reason,
+            created_by_account_id=account_id,
+            created_at=_now_iso(),
+            removed_at=None,
+            removed_by_account_id=None,
+            removal_reason=None,
+        )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO organization_scope_exclusions (exclusion_id, organization_id, "
+                    "pattern, reason, created_by_account_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        record.exclusion_id,
+                        organization_id,
+                        pattern,
+                        reason,
+                        account_id,
+                        record.created_at,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateExclusionError(pattern) from exc
+        return record
+
+    def get_scope_exclusion(
+        self, organization_id: str, exclusion_id: str
+    ) -> ScopeExclusionRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM organization_scope_exclusions "
+                "WHERE organization_id = ? AND exclusion_id = ?",
+                (organization_id, exclusion_id),
+            ).fetchone()
+        return None if row is None else ScopeExclusionRecord(**dict(row))
+
+    def list_scope_exclusions(
+        self, organization_id: str, *, include_removed: bool = False
+    ) -> list[ScopeExclusionRecord]:
+        query = "SELECT * FROM organization_scope_exclusions WHERE organization_id = ?"
+        if not include_removed:
+            query += " AND removed_at IS NULL"
+        with self._connect() as conn:
+            rows = conn.execute(query + " ORDER BY pattern, created_at", (organization_id,))
+            return [ScopeExclusionRecord(**dict(row)) for row in rows.fetchall()]
+
+    def active_exclusion_patterns(self, organization_id: str) -> list[str]:
+        return [record.pattern for record in self.list_scope_exclusions(organization_id)]
+
+    def remove_scope_exclusion(
+        self, *, organization_id: str, exclusion_id: str, account_id: str, reason: str
+    ) -> bool:
+        """Soft delete. False when the exclusion doesn't exist in this
+        organization or was already removed."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE organization_scope_exclusions SET removed_at = ?, "
+                "removed_by_account_id = ?, removal_reason = ? "
+                "WHERE organization_id = ? AND exclusion_id = ? AND removed_at IS NULL",
+                (_now_iso(), account_id, reason, organization_id, exclusion_id),
+            )
+        return bool(cursor.rowcount)
 
     def update_scan_status(
         self, scan_id: str, status: str, *, error_message: str | None = None

@@ -382,6 +382,10 @@ class Settings:
     vuln_match_timeout: int = 15
     wpscan_api_token: str | None = None
     scope_file: Path | None = None
+    # Exclusions saved on the scan's organization (API scans only), in
+    # SCOPE_FILE `!pattern` syntax without the `!`. Applied on top of
+    # SCOPE_FILE; exclusions always win over any positive scope match.
+    scope_exclusions: list[str] = field(default_factory=list)
     # Bounded iterative discovery. Conservative defaults — observe freely,
     # collect only in-scope indicators up to depth 1.
     max_discovery_depth: int = 1

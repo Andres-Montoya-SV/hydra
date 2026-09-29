@@ -144,6 +144,9 @@ def _scan_settings(
     # geo database is handed to each scan explicitly.
     settings.geoip_db_path = api_settings.geoip_db_path
     _apply_collection_capabilities(control_db, settings, account_id=account_id, scan_id=scan_id)
+    scan = control_db.get_owned_scan(scan_id, account_id)
+    if scan is not None and scan.organization_id:
+        settings.scope_exclusions = control_db.active_exclusion_patterns(scan.organization_id)
 
     # Productization Phase 01: a client-chosen 'passive' profile on a
     # manually-triggered scan gets the EXACT SAME narrowing Speed 1

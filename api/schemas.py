@@ -477,9 +477,9 @@ class ExposureEvidenceResponse(BaseModel):
     finding: ExposureFindingResponse | None = None
 
 
-class ReasonedExposureRequest(BaseModel):
-    """Shared by every audited exposure lifecycle transition, so the reason
-    rules can't drift between them."""
+class ReasonedRequest(BaseModel):
+    """Shared by every audited, reasoned change (exposure lifecycle, scope
+    exclusions), so the reason rules can't drift between them."""
 
     reason: str = Field(min_length=1, max_length=1000)
 
@@ -493,7 +493,7 @@ class ReasonedExposureRequest(BaseModel):
         return value
 
 
-class ReopenExposureRequest(ReasonedExposureRequest):
+class ReopenExposureRequest(ReasonedRequest):
     pass
 
 
@@ -506,7 +506,7 @@ class ExposureHistoryResponse(BaseModel):
     reason: str
 
 
-class ResolveExposureRequest(ReasonedExposureRequest):
+class ResolveExposureRequest(ReasonedRequest):
     pass
 
 
@@ -775,3 +775,35 @@ class CapabilityStatusResponse(BaseModel):
     intensity: str
     active: bool
     status: Literal["disabled", "runnable", "not_runnable"]
+
+
+class AddScopeExclusionRequest(ReasonedRequest):
+    # `host`, `*.host`, or `host/path-glob` — validated by the router with
+    # `core/scope.py::normalize_exclusion_pattern`.
+    pattern: str = Field(min_length=1, max_length=300)
+
+
+class RemoveScopeExclusionRequest(ReasonedRequest):
+    pass
+
+
+class ScopeExclusionResponse(BaseModel):
+    exclusion_id: str
+    pattern: str
+    reason: str
+    created_by_account_id: str
+    created_at: str
+    removed_at: str | None = None
+    removed_by_account_id: str | None = None
+    removal_reason: str | None = None
+
+
+class ScopeClassificationResponse(BaseModel):
+    host: str
+    classification: Literal[
+        "excluded", "known_asset", "candidate", "observed_related", "authorized_scope", "unknown"
+    ]
+    reason: str
+    asset_id: str | None = None
+    candidate_asset_id: str | None = None
+    exclusion_id: str | None = None

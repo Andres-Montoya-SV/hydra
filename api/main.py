@@ -38,6 +38,7 @@ from api.routers import (
     monitoring,
     reportability,
     scans,
+    scope,
     subscription,
     webhooks,
 )
@@ -251,6 +252,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(exposures.router)
     app.include_router(easm.router)
     app.include_router(collection.router)
+    app.include_router(scope.router)
     app.include_router(monitoring.router)
     app.include_router(scans.router)
     app.include_router(reportability.router)
