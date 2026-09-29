@@ -11,6 +11,7 @@ HTTP behavior, not just unit-tested in isolation.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -119,16 +120,14 @@ class TestDnsTxtEndToEndThroughTheRealApi:
         composition works when it does not; that gap is documented in
         docs/productization/01_onboarding.md instead of asserted here.
 
-        Stops at "scan accepted and queued with the right profile," the
-        same depth `test_full_flow_register_verify_then_scan_succeeds`
-        above already uses — this file's own `_stub_pipeline` only
-        replaces the three network-touching plugins, not `ToolManager`'s
-        tool-availability gate (`tests/test_api_scans.py`'s
-        `_install_pipeline_stubs` does that, and that file's own
-        `TestScanLifecycle` tests already poll a stubbed scan through to
-        `"completed"` — including for `profile: "passive"`, added
-        alongside this test). Re-proving full pipeline completion here
-        with a weaker stub would be redundant, not additional coverage."""
+        Polls to `"completed"`, same depth as
+        `tests/test_api_scans.py::TestScanLifecycle` — `_stub_pipeline`
+        now also mocks `ToolManager`/`DependencyService`, the same
+        proven-reliable pattern that file's own `_install_pipeline_stubs`
+        already used, after a real (if hard-to-reproduce-locally) CI
+        failure showed this test could otherwise race against genuine
+        tool-availability detection in an environment where the real
+        Go binaries are actually installed (the CI Docker image)."""
         client, dns_server = dns_backed_client
         journey_domain = "acceptance-journey.example"
         api_key = _create_account(client)
@@ -161,8 +160,18 @@ class TestDnsTxtEndToEndThroughTheRealApi:
         assert create_scan.status_code == 202
         scan_id = create_scan.json()["scan_id"]
 
-        status_body = client.get(f"/scans/{scan_id}", headers={"X-API-Key": api_key}).json()
-        assert status_body["status"] in ("queued", "running", "completed")
+        deadline = time.monotonic() + 10.0
+        status_body: dict = {}
+        while time.monotonic() < deadline:
+            status_body = client.get(f"/scans/{scan_id}", headers={"X-API-Key": api_key}).json()
+            if status_body["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+        assert status_body["status"] == "completed"
+        assert status_body["collection_profile"] == "passive"
+
+        report = client.get(f"/scans/{scan_id}/report", headers={"X-API-Key": api_key})
+        assert report.status_code == 200
         assert status_body["collection_profile"] == "passive"
 
     def test_verify_fails_clearly_when_the_record_is_missing(self, dns_backed_client) -> None:
@@ -275,45 +284,76 @@ def _stub_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     """The domain-verification gate is the subject of this test file —
     stub the actual scan execution the same way
     tests/test_api_scans.py does, so a 202 here means "the gate let it
-    through," not "we waited for a real recon pipeline."""
+    through," not "we waited for a real recon pipeline."
+
+    Two real bugs fixed here, found via a genuine (if hard-to-reproduce
+    locally) CI failure in `test_onboarding_acceptance_journey_account_to_first_scan`,
+    the first caller in this file to ever check a scan's FINAL status
+    rather than just the `202` accepted response:
+
+    1. The stub functions used to hardcode this module's own `DOMAIN`
+       constant into every written record, regardless of which domain
+       the actual scan targeted — wrong for `test_a_subdomain_of_a_
+       verified_domain_is_covered` (`sub.{DOMAIN}`) and for the
+       onboarding journey test (`acceptance-journey.example`) alike.
+       Now derived from `context.targets[0].domain`, the real requested
+       domain, every time.
+    2. This helper never mocked `ToolManager`/`DependencyService` the
+       way `tests/test_api_scans.py::_install_pipeline_stubs` does —
+       without that, the pipeline's real tool-availability detection
+       runs for real (the CI Docker image has genuine subfinder/dnsx/
+       httpx binaries installed), which is a real, if intermittent, race
+       against this test's per-method monkeypatching. Added the exact
+       same proven-reliable `ToolManager`/`DependencyService` mocking
+       `_install_pipeline_stubs` already uses, so every plugin's
+       tool-availability check is itself stubbed too, deterministically,
+       regardless of what binaries genuinely exist in the environment."""
     from unittest.mock import AsyncMock
 
+    from core.dependencies.service import DependencyService
     from core.models import ToolStatus
     from core.plugin_base import PluginResult
+    from core.tool_manager import ToolManager
     from modules.dnsx import DnsxPlugin
     from modules.httpx import HttpxPlugin
     from modules.subfinder import SubfinderPlugin
     from utils.files import write_jsonl, write_lines
 
+    def _target_domain(context) -> str:
+        return context.targets[0].domain if context.targets else DOMAIN
+
     async def stub_subfinder(self, context, input_path):
-        write_lines(context.output_dir / "subdomains.txt", [DOMAIN], base_dir=context.output_dir)
-        context.subdomains = [DOMAIN]
+        domain = _target_domain(context)
+        write_lines(context.output_dir / "subdomains.txt", [domain], base_dir=context.output_dir)
+        context.subdomains = [domain]
         return PluginResult(
             success=True, output_path=context.output_dir / "subdomains.txt", lines_produced=1
         )
 
     async def stub_dnsx(self, context, input_path):
+        domain = _target_domain(context)
         write_jsonl(
             context.output_dir / "dnsx_records.jsonl",
-            [{"host": DOMAIN, "a": ["203.0.113.5"], "status_code": "NOERROR"}],
+            [{"host": domain, "a": ["203.0.113.5"], "status_code": "NOERROR"}],
             base_dir=context.output_dir,
         )
-        write_lines(context.output_dir / "resolved.txt", [DOMAIN], base_dir=context.output_dir)
-        context.resolved = [DOMAIN]
+        write_lines(context.output_dir / "resolved.txt", [domain], base_dir=context.output_dir)
+        context.resolved = [domain]
         return PluginResult(
             success=True, output_path=context.output_dir / "resolved.txt", lines_produced=1
         )
 
     async def stub_httpx(self, context, input_path):
-        url = f"https://{DOMAIN}/"
+        domain = _target_domain(context)
+        url = f"https://{domain}/"
         write_jsonl(
             context.output_dir / "httpx.json",
-            [{"input": DOMAIN, "url": url, "status_code": 200}],
+            [{"input": domain, "url": url, "status_code": 200}],
             base_dir=context.output_dir,
         )
         write_lines(context.output_dir / "alive.txt", [url], base_dir=context.output_dir)
         context.alive_urls = [url]
-        context.httpx_results = [{"input": DOMAIN, "url": url, "status_code": 200}]
+        context.httpx_results = [{"input": domain, "url": url, "status_code": 200}]
         return PluginResult(
             success=True, output_path=context.output_dir / "httpx.json", lines_produced=1
         )
@@ -321,6 +361,30 @@ def _stub_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(SubfinderPlugin, "run", stub_subfinder)
     monkeypatch.setattr(DnsxPlugin, "run", stub_dnsx)
     monkeypatch.setattr(HttpxPlugin, "run", stub_httpx)
+
+    async def fake_validate(self, context):
+        for plugin in self.get_all_plugins():
+            info = plugin.build_tool_info()
+            info.status = (
+                ToolStatus.READY
+                if plugin.name in {"subfinder", "dnsx", "httpx"}
+                else ToolStatus.SKIPPED
+            )
+            context.tool_states[plugin.name] = info
+        return True
+
+    async def fake_analyze(self, force_refresh: bool = False):
+        return {}
+
+    monkeypatch.setattr(ToolManager, "validate_tools", fake_validate)
+    monkeypatch.setattr(ToolManager, "ensure_mandatory_tools", AsyncMock())
+    monkeypatch.setattr(
+        ToolManager, "is_runnable", lambda self, name: name in {"subfinder", "dnsx", "httpx"}
+    )
+    monkeypatch.setattr(DependencyService, "analyze_all", fake_analyze)
+    monkeypatch.setattr(
+        "ui.dependency_report.render_dependency_report", lambda *args, **kwargs: None
+    )
 
     from core.dependencies.service import DependencyService
     from core.tool_manager import ToolManager
