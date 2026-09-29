@@ -266,9 +266,34 @@ class TestRelationshipEvidence:
             assert resp.status_code == 404
 
 
+def _seed_domain_asset(
+    db: ControlDB, api_settings: APISettings, *, account_id: str, organization_id: str, domain: str
+):
+    from api.asset_backfill import backfill_assets_for_organization
+    from core.assets import Host
+
+    scan_id = secrets.token_hex(16)
+    db.create_scan(
+        scan_id=scan_id,
+        account_id=account_id,
+        domain=domain,
+        db_path=str(api_settings.data_dir),
+        organization_id=organization_id,
+    )
+    store = AssetStore(account_db_path(api_settings, account_id))
+    store.create_run(ScanRun(run_id=scan_id, started_at="2026-01-01T00:00:00+00:00"))
+    store.upsert_host(scan_id, Host(domain=domain, discovery_sources=["dnsx"]))
+    db.update_scan_status(scan_id, "completed")
+    backfill_assets_for_organization(
+        control_db=db, api_settings=api_settings, organization_id=organization_id
+    )
+    return db.get_asset_by_identity(
+        organization_id=organization_id, asset_type="domain", identity_key=f"domain:{domain}"
+    )
+
+
 class TestAssetRelationshipNeighborhood:
     def test_lists_relationships_reachable_from_the_asset(self, tmp_path: Path) -> None:
-        from api.asset_backfill import backfill_assets_for_organization
         from api.main import create_app
 
         with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
@@ -277,28 +302,12 @@ class TestAssetRelationshipNeighborhood:
             db = client.app.state.control_db
             api_settings: APISettings = client.app.state.api_settings
             organization_id, _ = db.list_organizations_for_account(account["account_id"])[0]
-
-            from core.assets import Host
-
-            scan_id = secrets.token_hex(16)
-            db.create_scan(
-                scan_id=scan_id,
+            asset = _seed_domain_asset(
+                db,
+                api_settings,
                 account_id=account["account_id"],
+                organization_id=organization_id,
                 domain="a.example.com",
-                db_path=str(api_settings.data_dir),
-                organization_id=organization_id,
-            )
-            store = AssetStore(account_db_path(api_settings, account["account_id"]))
-            store.create_run(ScanRun(run_id=scan_id, started_at="2026-01-01T00:00:00+00:00"))
-            store.upsert_host(scan_id, Host(domain="a.example.com", discovery_sources=["dnsx"]))
-            db.update_scan_status(scan_id, "completed")
-            backfill_assets_for_organization(
-                control_db=db, api_settings=api_settings, organization_id=organization_id
-            )
-            asset = db.get_asset_by_identity(
-                organization_id=organization_id,
-                asset_type="domain",
-                identity_key="domain:a.example.com",
             )
 
             _relationship_scan(
