@@ -128,6 +128,36 @@ def _require_billing_and_quota_ok(control_db: ControlDB, account_id: str):
     return limits
 
 
+def _validated_capability_override(
+    control_db: ControlDB, account_id: str, providers: list[str]
+) -> frozenset[str]:
+    """A per-scan provider override, checked before anything is written or
+    any quota is spent: only an owner of the scan's organization may
+    override, the providers must exist and be toggleable (422), and every
+    one must be within the account's tier (typed 403, never dropped)."""
+    from api.collection_capabilities import (
+        CapabilityRequestError,
+        not_entitled,
+        validate_requested,
+    )
+    from api.control_db import role_can_modify_scope
+    from api.routers.collection import account_tier, entitlement_error, invalid_request_error
+
+    organization_id = control_db.default_organization_id_for_account(account_id)
+    role = control_db.get_role_for_account_organization(account_id, organization_id)
+    if not role_can_modify_scope(role):
+        raise HTTPException(status_code=403, detail="Owner role required to override providers")
+    try:
+        requested = validate_requested(providers)
+    except CapabilityRequestError as exc:
+        raise invalid_request_error(exc) from exc
+    tier = account_tier(control_db, account_id)
+    blocked = not_entitled(requested, tier)
+    if blocked:
+        raise entitlement_error(tier, blocked)
+    return requested
+
+
 @router.post("", response_model=CreateScanResponse, status_code=202)
 async def create_scan(
     body: CreateScanRequest,
@@ -141,6 +171,11 @@ async def create_scan(
     _require_billing_and_quota_ok(control_db, auth.account_id)
     domain = normalize_domain(body.domain)
     _require_verified_domain_or_403(control_db, auth.account_id, domain)
+    override = (
+        None
+        if body.providers is None
+        else _validated_capability_override(control_db, auth.account_id, body.providers)
+    )
 
     scan_id = secrets.token_hex(16)
     db_path = str(account_settings(api_settings, auth.account_id).project_root)
@@ -150,6 +185,7 @@ async def create_scan(
         domain=domain,
         db_path=db_path,
         collection_profile=body.profile,
+        capability_override=override,
     )
     control_db.increment_scan_usage(auth.account_id, subscriptions.current_period_key())
 
@@ -180,6 +216,12 @@ def get_scan_status(
         updated_at=scan.updated_at,
         error_message=scan.error_message,
         collection_profile=scan.collection_profile,
+        capability_override=(
+            None if scan.capability_override is None else list(scan.capability_override)
+        ),
+        effective_providers=(
+            None if scan.effective_providers is None else list(scan.effective_providers)
+        ),
     )
 
 

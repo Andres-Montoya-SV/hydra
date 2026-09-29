@@ -319,3 +319,31 @@ class TestDegradedRunsAreLoggedOncePerCycle:
             r for r in caplog.records if "Degraded passive monitoring scan" in r.getMessage()
         ]
         assert per_domain and all(r.levelname == "DEBUG" for r in per_domain)
+
+
+class TestOnlyHostnameCollectorsCanSuppressRemovals:
+    def test_a_failed_vulnerability_scanner_does_not_hide_a_real_removal(
+        self, control_db: ControlDB, api_settings: APISettings
+    ) -> None:
+        sender = _Sender()
+        ids = _monitored_account(control_db, api_settings)
+        with_nuclei = [*HEALTHY, ("nuclei", "success_with_results", 3)]
+        nuclei_failed = [*HEALTHY, ("nuclei", "failed", 0)]
+        _run_cycle(
+            control_db,
+            api_settings,
+            sender,
+            ids,
+            hosts=["a.example.com", "b.example.com"],
+            outcomes=with_nuclei,
+        )
+
+        _run_cycle(
+            control_db, api_settings, sender, ids, hosts=["a.example.com"], outcomes=nuclei_failed
+        )
+
+        # nuclei doesn't produce hostnames, so its failure can't explain b
+        # disappearing: the removal is real and must still be reported.
+        assert len(sender.alerts) == 1
+        history = control_db.list_monitoring_notifications(ids[0], DOMAIN)
+        assert history[0].hosts_removed == ("b.example.com",)

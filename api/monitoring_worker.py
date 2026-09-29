@@ -162,16 +162,23 @@ def _easm_citations_for_run(control_db: ControlDB, organization_id: str, run_id:
 def _degraded_providers(
     control_db: ControlDB, row: MonitoredDomainRecord, scan_id: str, previous_scan_id: str | None
 ) -> list[str]:
-    """Collectors that contributed results to the baseline run but failed,
-    were unavailable, or ran only partially in this one. Empty when there's
-    no baseline yet or the row predates organizations (no outcomes to read)."""
+    """Hostname-producing collectors that contributed results to the baseline
+    run but failed, were unavailable, or ran only partially in this one.
+    Only providers whose output includes hostnames count: a failed
+    vulnerability scanner or ASN lookup can't make hosts disappear, so it
+    must not suppress a genuine removal alert. Empty when there's no
+    baseline yet or the row predates organizations (no outcomes to read)."""
     if previous_scan_id is None or not row.organization_id:
         return []
+    from api.collection_capabilities import hostname_producers
+
+    relevant = hostname_producers()
 
     def outcomes(run_id: str) -> dict[str, str]:
         return {
             o.provider: o.outcome
             for o in control_db.list_provider_run_outcomes(row.organization_id or "", run_id)
+            if o.provider in relevant
         }
 
     return regressed_providers(

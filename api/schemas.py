@@ -77,6 +77,10 @@ class CreateScanRequest(BaseModel):
     # exact same narrowing api/monitoring.py's Speed 1 monitoring already
     # applies — never a second, differently-defined "passive" here.
     profile: Literal["standard", "passive"] = "standard"
+    # Optional override of the organization's default provider set for this
+    # scan only (the complete set, not a delta). Never saved as the new
+    # default; must be within the tier's ceiling or the request is rejected.
+    providers: list[str] | None = Field(default=None, max_length=100)
 
 
 class CreateScanResponse(BaseModel):
@@ -92,6 +96,10 @@ class ScanStatusResponse(BaseModel):
     updated_at: str
     error_message: str | None = None
     collection_profile: str = "standard"
+    # The explicit per-scan override, if the scan had one.
+    capability_override: list[str] | None = None
+    # The optional providers that actually ran (set once execution starts).
+    effective_providers: list[str] | None = None
 
 
 class ClientReportRequest(BaseModel):
@@ -175,6 +183,45 @@ ProviderOutcome = Literal[
     "unavailable",
     "failed",
 ]
+
+
+class ProviderCapabilityInfo(BaseModel):
+    provider: str
+    capability: str
+    intensity: str
+    # Always-on base pipeline (subdomains, DNS, HTTP); can't be toggled.
+    required: bool
+    # Allowed by the organization's tier (always True for required providers).
+    entitled: bool
+
+
+class CollectionSettingsResponse(BaseModel):
+    organization_id: str
+    # "organization" once a default has been saved, "default" before that.
+    source: Literal["organization", "default"]
+    tier: str
+    enabled_providers: list[str]
+    # What scans actually run with: enabled_providers limited to the tier.
+    effective_providers: list[str]
+    # Saved as enabled but above the current tier (e.g. after a downgrade);
+    # they don't run until the tier allows them again.
+    not_entitled: list[str]
+    providers: list[ProviderCapabilityInfo]
+
+
+class UpdateCollectionSettingsRequest(BaseModel):
+    # The complete set of optional providers to enable (not a delta).
+    enabled_providers: list[str] = Field(max_length=100)
+
+
+class CapabilityAuditResponse(BaseModel):
+    audit_id: str
+    actor_account_id: str
+    scan_id: str | None = None
+    action: Literal["org_default_updated", "scan_override"]
+    before: list[str] | None = None
+    after: list[str]
+    created_at: str
 
 
 class ProviderRunOutcomeResponse(BaseModel):

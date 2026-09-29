@@ -409,6 +409,29 @@ CREATE INDEX IF NOT EXISTS idx_exposure_history
 -- Provider execution outcomes are operational evidence for exposure lifecycle.
 -- They intentionally do NOT resolve an exposure by themselves: a run-level
 -- provider success does not prove exhaustive coverage of every asset.
+-- Productization Roadmap v2 ("Capability & Tool Access"): an organization's
+-- saved default set of optional providers. No row = built-in defaults,
+-- exactly what every organization ran with before this table existed.
+CREATE TABLE IF NOT EXISTS organization_collection_settings (
+    organization_id TEXT PRIMARY KEY REFERENCES organizations(organization_id),
+    enabled_providers_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_account_id TEXT NOT NULL
+);
+-- Append-only: every change to an organization's default provider set and
+-- every per-scan override — who, which org, which scan, before/after, when.
+CREATE TABLE IF NOT EXISTS capability_audit_log (
+    audit_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    actor_account_id TEXT NOT NULL,
+    scan_id TEXT,
+    action TEXT NOT NULL CHECK(action IN ('org_default_updated', 'scan_override')),
+    before_json TEXT,
+    after_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_capability_audit_org
+    ON capability_audit_log(organization_id, created_at);
 CREATE TABLE IF NOT EXISTS provider_run_outcomes (
     organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
     account_id TEXT NOT NULL,
@@ -613,6 +636,12 @@ CREATE TABLE IF NOT EXISTS scans (
     -- Monitoring-triggered scans ignore this column entirely — their own
     -- trigger_source already decides passive vs. active.
     collection_profile TEXT NOT NULL DEFAULT 'standard',
+    -- Roadmap v2 capability toggle: the explicit per-scan provider set, if
+    -- the caller overrode the org default (NULL otherwise), and the set that
+    -- actually ran, recorded at execution so a scan stays explainable
+    -- regardless of later org-default or tier changes.
+    capability_override_json TEXT,
+    effective_providers_json TEXT,
     -- Fase 02: nullable at the schema level only because SQLite cannot
     -- ALTER TABLE ADD a NOT NULL column with a per-row (not fixed)
     -- default onto a table that already has rows — every code path that
@@ -1086,6 +1115,8 @@ class ScanRecord:
     trigger_source: str
     organization_id: str | None = None
     collection_profile: str = "standard"
+    capability_override: tuple[str, ...] | None = None
+    effective_providers: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1254,6 +1285,17 @@ class ExposureHistoryRecord:
     happened_at: str
     run_id: str | None
     reason: str
+
+
+@dataclass(frozen=True)
+class CapabilityAuditRecord:
+    audit_id: str
+    actor_account_id: str
+    scan_id: str | None
+    action: str
+    before: tuple[str, ...] | None
+    after: tuple[str, ...]
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -1498,6 +1540,8 @@ _SCANS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("heartbeat_at", "TEXT"),
     ("trigger_source", "TEXT NOT NULL DEFAULT 'manual'"),
     ("collection_profile", "TEXT NOT NULL DEFAULT 'standard'"),
+    ("capability_override_json", "TEXT"),
+    ("effective_providers_json", "TEXT"),
 )
 
 # White-label client report fix: an existing `subscriptions` table
@@ -3930,6 +3974,7 @@ class ControlDB:
         trigger_source: str = "manual",
         organization_id: str | None = None,
         collection_profile: str = "standard",
+        capability_override: frozenset[str] | None = None,
     ) -> None:
         """`organization_id` defaults to the account's own organization
         (Fase 02) when not given explicitly — every pre-existing caller
@@ -3937,15 +3982,23 @@ class ControlDB:
         `collection_profile` (Productization Phase 01) is caller-validated
         upstream (`api/schemas.py::CreateScanRequest`'s `Literal` type) —
         this method trusts it rather than re-validating, the same
-        division of responsibility `trigger_source` already has here."""
+        division of responsibility `trigger_source` already has here.
+
+        `capability_override` (Roadmap v2) must already be validated and
+        entitlement-checked by the caller; it is stored on the scan and its
+        audit entry is written in the same transaction, so an override can
+        never exist without its audit trail."""
         organization_id = organization_id or self.default_organization_id_for_account(account_id)
         now = _now_iso()
+        override_json = (
+            None if capability_override is None else json.dumps(sorted(capability_override))
+        )
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO scans "
                 "(scan_id, account_id, domain, db_path, status, created_at, updated_at, "
-                "trigger_source, organization_id, collection_profile) "
-                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+                "trigger_source, organization_id, collection_profile, capability_override_json) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
                 (
                     scan_id,
                     account_id,
@@ -3956,8 +4009,101 @@ class ControlDB:
                     trigger_source,
                     organization_id,
                     collection_profile,
+                    override_json,
                 ),
             )
+            if override_json is not None:
+                _insert_capability_audit(
+                    conn,
+                    organization_id=organization_id,
+                    actor_account_id=account_id,
+                    scan_id=scan_id,
+                    action="scan_override",
+                    before=None,
+                    after_json=override_json,
+                    created_at=now,
+                )
+
+    def set_scan_effective_providers(self, scan_id: str, providers: frozenset[str]) -> None:
+        """What actually ran for this scan, recorded at execution start."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE scans SET effective_providers_json = ? WHERE scan_id = ?",
+                (json.dumps(sorted(providers)), scan_id),
+            )
+
+    def get_org_collection_settings(self, organization_id: str) -> frozenset[str] | None:
+        """The organization's saved default provider set, or `None` if it
+        has never saved one (built-in defaults apply)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT enabled_providers_json FROM organization_collection_settings "
+                "WHERE organization_id = ?",
+                (organization_id,),
+            ).fetchone()
+        return None if row is None else frozenset(json.loads(row["enabled_providers_json"]))
+
+    def set_org_collection_settings(
+        self,
+        *,
+        organization_id: str,
+        actor_account_id: str,
+        providers: frozenset[str],
+        previous: frozenset[str],
+    ) -> bool:
+        """Saves the org default and audits it in one transaction. `previous`
+        is the effective default before the change (saved or built-in), so
+        the audit entry always shows a real before/after. Returns False —
+        and writes nothing, not even an audit row — when nothing changed."""
+        if providers == previous:
+            return False
+        now = _now_iso()
+        after_json = json.dumps(sorted(providers))
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO organization_collection_settings "
+                "(organization_id, enabled_providers_json, updated_at, updated_by_account_id) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(organization_id) DO UPDATE SET "
+                "enabled_providers_json = excluded.enabled_providers_json, "
+                "updated_at = excluded.updated_at, "
+                "updated_by_account_id = excluded.updated_by_account_id",
+                (organization_id, after_json, now, actor_account_id),
+            )
+            _insert_capability_audit(
+                conn,
+                organization_id=organization_id,
+                actor_account_id=actor_account_id,
+                scan_id=None,
+                action="org_default_updated",
+                before=previous,
+                after_json=after_json,
+                created_at=now,
+            )
+        return True
+
+    def list_capability_audit(
+        self, organization_id: str, *, limit: int = 100, offset: int = 0
+    ) -> list[CapabilityAuditRecord]:
+        limit = max(1, min(500, int(limit)))
+        offset = max(0, int(offset))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM capability_audit_log WHERE organization_id = ? "
+                "ORDER BY created_at DESC, audit_id LIMIT ? OFFSET ?",
+                (organization_id, limit, offset),
+            ).fetchall()
+        return [
+            CapabilityAuditRecord(
+                audit_id=row["audit_id"],
+                actor_account_id=row["actor_account_id"],
+                scan_id=row["scan_id"],
+                action=row["action"],
+                before=_json_tuple(row["before_json"]),
+                after=_json_tuple(row["after_json"]) or (),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
 
     def update_scan_status(
         self, scan_id: str, status: str, *, error_message: str | None = None
@@ -5420,6 +5566,39 @@ def _scan_record_from_row(row: sqlite3.Row) -> ScanRecord:
         trigger_source=row["trigger_source"],
         organization_id=row["organization_id"],
         collection_profile=row["collection_profile"],
+        capability_override=_json_tuple(row["capability_override_json"]),
+        effective_providers=_json_tuple(row["effective_providers_json"]),
+    )
+
+
+def _json_tuple(raw: str | None) -> tuple[str, ...] | None:
+    return None if raw is None else tuple(json.loads(raw))
+
+
+def _insert_capability_audit(
+    conn: sqlite3.Connection,
+    *,
+    organization_id: str,
+    actor_account_id: str,
+    scan_id: str | None,
+    action: str,
+    before: frozenset[str] | None,
+    after_json: str,
+    created_at: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO capability_audit_log (audit_id, organization_id, actor_account_id, "
+        "scan_id, action, before_json, after_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            secrets.token_hex(16),
+            organization_id,
+            actor_account_id,
+            scan_id,
+            action,
+            None if before is None else json.dumps(sorted(before)),
+            after_json,
+            created_at,
+        ),
     )
 
 

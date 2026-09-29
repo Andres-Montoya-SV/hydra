@@ -44,6 +44,7 @@ from api.tenancy import account_db_path, account_settings
 
 if TYPE_CHECKING:
     from api.settings import APISettings
+    from config.settings import Settings
 
 # Matches this codebase's own existing severity vocabulary
 # (core/assets.py::RiskLevel; every parser in core/parsers/registry.py
@@ -91,6 +92,39 @@ async def _deliver_high_severity_findings_webhook(
     await deliver_event_to_subscribers(control_db=control_db, account_id=account_id, event=event)
 
 
+def _apply_collection_capabilities(
+    control_db: ControlDB, settings: Settings, *, account_id: str, scan_id: str
+) -> None:
+    """Replaces the runtime role of the per-process `ENABLE_*` flags for API
+    scans: the scan's own override, else its organization's saved default,
+    else the account settings' current flags — clipped to the tier ceiling
+    as of execution time."""
+    from api import subscriptions
+    from api.collection_capabilities import (
+        apply_to_settings,
+        enabled_in_settings,
+        resolve_scan_providers,
+    )
+
+    scan = control_db.get_owned_scan(scan_id, account_id)
+    if scan is None:
+        return
+    tier = subscriptions.effective_limits(
+        subscriptions.get_or_create_subscription(control_db, account_id)
+    ).tier
+    enabled = resolve_scan_providers(
+        override=None if scan.capability_override is None else frozenset(scan.capability_override),
+        org_default=(
+            control_db.get_org_collection_settings(scan.organization_id)
+            if scan.organization_id
+            else None
+        ),
+        current=enabled_in_settings(settings),
+        tier=tier,
+    )
+    apply_to_settings(settings, enabled)
+
+
 async def execute_scan(
     *,
     api_settings: APISettings,
@@ -106,6 +140,7 @@ async def execute_scan(
     try:
         settings = account_settings(api_settings, account_id)
         settings.validate_or_raise()
+        _apply_collection_capabilities(control_db, settings, account_id=account_id, scan_id=scan_id)
 
         # Productization Phase 01: a client-chosen 'passive' profile on a
         # manually-triggered scan gets the EXACT SAME narrowing Speed 1
@@ -118,6 +153,12 @@ async def execute_scan(
             overrides = passive_monitoring_settings_overrides(enable_flags)
             for attr, value in overrides.items():
                 setattr(settings, attr, value)
+
+        # Recorded AFTER any passive narrowing, so the scan shows exactly
+        # which optional providers were allowed to run.
+        from api.collection_capabilities import enabled_in_settings
+
+        control_db.set_scan_effective_providers(scan_id, enabled_in_settings(settings))
 
         preflight_args = argparse.Namespace(domain=domain, targets_file=None, external=False)
         hydra_app._external_mode_preflight(preflight_args, settings)

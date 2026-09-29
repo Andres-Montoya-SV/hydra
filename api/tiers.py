@@ -172,6 +172,22 @@ def retention_days_for(limits: TierLimits, *, retention_days_override: int | Non
     )
 
 
+# Collection-capability ceiling per tier (Productization Roadmap v2, "Capability &
+# Tool Access"): the highest provider intensities (core/provider_contract.py::
+# ProviderIntensity) an organization on this tier may ever enable, as an org
+# default or a scan override. A ceiling on which TOOLS may run, never on which
+# TARGETS may be scanned — scope authorization is untouched by this table.
+# Every provider on by default today is at or below "active_standard", so no
+# existing account's behavior changes; high-volume collectors (port scanning,
+# content/parameter fuzzing, cloud-bucket enumeration) need Pro or Ultra.
+TIER_PROVIDER_INTENSITIES: dict[Tier, frozenset[str]] = {
+    "free": frozenset({"passive", "third_party_api", "active_standard"}),
+    "medium": frozenset({"passive", "third_party_api", "active_standard"}),
+    "pro": frozenset({"passive", "third_party_api", "active_standard", "active_high_volume"}),
+    "ultra": frozenset({"passive", "third_party_api", "active_standard", "active_high_volume"}),
+}
+
+
 def tier_limits(tier: str) -> TierLimits:
     try:
         return TIERS[tier]  # type: ignore[index]
