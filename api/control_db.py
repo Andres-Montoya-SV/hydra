@@ -3977,17 +3977,10 @@ class ControlDB:
         capability_override: frozenset[str] | None = None,
     ) -> None:
         """`organization_id` defaults to the account's own organization
-        (Fase 02) when not given explicitly — every pre-existing caller
-        (every router, every test) keeps working unchanged.
-        `collection_profile` (Productization Phase 01) is caller-validated
-        upstream (`api/schemas.py::CreateScanRequest`'s `Literal` type) —
-        this method trusts it rather than re-validating, the same
-        division of responsibility `trigger_source` already has here.
-
-        `capability_override` (Roadmap v2) must already be validated and
-        entitlement-checked by the caller; it is stored on the scan and its
-        audit entry is written in the same transaction, so an override can
-        never exist without its audit trail."""
+        (Fase 02). `collection_profile` (Productization Phase 01) and
+        `capability_override` (Roadmap v2) are caller-validated upstream;
+        the override's audit entry is written in the same transaction, so
+        an override can never exist without its audit trail."""
         organization_id = organization_id or self.default_organization_id_for_account(account_id)
         now = _now_iso()
         override_json = (
@@ -4013,16 +4006,18 @@ class ControlDB:
                 ),
             )
             if override_json is not None:
-                _insert_capability_audit(
-                    conn,
-                    organization_id=organization_id,
-                    actor_account_id=account_id,
-                    scan_id=scan_id,
-                    action="scan_override",
-                    before=None,
-                    after_json=override_json,
-                    created_at=now,
-                )
+                _audit_scan_override(conn, organization_id, account_id, scan_id, override_json, now)
+
+    def account_for_run(self, organization_id: str, run_id: str) -> str | None:
+        """Which account's scan produced `run_id` — only if that scan belongs
+        to `organization_id` (a foreign run is indistinguishable from none).
+        Used to open the right per-account recon.db for a durable asset."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT account_id FROM scans WHERE scan_id = ? AND organization_id = ?",
+                (run_id, organization_id),
+            ).fetchone()
+        return None if row is None else str(row["account_id"])
 
     def set_scan_effective_providers(self, scan_id: str, providers: frozenset[str]) -> None:
         """What actually ran for this scan, recorded at execution start."""
@@ -5573,6 +5568,26 @@ def _scan_record_from_row(row: sqlite3.Row) -> ScanRecord:
 
 def _json_tuple(raw: str | None) -> tuple[str, ...] | None:
     return None if raw is None else tuple(json.loads(raw))
+
+
+def _audit_scan_override(
+    conn: sqlite3.Connection,
+    organization_id: str,
+    account_id: str,
+    scan_id: str,
+    override_json: str,
+    created_at: str,
+) -> None:
+    _insert_capability_audit(
+        conn,
+        organization_id=organization_id,
+        actor_account_id=account_id,
+        scan_id=scan_id,
+        action="scan_override",
+        before=None,
+        after_json=override_json,
+        created_at=created_at,
+    )
 
 
 def _insert_capability_audit(

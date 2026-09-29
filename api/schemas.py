@@ -681,6 +681,33 @@ class AssetIdentifierResponse(BaseModel):
     last_seen_at: str
 
 
+class GeoLocationResponse(BaseModel):
+    country: str | None = None
+    region: str | None = None
+    city: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    # The offline database this came from (edition@build date) and its age
+    # when the lookup ran. A stale database is degraded evidence.
+    source: str
+    database_age_days: int | None = None
+    stale: bool
+
+
+class NetworkIntelligenceResponse(BaseModel):
+    asset_id: str
+    # The scan the network data comes from (the asset's most recent run).
+    run_id: str | None = None
+    ips: list[str]
+    asn: str | None = None
+    asn_org: str | None = None
+    network_cidr: str | None = None
+    hosting_provider: str | None = None
+    # None when no geo enrichment ran for this asset (no database configured,
+    # or no location for its IPs) — never a guessed location.
+    geo: GeoLocationResponse | None = None
+
+
 class RelationshipResponse(BaseModel):
     relationship_id: str
     source_entity: str

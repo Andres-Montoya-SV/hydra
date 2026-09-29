@@ -65,6 +65,8 @@ from api.schemas import (
     CurrentTechnologyResponse,
     DiscardCandidateAssetRequest,
     EvidenceResponse,
+    GeoLocationResponse,
+    NetworkIntelligenceResponse,
     ObservationResponse,
     OrganizationMemberResponse,
     OrganizationResponse,
@@ -509,6 +511,72 @@ def list_asset_identifiers(
         )
         for row in db.list_identifiers_for_asset(asset_id)
     ]
+
+
+def _latest_host(request: Request, organization_id: str, asset: AssetRecord):  # noqa: ANN202
+    """The host as the asset's most recent run recorded it, read from the
+    recon.db of the account whose scan produced that run. `None` when there
+    is nothing to read (non-host asset, no run, db missing). Never creates
+    a database as a side effect of a read."""
+    if asset.asset_type != "domain" or not asset.last_seen_run_id:
+        return None
+    db = _db(request)
+    account_id = db.account_for_run(organization_id, asset.last_seen_run_id)
+    if account_id is None:
+        return None
+    from api.tenancy import account_db_path
+    from core.store import AssetStore
+
+    path = account_db_path(request.app.state.api_settings, account_id)
+    if not path.exists():
+        return None
+    domain = asset.identity_key.split(":", 1)[1]
+    return AssetStore(path).get_host(asset.last_seen_run_id, domain)
+
+
+@router.get(
+    "/{organization_id}/assets/{asset_id}/network",
+    response_model=NetworkIntelligenceResponse,
+)
+def get_asset_network(
+    organization_id: str,
+    asset_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> NetworkIntelligenceResponse:
+    """Network & Geo Intelligence: who owns the asset's IPs (ASN, BGP
+    prefix, hosting provider, via Team Cymru) and where they are (offline
+    geo lookup — no IP ever leaves the machine), with the geo database's
+    freshness so stale data is visible."""
+    from core.geoip import GEOIP_MAX_AGE_DAYS
+
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    asset = _require_asset(db, organization_id, asset_id)
+    host = _latest_host(request, organization_id, asset)
+    geo = None
+    if host is not None and host.geo_source:
+        age = host.geo_db_age_days
+        geo = GeoLocationResponse(
+            country=host.country,
+            region=host.region,
+            city=host.city,
+            latitude=host.latitude,
+            longitude=host.longitude,
+            source=host.geo_source,
+            database_age_days=age,
+            stale=age is None or age > GEOIP_MAX_AGE_DAYS,
+        )
+    return NetworkIntelligenceResponse(
+        asset_id=asset_id,
+        run_id=asset.last_seen_run_id,
+        ips=list(host.ips) if host is not None else [],
+        asn=host.asn if host is not None else None,
+        asn_org=host.asn_org if host is not None else None,
+        network_cidr=host.cidr if host is not None else None,
+        hosting_provider=host.provider if host is not None else None,
+        geo=geo,
+    )
 
 
 @router.get("/{organization_id}/relationships", response_model=list[RelationshipResponse])

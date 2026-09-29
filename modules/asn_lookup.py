@@ -94,6 +94,7 @@ class AsnLookupPlugin(BaseToolPlugin):
                 unavailable=True,
             )
 
+        records = _add_geo(records, self.settings.geoip_db_path)
         count = write_jsonl(output_path, records, base_dir=context.output_dir)
         self.update_status(context, ToolStatus.COMPLETED, output_lines=count)
         return PluginResult(
@@ -102,6 +103,38 @@ class AsnLookupPlugin(BaseToolPlugin):
             lines_produced=count,
             message=f"Enriched {count} IP address(es)",
         )
+
+
+def _add_geo(records: list[dict[str, str]], geoip_db_path: str | None) -> list[dict[str, str]]:
+    """Adds offline geo fields (region, city, coordinates, geo country) to
+    each Team Cymru record, with the database edition/build and its age so
+    the evidence carries its own freshness. A local file read per IP — no
+    network. No database configured means records are returned unchanged."""
+    from core.geoip import open_geoip
+
+    geo = open_geoip(geoip_db_path)
+    if geo is None:
+        return records
+    try:
+        source, age = geo.info.source(), geo.info.age_days()
+        for record in records:
+            location = geo.lookup(str(record.get("ip", "")))
+            if location is None:
+                continue
+            record.update(
+                {
+                    "geo_country": location.country,
+                    "region": location.region,
+                    "city": location.city,
+                    "latitude": location.latitude,
+                    "longitude": location.longitude,
+                    "geo_source": source,
+                    "geo_db_age_days": age,
+                }
+            )
+    finally:
+        geo.close()
+    return records
 
 
 def _format_exc(exc: BaseException, *, fallback: str) -> str:

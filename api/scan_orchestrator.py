@@ -125,6 +125,43 @@ def _apply_collection_capabilities(
     apply_to_settings(settings, enabled)
 
 
+def _scan_settings(
+    api_settings: APISettings,
+    control_db: ControlDB,
+    *,
+    account_id: str,
+    scan_id: str,
+    passive: bool,
+) -> Settings:
+    """The account's settings with this scan's collection capabilities
+    applied, narrowed for passive scans, and the effective provider set
+    recorded on the scan."""
+    from api.collection_capabilities import enabled_in_settings
+
+    settings = account_settings(api_settings, account_id)
+    settings.validate_or_raise()
+    # Per-account settings don't read .env, so the service-level offline
+    # geo database is handed to each scan explicitly.
+    settings.geoip_db_path = api_settings.geoip_db_path
+    _apply_collection_capabilities(control_db, settings, account_id=account_id, scan_id=scan_id)
+
+    # Productization Phase 01: a client-chosen 'passive' profile on a
+    # manually-triggered scan gets the EXACT SAME narrowing Speed 1
+    # monitoring already applies — one definition of "passive" for
+    # this whole service, not a second one invented here.
+    if passive:
+        from api.monitoring import passive_monitoring_settings_overrides
+
+        enable_flags = {k: v for k, v in vars(settings).items() if k.startswith("enable_")}
+        for attr, value in passive_monitoring_settings_overrides(enable_flags).items():
+            setattr(settings, attr, value)
+
+    # Recorded AFTER any passive narrowing, so the scan shows exactly
+    # which optional providers were allowed to run.
+    control_db.set_scan_effective_providers(scan_id, enabled_in_settings(settings))
+    return settings
+
+
 async def execute_scan(
     *,
     api_settings: APISettings,
@@ -138,28 +175,13 @@ async def execute_scan(
     import app as hydra_app  # deferred: heavy import graph (ToolManager, plugins, …)
 
     try:
-        settings = account_settings(api_settings, account_id)
-        settings.validate_or_raise()
-        _apply_collection_capabilities(control_db, settings, account_id=account_id, scan_id=scan_id)
-
-        # Productization Phase 01: a client-chosen 'passive' profile on a
-        # manually-triggered scan gets the EXACT SAME narrowing Speed 1
-        # monitoring already applies — one definition of "passive" for
-        # this whole service, not a second one invented here.
-        if trigger_source == "scheduled_passive" or collection_profile == "passive":
-            from api.monitoring import passive_monitoring_settings_overrides
-
-            enable_flags = {k: v for k, v in vars(settings).items() if k.startswith("enable_")}
-            overrides = passive_monitoring_settings_overrides(enable_flags)
-            for attr, value in overrides.items():
-                setattr(settings, attr, value)
-
-        # Recorded AFTER any passive narrowing, so the scan shows exactly
-        # which optional providers were allowed to run.
-        from api.collection_capabilities import enabled_in_settings
-
-        control_db.set_scan_effective_providers(scan_id, enabled_in_settings(settings))
-
+        settings = _scan_settings(
+            api_settings,
+            control_db,
+            account_id=account_id,
+            scan_id=scan_id,
+            passive=trigger_source == "scheduled_passive" or collection_profile == "passive",
+        )
         preflight_args = argparse.Namespace(domain=domain, targets_file=None, external=False)
         hydra_app._external_mode_preflight(preflight_args, settings)
 

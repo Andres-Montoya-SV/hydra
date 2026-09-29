@@ -23,3 +23,7 @@ cryptography==50.0.1
 # (ENABLE_WAFW00F=true). Pure Python, no other system dependency.
 wafw00f==2.4.2
 
+# Offline IP geolocation (core/geoip.py) — reads a local MaxMind-format
+# database (GEOIP_DB_PATH); every lookup is a local file read, never a
+# network request. Apache-2.0. Unused when GEOIP_DB_PATH is empty.
+maxminddb==3.2.0
