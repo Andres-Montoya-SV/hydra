@@ -35,6 +35,8 @@ class WebhookTestHandler(http.server.BaseHTTPRequestHandler):
     # What the server answers with (a ticketing API's created-issue JSON,
     # for instance); the default empty object suits plain webhooks.
     response_body = b"{}"
+    # Extra response headers, e.g. {"Retry-After": "900"} for a 429.
+    extra_headers: dict[str, str] = {}
     # Set to a positive number to make the handler sleep before
     # responding — used to exercise the client's own timeout.
     delay_seconds = 0.0
@@ -59,6 +61,8 @@ class WebhookTestHandler(http.server.BaseHTTPRequestHandler):
         )
         self.send_response(self.response_status)
         self.send_header("Content-Type", "application/json")
+        for name, value in self.extra_headers.items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(self.response_body)
 

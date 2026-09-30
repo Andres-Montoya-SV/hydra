@@ -158,7 +158,7 @@ async def _deliver_ticket(
     event was already turned into a ticket (e.g. a retry after the ticket
     was created but before the delivery was marked), so nothing is sent."""
     from api.secrets_box import SecretsUnavailableError, reveal
-    from api.ticketing import create_ticket
+    from api.ticketing import RateLimitedError, create_ticket
 
     exposure_id = str(work.event.payload.get("exposure_id") or "")
     if not exposure_id or control_db.get_ticket_link(integration.integration_id, exposure_id):
@@ -175,7 +175,8 @@ async def _deliver_ticket(
         )
     except (ValueError, SecretsUnavailableError) as exc:
         error = str(exc) or type(exc).__name__
-        outcome = _record(control_db, work, error)
+        wait = exc.retry_after if isinstance(exc, RateLimitedError) else None
+        outcome = _record(control_db, work, error, min_wait_seconds=wait)
         if outcome == "dead":
             control_db.record_ticketing_outcome(
                 integration.integration_id,
@@ -196,25 +197,43 @@ async def _deliver_ticket(
     return _record(control_db, work, None)
 
 
-def _record(control_db: ControlDB, work: DeliveryWork, error: str | None) -> str:
-    """Records one attempt's result: delivered, retrying (with backoff), or
-    dead once MAX_ATTEMPTS is reached."""
+def _record(
+    control_db: ControlDB,
+    work: DeliveryWork,
+    error: str | None,
+    *,
+    min_wait_seconds: int | None = None,
+) -> str:
+    """Records one attempt's result: delivered, retrying (with backoff, and
+    never sooner than a provider's Retry-After, capped at the longest step),
+    or dead once MAX_ATTEMPTS is reached."""
     now = datetime.now(timezone.utc)
     if error is None:
         control_db.record_delivery_attempt(work.delivery_id, error=None, now=now, retry_at=None)
         return "delivered"
     retry_at = next_attempt(work.attempts, now)
+    if retry_at is not None and min_wait_seconds:
+        wait = min(min_wait_seconds, RETRY_SCHEDULE_SECONDS[-1])
+        retry_at = max(retry_at, now + timedelta(seconds=wait))
     control_db.record_delivery_attempt(work.delivery_id, error=error, now=now, retry_at=retry_at)
     if retry_at is not None:
         return "retrying"
     logger.warning(
-        "Delivery %s of %s is dead after %d attempts: %s",
+        "Delivery %s of %s to %s is dead after %d attempts: %s",
         work.delivery_id,
         work.event.event_type,
+        _destination(work),
         MAX_ATTEMPTS,
         error,
     )
     return "dead"
+
+
+def _destination(work: DeliveryWork) -> str:
+    """`webhook <id>` or `<provider> integration <id>`, for logs."""
+    if work.ticketing is not None:
+        return f"{work.ticketing.provider} integration {work.ticketing.integration_id}"
+    return f"webhook {work.webhook.webhook_id}" if work.webhook else "no destination"
 
 
 async def run_integration_delivery_cycle(

@@ -7,10 +7,11 @@ no second authorization system.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, WebhookRecord
+from api.routers.delivery_logs import Page, delivery_responses, page
 from api.schemas import (
     DeliveryResponse,
     RegisterWebhookRequest,
@@ -99,20 +100,18 @@ def delete_webhook(
 def list_deliveries(
     webhook_id: str,
     request: Request,
-    limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    paging: Page = Depends(page),
     auth: AuthContext = Depends(require_api_key),
 ) -> list[DeliveryResponse]:
     """Productization Phase 08: this webhook's delivery log, newest first."""
     control_db = _control_db(request)
     if control_db.get_webhook(webhook_id, auth.account_id) is None:
         raise HTTPException(status_code=404, detail=f"{webhook_id!r} not found")
-    return [
-        DeliveryResponse.model_validate(row, from_attributes=True)
-        for row in control_db.list_deliveries_for_webhook(
-            webhook_id, auth.account_id, limit=limit, offset=offset
+    return delivery_responses(
+        control_db.list_deliveries_for_webhook(
+            webhook_id, auth.account_id, limit=paging.limit, offset=paging.offset
         )
-    ]
+    )
 
 
 @router.post("/{webhook_id}/deliveries/{delivery_id}/redeliver", status_code=202)

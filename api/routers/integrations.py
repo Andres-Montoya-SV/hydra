@@ -12,10 +12,11 @@ from __future__ import annotations
 
 from typing import Literal, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from api.auth import AuthContext, require_api_key
 from api.control_db import TicketingIntegrationRecord
+from api.routers.delivery_logs import Page, delivery_responses, page
 from api.routers.org_access import control_db, require_member, require_owner
 from api.schemas import (
     CreateTicketingIntegrationRequest,
@@ -134,15 +135,13 @@ def list_integration_deliveries(
     organization_id: str,
     integration_id: str,
     request: Request,
-    limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    paging: Page = Depends(page),
     auth: AuthContext = Depends(require_api_key),
 ) -> list[DeliveryResponse]:
     db = control_db(request)
     require_member(db, auth.account_id, organization_id)
     if db.get_ticketing_integration(organization_id, integration_id) is None:
         raise HTTPException(status_code=404, detail="Integration not found")
-    return [
-        DeliveryResponse.model_validate(row, from_attributes=True)
-        for row in db.list_deliveries_for_ticketing(integration_id, limit=limit, offset=offset)
-    ]
+    return delivery_responses(
+        db.list_deliveries_for_ticketing(integration_id, limit=paging.limit, offset=paging.offset)
+    )

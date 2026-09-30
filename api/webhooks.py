@@ -69,7 +69,7 @@ import json
 import logging
 import secrets
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -254,6 +254,13 @@ def event_for_high_severity_findings(
     )
 
 
+class PinnedResponse(NamedTuple):
+    status: int | None  # None: transport error, see `error`
+    content: bytes
+    error: str
+    retry_after: int | None  # seconds, from a numeric Retry-After header
+
+
 async def _post_to_pinned_ip(
     *,
     url: str,
@@ -266,7 +273,7 @@ async def _post_to_pinned_ip(
     extra_headers: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
     """A signed webhook POST to an already-validated IP: `(ok, error)`."""
-    status, _content, error = await send_pinned(
+    response = await send_pinned(
         url=url,
         connect_ip=connect_ip,
         hostname=hostname,
@@ -274,11 +281,11 @@ async def _post_to_pinned_ip(
         headers={_SIGNATURE_HEADER: signature, _EVENT_HEADER: event_type, **(extra_headers or {})},
         verify=verify,
     )
-    if status is None:
-        return False, error
-    if 200 <= status < 300:
+    if response.status is None:
+        return False, response.error
+    if 200 <= response.status < 300:
         return True, ""
-    return False, f"HTTP {status}"
+    return False, f"HTTP {response.status}"
 
 
 async def send_pinned(
@@ -289,12 +296,12 @@ async def send_pinned(
     body: bytes,
     headers: dict[str, str],
     verify: bool = True,
-) -> tuple[int | None, bytes, str]:
+) -> PinnedResponse:
     """POSTs JSON to `connect_ip` (already validated), never letting the
-    HTTP client re-resolve `hostname` itself: `(status, body, error)`,
-    status None on a transport error. TLS is verified against the real
-    hostname via SNI (`verify` is True on every production path; tests
-    pass False to reach a local self-signed server)."""
+    HTTP client re-resolve `hostname` itself; `status` is None on a
+    transport error. TLS is verified against the real hostname via SNI
+    (`verify` is True on every production path; tests pass False to reach
+    a local self-signed server)."""
     import httpx
 
     parsed = urlparse(url)
@@ -314,20 +321,31 @@ async def send_pinned(
             )
             response = await client.send(request)
     except httpx.RequestError as exc:
-        return None, b"", f"{type(exc).__name__}: {exc}"
-    return response.status_code, response.content, ""
+        return PinnedResponse(None, b"", f"{type(exc).__name__}: {exc}", None)
+    return PinnedResponse(
+        response.status_code,
+        response.content,
+        "",
+        _retry_after_seconds(response.headers.get("Retry-After")),
+    )
+
+
+def _retry_after_seconds(value: str | None) -> int | None:
+    """A numeric `Retry-After` (seconds). The HTTP-date form is ignored:
+    the retry schedule then applies as usual."""
+    return int(value) if value and value.strip().isdigit() else None
 
 
 async def post_json_safely(
     url: str, *, body: bytes, headers: dict[str, str], verify: bool = True
-) -> tuple[int | None, bytes, str]:
+) -> PinnedResponse:
     """`send_pinned` behind the same destination check every webhook
     attempt gets (SSRF / DNS rebinding), for callers with their own URL:
     ticketing APIs at a customer-supplied Jira or ServiceNow host."""
     allowed, reason, connect_ip = await validate_webhook_destination(url)
     hostname = urlparse(url).hostname
     if not allowed or hostname is None:
-        return None, b"", reason or "URL has no host."
+        return PinnedResponse(None, b"", reason or "URL has no host.", None)
     return await send_pinned(
         url=url,
         connect_ip=connect_ip,

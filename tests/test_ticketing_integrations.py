@@ -10,6 +10,7 @@ import base64
 import json
 import secrets
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,7 @@ from api.ticketing import (
     parse_response,
     validate,
 )
+from api.webhooks import generate_webhook_secret
 
 KEY = Fernet.generate_key().decode()
 JIRA_CREDENTIAL = {"email": "bot@acme.example", "api_token": "jira-token-DO-NOT-LEAK"}
@@ -440,3 +442,74 @@ def test_organization_events_reach_only_that_organizations_integrations(tmp_path
             "SELECT webhook_id, destination_type FROM integration_deliveries"
         ).fetchall()
     assert routed == [(mine.integration_id, "ticketing")]
+
+
+class TestReviewFollowUps:
+    def test_a_429_waits_at_least_retry_after(self, tmp_path: Path, jira_site: str) -> None:
+        with _client(tmp_path) as client:
+            headers, account_id, org = _owner(client)
+            _connect_jira(client, headers, org, jira_site)
+            db = client.app.state.control_db
+            _seed_exposure(client, account_id, org, run_id="run-1")
+            db.enqueue_exposure_lifecycle_events(org, "run-1")
+            reset_webhook_test_state(status=429, body=b"{}")
+            WebhookTestHandler.extra_headers = {"Retry-After": "900"}
+            try:
+                stats = _cycle(client)
+            finally:
+                WebhookTestHandler.extra_headers = {}
+
+            with sqlite3.connect(db.db_path) as conn:
+                row = conn.execute(
+                    "SELECT last_error, next_attempt_at FROM integration_deliveries"
+                ).fetchone()
+            wait = datetime.fromisoformat(row[1]) - datetime.now(timezone.utc)
+            assert stats["retrying"] == 1
+            assert row[0] == "HTTP 429 (rate limited)"
+            assert timedelta(seconds=880) < wait <= timedelta(seconds=900)  # not the 30s step
+
+    def test_a_dead_delivery_log_names_its_destination(
+        self,
+        tmp_path: Path,
+        jira_site: str,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(integration_worker, "MAX_ATTEMPTS", 1)
+        with _client(tmp_path) as client:
+            headers, account_id, org = _owner(client)
+            integration_id = _connect_jira(client, headers, org, jira_site).json()["integration_id"]
+            _seed_exposure(client, account_id, org, run_id="run-1")
+            client.app.state.control_db.enqueue_exposure_lifecycle_events(org, "run-1")
+            reset_webhook_test_state(status=500)
+
+            with caplog.at_level("WARNING", logger="hydra.api.integrations"):
+                _cycle(client)
+
+            assert f"to jira integration {integration_id} is dead" in caplog.text
+            assert "DO-NOT-LEAK" not in caplog.text
+
+    def test_sealing_touches_only_unsealed_rows(self, tmp_path: Path) -> None:
+        box = SecretBox([KEY])
+        db = ControlDB(tmp_path / "c.db", secret_box=box)
+        account = db.create_account(email="seal-sql@example.com")
+        sealed_hook = db.create_webhook(
+            account_id=account,
+            url="https://a.example/h",
+            secret=generate_webhook_secret(),
+            event_types=("monitoring.changed",),
+        )
+        with sqlite3.connect(db.db_path) as conn:
+            before = conn.execute("SELECT secret FROM webhooks").fetchone()[0]
+            conn.execute(
+                "INSERT INTO webhooks (webhook_id, account_id, url, secret, "
+                "event_types_json, created_at, updated_at) VALUES "
+                "('legacy', ?, 'https://b.example/h', 'plain', '[]', 'x', 'x')",
+                (account,),
+            )
+
+        assert db.seal_plaintext_secrets() == 1
+        with sqlite3.connect(db.db_path) as conn:
+            rows = dict(conn.execute("SELECT webhook_id, secret FROM webhooks").fetchall())
+        assert rows[sealed_hook.webhook_id] == before  # never re-sealed
+        assert box.reveal(rows["legacy"]) == "plain"

@@ -181,7 +181,7 @@ nowhere safe to keep a third-party API token.
 - **Dependency:** `cryptography` moved into `requirements-api`, with the
   same audited pin as before.
 
-## Ticketing (`api/ticketing.py`)
+## Ticketing (`api/ticketing/`)
 
 | Provider | Request | Auth | Config / credential |
 |---|---|---|---|
@@ -209,11 +209,16 @@ nowhere safe to keep a third-party API token.
   through the same SSRF / DNS-rebinding gate as a webhook URL, both when
   the integration is created and on every attempt. Linear's API host is
   fixed.
-- **Wire formats** are pure functions, tested against each provider's
+- **Rate limits.** A provider's HTTP 429 is honored: a numeric
+  `Retry-After` delays the next attempt, capped at the longest backoff
+  step (6h). The HTTP-date form falls back to the normal schedule.
+- **Wire formats** are pure functions, one module per provider
+  (`api/ticketing/jira.py`, `linear.py`, `servicenow.py`) behind a common
+  interface (`api/ticketing/base.py::Provider`), tested against each provider's
   documented request and response shapes. End-to-end tests point a Jira
   integration at a real local HTTPS server. No real service is called.
 
-### API
+### Ticketing API
 
 | Endpoint | Who |
 |---|---|

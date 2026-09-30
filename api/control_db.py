@@ -51,7 +51,7 @@ from api.observation_identity import (
     EvidenceContent,
 )
 from api.relationship_identity import RelationshipDraft
-from api.secrets_box import SecretBox, SecretsUnavailableError, is_sealed, reveal
+from api.secrets_box import SEALED_PREFIX, SecretBox, SecretsUnavailableError, reveal
 from api.technology_catalog import parse_technology_detail
 from core.risk_scoring import BusinessContext, RiskFactors
 from core.store import connect_sqlite
@@ -6025,10 +6025,12 @@ class ControlDB:
         sealed = 0
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute("SELECT webhook_id, secret FROM webhooks").fetchall()
+            rows = conn.execute(
+                "SELECT webhook_id, secret FROM webhooks "
+                "WHERE secret != '' AND substr(secret, 1, ?) != ?",
+                (len(SEALED_PREFIX), SEALED_PREFIX),
+            ).fetchall()
             for row in rows:
-                if is_sealed(row["secret"]):
-                    continue
                 conn.execute(
                     "UPDATE webhooks SET secret = ? WHERE webhook_id = ?",
                     (self.secret_box.seal(row["secret"]), row["webhook_id"]),
