@@ -26,7 +26,7 @@ from config.settings import Settings
 from core.dependencies.models import ToolHealth, ToolReport, ValidationResult
 from core.dependencies.service import DependencyService
 from core.models import PipelineContext, ToolInfo, ToolStatus
-from core.provider_qualification import PROFILES, qualify, qualify_report
+from core.provider_qualification import PROFILES, lists_flag, qualify, qualify_report
 from core.tool_manager import ToolManager
 
 REPO = Path(__file__).resolve().parent.parent
@@ -169,27 +169,33 @@ def _report(tool: str, version: str, help_text: str) -> ToolReport:
     )
 
 
-def _preflight(tmp_path: Path, tool: str, version: str, help_text: str) -> PipelineContext:
+def _preflight(
+    tmp_path: Path, tool: str, version: str, help_text: str, *, required: bool = False
+) -> tuple[PipelineContext, bool]:
+    """Runs the preflight for one tool; returns the context and whether
+    every mandatory tool is still usable."""
     manager = ToolManager(Settings(project_root=tmp_path))
     manager._reports[tool] = _report(tool, version, help_text)
     context = PipelineContext(output_dir=tmp_path)
     context.tool_states[tool] = ToolInfo(
-        name=tool, display_name=tool, required=False, enabled=True, status=ToolStatus.READY
+        name=tool, display_name=tool, required=required, enabled=True, status=ToolStatus.READY
     )
-    manager._qualify_providers(context)
-    return context
+    return context, manager._qualify_providers(context)
 
 
 class TestPreflight:
     def test_a_binary_that_lost_a_flag_is_made_unavailable(self, tmp_path: Path) -> None:
-        context = _preflight(tmp_path, "katana", "1.7.0", _help_with("katana", drop="-jsonl"))
+        context, mandatory_ok = _preflight(
+            tmp_path, "katana", "1.7.0", _help_with("katana", drop="-jsonl")
+        )
 
         assert context.tool_states["katana"].status is ToolStatus.UNAVAILABLE
         assert context.metadata["provider_qualification"]["katana"]["status"] == "missing_flags"
         assert any("-jsonl" in w for w in context.warnings)
+        assert mandatory_ok is True and context.errors == []  # optional: degrade only
 
     def test_an_unverified_version_runs_with_a_warning(self, tmp_path: Path) -> None:
-        context = _preflight(tmp_path, "katana", "1.8.0", _help_with("katana"))
+        context, _ = _preflight(tmp_path, "katana", "1.8.0", _help_with("katana"))
 
         assert context.tool_states["katana"].status is ToolStatus.READY
         assert context.metadata["provider_qualification"]["katana"]["status"] == (
@@ -198,10 +204,52 @@ class TestPreflight:
         assert any("not a qualified version" in w for w in context.warnings)
 
     def test_a_qualified_binary_is_untouched(self, tmp_path: Path) -> None:
-        context = _preflight(tmp_path, "katana", "1.7.0", _help_with("katana"))
+        context, mandatory_ok = _preflight(tmp_path, "katana", "1.7.0", _help_with("katana"))
 
         assert context.tool_states["katana"].status is ToolStatus.READY
-        assert context.warnings == []
+        assert context.warnings == [] and mandatory_ok is True
 
     def test_no_report_means_not_installed_never_qualified(self) -> None:
         assert qualify_report("katana", None).status == "not_installed"
+
+    def test_a_mandatory_tool_that_fails_qualification_fails_the_preflight(
+        self, tmp_path: Path
+    ) -> None:
+        context, mandatory_ok = _preflight(
+            tmp_path, "httpx", "1.12.0", _help_with("httpx", drop="-json"), required=True
+        )
+
+        assert mandatory_ok is False
+        assert context.tool_states["httpx"].status is ToolStatus.UNAVAILABLE
+        assert any("-json" in e for e in context.errors)
+
+
+class TestFlagMatching:
+    @pytest.mark.parametrize(
+        "help_text",
+        ["  --domain string", "  -domain string", "  -d2 int", "  -dns-resolver"],
+    )
+    def test_a_short_flag_inside_a_longer_one_does_not_count(self, help_text: str) -> None:
+        assert not lists_flag(help_text, "-d")
+
+    @pytest.mark.parametrize(
+        ("help_text", "token"),
+        [
+            ("  -d int\n", "-d"),
+            ("  -d, --domain string", "-d"),
+            ("-sV: Probe open ports", "-sV"),
+            ("-T<0-5>: Set timing template", "-T<0-5>"),
+            ("[-p ports]", "-p"),
+            ("  -json=true", "-json"),
+        ],
+    )
+    def test_standalone_flags_with_real_help_punctuation(self, help_text: str, token: str) -> None:
+        assert lists_flag(help_text, token)
+
+    def test_a_dropped_short_flag_is_caught_even_if_a_long_form_remains(self) -> None:
+        help_text = _help_with("subfinder", drop="-d") + "\n  -domain string"
+
+        result = qualify("subfinder", installed=True, version="2.16.0", help_text=help_text)
+
+        assert result.status == "missing_flags"
+        assert "-d" in result.reasons[0]

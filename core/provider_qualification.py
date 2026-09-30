@@ -27,6 +27,7 @@ KNOWN_INCOMPATIBLE_VERSIONS, e.g. amass v5) take precedence.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -186,6 +187,14 @@ def normalize_version(version: str | None) -> str | None:
     return version.strip().lstrip("vV") if version else None
 
 
+def lists_flag(help_text: str, token: str) -> bool:
+    """Whether the help output lists `token` as a flag of its own — not as
+    part of a longer one: `-d` must not match inside `--domain`, `-domain`
+    or `-d2`. The token may not touch a letter, digit, `_` or `-` on either
+    side; punctuation such as `,` `:` `=` `[` or a space may follow it."""
+    return re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", help_text) is not None
+
+
 def qualify(tool: str, *, installed: bool, version: str | None, help_text: str) -> Qualification:
     """The qualification of one installed tool, from what the binary itself
     reports. Deterministic; every non-qualified status says why."""
@@ -196,7 +205,7 @@ def qualify(tool: str, *, installed: bool, version: str | None, help_text: str) 
     incompatible = known_incompatible_version(tool, version)
     if incompatible:
         return Qualification(tool, "known_incompatible", version, (incompatible,))
-    missing = sorted(f for f, token in profile.flags.items() if token not in help_text)
+    missing = sorted(f for f, token in profile.flags.items() if not lists_flag(help_text, token))
     if missing:
         return Qualification(
             tool,

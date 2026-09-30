@@ -144,19 +144,21 @@ class ToolManager:
                     if report.health == ToolHealth.MISSING:
                         context.add_warning(f"{plugin.display_name}: {report.status_reason}")
 
-        self._qualify_providers(context)
-        return mandatory_ok
+        return self._qualify_providers(context) and mandatory_ok
 
-    def _qualify_providers(self, context: PipelineContext) -> None:
+    def _qualify_providers(self, context: PipelineContext) -> bool:
         """Productization Phase 09: qualify every ready, profiled provider
         against the binary actually installed (core/provider_qualification.py)
         and record the result in the run's metadata. A binary that no longer
         accepts a flag Hydra passes, or a confirmed-incompatible version, is
-        made UNAVAILABLE (coverage visibly missing, never garbage output); an
-        unverified or undetectable version runs, with a warning."""
+        made UNAVAILABLE (coverage visibly missing, never garbage output) and,
+        for a mandatory tool, fails the preflight like any missing mandatory
+        tool; an unverified or undetectable version runs, with a warning.
+        Returns whether every mandatory tool is still usable."""
         from core.provider_qualification import PROFILES, qualify_report
 
         results: dict[str, dict[str, object]] = {}
+        mandatory_ok = True
         for name in PROFILES:
             info = context.tool_states.get(name)
             if info is None or info.status is not ToolStatus.READY:
@@ -173,7 +175,11 @@ class ToolManager:
             if outcome.status in ("missing_flags", "known_incompatible"):
                 info.status = ToolStatus.UNAVAILABLE
                 info.error_message = outcome.reasons[0]
+                if info.required:
+                    mandatory_ok = False
+                    context.add_error(f"{info.display_name}: {outcome.reasons[0]}")
         context.metadata["provider_qualification"] = results
+        return mandatory_ok
 
     async def ensure_mandatory_tools(self) -> None:
         """Raise only when mandatory tools cannot execute — not when version is unknown."""
