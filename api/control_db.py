@@ -3084,6 +3084,30 @@ class ControlDB:
             )
         return None if previous is None else str(previous["risk_level"])
 
+    def export_assets_page(
+        self, organization_id: str, *, after: str, limit: int
+    ) -> list[AssetRecord]:
+        """Keyset page (asset_id > `after`): stable under concurrent writes,
+        unlike OFFSET over a mutable sort column."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM assets WHERE organization_id = ? AND asset_id > ? "
+                "ORDER BY asset_id LIMIT ?",
+                (organization_id, after, limit),
+            ).fetchall()
+        return [_asset_record_from_row(row) for row in rows]
+
+    def export_exposures_page(
+        self, organization_id: str, *, after: str, limit: int
+    ) -> list[ExposureRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM exposures WHERE organization_id = ? AND exposure_id > ? "
+                "ORDER BY exposure_id LIMIT ?",
+                (organization_id, after, limit),
+            ).fetchall()
+        return [_exposure_record_from_row(row) for row in rows]
+
     def inventory_facets(self, organization_id: str, *, top: int) -> InventoryFacets:
         with self._connect() as conn:
             by_type = conn.execute(
