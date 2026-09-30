@@ -232,6 +232,11 @@ class ProviderRunOutcomeResponse(BaseModel):
     outcome: ProviderOutcome
     output_lines: int
     recorded_at: str
+    # For degraded outcomes: "transient" (re-running is likely to help),
+    # "configuration" (enabled but not installed: fix setup first) or
+    # "unknown". None when the collector didn't fail. Scans recorded before
+    # this field existed report None.
+    failure_class: Literal["transient", "configuration", "unknown"] | None = None
 
 
 class ScanCollectionResponse(BaseModel):

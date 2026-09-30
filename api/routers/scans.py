@@ -259,7 +259,7 @@ def get_scan_collection(
     found". Empty (and not degraded) for a scan that hasn't completed,
     since outcomes are recorded only once a scan finishes."""
     import modules  # noqa: F401 - registers every plugin for the inventory
-    from core.provider_contract import provider_inventory
+    from core.provider_contract import FailureClass, provider_inventory
 
     control_db = _control_db(request)
     scan = _owned_scan_or_404(control_db, scan_id, auth.account_id)
@@ -278,6 +278,7 @@ def get_scan_collection(
             outcome=cast(ProviderOutcome, row.outcome),
             output_lines=row.output_lines,
             recorded_at=row.recorded_at,
+            failure_class=cast(FailureClass | None, row.failure_class),
         )
         for row in rows
     ]

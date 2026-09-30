@@ -472,6 +472,9 @@ CREATE TABLE IF NOT EXISTS provider_run_outcomes (
     outcome TEXT NOT NULL,
     output_lines INTEGER NOT NULL DEFAULT 0,
     recorded_at TEXT NOT NULL,
+    -- transient / configuration / unknown for degraded outcomes, NULL
+    -- otherwise (core/provider_contract.py::failure_class).
+    failure_class TEXT,
     PRIMARY KEY (run_id, provider)
 );
 CREATE INDEX IF NOT EXISTS idx_provider_run_outcomes_org
@@ -1371,6 +1374,7 @@ class ProviderRunOutcomeRecord:
     outcome: str
     output_lines: int
     recorded_at: str
+    failure_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1583,6 +1587,7 @@ _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 # Durable-queue fix: an existing `scans` table (every account with a
 # scan predating this fix) needs these three columns added the same way
 # `accounts` needed its email-verification columns added.
+_PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("failure_class", "TEXT"),)
 _SCANS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ("worker_id", "TEXT"),
@@ -1735,6 +1740,9 @@ class ControlDB:
         with self._connect() as conn:
             _migrate_table_columns(conn, "accounts", _ACCOUNTS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "scans", _SCANS_MIGRATION_COLUMNS)
+            _migrate_table_columns(
+                conn, "provider_run_outcomes", _PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS
+            )
             _migrate_table_columns(conn, "subscriptions", _SUBSCRIPTIONS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "candidate_assets", _CANDIDATE_ASSETS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "evidence", _EVIDENCE_MIGRATION_COLUMNS)
@@ -3071,8 +3079,10 @@ class ControlDB:
         account_id: str,
         run_id: str,
         outcomes: list[tuple[str, str, int]],
+        failure_classes: dict[str, str] | None = None,
     ) -> None:
-        """Persist Fase-09 provider outcomes as durable operational evidence."""
+        """Persist Fase-09 provider outcomes as durable operational evidence.
+        `failure_classes` (provider -> class) is set for degraded outcomes."""
         allowed_outcomes = {
             "success_with_results",
             "success_no_results",
@@ -3099,12 +3109,12 @@ class ControlDB:
             now = _now_iso()
             for provider, outcome, output_lines in outcomes:
                 conn.execute(
-                    "INSERT INTO provider_run_outcomes "
-                    "(organization_id, account_id, run_id, provider, outcome, output_lines, recorded_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "INSERT INTO provider_run_outcomes (organization_id, account_id, run_id, "
+                    "provider, outcome, output_lines, recorded_at, failure_class) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(run_id, provider) DO UPDATE SET "
                     "outcome=excluded.outcome, output_lines=excluded.output_lines, "
-                    "recorded_at=excluded.recorded_at",
+                    "recorded_at=excluded.recorded_at, failure_class=excluded.failure_class",
                     (
                         organization_id,
                         account_id,
@@ -3113,6 +3123,7 @@ class ControlDB:
                         outcome,
                         max(0, int(output_lines)),
                         now,
+                        (failure_classes or {}).get(provider),
                     ),
                 )
 
@@ -5957,6 +5968,7 @@ def _provider_run_outcome_record_from_row(row: sqlite3.Row) -> ProviderRunOutcom
         outcome=row["outcome"],
         output_lines=int(row["output_lines"]),
         recorded_at=row["recorded_at"],
+        failure_class=row["failure_class"],
     )
 
 
