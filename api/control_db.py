@@ -432,6 +432,42 @@ CREATE TABLE IF NOT EXISTS capability_audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_capability_audit_org
     ON capability_audit_log(organization_id, created_at);
+-- Productization Phase 08: the one canonical integration outbox. An event
+-- is written in the same transaction as the change that caused it (or,
+-- for monitoring, before the notification it mirrors is marked sent), and
+-- fanned out to one delivery row per subscribed destination. A background
+-- worker delivers with durable backoff; nothing is lost to a restart.
+-- `dedup_key` makes enqueueing the same logical event twice a no-op.
+CREATE TABLE IF NOT EXISTS integration_events (
+    event_id TEXT PRIMARY KEY,
+    organization_id TEXT REFERENCES organizations(organization_id),
+    -- The account an account-level event belongs to; NULL for organization
+    -- events (fanned out to the organization's webhooks).
+    account_id TEXT REFERENCES accounts(account_id),
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    dedup_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS integration_deliveries (
+    delivery_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES integration_events(event_id),
+    webhook_id TEXT NOT NULL,
+    account_id TEXT NOT NULL REFERENCES accounts(account_id),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'in_flight', 'delivered', 'dead')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    lease_until TEXT,
+    last_error TEXT,
+    delivered_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (event_id, webhook_id)
+);
+CREATE INDEX IF NOT EXISTS idx_integration_deliveries_due
+    ON integration_deliveries(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_integration_deliveries_webhook
+    ON integration_deliveries(webhook_id, created_at);
 -- Productization Phase 07: the human remediation workflow for an exposure,
 -- kept apart from detection truth (exposures / exposure_evidence /
 -- exposure_history are never changed by it). No row = default "triage".
@@ -980,7 +1016,10 @@ CREATE TABLE IF NOT EXISTS webhooks (
     updated_at TEXT NOT NULL,
     -- Fase 02: see the identical comment on `scans.organization_id` for
     -- why this is schema-nullable but application-guaranteed non-null.
-    organization_id TEXT REFERENCES organizations(organization_id)
+    organization_id TEXT REFERENCES organizations(organization_id),
+    -- Productization Phase 08: payload format for the destination:
+    -- 'generic' (signed JSON envelope), 'slack' or 'teams' (chat message).
+    kind TEXT NOT NULL DEFAULT 'generic'
 );
 CREATE INDEX IF NOT EXISTS idx_webhooks_account ON webhooks(account_id);
 CREATE INDEX IF NOT EXISTS idx_webhooks_organization ON webhooks(organization_id);
@@ -1293,6 +1332,7 @@ class WebhookRecord:
     created_at: str
     updated_at: str
     organization_id: str | None = None
+    kind: str = "generic"
 
 
 @dataclass(frozen=True)
@@ -1458,6 +1498,39 @@ class RemediationEventRecord:
 
 class RemediationNotFoundError(LookupError):
     """One or more exposure ids don't belong to the organization."""
+
+
+@dataclass(frozen=True)
+class IntegrationEventRecord:
+    event_id: str
+    organization_id: str | None
+    account_id: str | None
+    event_type: str
+    payload: dict[str, object]
+    created_at: str
+
+
+@dataclass(frozen=True)
+class DeliveryWork:
+    """One claimed delivery: what to send, where, and how many tries so far."""
+
+    delivery_id: str
+    attempts: int
+    event: IntegrationEventRecord
+    webhook: WebhookRecord
+
+
+@dataclass(frozen=True)
+class DeliveryRecord:
+    delivery_id: str
+    event_id: str
+    event_type: str
+    status: str
+    attempts: int
+    next_attempt_at: str
+    last_error: str | None
+    delivered_at: str | None
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -1715,6 +1788,9 @@ _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 # scan predating this fix) needs these three columns added the same way
 # `accounts` needed its email-verification columns added.
 _PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("failure_class", "TEXT"),)
+_WEBHOOKS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("kind", "TEXT NOT NULL DEFAULT 'generic'"),
+)
 _SCANS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ("worker_id", "TEXT"),
@@ -1867,6 +1943,7 @@ class ControlDB:
         with self._connect() as conn:
             _migrate_table_columns(conn, "accounts", _ACCOUNTS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "scans", _SCANS_MIGRATION_COLUMNS)
+            _migrate_table_columns(conn, "webhooks", _WEBHOOKS_MIGRATION_COLUMNS)
             _migrate_table_columns(
                 conn, "provider_run_outcomes", _PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS
             )
@@ -2941,18 +3018,13 @@ class ControlDB:
                 ),
             )
             if cursor.rowcount:
-                conn.execute(
-                    "INSERT INTO exposure_history "
-                    "(event_id, exposure_id, organization_id, event_type, happened_at, run_id, reason) "
-                    "VALUES (?, ?, ?, 'resolved', ?, ?, ?)",
-                    (
-                        secrets.token_hex(16),
-                        exposure_id,
-                        organization_id,
-                        resolved_at,
-                        resolved_run_id,
-                        resolution_reason,
-                    ),
+                _record_resolution(
+                    conn,
+                    organization_id,
+                    exposure_id,
+                    resolved_at,
+                    resolved_run_id,
+                    resolution_reason,
                 )
         return bool(cursor.rowcount)
 
@@ -3306,7 +3378,7 @@ class ControlDB:
             current = _effective_states(conn, organization_id, exposure_ids, now)
             check_transitions(current, target, reason=reason, accepted_until=until, now=now)
             for exposure_id in exposure_ids:
-                _store_transition(
+                event_id = _store_transition(
                     conn,
                     organization_id,
                     exposure_id,
@@ -3316,6 +3388,19 @@ class ControlDB:
                     reason=reason,
                     accepted_until=until,
                     stamp=now.isoformat(),
+                )
+                _enqueue_exposure_event(
+                    conn,
+                    organization_id,
+                    exposure_id,
+                    "remediation.state_changed",
+                    dedup_key=f"remediation:{event_id}",
+                    extra={
+                        "from_state": current[exposure_id],
+                        "to_state": target,
+                        "reason": reason,
+                        "actor_account_id": actor_account_id,
+                    },
                 )
 
     def update_remediation_fields(
@@ -3346,7 +3431,7 @@ class ControlDB:
                     _set_remediation_field(
                         conn, organization_id, exposure_id, field, value, actor_account_id, stamp
                     )
-                    _remediation_event(
+                    event_id = _remediation_event(
                         conn,
                         organization_id,
                         exposure_id,
@@ -3357,6 +3442,16 @@ class ControlDB:
                         None,
                         stamp,
                     )
+                    if field == "assignee_account_id":
+                        _enqueue_assignment(
+                            conn,
+                            organization_id,
+                            exposure_id,
+                            event_id,
+                            previous=old,
+                            assignee=value,
+                            actor=actor_account_id,
+                        )
 
     def add_remediation_comment(
         self, *, organization_id: str, exposure_id: str, actor_account_id: str, body: str
@@ -3433,6 +3528,184 @@ class ControlDB:
                 )
                 for row in rows
             ]
+
+    def enqueue_integration_event(
+        self,
+        *,
+        account_id: str | None,
+        organization_id: str | None,
+        event_type: str,
+        data: dict[str, object],
+        dedup_key: str,
+    ) -> str | None:
+        """Writes the event and its per-destination deliveries. Returns the
+        event id, or None if this dedup_key was already enqueued."""
+        with self._connect() as conn:
+            return _enqueue_integration_event(
+                conn,
+                account_id=account_id,
+                organization_id=organization_id,
+                event_type=event_type,
+                data=data,
+                dedup_key=dedup_key,
+                now=_now_iso(),
+            )
+
+    def enqueue_exposure_lifecycle_events(self, organization_id: str, run_id: str) -> int:
+        """exposure.opened for every exposure first seen in this run and
+        exposure.reopened for every reopening it recorded. Each is keyed on
+        the exposure / history row, so calling this again is a no-op.
+        Returns how many new events were enqueued."""
+        now = _now_iso()
+        enqueued = 0
+        with self._connect() as conn:
+            opened = conn.execute(
+                "SELECT exposure_id FROM exposures WHERE organization_id = ? "
+                "AND first_seen_run_id = ? ORDER BY exposure_id",
+                (organization_id, run_id),
+            ).fetchall()
+            reopened = conn.execute(
+                "SELECT event_id, exposure_id, reason FROM exposure_history "
+                "WHERE organization_id = ? AND run_id = ? AND event_type = 'reopened' "
+                "ORDER BY happened_at, event_id",
+                (organization_id, run_id),
+            ).fetchall()
+            events = [
+                (
+                    "exposure.opened",
+                    row["exposure_id"],
+                    f"exposure.opened:{row['exposure_id']}",
+                    {"run_id": run_id},
+                )
+                for row in opened
+            ] + [
+                (
+                    "exposure.reopened",
+                    row["exposure_id"],
+                    f"exposure.reopened:{row['event_id']}",
+                    {"run_id": run_id, "reason": row["reason"]},
+                )
+                for row in reopened
+            ]
+            for event_type, exposure_id, dedup_key, extra in events:
+                if _enqueue_integration_event(
+                    conn,
+                    account_id=None,
+                    organization_id=organization_id,
+                    event_type=event_type,
+                    data={**_exposure_brief(conn, exposure_id), **extra},
+                    dedup_key=dedup_key,
+                    now=now,
+                ):
+                    enqueued += 1
+        return enqueued
+
+    def claim_due_deliveries(
+        self, *, now: datetime, limit: int, lease_seconds: int
+    ) -> list[DeliveryWork]:
+        """Due pending deliveries, plus in-flight ones whose lease expired
+        (a worker died mid-send), marked in_flight under a lease so no
+        other worker takes them. Deliveries to a destination that is gone
+        or disabled are marked dead instead of sent."""
+        stamp = now.isoformat()
+        lease = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT d.delivery_id, d.attempts, d.webhook_id, e.* FROM integration_deliveries d "
+                "JOIN integration_events e ON e.event_id = d.event_id "
+                "WHERE (d.status = 'pending' AND julianday(d.next_attempt_at) <= julianday(?)) "
+                "OR (d.status = 'in_flight' AND julianday(d.lease_until) <= julianday(?)) "
+                "ORDER BY d.next_attempt_at, d.delivery_id LIMIT ?",
+                (stamp, stamp, limit),
+            ).fetchall()
+            work = []
+            for row in rows:
+                webhook_row = conn.execute(
+                    "SELECT * FROM webhooks WHERE webhook_id = ? AND status = 'active'",
+                    (row["webhook_id"],),
+                ).fetchone()
+                if webhook_row is None:
+                    _finish_delivery(
+                        conn,
+                        row["delivery_id"],
+                        "dead",
+                        "destination removed " "or disabled",
+                        stamp,
+                        None,
+                    )
+                    continue
+                conn.execute(
+                    "UPDATE integration_deliveries SET status = 'in_flight', lease_until = ? "
+                    "WHERE delivery_id = ?",
+                    (lease, row["delivery_id"]),
+                )
+                work.append(
+                    DeliveryWork(
+                        delivery_id=row["delivery_id"],
+                        attempts=int(row["attempts"]),
+                        event=_integration_event_from_row(row),
+                        webhook=_webhook_record_from_row(webhook_row),
+                    )
+                )
+        return work
+
+    def record_delivery_attempt(
+        self, delivery_id: str, *, error: str | None, now: datetime, retry_at: datetime | None
+    ) -> None:
+        """`error` None = delivered. Otherwise the attempt failed: with
+        `retry_at` it's rescheduled, without it the delivery is dead."""
+        stamp = now.isoformat()
+        with self._connect() as conn:
+            if error is None:
+                _finish_delivery(conn, delivery_id, "delivered", None, stamp, stamp)
+            elif retry_at is not None:
+                conn.execute(
+                    "UPDATE integration_deliveries SET status = 'pending', attempts = attempts + 1, "
+                    "next_attempt_at = ?, lease_until = NULL, last_error = ? "
+                    "WHERE delivery_id = ?",
+                    (retry_at.isoformat(), error, delivery_id),
+                )
+            else:
+                _finish_delivery(conn, delivery_id, "dead", error, stamp, None)
+
+    def list_deliveries_for_webhook(
+        self, webhook_id: str, account_id: str, *, limit: int, offset: int
+    ) -> list[DeliveryRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT d.*, e.event_type FROM integration_deliveries d "
+                "JOIN integration_events e ON e.event_id = d.event_id "
+                "WHERE d.webhook_id = ? AND d.account_id = ? "
+                "ORDER BY d.created_at DESC, d.delivery_id LIMIT ? OFFSET ?",
+                (webhook_id, account_id, limit, offset),
+            ).fetchall()
+        return [
+            DeliveryRecord(
+                delivery_id=row["delivery_id"],
+                event_id=row["event_id"],
+                event_type=row["event_type"],
+                status=row["status"],
+                attempts=row["attempts"],
+                next_attempt_at=row["next_attempt_at"],
+                last_error=row["last_error"],
+                delivered_at=row["delivered_at"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def redeliver(self, webhook_id: str, delivery_id: str, account_id: str) -> bool:
+        """Puts a dead or delivered delivery back in the queue, due now.
+        False if it isn't this account's, or is already queued."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE integration_deliveries SET status = 'pending', next_attempt_at = ?, "
+                "lease_until = NULL WHERE delivery_id = ? AND webhook_id = ? AND account_id = ? "
+                "AND status IN ('dead', 'delivered')",
+                (_now_iso(), delivery_id, webhook_id, account_id),
+            )
+        return bool(cursor.rowcount)
 
     def export_assets_page(
         self, organization_id: str, *, after: str, limit: int
@@ -5531,6 +5804,7 @@ class ControlDB:
         secret: str,
         event_types: tuple[str, ...],
         organization_id: str | None = None,
+        kind: str = "generic",
     ) -> WebhookRecord:
         """`organization_id` defaults to the account's own organization
         (Fase 02) when not given explicitly — see `create_scan`'s
@@ -5542,8 +5816,8 @@ class ControlDB:
             conn.execute(
                 "INSERT INTO webhooks "
                 "(webhook_id, account_id, url, secret, event_types_json, status, "
-                "consecutive_failures, created_at, updated_at, organization_id) "
-                "VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)",
+                "consecutive_failures, created_at, updated_at, organization_id, kind) "
+                "VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?)",
                 (
                     webhook_id,
                     account_id,
@@ -5553,6 +5827,7 @@ class ControlDB:
                     now,
                     now,
                     organization_id,
+                    kind,
                 ),
             )
         return WebhookRecord(
@@ -5569,6 +5844,7 @@ class ControlDB:
             last_error=None,
             created_at=now,
             updated_at=now,
+            kind=kind,
         )
 
     def get_webhook(self, webhook_id: str, account_id: str) -> WebhookRecord | None:
@@ -6499,7 +6775,7 @@ def _store_transition(
     reason: str | None,
     accepted_until: str | None,
     stamp: str,
-) -> None:
+) -> str:
     conn.execute(
         "INSERT INTO exposure_remediation (exposure_id, organization_id, state, "
         "state_changed_at, state_reason, accepted_until, updated_by_account_id, "
@@ -6519,7 +6795,7 @@ def _store_transition(
             stamp,
         ),
     )
-    _remediation_event(
+    event_id = _remediation_event(
         conn,
         organization_id,
         exposure_id,
@@ -6530,6 +6806,7 @@ def _store_transition(
         reason,
         stamp,
     )
+    return event_id
 
 
 def _remediation_event(
@@ -6542,13 +6819,14 @@ def _remediation_event(
     to_value: str | None,
     body: str | None,
     stamp: str,
-) -> None:
+) -> str:
+    event_id = secrets.token_hex(16)
     conn.execute(
         "INSERT INTO remediation_events (event_id, organization_id, exposure_id, "
         "actor_account_id, event_type, from_value, to_value, body, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            secrets.token_hex(16),
+            event_id,
             organization_id,
             exposure_id,
             actor_account_id,
@@ -6558,6 +6836,162 @@ def _remediation_event(
             body,
             stamp,
         ),
+    )
+    return event_id
+
+
+def _enqueue_integration_event(
+    conn: sqlite3.Connection,
+    *,
+    account_id: str | None,
+    organization_id: str | None,
+    event_type: str,
+    data: dict[str, object],
+    dedup_key: str,
+    now: str,
+) -> str | None:
+    """Runs on the caller's connection, so the event commits (or rolls
+    back) together with the change that produced it. Fans out to the
+    active, subscribed webhooks of the event's organization (or, for an
+    event without one, of the account)."""
+    event_id = secrets.token_hex(16)
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO integration_events (event_id, organization_id, account_id, "
+        "event_type, payload_json, dedup_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            event_id,
+            organization_id,
+            account_id,
+            event_type,
+            json.dumps(data, sort_keys=True),
+            dedup_key,
+            now,
+        ),
+    )
+    if not cursor.rowcount:
+        return None
+    subscribers = conn.execute(
+        "SELECT webhook_id, account_id, event_types_json FROM webhooks WHERE status = 'active' "
+        "AND ((? IS NOT NULL AND organization_id = ?) OR (? IS NULL AND account_id = ?))",
+        (organization_id, organization_id, organization_id, account_id),
+    ).fetchall()
+    for row in subscribers:
+        if event_type in json.loads(row["event_types_json"]):
+            conn.execute(
+                "INSERT INTO integration_deliveries (delivery_id, event_id, webhook_id, "
+                "account_id, next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (secrets.token_hex(16), event_id, row["webhook_id"], row["account_id"], now, now),
+            )
+    return event_id
+
+
+def _exposure_brief(conn: sqlite3.Connection, exposure_id: str) -> dict[str, object]:
+    """The exposure fields every exposure/remediation event carries."""
+    row = conn.execute(
+        "SELECT exposure_id, asset_id, title, severity, status FROM exposures "
+        "WHERE exposure_id = ?",
+        (exposure_id,),
+    ).fetchone()
+    return {} if row is None else dict(row)
+
+
+def _record_resolution(
+    conn: sqlite3.Connection,
+    organization_id: str,
+    exposure_id: str,
+    resolved_at: str,
+    resolved_run_id: str | None,
+    reason: str,
+) -> None:
+    """The append-only history row for an explicit resolve, and its
+    exposure.resolved integration event, in the resolve's transaction."""
+    history_id = secrets.token_hex(16)
+    conn.execute(
+        "INSERT INTO exposure_history "
+        "(event_id, exposure_id, organization_id, event_type, happened_at, run_id, reason) "
+        "VALUES (?, ?, ?, 'resolved', ?, ?, ?)",
+        (history_id, exposure_id, organization_id, resolved_at, resolved_run_id, reason),
+    )
+    _enqueue_exposure_event(
+        conn,
+        organization_id,
+        exposure_id,
+        "exposure.resolved",
+        dedup_key=f"exposure.resolved:{history_id}",
+        extra={"reason": reason},
+    )
+
+
+def _enqueue_exposure_event(
+    conn: sqlite3.Connection,
+    organization_id: str,
+    exposure_id: str,
+    event_type: str,
+    *,
+    dedup_key: str,
+    extra: dict[str, object],
+) -> None:
+    """An organization-level exposure / remediation event, on the caller's
+    connection so it commits with the change."""
+    _enqueue_integration_event(
+        conn,
+        account_id=None,
+        organization_id=organization_id,
+        event_type=event_type,
+        data={**_exposure_brief(conn, exposure_id), **extra},
+        dedup_key=dedup_key,
+        now=_now_iso(),
+    )
+
+
+def _enqueue_assignment(
+    conn: sqlite3.Connection,
+    organization_id: str,
+    exposure_id: str,
+    remediation_event_id: str,
+    *,
+    previous: str | None,
+    assignee: str | None,
+    actor: str,
+) -> None:
+    _enqueue_exposure_event(
+        conn,
+        organization_id,
+        exposure_id,
+        "remediation.assigned",
+        dedup_key=f"remediation:{remediation_event_id}",
+        extra={
+            "previous_assignee_account_id": previous,
+            "assignee_account_id": assignee,
+            "actor_account_id": actor,
+        },
+    )
+
+
+def _finish_delivery(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    status: str,
+    error: str | None,
+    stamp: str,
+    delivered_at: str | None,
+) -> None:
+    conn.execute(
+        "UPDATE integration_deliveries SET status = ?, attempts = attempts + 1, "
+        "last_error = ?, delivered_at = ?, lease_until = NULL, next_attempt_at = ? "
+        "WHERE delivery_id = ?",
+        (status, error, delivered_at, stamp, delivery_id),
+    )
+
+
+def _integration_event_from_row(row: sqlite3.Row) -> IntegrationEventRecord:
+    return IntegrationEventRecord(
+        event_id=row["event_id"],
+        organization_id=row["organization_id"],
+        account_id=row["account_id"],
+        event_type=row["event_type"],
+        payload=json.loads(row["payload_json"]),
+        created_at=row["created_at"],
     )
 
 
@@ -6647,6 +7081,7 @@ def _webhook_record_from_row(row: sqlite3.Row) -> WebhookRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         organization_id=row["organization_id"],
+        kind=row["kind"],
     )
 
 
