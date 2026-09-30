@@ -558,6 +558,14 @@ class ExposureReportEntryResponse(BaseModel):
     risk_reasons: list[str]
 
 
+class RiskFactorResponse(BaseModel):
+    name: str
+    value: str
+    source: Literal["observed", "declared", "unknown"]
+    effect: Literal["escalates", "de-escalates", "caps", "none"]
+    reason: str
+
+
 class ExposureRiskResponse(BaseModel):
     """Fase 21: deterministic, explainable risk/criticality — `level` is
     never returned without `reasons`, the phase's own explicit
@@ -566,6 +574,11 @@ class ExposureRiskResponse(BaseModel):
     exposure_id: str
     level: Literal["low", "medium", "high", "critical"]
     reasons: list[str]
+    # Productization Phase 06: every factor considered — its value, whether
+    # it was observed by Hydra or declared by the organization, and what it
+    # did to the level — plus the signals that could not be assessed.
+    factors: list[RiskFactorResponse] = []
+    unknowns: list[str] = []
 
 
 # Fase 19 (EASM roadmap) — API surface for the domain model Fases 02-18
@@ -931,3 +944,43 @@ class InventoryFacetsResponse(BaseModel):
     candidates_by_review_status: dict[str, int]
     technologies: list[FacetCountResponse]
     open_ports: list[FacetCountResponse]
+
+
+class AssetBusinessContextRequest(BaseModel):
+    """Replaces the asset's declared context; null / empty clears a field.
+    Declared by the organization, never inferred."""
+
+    environment: Literal["production", "staging", "development", "test"] | None = None
+    criticality: Literal["critical", "high", "medium", "low"] | None = None
+    data_handled: list[Literal["identity", "payment", "personal_data"]] = Field(
+        default_factory=list, max_length=3
+    )
+    owner: str | None = Field(default=None, max_length=200)
+
+    @field_validator("owner")
+    @classmethod
+    def _owner_is_plain_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if any(ord(ch) < 32 for ch in value):
+            raise ValueError("owner must not contain control characters")
+        return value or None
+
+
+class AssetBusinessContextResponse(BaseModel):
+    asset_id: str
+    # False when nothing has been declared yet (all fields unknown).
+    declared: bool
+    environment: str | None = None
+    criticality: str | None = None
+    data_handled: list[str] = []
+    owner: str | None = None
+
+
+class AssetContextAuditResponse(BaseModel):
+    audit_id: str
+    actor_account_id: str
+    before: dict[str, object] | None = None
+    after: dict[str, object]
+    created_at: str

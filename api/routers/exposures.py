@@ -6,6 +6,7 @@ a finding in a later scan never resolves anything — see
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -25,6 +26,7 @@ from api.schemas import (
     ExposureRiskResponse,
     ReopenExposureRequest,
     ResolveExposureRequest,
+    RiskFactorResponse,
 )
 from api.settings import APISettings
 from api.tenancy import account_db_path
@@ -259,6 +261,8 @@ def get_exposure_risk(
         exposure_id=exposure_id,
         level=classification.level.value,  # type: ignore[arg-type]
         reasons=list(classification.reasons),
+        factors=[RiskFactorResponse(**asdict(f)) for f in classification.factors],
+        unknowns=list(classification.unknowns),
     )
 
 
