@@ -51,6 +51,7 @@ from api.observation_identity import (
     EvidenceContent,
 )
 from api.relationship_identity import RelationshipDraft
+from api.secrets_box import SecretBox, is_sealed, reveal
 from api.technology_catalog import parse_technology_detail
 from core.risk_scoring import BusinessContext, RiskFactors
 from core.store import connect_sqlite
@@ -1937,8 +1938,12 @@ class ControlDB:
     whole service allowed to have rows belonging to more than one
     account; every other database is per-account (`api/tenancy.py`)."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, secret_box: SecretBox | None = None) -> None:
         self.db_path = db_path
+        # Productization Phase 08b: seals stored third-party secrets
+        # (api/secrets_box.py). None = no key configured: webhook secrets
+        # stay plaintext as before, ticketing integrations are refused.
+        self.secret_box = secret_box
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             _migrate_table_columns(conn, "accounts", _ACCOUNTS_MIGRATION_COLUMNS)
@@ -2283,7 +2288,7 @@ class ControlDB:
                 "SELECT * FROM webhooks WHERE organization_id = ? ORDER BY created_at",
                 (organization_id,),
             ).fetchall()
-        return [_webhook_record_from_row(row) for row in rows]
+        return [_webhook_record_from_row(row, self.secret_box) for row in rows]
 
     def list_scans_for_organization(self, organization_id: str) -> list[ScanRecord]:
         with self._connect() as conn:
@@ -3645,7 +3650,7 @@ class ControlDB:
                         delivery_id=row["delivery_id"],
                         attempts=int(row["attempts"]),
                         event=_integration_event_from_row(row),
-                        webhook=_webhook_record_from_row(webhook_row),
+                        webhook=_webhook_record_from_row(webhook_row, self.secret_box),
                     )
                 )
         return work
@@ -5796,6 +5801,26 @@ class ControlDB:
             ).fetchone()
         return int(row["c"])
 
+    def seal_plaintext_secrets(self) -> int:
+        """With a key configured, seals every webhook secret still stored in
+        plaintext (written before encryption existed or without a key).
+        Idempotent; returns how many were sealed."""
+        if self.secret_box is None:
+            return 0
+        sealed = 0
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("SELECT webhook_id, secret FROM webhooks").fetchall()
+            for row in rows:
+                if is_sealed(row["secret"]):
+                    continue
+                conn.execute(
+                    "UPDATE webhooks SET secret = ? WHERE webhook_id = ?",
+                    (self.secret_box.seal(row["secret"]), row["webhook_id"]),
+                )
+                sealed += 1
+        return sealed
+
     def create_webhook(
         self,
         *,
@@ -5822,7 +5847,7 @@ class ControlDB:
                     webhook_id,
                     account_id,
                     url,
-                    secret,
+                    self.secret_box.seal(secret) if self.secret_box else secret,
                     json.dumps(list(event_types)),
                     now,
                     now,
@@ -5858,14 +5883,14 @@ class ControlDB:
                 "SELECT * FROM webhooks WHERE webhook_id = ? AND account_id = ?",
                 (webhook_id, account_id),
             ).fetchone()
-        return None if row is None else _webhook_record_from_row(row)
+        return None if row is None else _webhook_record_from_row(row, self.secret_box)
 
     def list_webhooks_for_account(self, account_id: str) -> list[WebhookRecord]:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM webhooks WHERE account_id = ? ORDER BY created_at", (account_id,)
             ).fetchall()
-        return [_webhook_record_from_row(row) for row in rows]
+        return [_webhook_record_from_row(row, self.secret_box) for row in rows]
 
     def list_active_webhooks_for_event(
         self, account_id: str, event_type: str
@@ -5884,7 +5909,7 @@ class ControlDB:
         return [
             record
             for row in rows
-            if event_type in (record := _webhook_record_from_row(row)).event_types
+            if event_type in (record := _webhook_record_from_row(row, self.secret_box)).event_types
         ]
 
     def delete_webhook(self, webhook_id: str, account_id: str) -> bool:
@@ -7066,12 +7091,13 @@ def _monitored_domain_record_from_row(row: sqlite3.Row) -> MonitoredDomainRecord
     )
 
 
-def _webhook_record_from_row(row: sqlite3.Row) -> WebhookRecord:
+def _webhook_record_from_row(row: sqlite3.Row, box: SecretBox | None = None) -> WebhookRecord:
+    """`secret` is always the plaintext signing secret (revealed if sealed)."""
     return WebhookRecord(
         webhook_id=row["webhook_id"],
         account_id=row["account_id"],
         url=row["url"],
-        secret=row["secret"],
+        secret=reveal(row["secret"], box),
         event_types=tuple(json.loads(row["event_types_json"])),
         status=row["status"],
         consecutive_failures=row["consecutive_failures"],

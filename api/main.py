@@ -49,6 +49,7 @@ from api.routers import (
     webhooks,
 )
 from api.scan_worker import generate_worker_id, run_worker_loop
+from api.secrets_box import box_from_keys
 from api.settings import APISettings, load_api_settings, validate_email_provider_config
 from api.wompi_client import WompiClient
 
@@ -84,7 +85,12 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.api_settings = settings
-        app.state.control_db = ControlDB(settings.control_db_path)
+        app.state.control_db = ControlDB(
+            settings.control_db_path, secret_box=box_from_keys(settings.secrets_keys)
+        )
+        sealed = app.state.control_db.seal_plaintext_secrets()
+        if sealed:
+            logger.info("Sealed %d plaintext webhook secret(s) at rest.", sealed)
         # GET /health's liveness signal for the three loops below
         # (api/health.py) — one instance, shared by every loop and read
         # by the health route.
