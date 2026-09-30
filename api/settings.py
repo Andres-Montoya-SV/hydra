@@ -226,6 +226,10 @@ class APISettings:
     # (one indexed range query) to run 24x/day against even a
     # 300k-row table.
     monitoring_poll_interval_seconds: float = 3600.0
+    # Productization Phase 08: how often the integration outbox is drained
+    # (api/integration_worker.py). Deliveries are durable either way; this
+    # only sets how soon a new event reaches its destinations.
+    integration_delivery_interval_seconds: float = 15.0
     # Speed 1 (passive) cadence — daily, per the task's own name for it.
     monitoring_passive_interval_hours: int = 24
     # Speed 2 (active) cadence — weekly.
@@ -381,6 +385,9 @@ def load_api_settings() -> APISettings:
     monitoring_poll_interval = os.getenv("HYDRA_API_MONITORING_POLL_INTERVAL_SECONDS")
     if monitoring_poll_interval:
         settings.monitoring_poll_interval_seconds = float(monitoring_poll_interval)
+    integration_interval = os.getenv("HYDRA_API_INTEGRATION_DELIVERY_INTERVAL_SECONDS")
+    if integration_interval:
+        settings.integration_delivery_interval_seconds = float(integration_interval)
     monitoring_passive_hours = os.getenv("HYDRA_API_MONITORING_PASSIVE_INTERVAL_HOURS")
     if monitoring_passive_hours:
         settings.monitoring_passive_interval_hours = int(monitoring_passive_hours)

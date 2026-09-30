@@ -22,6 +22,7 @@ from api.backup_worker import run_backup_loop
 from api.control_db import ControlDB
 from api.email_sender import ConsoleEmailSender, EmailSender, PostmarkEmailSender
 from api.health import LoopHeartbeats
+from api.integration_worker import run_integration_delivery_loop
 from api.monitoring_worker import run_monitoring_loop
 from api.observability import configure_logging, init_sentry
 from api.rate_limit import PersistentTokenBucketLimiter
@@ -210,12 +211,28 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             settings.monitoring_asset_count_ceiling,
         )
 
+        # Productization Phase 08: drains the canonical integration outbox
+        # (webhooks, Slack, Teams) — see api/integration_worker.py.
+        integration_task = asyncio.create_task(
+            run_integration_delivery_loop(
+                api_settings=settings,
+                control_db=app.state.control_db,
+                stop_event=stop_event,
+                heartbeats=app.state.loop_heartbeats,
+            )
+        )
+        logger.info(
+            "Integration delivery loop started (interval=%.0fs).",
+            settings.integration_delivery_interval_seconds,
+        )
+
         yield
         stop_event.set()
         await worker_task
         await reconciliation_task
         await backup_task
         await monitoring_task
+        await integration_task
 
     app = FastAPI(
         title="Hydra EASM API",

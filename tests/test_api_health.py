@@ -122,7 +122,13 @@ class TestHealthCheckPureFunction:
     def test_everything_alive_and_recent_is_healthy(self, api_settings: APISettings) -> None:
         control_db = ControlDB(api_settings.control_db_path)
         heartbeats = LoopHeartbeats()
-        for name in ("scan_worker", "reconciliation", "backup", "monitoring"):
+        for name in (
+            "scan_worker",
+            "reconciliation",
+            "backup",
+            "monitoring",
+            "integration_delivery",
+        ):
             heartbeats.mark_alive(name)
 
         healthy, checks = check_health(

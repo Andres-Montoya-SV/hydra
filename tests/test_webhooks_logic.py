@@ -162,6 +162,14 @@ class TestEventBuilders:
         assert event.payload["findings"] == findings
 
     def test_all_event_types_used_by_builders_are_in_the_declared_set(self) -> None:
-        assert {"monitoring.changed", "monitoring.needs_review", "finding.high_severity"} == set(
-            EVENT_TYPES
-        )
+        assert set(EVENT_TYPES) == {
+            "monitoring.changed",
+            "monitoring.needs_review",
+            "finding.high_severity",
+            # Productization Phase 08
+            "exposure.opened",
+            "exposure.reopened",
+            "exposure.resolved",
+            "remediation.state_changed",
+            "remediation.assigned",
+        }

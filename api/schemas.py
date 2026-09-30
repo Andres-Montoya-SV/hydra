@@ -291,11 +291,15 @@ class RegisterWebhookRequest(BaseModel):
         min_length=1,
         description="Which events to receive — see api/webhooks.py::EVENT_TYPES for the full set.",
     )
+    # 'generic': the signed JSON envelope, for your own endpoint. 'slack' /
+    # 'teams': an incoming-webhook URL; receives a chat message summary.
+    kind: Literal["generic", "slack", "teams"] = "generic"
 
 
 class WebhookResponse(BaseModel):
     webhook_id: str
     url: str
+    kind: Literal["generic", "slack", "teams"] = "generic"
     event_types: list[str]
     status: Literal["active", "disabled"]
     consecutive_failures: int
@@ -1101,4 +1105,19 @@ class RemediationEventResponse(BaseModel):
     from_value: str | None = None
     to_value: str | None = None
     body: str | None = None
+    created_at: str
+
+
+class DeliveryResponse(BaseModel):
+    """One event's delivery to one webhook: `pending` (queued or waiting
+    to retry), `in_flight`, `delivered`, or `dead` (gave up; redeliverable)."""
+
+    delivery_id: str
+    event_id: str
+    event_type: str
+    status: Literal["pending", "in_flight", "delivered", "dead"]
+    attempts: int
+    next_attempt_at: str
+    last_error: str | None = None
+    delivered_at: str | None = None
     created_at: str

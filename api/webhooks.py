@@ -1,10 +1,11 @@
 """Outbound webhooks — a customer wires Hydra into whatever tool their
-team actually lives in (Slack, Teams, Jira via a Zapier/n8n bridge, their
-own automation) by registering a plain HTTPS URL, rather than Hydra
-building a bespoke integration per destination. A single generic, signed
-webhook gets most of that value for a fraction of the surface area of a
-native Slack/Teams/Jira app — those remain explicit non-goals for this
-pass (docs/PAID_API_DESIGN.md's dated section has the full reasoning).
+team actually lives in by registering a plain HTTPS URL: their own
+endpoint (a signed JSON envelope), or a Slack / Microsoft Teams incoming
+webhook (a chat message). Productization Phase 08 made delivery durable:
+events go on one canonical outbox and `api/integration_worker.py` sends
+them with persistent backoff; this module keeps the signing, payload
+shapes and the single-attempt, SSRF-safe send it uses. Native ticketing
+(Jira, Linear, ServiceNow) is a separate follow-up.
 
 **Reuses, never reinvents, two things this codebase already has real,
 tested answers for**:
@@ -82,8 +83,23 @@ logger = logging.getLogger("hydra.api.webhooks")
 # permanently-unmatched webhook (`api/routers/webhooks.py` rejects any
 # value outside this set at registration time).
 EVENT_TYPES: frozenset[str] = frozenset(
-    {"monitoring.changed", "monitoring.needs_review", "finding.high_severity"}
+    {
+        "monitoring.changed",
+        "monitoring.needs_review",
+        "finding.high_severity",
+        # Productization Phase 08 (exposure lifecycle and Phase 07's
+        # remediation workflow).
+        "exposure.opened",
+        "exposure.reopened",
+        "exposure.resolved",
+        "remediation.state_changed",
+        "remediation.assigned",
+    }
 )
+
+# Destination payload formats: a signed JSON envelope for the customer's own
+# endpoint, or a chat message for Slack / Microsoft Teams incoming webhooks.
+DESTINATION_KINDS: frozenset[str] = frozenset({"generic", "slack", "teams"})
 
 # A real, enforced cap — an account cannot use webhook registration to
 # fan out an unbounded number of outbound requests from Hydra's own
@@ -111,6 +127,10 @@ DISABLE_AFTER_CONSECUTIVE_FAILURES = 5
 
 _SIGNATURE_HEADER = "X-Hydra-Signature"
 _EVENT_HEADER = "X-Hydra-Event"
+# Stable across retries and redeliveries of the same event to the same
+# destination, so a receiver can drop duplicates.
+EVENT_ID_HEADER = "X-Hydra-Event-Id"
+DELIVERY_ID_HEADER = "X-Hydra-Delivery-Id"
 
 
 def generate_webhook_secret() -> str:
@@ -243,6 +263,7 @@ async def _post_to_pinned_ip(
     signature: str,
     event_type: str,
     verify: bool = True,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
     """The actual delivery attempt — connects to `connect_ip` (already
     validated), never lets the HTTP client re-resolve `hostname` itself.
@@ -276,6 +297,7 @@ async def _post_to_pinned_ip(
                     "Content-Type": "application/json",
                     _SIGNATURE_HEADER: signature,
                     _EVENT_HEADER: event_type,
+                    **(extra_headers or {}),
                 },
                 extensions={"sni_hostname": hostname},
             )
@@ -286,6 +308,47 @@ async def _post_to_pinned_ip(
     if 200 <= response.status_code < 300:
         return True, ""
     return False, f"HTTP {response.status_code}"
+
+
+async def attempt_delivery(
+    webhook: WebhookRecord,
+    *,
+    body: bytes,
+    event_type: str,
+    verify: bool = True,
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[bool, str, bool]:
+    """ONE delivery attempt: `(delivered, error, retryable)`. The
+    destination is re-validated on every attempt, not once — the actual
+    DNS-rebinding defense: a URL that resolved safely before but rebinds
+    to a private address now is refused here, not connected to. A refused
+    destination is not retryable right away; a transport error or non-2xx
+    response is."""
+    allowed, reason, connect_ip = await validate_webhook_destination(webhook.url)
+    if not allowed:
+        logger.warning(
+            "Webhook %s delivery refused for account %s: %s",
+            webhook.webhook_id,
+            webhook.account_id,
+            reason,
+        )
+        return False, reason, False
+    hostname = urlparse(webhook.url).hostname
+    if hostname is None:
+        # Unreachable in practice: validate_webhook_destination above
+        # already confirmed this exact URL has a host.
+        return False, "URL has no host.", False
+    ok, error = await _post_to_pinned_ip(
+        url=webhook.url,
+        connect_ip=connect_ip,
+        hostname=hostname,
+        body=body,
+        signature=sign_payload(webhook.secret, body),
+        event_type=event_type,
+        verify=verify,
+        extra_headers=extra_headers,
+    )
+    return ok, error, True
 
 
 async def deliver_event(
@@ -303,44 +366,17 @@ async def deliver_event(
         return False  # not subscribed to this event type — not a failure
 
     body = json.dumps(event.payload, sort_keys=True).encode("utf-8")
-    signature = sign_payload(webhook.secret, body)
 
     last_error = "unknown error"
     for attempt in range(MAX_DELIVERY_ATTEMPTS):
-        # Re-validated on EVERY attempt, not once before the loop — the
-        # actual DNS-rebinding defense: a URL that resolved safely on
-        # attempt 1 but rebinds to a private address by attempt 2 is
-        # caught here, not connected to.
-        allowed, reason, connect_ip = await validate_webhook_destination(webhook.url)
-        if not allowed:
-            last_error = reason
-            logger.warning(
-                "Webhook %s delivery refused for account %s: %s",
-                webhook.webhook_id,
-                webhook.account_id,
-                reason,
-            )
-            break  # a refused destination will not become allowed by retrying immediately
-
-        hostname = urlparse(webhook.url).hostname
-        if hostname is None:
-            # Unreachable in practice: validate_webhook_destination above
-            # already confirmed this exact URL has a host.
-            last_error = "URL has no host."
-            break
-        ok, error = await _post_to_pinned_ip(
-            url=webhook.url,
-            connect_ip=connect_ip,
-            hostname=hostname,
-            body=body,
-            signature=signature,
-            event_type=event.event_type,
-            verify=verify,
+        ok, last_error, retryable = await attempt_delivery(
+            webhook, body=body, event_type=event.event_type, verify=verify
         )
         if ok:
             control_db.record_webhook_delivery_success(webhook.webhook_id)
             return True
-        last_error = error
+        if not retryable:
+            break  # a refused destination will not become allowed by retrying immediately
         if attempt < MAX_DELIVERY_ATTEMPTS - 1:
             import asyncio
 

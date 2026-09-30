@@ -816,30 +816,24 @@ class TestNoLostOrDuplicateNotificationAcrossAnInterruption:
         assert third_sender.monitoring_alerts == []
 
 
-class TestEmailAndWebhookDeliveryShareTheSameOutboxRow:
-    """`_flush_pending_notifications` reads each notify-worthy outcome
-    from the SAME durable outbox row for both the email and the webhook
-    (`_deliver_webhooks_for_outcome`) — never two independent "is this
-    worth alerting" decisions that could disagree. Delivery MECHANICS
-    (real HTTPS, real HMAC signing, retries, disable-after-N-failures)
-    are already exhaustively covered against a real local server in
-    `tests/test_webhook_delivery.py`; these tests stub
-    `api.webhooks.deliver_event_to_subscribers` itself (the exact
-    boundary `_deliver_webhooks_for_outcome` calls into) to verify the
-    WIRING — that a webhook delivery is actually attempted, for the
-    right account and the right event, driven by the same outcome as
-    the email — and the failure-isolation guarantee around it, without
-    re-testing delivery mechanics a second time."""
+class TestEmailAndIntegrationEventsShareTheSameOutboxRow:
+    """`_flush_pending_notifications` turns each notify-worthy outcome
+    (the SAME durable notification row the email is built from) into one
+    event on the canonical integration outbox (Productization Phase 08),
+    BEFORE the email is attempted. Delivery itself happens later in
+    `api/integration_worker.py` (covered in tests/test_integration_outbox.py
+    and, for real HTTPS mechanics, tests/test_webhook_delivery.py), so a
+    failing receiver can no longer touch the email path at all."""
 
-    def _register_webhook(self, control_db: ControlDB, account_id: str) -> None:
+    def _register_webhook(self, control_db: ControlDB, account_id: str) -> str:
         from api.webhooks import generate_webhook_secret
 
-        control_db.create_webhook(
+        return control_db.create_webhook(
             account_id=account_id,
             url="https://example.invalid/hook",
             secret=generate_webhook_secret(),
             event_types=("monitoring.changed", "monitoring.needs_review"),
-        )
+        ).webhook_id
 
     def _cause_a_notification(
         self,
@@ -848,8 +842,13 @@ class TestEmailAndWebhookDeliveryShareTheSameOutboxRow:
         sender,
         domain: str,
         tier: str = "pro",
+        webhooks: dict[str, str] | None = None,
     ) -> str:
+        """`webhooks`, if given, gets `{account_id: webhook_id}` registered
+        right after the account exists, before any notification."""
         account_id = _account(control_db, tier=tier)
+        if webhooks is not None:
+            webhooks[account_id] = self._register_webhook(control_db, account_id)
         _verify_domain(control_db, account_id, domain)
         record = _monitor(control_db, api_settings, account_id, domain)
 
@@ -867,85 +866,64 @@ class TestEmailAndWebhookDeliveryShareTheSameOutboxRow:
         control_db.update_scan_status(second_scan_id, "completed")
         return account_id
 
-    def test_a_notify_worthy_outcome_sends_both_an_email_and_a_webhook_for_the_same_change(
-        self,
-        control_db: ControlDB,
-        api_settings: APISettings,
-        sender: _RecordingEmailSender,
-        monkeypatch: pytest.MonkeyPatch,
+    @staticmethod
+    def _outbox(control_db: ControlDB) -> list[tuple[str, str, str, str]]:
+        with sqlite3.connect(control_db.db_path) as conn:
+            return conn.execute(
+                "SELECT e.account_id, e.event_type, json_extract(e.payload_json, '$.domain'), "
+                "d.webhook_id FROM integration_events e "
+                "JOIN integration_deliveries d ON d.event_id = e.event_id ORDER BY e.created_at"
+            ).fetchall()
+
+    def test_one_outcome_is_one_email_and_one_queued_delivery(
+        self, control_db: ControlDB, api_settings: APISettings, sender: _RecordingEmailSender
     ) -> None:
-        import api.webhooks as webhooks_module
-
-        calls: list[tuple[str, str, str]] = []
-
-        async def _recording_deliver(*, control_db, account_id, event, verify=True):
-            calls.append((account_id, event.event_type, event.payload["domain"]))
-
-        monkeypatch.setattr(webhooks_module, "deliver_event_to_subscribers", _recording_deliver)
-
         account_id = self._cause_a_notification(control_db, api_settings, sender, "example.com")
-        self._register_webhook(control_db, account_id)
+        webhook_id = self._register_webhook(control_db, account_id)
 
         run_monitoring_cycle(api_settings=api_settings, control_db=control_db, email_sender=sender)
 
         assert len(sender.monitoring_alerts) == 1
-        assert calls == [(account_id, "monitoring.changed", "example.com")]
+        assert self._outbox(control_db) == [
+            (account_id, "monitoring.changed", "example.com", webhook_id)
+        ]
 
-    def test_a_webhook_delivery_exception_does_not_prevent_that_accounts_email(
-        self,
-        control_db: ControlDB,
-        api_settings: APISettings,
-        sender: _RecordingEmailSender,
-        monkeypatch: pytest.MonkeyPatch,
+    def test_an_email_failure_keeps_the_event_and_the_retry_never_duplicates_it(
+        self, control_db: ControlDB, api_settings: APISettings, sender: _RecordingEmailSender
     ) -> None:
-        import api.webhooks as webhooks_module
-
-        async def _raising_deliver(*, control_db, account_id, event, verify=True):
-            raise RuntimeError("simulated webhook receiver outage")
-
-        monkeypatch.setattr(webhooks_module, "deliver_event_to_subscribers", _raising_deliver)
-
         account_id = self._cause_a_notification(control_db, api_settings, sender, "example.com")
         self._register_webhook(control_db, account_id)
 
-        stats = run_monitoring_cycle(
-            api_settings=api_settings, control_db=control_db, email_sender=sender
-        )
+        class _FailingSender:
+            def send_monitoring_alert(self, **kwargs):  # noqa: ANN003, ANN201
+                raise RuntimeError("simulated crash while sending the email")
 
-        assert stats["notified_accounts"] == 1
-        assert len(sender.monitoring_alerts) == 1
+        with pytest.raises(RuntimeError):
+            run_monitoring_cycle(
+                api_settings=api_settings, control_db=control_db, email_sender=_FailingSender()
+            )
+        after_crash = self._outbox(control_db)
+        run_monitoring_cycle(api_settings=api_settings, control_db=control_db, email_sender=sender)
 
-    def test_a_webhook_failure_for_one_account_never_blocks_a_different_accounts_notification(
-        self,
-        control_db: ControlDB,
-        api_settings: APISettings,
-        sender: _RecordingEmailSender,
-        monkeypatch: pytest.MonkeyPatch,
+        assert len(after_crash) == 1  # already durable before the email was attempted
+        assert len(sender.monitoring_alerts) == 1  # the unsent notification was retried
+        assert self._outbox(control_db) == after_crash  # and its event was not enqueued twice
+
+    def test_each_accounts_event_reaches_only_its_own_webhook(
+        self, control_db: ControlDB, api_settings: APISettings, sender: _RecordingEmailSender
     ) -> None:
-        import api.webhooks as webhooks_module
-
-        async def _always_raising_deliver(*, control_db, account_id, event, verify=True):
-            raise RuntimeError("simulated webhook receiver outage")
-
-        monkeypatch.setattr(
-            webhooks_module, "deliver_event_to_subscribers", _always_raising_deliver
+        webhooks: dict[str, str] = {}
+        account_a = self._cause_a_notification(
+            control_db, api_settings, sender, "a-example.com", webhooks=webhooks
         )
-
-        account_a = self._cause_a_notification(control_db, api_settings, sender, "a-example.com")
-        self._register_webhook(control_db, account_a)
-        account_b = self._cause_a_notification(control_db, api_settings, sender, "b-example.com")
-        self._register_webhook(control_db, account_b)
+        account_b = self._cause_a_notification(
+            control_db, api_settings, sender, "b-example.com", webhooks=webhooks
+        )
 
         run_monitoring_cycle(api_settings=api_settings, control_db=control_db, email_sender=sender)
 
-        # Harvesting is cycle-wide, not scoped to one account, so which of
-        # these two accounts' notifications actually gets flushed by which
-        # of the several `run_monitoring_cycle` calls above (some inside
-        # `_cause_a_notification`'s own setup, one here) is an
-        # implementation detail — what must hold regardless is that BOTH
-        # accounts were notified by email exactly once across the whole
-        # sequence, proving account A's always-raising webhook delivery
-        # never silently swallowed account B's notification too.
+        routed = {(row[0], row[3]) for row in self._outbox(control_db)}
+        assert routed == {(account_a, webhooks[account_a]), (account_b, webhooks[account_b])}
         notified_account_ids = [alert[1] for alert in sender.monitoring_alerts]
         assert notified_account_ids.count(account_a) == 1
         assert notified_account_ids.count(account_b) == 1

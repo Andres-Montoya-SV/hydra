@@ -7,11 +7,16 @@ no second authorization system.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, WebhookRecord
-from api.schemas import RegisterWebhookRequest, WebhookCreatedResponse, WebhookResponse
+from api.schemas import (
+    DeliveryResponse,
+    RegisterWebhookRequest,
+    WebhookCreatedResponse,
+    WebhookResponse,
+)
 from api.webhooks import (
     EVENT_TYPES,
     MAX_WEBHOOKS_PER_ACCOUNT,
@@ -65,6 +70,7 @@ async def register_webhook(
         url=body.url,
         secret=generate_webhook_secret(),
         event_types=tuple(body.event_types),
+        kind=body.kind,
     )
     return WebhookCreatedResponse(**_to_response_fields(record), secret=record.secret)
 
@@ -89,10 +95,45 @@ def delete_webhook(
         raise HTTPException(status_code=404, detail=f"{webhook_id!r} not found")
 
 
+@router.get("/{webhook_id}/deliveries", response_model=list[DeliveryResponse])
+def list_deliveries(
+    webhook_id: str,
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    auth: AuthContext = Depends(require_api_key),
+) -> list[DeliveryResponse]:
+    """Productization Phase 08: this webhook's delivery log, newest first."""
+    control_db = _control_db(request)
+    if control_db.get_webhook(webhook_id, auth.account_id) is None:
+        raise HTTPException(status_code=404, detail=f"{webhook_id!r} not found")
+    return [
+        DeliveryResponse.model_validate(row, from_attributes=True)
+        for row in control_db.list_deliveries_for_webhook(
+            webhook_id, auth.account_id, limit=limit, offset=offset
+        )
+    ]
+
+
+@router.post("/{webhook_id}/deliveries/{delivery_id}/redeliver", status_code=202)
+def redeliver(
+    webhook_id: str,
+    delivery_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> Response:
+    """Queues a dead (or already delivered) delivery again, due now. The
+    receiver gets the same event id, so it can recognize a repeat."""
+    if not _control_db(request).redeliver(webhook_id, delivery_id, auth.account_id):
+        raise HTTPException(status_code=404, detail="Delivery not found or already queued")
+    return Response(status_code=202)
+
+
 def _to_response_fields(record: WebhookRecord) -> dict:
     return {
         "webhook_id": record.webhook_id,
         "url": record.url,
+        "kind": record.kind,
         "event_types": list(record.event_types),
         "status": record.status,
         "consecutive_failures": record.consecutive_failures,
