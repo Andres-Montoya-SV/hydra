@@ -1,16 +1,20 @@
 """Historical scan comparison — host-set and field-level changes.
 
-**DEPRECATED, 2026-09-28 (Fase 21 EASM roadmap cleanup)**: Fase 01's
-consolidation plan (`docs/easm/00_consolidation_plan.md`) marked this
-module's `ScanDiff` for absorption into the durable, cross-run Change
-Event model Fase 05 later built (`api/change_detection.py`/
-`api/change_backfill.py`). That migration was never done: this module
-still has no deprecation notice of its own before now, and is still
-actively imported by `core/runner.py`, `core/intel/cli.py`, and
-`core/verification/grounding.py`. Not migrated in this pass — confirming
-those three callers can be safely repointed at the EASM change-event
-model is its own reconnaissance task, not something to attempt blind in
-this roadmap's closing phase.
+**Retained, not deprecated (re-audited in Productization Phase 09,
+2026-09-30).** Fase 01's consolidation plan marked `ScanDiff` for
+absorption into the durable Change Event model Fase 05 built
+(`api/change_detection.py`). That model lives in the API's control
+database, which the CLI pipeline doesn't use; this module is the CLI's
+only diff and has live consumers:
+
+- `core/runner.py` writes each run's `diff.json` and sends the CLI's
+  `WEBHOOK_URL` notification (`core/webhook.py::notify_scan_diff`);
+- `core/intel/cli.py::cmd_diff_runs` backs the `diff-runs` command.
+
+(An earlier note also listed `core/verification/grounding.py` as an
+importer; it isn't one.) Removing it would remove those CLI features, so
+it stays until the CLI has its own path to change events — see
+docs/productization/09_provider_qualification.md.
 """
 
 from __future__ import annotations

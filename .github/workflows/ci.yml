@@ -76,7 +76,11 @@ jobs:
         # The image installs requirements-optional.txt, so a missing optional
         # package here is a broken image: fail instead of skipping
         # (tests/_optional_deps.py).
-        run: docker run --rm -e HYDRA_REQUIRE_OPTIONAL_DEPS=1 hydra:ci pytest tests/ -q
+        # HYDRA_REQUIRE_IMAGE_TOOLS: the pinned provider binaries must be present
+        # and qualify against core/provider_qualification.py (Phase 09).
+        run: >-
+          docker run --rm -e HYDRA_REQUIRE_OPTIONAL_DEPS=1 -e HYDRA_REQUIRE_IMAGE_TOOLS=1
+          hydra:ci pytest tests/ -q
       - name: ruff inside container
         run: docker run --rm hydra:ci ruff check .
       - name: black inside container
