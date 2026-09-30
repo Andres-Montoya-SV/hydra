@@ -5,7 +5,7 @@ the organization's full asset or exposure inventory as a streamed file
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 
 from api.auth import AuthContext, require_api_key
@@ -22,17 +22,19 @@ def export_dataset(
     organization_id: str,
     dataset: Dataset,
     request: Request,
-    format: ExportFormat = "csv",  # noqa: A002 - the public query parameter name
+    # Public query parameter `format`; named differently in Python so it
+    # doesn't shadow the built-in.
+    export_format: ExportFormat = Query(default="csv", alias="format"),
     auth: AuthContext = Depends(require_api_key),
 ) -> StreamingResponse:
     db = control_db(request)
     require_member(db, auth.account_id, organization_id)
-    stream = stream_csv if format == "csv" else stream_ndjson
+    stream = stream_csv if export_format == "csv" else stream_ndjson
     return StreamingResponse(
         stream(db, organization_id, dataset),
-        media_type=_MEDIA_TYPES[format],
+        media_type=_MEDIA_TYPES[export_format],
         headers={
-            "Content-Disposition": f'attachment; filename="{dataset}.{format}"',
+            "Content-Disposition": f'attachment; filename="{dataset}.{export_format}"',
             "Cache-Control": "no-store",
         },
     )
