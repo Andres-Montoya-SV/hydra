@@ -593,6 +593,8 @@ def _org_scoped_get_paths(org: str, asset_id: str, candidate_id: str) -> list[st
         f"/organizations/{org}/assets/{asset_id}/relationships",
         f"/organizations/{org}/assets/{asset_id}/network",
         f"/organizations/{org}/assets/{asset_id}/visual",
+        f"/organizations/{org}/assets/{asset_id}/context",
+        f"/organizations/{org}/assets/{asset_id}/context/audit",
         f"/organizations/{org}/analyst/assets/{asset_id}/provenance",
         f"/organizations/{org}/explanations/asset/{asset_id}",
         f"/organizations/{org}/scope/exclusions",

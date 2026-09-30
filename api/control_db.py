@@ -52,7 +52,7 @@ from api.observation_identity import (
 )
 from api.relationship_identity import RelationshipDraft
 from api.technology_catalog import parse_technology_detail
-from core.risk_scoring import RiskFactors
+from core.risk_scoring import BusinessContext, RiskFactors
 from core.store import connect_sqlite
 
 _SCHEMA = """
@@ -432,6 +432,32 @@ CREATE TABLE IF NOT EXISTS capability_audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_capability_audit_org
     ON capability_audit_log(organization_id, created_at);
+-- Productization Phase 06: business context the organization declares per
+-- asset (never inferred). Feeds the deterministic risk engine. Each change
+-- is appended to asset_business_context_audit in the same transaction.
+CREATE TABLE IF NOT EXISTS asset_business_context (
+    asset_id TEXT PRIMARY KEY REFERENCES assets(asset_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    environment TEXT CHECK(environment IS NULL OR environment IN
+        ('production', 'staging', 'development', 'test')),
+    criticality TEXT CHECK(criticality IS NULL OR criticality IN
+        ('critical', 'high', 'medium', 'low')),
+    data_handled_json TEXT NOT NULL DEFAULT '[]',
+    owner TEXT,
+    updated_by_account_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS asset_business_context_audit (
+    audit_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    actor_account_id TEXT NOT NULL,
+    before_json TEXT,
+    after_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_asset_business_context_audit
+    ON asset_business_context_audit(organization_id, asset_id, created_at);
 -- Roadmap v2: targets an organization never wants collected against, in
 -- SCOPE_FILE `!pattern` syntax. Removal is a soft delete (removed_at/by and
 -- the reason stay), so the exclusion history is never lost. At most one
@@ -1357,6 +1383,15 @@ class InventoryFacets:
     technologies: list[tuple[str, int]]
     # Most common first, at most `top`: ("443/tcp", port asset count).
     open_ports: list[tuple[str, int]]
+
+
+@dataclass(frozen=True)
+class AssetContextAuditRecord:
+    audit_id: str
+    actor_account_id: str
+    before: dict[str, object] | None
+    after: dict[str, object]
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -2940,46 +2975,48 @@ class ControlDB:
                 (datetime.fromisoformat(now) - datetime.fromisoformat(exposure.first_seen_at)).days,
             )
 
-        related_to_critical_asset = False
-        related_reason: str | None = None
-        if asset is not None:
-            edges, _truncated = self.relationship_neighborhood(
-                organization_id, exposure.asset_id, max_depth=1
-            )
-            neighbor_asset_ids = {
-                (
-                    edge.target_asset_id
-                    if edge.source_asset_id == exposure.asset_id
-                    else edge.source_asset_id
-                )
-                for edge in edges
-            } - {exposure.asset_id, None}
-            for neighbor_asset_id in sorted(a for a in neighbor_asset_ids if a):
-                neighbor_exposures = self.list_exposures_for_organization(
-                    organization_id, asset_id=neighbor_asset_id, status=None
-                )
-                critical_neighbor = next(
-                    (
-                        e
-                        for e in neighbor_exposures
-                        if e.status in ("open", "reopened") and e.severity in ("high", "critical")
-                    ),
-                    None,
-                )
-                if critical_neighbor is not None:
-                    related_to_critical_asset = True
-                    related_reason = (
-                        f"related to asset {neighbor_asset_id} which has its own open "
-                        f"{critical_neighbor.severity} exposure ({critical_neighbor.title})"
-                    )
-                    break
+        related_reason = (
+            self._critical_neighbor_reason(organization_id, exposure.asset_id)
+            if asset is not None
+            else None
+        )
 
         return RiskFactors(
             severity=exposure.severity,
             domain_verified=domain_verified,
             days_open=days_open,
-            related_to_critical_asset=related_to_critical_asset,
+            related_to_critical_asset=related_reason is not None,
             related_critical_asset_reason=related_reason,
+            context=self.get_asset_business_context(organization_id, exposure.asset_id),
+            confidence_score=exposure.confidence_score,
+            detected_location=exposure.location or None,
+        )
+
+    def _critical_neighbor_reason(self, organization_id: str, asset_id: str) -> str | None:
+        """Why the asset counts as related to a critical one: the first
+        directly related asset (Fase 07 graph, depth 1, in asset_id order)
+        with its own open high/critical exposure, or None. One query for
+        all neighbors, not one per neighbor."""
+        edges, _truncated = self.relationship_neighborhood(organization_id, asset_id, max_depth=1)
+        neighbor_asset_ids = {
+            edge.target_asset_id if edge.source_asset_id == asset_id else edge.source_asset_id
+            for edge in edges
+        } - {asset_id, None}
+        if not neighbor_asset_ids:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT asset_id, severity, title FROM exposures "
+                "WHERE organization_id = ? AND asset_id IN (SELECT value FROM json_each(?)) "
+                "AND status IN ('open', 'reopened') AND severity IN ('high', 'critical') "
+                "ORDER BY asset_id, last_seen_at DESC, exposure_id LIMIT 1",
+                (organization_id, json.dumps(sorted(a for a in neighbor_asset_ids if a))),
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            f"related to asset {row['asset_id']} which has its own open "
+            f"{row['severity']} exposure ({row['title']})"
         )
 
     def list_exposures_for_organization(
@@ -3083,6 +3120,94 @@ class ControlDB:
                 (exposure_id, organization_id, run_id, risk_level, json.dumps(reasons), _now_iso()),
             )
         return None if previous is None else str(previous["risk_level"])
+
+    def get_asset_business_context(
+        self, organization_id: str, asset_id: str
+    ) -> BusinessContext | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM asset_business_context WHERE organization_id = ? AND asset_id = ?",
+                (organization_id, asset_id),
+            ).fetchone()
+        return None if row is None else _business_context_from_row(row)
+
+    def set_asset_business_context(
+        self,
+        *,
+        organization_id: str,
+        asset_id: str,
+        actor_account_id: str,
+        context: BusinessContext,
+    ) -> bool:
+        """Replaces the asset's declared context. Returns False (and writes
+        nothing, no audit entry) when it is unchanged."""
+        now = _now_iso()
+        with self._connect() as conn:
+            # Take the write lock BEFORE reading the previous state, so the
+            # "unchanged?" check and the audit's `before` are exactly the
+            # state this write replaces, even with concurrent owners.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM asset_business_context WHERE organization_id = ? AND asset_id = ?",
+                (organization_id, asset_id),
+            ).fetchone()
+            previous = None if row is None else _business_context_from_row(row)
+            if previous == context:
+                return False
+            conn.execute(
+                "INSERT INTO asset_business_context (asset_id, organization_id, environment, "
+                "criticality, data_handled_json, owner, updated_by_account_id, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(asset_id) DO UPDATE SET "
+                "environment = excluded.environment, criticality = excluded.criticality, "
+                "data_handled_json = excluded.data_handled_json, owner = excluded.owner, "
+                "updated_by_account_id = excluded.updated_by_account_id, "
+                "updated_at = excluded.updated_at",
+                (
+                    asset_id,
+                    organization_id,
+                    context.environment,
+                    context.criticality,
+                    json.dumps(sorted(context.data_handled)),
+                    context.owner,
+                    actor_account_id,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO asset_business_context_audit (audit_id, organization_id, asset_id, "
+                "actor_account_id, before_json, after_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    secrets.token_hex(16),
+                    organization_id,
+                    asset_id,
+                    actor_account_id,
+                    None if previous is None else json.dumps(_context_dict(previous)),
+                    json.dumps(_context_dict(context)),
+                    now,
+                ),
+            )
+        return True
+
+    def list_asset_business_context_audit(
+        self, organization_id: str, asset_id: str, *, limit: int, offset: int
+    ) -> list[AssetContextAuditRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM asset_business_context_audit WHERE organization_id = ? "
+                "AND asset_id = ? ORDER BY created_at DESC, audit_id LIMIT ? OFFSET ?",
+                (organization_id, asset_id, limit, offset),
+            ).fetchall()
+        return [
+            AssetContextAuditRecord(
+                audit_id=row["audit_id"],
+                actor_account_id=row["actor_account_id"],
+                before=None if row["before_json"] is None else json.loads(row["before_json"]),
+                after=json.loads(row["after_json"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
 
     def export_assets_page(
         self, organization_id: str, *, after: str, limit: int
@@ -5992,6 +6117,24 @@ def _validate_provider_outcomes(outcomes: list[tuple[str, str, int]]) -> None:
     for provider, outcome, _output_lines in outcomes:
         if not provider.strip() or outcome not in _RECORDABLE_OUTCOMES:
             raise ValueError("invalid provider execution outcome")
+
+
+def _business_context_from_row(row: sqlite3.Row) -> BusinessContext:
+    return BusinessContext(
+        environment=row["environment"],
+        criticality=row["criticality"],
+        data_handled=frozenset(json.loads(row["data_handled_json"] or "[]")),
+        owner=row["owner"],
+    )
+
+
+def _context_dict(context: BusinessContext) -> dict[str, object]:
+    return {
+        "environment": context.environment,
+        "criticality": context.criticality,
+        "data_handled": sorted(context.data_handled),
+        "owner": context.owner,
+    }
 
 
 def _audit_scan_override(
