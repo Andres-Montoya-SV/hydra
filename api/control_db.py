@@ -3607,13 +3607,13 @@ class ControlDB:
         return None if row is None else _observation_batch_record_from_row(row)
 
     def list_observation_batches_for_organization(
-        self, organization_id: str
+        self, organization_id: str, *, limit: int | None = None, offset: int = 0
     ) -> list[ObservationBatchRecord]:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM observation_batches WHERE organization_id = ? "
-                "ORDER BY imported_at, batch_id",
-                (organization_id,),
+                "ORDER BY imported_at, batch_id LIMIT ? OFFSET ?",
+                (organization_id, _sql_limit(limit), offset),
             ).fetchall()
         return [_observation_batch_record_from_row(row) for row in rows]
 
