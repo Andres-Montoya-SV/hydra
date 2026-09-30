@@ -6,7 +6,6 @@ and read by the real `maxminddb` reader — never a mocked reader."""
 
 from __future__ import annotations
 
-import importlib.util
 import secrets
 import socket
 import sys
@@ -30,12 +29,6 @@ from core.store import AssetStore
 from modules.asn_lookup import AsnLookupPlugin
 from utils.files import read_jsonl, write_jsonl
 
-# `maxminddb` is an optional runtime dependency (requirements-optional.txt):
-# the Python-version CI matrix runs without it, the Docker job with it.
-needs_reader = pytest.mark.skipif(
-    importlib.util.find_spec("maxminddb") is None, reason="maxminddb not installed"
-)
-
 SAN_JOSE = {
     "country": {"iso_code": "US"},
     "subdivisions": [{"names": {"en": "California"}}],
@@ -57,7 +50,6 @@ def _db(tmp_path: Path, *, age_days: int = 3) -> Path:
 
 
 class TestGeoDatabase:
-    @needs_reader
     def test_lookup_returns_location_and_provenance(self, tmp_path: Path) -> None:
         geo = open_geoip(_db(tmp_path, age_days=3))
         assert geo is not None
@@ -73,7 +65,6 @@ class TestGeoDatabase:
         assert geo.info.source().startswith("GeoLite2-City@")
         assert geo.info.age_days() == 3
 
-    @needs_reader
     def test_unknown_or_invalid_ip_is_none(self, tmp_path: Path) -> None:
         geo = open_geoip(_db(tmp_path))
         assert geo is not None
@@ -88,6 +79,9 @@ class TestGeoDatabase:
         assert open_geoip(corrupt) is None
 
 
+# `maxminddb` is optional at runtime but a test dependency (requirements-dev),
+# so every test here runs in every CI job. The missing-library path is
+# exercised by blocking the import, not by depending on what's installed.
 def test_without_the_reader_library_geo_is_skipped_not_an_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -110,7 +104,6 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", refuse)
 
 
-@needs_reader
 class TestZeroNetwork:
     def test_opening_and_looking_up_never_touches_the_network(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -125,7 +118,6 @@ class TestZeroNetwork:
 
 
 class TestAsnLookupEnrichment:
-    @needs_reader
     async def test_geo_fields_reach_the_host_and_geo_country_wins(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -10,7 +10,6 @@ simulated restart).
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import subprocess
 import sys
@@ -21,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from _optional_deps import requires_modules
 
 from api.control_db import ControlDB
 from api.rate_limit import PersistentTokenBucketLimiter, RateLimitExceededError
@@ -39,11 +39,9 @@ from api.rate_limit import PersistentTokenBucketLimiter, RateLimitExceededError
 # to a clear skip rather than a hard failure in any environment that
 # still lacks the API extras — the same "skip, never hard-fail over a
 # missing optional dependency" convention every tool-gated test in this
-# project already follows.
-_HAS_API_RUNTIME_DEPS = (
-    importlib.util.find_spec("fastapi") is not None
-    and importlib.util.find_spec("uvicorn") is not None
-)
+# project already follows — except under HYDRA_REQUIRE_OPTIONAL_DEPS=1
+# (the Docker CI job), where a missing one fails; see tests/_optional_deps.py.
+_REQUIRES_API_RUNTIME = requires_modules("fastapi", "uvicorn")
 
 
 @pytest.fixture
@@ -314,11 +312,9 @@ class TestPersistedRateLimiterCrossProcess:
         assert allowed_count == 5
 
 
-@pytest.mark.skipif(
-    not _HAS_API_RUNTIME_DEPS,
-    reason="fastapi/uvicorn not installed (pip install -r requirements-api.txt) — this "
-    "test spawns a real uvicorn subprocess serving the actual FastAPI app.",
-)
+# Spawns a real uvicorn subprocess serving the actual FastAPI app
+# (pip install -r requirements-api.txt).
+@_REQUIRES_API_RUNTIME
 class TestKillAndRelaunchAgainstARealSeparateProcess:
     """Task's own explicit requirement: verified the same way Hallazgo 2
     was verified live — a real process kill+relaunch against the same

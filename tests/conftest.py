@@ -14,8 +14,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _httpx_verification import verified_tool_path_or_skip  # noqa: E402
+from _optional_deps import install_strict_importorskip  # noqa: E402
 
 from config.settings import Settings  # noqa: E402
+
+# HYDRA_REQUIRE_OPTIONAL_DEPS=1 (the Docker CI job): a missing optional
+# package fails instead of skipping. See tests/_optional_deps.py.
+install_strict_importorskip()
 
 # See docs/PAID_API_DESIGN.md's "Round 1 implemented" section for the
 # full incident writeup: the Python `httpx` PyPI package (a test-only

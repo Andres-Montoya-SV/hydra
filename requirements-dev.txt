@@ -39,3 +39,8 @@ ruff==0.11.2
 # docs/PAID_API_DESIGN.md's "Round 1 implemented" section for the full
 # incident writeup.
 httpx==0.28.1
+# maxminddb: optional at runtime (requirements-optional.txt, only used when
+# GEOIP_DB_PATH is set) but required for tests, so every CI job — not only
+# the Docker one — runs the real geo lookup tests (tests/test_network_geo_
+# intelligence.py) instead of skipping them. Same pin as requirements-optional.
+maxminddb==3.2.0
