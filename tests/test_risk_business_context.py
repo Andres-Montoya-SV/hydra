@@ -6,6 +6,9 @@ listed as unknowns, and with no new inputs the Fase 21 result is unchanged."""
 
 from __future__ import annotations
 
+import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -13,7 +16,11 @@ from _verified_account import create_verified_account
 from fastapi.testclient import TestClient
 from test_api_exposure_operations import _account, _client, _seed_exposure
 
+from api.asset_identity import ReconciliationDecision
+from api.control_db import ControlDB
+from api.exposure_identity import exposure_from_finding
 from api.monitoring_worker import _risk_change_citations
+from api.relationship_identity import relationship_from_rows
 from core.risk_scoring import (
     BusinessContext,
     RiskFactors,
@@ -236,3 +243,177 @@ class TestRiskReflectsContext:
 
             assert len(citations) == 1
             assert "declared business criticality is critical" in citations[0]
+
+
+class TestContextAuditUnderConcurrency:
+    def test_the_audit_chain_is_unbroken_with_concurrent_owners(self, tmp_path: Path) -> None:
+        """Each audit entry's `before` must be exactly the previous entry's
+        `after`: the read of the previous state and the write happen in one
+        write-locked transaction."""
+        db = ControlDB(tmp_path / "control.db")
+        account_id = db.create_account(email="race@example.com")
+        org = db.default_organization_id_for_account(account_id)
+        db.apply_asset_reconciliation(
+            organization_id=org,
+            run_id="seed",
+            observed_at="2026-09-01T00:00:00+00:00",
+            decisions=[
+                ReconciliationDecision(
+                    asset_id="asset-r",
+                    asset_type="domain",
+                    identity_key="domain:r.example.com",
+                    is_new=True,
+                    identifiers=(),
+                )
+            ],
+        )
+        owners = [f"team-{i}" for i in range(8)]
+
+        def save(owner: str) -> None:
+            for criticality in ("low", "medium", "high"):
+                db.set_asset_business_context(
+                    organization_id=org,
+                    asset_id="asset-r",
+                    actor_account_id=account_id,
+                    context=BusinessContext(criticality=criticality, owner=owner),
+                )
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(save, owners))
+
+        with sqlite3.connect(db.db_path) as conn:
+            chain = [
+                (None if b is None else json.loads(b), json.loads(a))
+                for b, a in conn.execute(
+                    "SELECT before_json, after_json FROM asset_business_context_audit "
+                    "ORDER BY rowid"
+                )
+            ]
+        assert chain[0][0] is None
+        assert all(chain[i][0] == chain[i - 1][1] for i in range(1, len(chain)))
+        assert chain[-1][1]["owner"] == db.get_asset_business_context(org, "asset-r").owner
+
+
+def _asset(db: ControlDB, org: str, asset_id: str) -> None:
+    db.apply_asset_reconciliation(
+        organization_id=org,
+        run_id="seed",
+        observed_at="2026-09-01T00:00:00+00:00",
+        decisions=[
+            ReconciliationDecision(
+                asset_id=asset_id,
+                asset_type="domain",
+                identity_key=f"domain:{asset_id}.example.com",
+                is_new=True,
+                identifiers=(),
+            )
+        ],
+    )
+
+
+def _relate(db: ControlDB, org: str, source: str, target: str) -> None:
+    draft = relationship_from_rows(
+        {
+            "source_entity": f"domain:{source}.example.com",
+            "target_entity": f"domain:{target}.example.com",
+            "relationship_type": "SHARES_IPV4",
+            "confidence": "HIGH",
+            "strength": "strong",
+            "evidence_id": f"ev-{target}",
+            "data_json": "{}",
+        },
+        {
+            "evidence_id": f"ev-{target}",
+            "source": "fixture",
+            "collector": "fixture",
+            "reason": "shared IP",
+            "metadata_json": "{}",
+            "observed_at": "2026-09-01T00:00:00+00:00",
+        },
+    )
+    assert draft is not None
+    db.upsert_relationship(
+        organization_id=org,
+        run_id="scan-n",
+        draft=draft,
+        source_asset_id=source,
+        target_asset_id=target,
+    )
+
+
+def _critical_exposure(
+    db: ControlDB, account_id: str, org: str, asset_id: str, severity: str = "high"
+) -> None:
+    draft = exposure_from_finding(
+        {
+            "host": f"{asset_id}.example.com",
+            "template_id": f"t-{asset_id}",
+            "severity": severity,
+            "source": "nuclei",
+            "url": f"https://{asset_id}.example.com/x",
+            "name": f"{asset_id} bug",
+        },
+        asset_id=asset_id,
+    )
+    assert draft is not None
+    db.upsert_exposure(
+        organization_id=org, account_id=account_id, run_id="scan-n", finding_id=1, draft=draft
+    )
+
+
+class TestCriticalNeighborLookup:
+    def _graph(self, tmp_path: Path, neighbors: int) -> tuple[ControlDB, str, str]:
+        db = ControlDB(tmp_path / f"control-{neighbors}.db")
+        account_id = db.create_account(email=f"n{neighbors}@example.com")
+        org = db.default_organization_id_for_account(account_id)
+        db.create_scan(
+            scan_id="scan-n",
+            account_id=account_id,
+            domain="example.com",
+            db_path="x",
+            organization_id=org,
+        )
+        _asset(db, org, "root")
+        for i in range(neighbors):
+            name = f"n{i:02d}"
+            _asset(db, org, name)
+            _relate(db, org, "root", name)
+        return db, account_id, org
+
+    def test_the_first_neighbor_in_id_order_with_a_critical_exposure_is_cited(
+        self, tmp_path: Path
+    ) -> None:
+        db, account_id, org = self._graph(tmp_path, 4)
+        _critical_exposure(db, account_id, org, "n03", "critical")
+        _critical_exposure(db, account_id, org, "n01", "high")
+        _critical_exposure(db, account_id, org, "n00", "medium")  # not critical: ignored
+
+        assert db._critical_neighbor_reason(org, "root") == (
+            "related to asset n01 which has its own open high exposure (n01 bug)"
+        )
+
+    def test_no_critical_neighbor_is_none(self, tmp_path: Path) -> None:
+        db, account_id, org = self._graph(tmp_path, 2)
+        _critical_exposure(db, account_id, org, "n00", "low")
+
+        assert db._critical_neighbor_reason(org, "root") is None
+
+    def test_query_count_does_not_grow_with_neighbors(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        counts = []
+        for neighbors in (1, 12):
+            db, _, org = self._graph(tmp_path, neighbors)
+            calls = 0
+            original = db._connect
+
+            def counting_connect(original=original):  # noqa: ANN001, ANN202
+                nonlocal calls
+                calls += 1
+                return original()
+
+            monkeypatch.setattr(db, "_connect", counting_connect)
+            db._critical_neighbor_reason(org, "root")
+            counts.append(calls)
+
+        assert counts[0] == counts[1]

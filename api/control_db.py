@@ -2994,30 +2994,30 @@ class ControlDB:
 
     def _critical_neighbor_reason(self, organization_id: str, asset_id: str) -> str | None:
         """Why the asset counts as related to a critical one: the first
-        directly related asset (Fase 07 graph, depth 1) with its own open
-        high/critical exposure, or None."""
+        directly related asset (Fase 07 graph, depth 1, in asset_id order)
+        with its own open high/critical exposure, or None. One query for
+        all neighbors, not one per neighbor."""
         edges, _truncated = self.relationship_neighborhood(organization_id, asset_id, max_depth=1)
         neighbor_asset_ids = {
             edge.target_asset_id if edge.source_asset_id == asset_id else edge.source_asset_id
             for edge in edges
         } - {asset_id, None}
-        for neighbor_asset_id in sorted(a for a in neighbor_asset_ids if a):
-            critical_neighbor = next(
-                (
-                    e
-                    for e in self.list_exposures_for_organization(
-                        organization_id, asset_id=neighbor_asset_id, status=None
-                    )
-                    if e.status in ("open", "reopened") and e.severity in ("high", "critical")
-                ),
-                None,
-            )
-            if critical_neighbor is not None:
-                return (
-                    f"related to asset {neighbor_asset_id} which has its own open "
-                    f"{critical_neighbor.severity} exposure ({critical_neighbor.title})"
-                )
-        return None
+        if not neighbor_asset_ids:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT asset_id, severity, title FROM exposures "
+                "WHERE organization_id = ? AND asset_id IN (SELECT value FROM json_each(?)) "
+                "AND status IN ('open', 'reopened') AND severity IN ('high', 'critical') "
+                "ORDER BY asset_id, last_seen_at DESC, exposure_id LIMIT 1",
+                (organization_id, json.dumps(sorted(a for a in neighbor_asset_ids if a))),
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            f"related to asset {row['asset_id']} which has its own open "
+            f"{row['severity']} exposure ({row['title']})"
+        )
 
     def list_exposures_for_organization(
         self,
@@ -3141,11 +3141,19 @@ class ControlDB:
     ) -> bool:
         """Replaces the asset's declared context. Returns False (and writes
         nothing, no audit entry) when it is unchanged."""
-        previous = self.get_asset_business_context(organization_id, asset_id)
-        if previous == context:
-            return False
         now = _now_iso()
         with self._connect() as conn:
+            # Take the write lock BEFORE reading the previous state, so the
+            # "unchanged?" check and the audit's `before` are exactly the
+            # state this write replaces, even with concurrent owners.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM asset_business_context WHERE organization_id = ? AND asset_id = ?",
+                (organization_id, asset_id),
+            ).fetchone()
+            previous = None if row is None else _business_context_from_row(row)
+            if previous == context:
+                return False
             conn.execute(
                 "INSERT INTO asset_business_context (asset_id, organization_id, environment, "
                 "criticality, data_handled_json, owner, updated_by_account_id, updated_at) "
