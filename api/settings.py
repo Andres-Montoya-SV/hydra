@@ -73,6 +73,10 @@ class APISettings:
     # Round 1). `None` means the endpoint refuses every request (fail
     # closed), never "admin auth is optional."
     admin_token: str | None = None
+    # Productization Phase 08b: comma-separated Fernet keys sealing stored
+    # third-party secrets (api/secrets_box.py); first key encrypts, all
+    # decrypt (rotation). Unset: ticketing integrations can't be created.
+    secrets_keys: str | None = None
 
     # Hallazgo 1 (account-creation abuse) fix. `account_creation_rate_
     # limit_per_ip_per_day`: a rolling 24h window, not a calendar day
@@ -327,6 +331,7 @@ def load_api_settings() -> APISettings:
     settings.geoip_db_path = os.getenv("GEOIP_DB_PATH") or None
     settings.wompi_client_id = os.getenv("WOMPI_CLIENT_ID") or None
     settings.wompi_client_secret = os.getenv("WOMPI_CLIENT_SECRET") or None
+    settings.secrets_keys = os.getenv("HYDRA_API_SECRETS_KEYS") or None
     settings.dev_wompi_id_base_url = os.getenv("HYDRA_API_DEV_WOMPI_ID_BASE_URL") or None
     settings.dev_wompi_api_base_url = os.getenv("HYDRA_API_DEV_WOMPI_API_BASE_URL") or None
     settings.wompi_link_url_medium = os.getenv("HYDRA_WOMPI_LINK_URL_MEDIUM") or None

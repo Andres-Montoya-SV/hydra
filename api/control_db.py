@@ -51,6 +51,7 @@ from api.observation_identity import (
     EvidenceContent,
 )
 from api.relationship_identity import RelationshipDraft
+from api.secrets_box import SEALED_PREFIX, SecretBox, SecretsUnavailableError, reveal
 from api.technology_catalog import parse_technology_detail
 from core.risk_scoring import BusinessContext, RiskFactors
 from core.store import connect_sqlite
@@ -452,7 +453,11 @@ CREATE TABLE IF NOT EXISTS integration_events (
 CREATE TABLE IF NOT EXISTS integration_deliveries (
     delivery_id TEXT PRIMARY KEY,
     event_id TEXT NOT NULL REFERENCES integration_events(event_id),
+    -- The destination: a webhooks.webhook_id or, for destination_type
+    -- 'ticketing', a ticketing_integrations.integration_id.
     webhook_id TEXT NOT NULL,
+    destination_type TEXT NOT NULL DEFAULT 'webhook'
+        CHECK(destination_type IN ('webhook', 'ticketing')),
     account_id TEXT NOT NULL REFERENCES accounts(account_id),
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK(status IN ('pending', 'in_flight', 'delivered', 'dead')),
@@ -468,6 +473,37 @@ CREATE INDEX IF NOT EXISTS idx_integration_deliveries_due
     ON integration_deliveries(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_integration_deliveries_webhook
     ON integration_deliveries(webhook_id, created_at);
+-- Productization Phase 08b: ticketing destinations (Jira, Linear,
+-- ServiceNow). `credential` is always sealed (api/secrets_box.py) and is
+-- never returned by the API. `config_json` holds only non-secret settings.
+CREATE TABLE IF NOT EXISTS ticketing_integrations (
+    integration_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    provider TEXT NOT NULL CHECK(provider IN ('jira', 'linear', 'servicenow')),
+    name TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    credential TEXT NOT NULL,
+    event_types_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'disabled')),
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_by_account_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ticketing_integrations_org
+    ON ticketing_integrations(organization_id, status);
+-- One ticket per (integration, exposure): the retry-safety guard, and the
+-- link back from the exposure to its ticket.
+CREATE TABLE IF NOT EXISTS ticketing_links (
+    integration_id TEXT NOT NULL REFERENCES ticketing_integrations(integration_id),
+    exposure_id TEXT NOT NULL REFERENCES exposures(exposure_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    external_key TEXT NOT NULL,
+    external_url TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (integration_id, exposure_id)
+);
 -- Productization Phase 07: the human remediation workflow for an exposure,
 -- kept apart from detection truth (exposures / exposure_evidence /
 -- exposure_history are never changed by it). No row = default "triage".
@@ -1501,6 +1537,23 @@ class RemediationNotFoundError(LookupError):
 
 
 @dataclass(frozen=True)
+class TicketingIntegrationRecord:
+    integration_id: str
+    organization_id: str
+    provider: str
+    name: str
+    config: dict[str, str]
+    # Sealed at rest; reveal with ControlDB.secret_box only to send.
+    sealed_credential: str
+    event_types: tuple[str, ...]
+    status: str
+    consecutive_failures: int
+    last_error: str | None
+    created_by_account_id: str
+    created_at: str
+
+
+@dataclass(frozen=True)
 class IntegrationEventRecord:
     event_id: str
     organization_id: str | None
@@ -1512,12 +1565,14 @@ class IntegrationEventRecord:
 
 @dataclass(frozen=True)
 class DeliveryWork:
-    """One claimed delivery: what to send, where, and how many tries so far."""
+    """One claimed delivery: what to send, where (a webhook OR a ticketing
+    integration), and how many tries so far."""
 
     delivery_id: str
     attempts: int
     event: IntegrationEventRecord
-    webhook: WebhookRecord
+    webhook: WebhookRecord | None = None
+    ticketing: TicketingIntegrationRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -1788,6 +1843,9 @@ _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 # scan predating this fix) needs these three columns added the same way
 # `accounts` needed its email-verification columns added.
 _PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("failure_class", "TEXT"),)
+_INTEGRATION_DELIVERIES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("destination_type", "TEXT NOT NULL DEFAULT 'webhook'"),
+)
 _WEBHOOKS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("kind", "TEXT NOT NULL DEFAULT 'generic'"),
 )
@@ -1937,13 +1995,20 @@ class ControlDB:
     whole service allowed to have rows belonging to more than one
     account; every other database is per-account (`api/tenancy.py`)."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, secret_box: SecretBox | None = None) -> None:
         self.db_path = db_path
+        # Productization Phase 08b: seals stored third-party secrets
+        # (api/secrets_box.py). None = no key configured: webhook secrets
+        # stay plaintext as before, ticketing integrations are refused.
+        self.secret_box = secret_box
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             _migrate_table_columns(conn, "accounts", _ACCOUNTS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "scans", _SCANS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "webhooks", _WEBHOOKS_MIGRATION_COLUMNS)
+            _migrate_table_columns(
+                conn, "integration_deliveries", _INTEGRATION_DELIVERIES_MIGRATION_COLUMNS
+            )
             _migrate_table_columns(
                 conn, "provider_run_outcomes", _PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS
             )
@@ -2283,7 +2348,7 @@ class ControlDB:
                 "SELECT * FROM webhooks WHERE organization_id = ? ORDER BY created_at",
                 (organization_id,),
             ).fetchall()
-        return [_webhook_record_from_row(row) for row in rows]
+        return [_webhook_record_from_row(row, self.secret_box) for row in rows]
 
     def list_scans_for_organization(self, organization_id: str) -> list[ScanRecord]:
         with self._connect() as conn:
@@ -3612,7 +3677,8 @@ class ControlDB:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                "SELECT d.delivery_id, d.attempts, d.webhook_id, e.* FROM integration_deliveries d "
+                "SELECT d.delivery_id, d.attempts, d.webhook_id, d.destination_type, e.* "
+                "FROM integration_deliveries d "
                 "JOIN integration_events e ON e.event_id = d.event_id "
                 "WHERE (d.status = 'pending' AND julianday(d.next_attempt_at) <= julianday(?)) "
                 "OR (d.status = 'in_flight' AND julianday(d.lease_until) <= julianday(?)) "
@@ -3621,34 +3687,187 @@ class ControlDB:
             ).fetchall()
             work = []
             for row in rows:
-                webhook_row = conn.execute(
-                    "SELECT * FROM webhooks WHERE webhook_id = ? AND status = 'active'",
-                    (row["webhook_id"],),
-                ).fetchone()
-                if webhook_row is None:
-                    _finish_delivery(
-                        conn,
-                        row["delivery_id"],
-                        "dead",
-                        "destination removed " "or disabled",
-                        stamp,
-                        None,
-                    )
-                    continue
-                conn.execute(
-                    "UPDATE integration_deliveries SET status = 'in_flight', lease_until = ? "
-                    "WHERE delivery_id = ?",
-                    (lease, row["delivery_id"]),
-                )
-                work.append(
-                    DeliveryWork(
-                        delivery_id=row["delivery_id"],
-                        attempts=int(row["attempts"]),
-                        event=_integration_event_from_row(row),
-                        webhook=_webhook_record_from_row(webhook_row),
-                    )
-                )
+                item = self._claim_one(conn, row, lease, stamp)
+                if item is not None:
+                    work.append(item)
         return work
+
+    def _claim_one(
+        self, conn: sqlite3.Connection, row: sqlite3.Row, lease: str, stamp: str
+    ) -> DeliveryWork | None:
+        """Leases one delivery, or marks it dead if its destination is gone
+        or disabled."""
+        if row["destination_type"] == "ticketing":
+            ticketing = conn.execute(
+                "SELECT * FROM ticketing_integrations WHERE integration_id = ? "
+                "AND status = 'active'",
+                (row["webhook_id"],),
+            ).fetchone()
+            webhook = None
+        else:
+            ticketing = None
+            webhook = conn.execute(
+                "SELECT * FROM webhooks WHERE webhook_id = ? AND status = 'active'",
+                (row["webhook_id"],),
+            ).fetchone()
+        if webhook is None and ticketing is None:
+            _finish_delivery(
+                conn, row["delivery_id"], "dead", "destination removed or disabled", stamp, None
+            )
+            return None
+        conn.execute(
+            "UPDATE integration_deliveries SET status = 'in_flight', lease_until = ? "
+            "WHERE delivery_id = ?",
+            (lease, row["delivery_id"]),
+        )
+        return DeliveryWork(
+            delivery_id=row["delivery_id"],
+            attempts=int(row["attempts"]),
+            event=_integration_event_from_row(row),
+            webhook=None if webhook is None else _webhook_record_from_row(webhook, self.secret_box),
+            ticketing=None if ticketing is None else _ticketing_record_from_row(ticketing),
+        )
+
+    def create_ticketing_integration(
+        self,
+        *,
+        organization_id: str,
+        actor_account_id: str,
+        provider: str,
+        name: str,
+        config: dict[str, str],
+        credential: dict[str, str],
+        event_types: tuple[str, ...],
+    ) -> TicketingIntegrationRecord:
+        """The credential is sealed before it touches the database; without
+        a configured key this refuses (SecretsUnavailableError)."""
+        if self.secret_box is None:
+            raise SecretsUnavailableError("HYDRA_API_SECRETS_KEYS is not configured")
+        integration_id = secrets.token_hex(16)
+        now = _now_iso()
+        sealed = self.secret_box.seal(json.dumps(credential, sort_keys=True))
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO ticketing_integrations (integration_id, organization_id, provider, "
+                "name, config_json, credential, event_types_json, created_by_account_id, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    integration_id,
+                    organization_id,
+                    provider,
+                    name,
+                    json.dumps(config, sort_keys=True),
+                    sealed,
+                    json.dumps(list(event_types)),
+                    actor_account_id,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM ticketing_integrations WHERE integration_id = ?", (integration_id,)
+            ).fetchone()
+        return _ticketing_record_from_row(row)
+
+    def list_ticketing_integrations(self, organization_id: str) -> list[TicketingIntegrationRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ticketing_integrations WHERE organization_id = ? "
+                "ORDER BY created_at, integration_id",
+                (organization_id,),
+            ).fetchall()
+        return [_ticketing_record_from_row(row) for row in rows]
+
+    def get_ticketing_integration(
+        self, organization_id: str, integration_id: str
+    ) -> TicketingIntegrationRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM ticketing_integrations WHERE organization_id = ? "
+                "AND integration_id = ?",
+                (organization_id, integration_id),
+            ).fetchone()
+        return None if row is None else _ticketing_record_from_row(row)
+
+    def remove_ticketing_integration(self, organization_id: str, integration_id: str) -> bool:
+        """Disables it and erases its credential; its ticket links stay as
+        history. Queued deliveries to it become dead when claimed."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE ticketing_integrations SET status = 'disabled', credential = '', "
+                "updated_at = ? WHERE organization_id = ? AND integration_id = ? "
+                "AND status = 'active'",
+                (_now_iso(), organization_id, integration_id),
+            )
+        return bool(cursor.rowcount)
+
+    def record_ticketing_outcome(
+        self, integration_id: str, *, error: str | None, disable_after: int
+    ) -> None:
+        """Success resets the failure streak; a dead delivery extends it and
+        disables the integration at `disable_after`, atomically."""
+        with self._connect() as conn:
+            if error is None:
+                conn.execute(
+                    "UPDATE ticketing_integrations SET consecutive_failures = 0, "
+                    "last_error = NULL, updated_at = ? WHERE integration_id = ?",
+                    (_now_iso(), integration_id),
+                )
+                return
+            conn.execute(
+                "UPDATE ticketing_integrations SET consecutive_failures = consecutive_failures + 1, "
+                "last_error = ?, updated_at = ?, status = CASE WHEN consecutive_failures + 1 >= ? "
+                "THEN 'disabled' ELSE status END WHERE integration_id = ?",
+                (error, _now_iso(), disable_after, integration_id),
+            )
+
+    def get_ticket_link(self, integration_id: str, exposure_id: str) -> tuple[str, str] | None:
+        """(external_key, external_url) of the ticket already created."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT external_key, external_url FROM ticketing_links "
+                "WHERE integration_id = ? AND exposure_id = ?",
+                (integration_id, exposure_id),
+            ).fetchone()
+        return None if row is None else (str(row[0]), str(row[1]))
+
+    def link_ticket(
+        self,
+        *,
+        organization_id: str,
+        integration_id: str,
+        exposure_id: str,
+        external_key: str,
+        external_url: str,
+    ) -> None:
+        """Records the created ticket and, if the exposure's remediation has
+        no ticket link yet, sets it (as an audited remediation event by the
+        integration)."""
+        stamp = _now_iso()
+        actor = f"integration:{integration_id}"
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR IGNORE INTO ticketing_links (integration_id, exposure_id, "
+                "organization_id, external_key, external_url, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (integration_id, exposure_id, organization_id, external_key, external_url, stamp),
+            )
+            if _remediation_row(conn, organization_id, exposure_id).ticket_url is None:
+                _set_remediation_field(
+                    conn, organization_id, exposure_id, "ticket_url", external_url, actor, stamp
+                )
+                _remediation_event(
+                    conn,
+                    organization_id,
+                    exposure_id,
+                    actor,
+                    "ticket_changed",
+                    None,
+                    external_url,
+                    None,
+                    stamp,
+                )
 
     def record_delivery_attempt(
         self, delivery_id: str, *, error: str | None, now: datetime, retry_at: datetime | None
@@ -3680,20 +3899,21 @@ class ControlDB:
                 "ORDER BY d.created_at DESC, d.delivery_id LIMIT ? OFFSET ?",
                 (webhook_id, account_id, limit, offset),
             ).fetchall()
-        return [
-            DeliveryRecord(
-                delivery_id=row["delivery_id"],
-                event_id=row["event_id"],
-                event_type=row["event_type"],
-                status=row["status"],
-                attempts=row["attempts"],
-                next_attempt_at=row["next_attempt_at"],
-                last_error=row["last_error"],
-                delivered_at=row["delivered_at"],
-                created_at=row["created_at"],
-            )
-            for row in rows
-        ]
+        return [_delivery_record_from_row(row) for row in rows]
+
+    def list_deliveries_for_ticketing(
+        self, integration_id: str, *, limit: int, offset: int
+    ) -> list[DeliveryRecord]:
+        """Caller must first check the integration belongs to the organization."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT d.*, e.event_type FROM integration_deliveries d "
+                "JOIN integration_events e ON e.event_id = d.event_id "
+                "WHERE d.webhook_id = ? AND d.destination_type = 'ticketing' "
+                "ORDER BY d.created_at DESC, d.delivery_id LIMIT ? OFFSET ?",
+                (integration_id, limit, offset),
+            ).fetchall()
+        return [_delivery_record_from_row(row) for row in rows]
 
     def redeliver(self, webhook_id: str, delivery_id: str, account_id: str) -> bool:
         """Puts a dead or delivered delivery back in the queue, due now.
@@ -5796,6 +6016,28 @@ class ControlDB:
             ).fetchone()
         return int(row["c"])
 
+    def seal_plaintext_secrets(self) -> int:
+        """With a key configured, seals every webhook secret still stored in
+        plaintext (written before encryption existed or without a key).
+        Idempotent; returns how many were sealed."""
+        if self.secret_box is None:
+            return 0
+        sealed = 0
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT webhook_id, secret FROM webhooks "
+                "WHERE secret != '' AND substr(secret, 1, ?) != ?",
+                (len(SEALED_PREFIX), SEALED_PREFIX),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE webhooks SET secret = ? WHERE webhook_id = ?",
+                    (self.secret_box.seal(row["secret"]), row["webhook_id"]),
+                )
+                sealed += 1
+        return sealed
+
     def create_webhook(
         self,
         *,
@@ -5822,7 +6064,7 @@ class ControlDB:
                     webhook_id,
                     account_id,
                     url,
-                    secret,
+                    self.secret_box.seal(secret) if self.secret_box else secret,
                     json.dumps(list(event_types)),
                     now,
                     now,
@@ -5858,14 +6100,14 @@ class ControlDB:
                 "SELECT * FROM webhooks WHERE webhook_id = ? AND account_id = ?",
                 (webhook_id, account_id),
             ).fetchone()
-        return None if row is None else _webhook_record_from_row(row)
+        return None if row is None else _webhook_record_from_row(row, self.secret_box)
 
     def list_webhooks_for_account(self, account_id: str) -> list[WebhookRecord]:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM webhooks WHERE account_id = ? ORDER BY created_at", (account_id,)
             ).fetchall()
-        return [_webhook_record_from_row(row) for row in rows]
+        return [_webhook_record_from_row(row, self.secret_box) for row in rows]
 
     def list_active_webhooks_for_event(
         self, account_id: str, event_type: str
@@ -5884,7 +6126,7 @@ class ControlDB:
         return [
             record
             for row in rows
-            if event_type in (record := _webhook_record_from_row(row)).event_types
+            if event_type in (record := _webhook_record_from_row(row, self.secret_box)).event_types
         ]
 
     def delete_webhook(self, webhook_id: str, account_id: str) -> bool:
@@ -6882,7 +7124,36 @@ def _enqueue_integration_event(
                 "account_id, next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (secrets.token_hex(16), event_id, row["webhook_id"], row["account_id"], now, now),
             )
+    if organization_id is not None:
+        _fan_out_to_ticketing(conn, event_id, organization_id, event_type, now)
     return event_id
+
+
+def _fan_out_to_ticketing(
+    conn: sqlite3.Connection, event_id: str, organization_id: str, event_type: str, now: str
+) -> None:
+    """Organization events also go to the organization's active, subscribed
+    ticketing integrations (Phase 08b). The delivery's account is the
+    integration's creator, for accountability in the delivery log."""
+    for row in conn.execute(
+        "SELECT integration_id, created_by_account_id, event_types_json "
+        "FROM ticketing_integrations WHERE organization_id = ? AND status = 'active'",
+        (organization_id,),
+    ).fetchall():
+        if event_type in json.loads(row["event_types_json"]):
+            conn.execute(
+                "INSERT INTO integration_deliveries (delivery_id, event_id, webhook_id, "
+                "destination_type, account_id, next_attempt_at, created_at) "
+                "VALUES (?, ?, ?, 'ticketing', ?, ?, ?)",
+                (
+                    secrets.token_hex(16),
+                    event_id,
+                    row["integration_id"],
+                    row["created_by_account_id"],
+                    now,
+                    now,
+                ),
+            )
 
 
 def _exposure_brief(conn: sqlite3.Connection, exposure_id: str) -> dict[str, object]:
@@ -6984,6 +7255,37 @@ def _finish_delivery(
     )
 
 
+def _ticketing_record_from_row(row: sqlite3.Row) -> TicketingIntegrationRecord:
+    return TicketingIntegrationRecord(
+        integration_id=row["integration_id"],
+        organization_id=row["organization_id"],
+        provider=row["provider"],
+        name=row["name"],
+        config=json.loads(row["config_json"]),
+        sealed_credential=row["credential"],
+        event_types=tuple(json.loads(row["event_types_json"])),
+        status=row["status"],
+        consecutive_failures=int(row["consecutive_failures"]),
+        last_error=row["last_error"],
+        created_by_account_id=row["created_by_account_id"],
+        created_at=row["created_at"],
+    )
+
+
+def _delivery_record_from_row(row: sqlite3.Row) -> DeliveryRecord:
+    return DeliveryRecord(
+        delivery_id=row["delivery_id"],
+        event_id=row["event_id"],
+        event_type=row["event_type"],
+        status=row["status"],
+        attempts=row["attempts"],
+        next_attempt_at=row["next_attempt_at"],
+        last_error=row["last_error"],
+        delivered_at=row["delivered_at"],
+        created_at=row["created_at"],
+    )
+
+
 def _integration_event_from_row(row: sqlite3.Row) -> IntegrationEventRecord:
     return IntegrationEventRecord(
         event_id=row["event_id"],
@@ -7066,12 +7368,13 @@ def _monitored_domain_record_from_row(row: sqlite3.Row) -> MonitoredDomainRecord
     )
 
 
-def _webhook_record_from_row(row: sqlite3.Row) -> WebhookRecord:
+def _webhook_record_from_row(row: sqlite3.Row, box: SecretBox | None = None) -> WebhookRecord:
+    """`secret` is always the plaintext signing secret (revealed if sealed)."""
     return WebhookRecord(
         webhook_id=row["webhook_id"],
         account_id=row["account_id"],
         url=row["url"],
-        secret=row["secret"],
+        secret=reveal(row["secret"], box),
         event_types=tuple(json.loads(row["event_types_json"])),
         status=row["status"],
         consecutive_failures=row["consecutive_failures"],
