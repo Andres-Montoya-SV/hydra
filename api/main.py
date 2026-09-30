@@ -28,15 +28,19 @@ from api.rate_limit import PersistentTokenBucketLimiter
 from api.reconciliation_worker import run_reconciliation_loop
 from api.routers import (
     accounts,
+    asset_context,
     collection,
     domains,
     easm,
     explanations,
+    exports,
     exposures,
     health,
     hypotheses,
+    imports,
     keys,
     monitoring,
+    remediation,
     reportability,
     scans,
     scope,
@@ -251,10 +255,14 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(keys.router)
     app.include_router(domains.router)
     app.include_router(exposures.router)
+    app.include_router(remediation.router)
     app.include_router(easm.router)
+    app.include_router(asset_context.router)
     app.include_router(explanations.router)
     app.include_router(collection.router)
     app.include_router(scope.router)
+    app.include_router(imports.router)
+    app.include_router(exports.router)
     app.include_router(monitoring.router)
     app.include_router(scans.router)
     app.include_router(reportability.router)

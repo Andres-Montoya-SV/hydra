@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import re
 from typing import Literal
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from core.remediation import to_utc_iso
 
 # A minimal, pragmatic format check — not full RFC 5322 validation
 # (pydantic's `EmailStr` would need the `email-validator` extra, a new
@@ -232,6 +235,11 @@ class ProviderRunOutcomeResponse(BaseModel):
     outcome: ProviderOutcome
     output_lines: int
     recorded_at: str
+    # For degraded outcomes: "transient" (re-running is likely to help),
+    # "configuration" (enabled but not installed: fix setup first) or
+    # "unknown". None when the collector didn't fail. Scans recorded before
+    # this field existed report None.
+    failure_class: Literal["transient", "configuration", "unknown"] | None = None
 
 
 class ScanCollectionResponse(BaseModel):
@@ -240,6 +248,25 @@ class ScanCollectionResponse(BaseModel):
     # ran — a completed scan is not necessarily a clean one.
     degraded: bool
     outcomes: list[ProviderRunOutcomeResponse]
+
+
+class ScanChangeSummaryResponse(BaseModel):
+    """What this scan changed, as counts. Lifecycle keys are the change
+    detector's states (new, changed, disappeared, reappeared); exposure keys
+    are history events (observed, reopened, resolved)."""
+
+    scan_id: str
+    status: str
+    # A degraded scan's counts can under-report (a collector didn't run
+    # cleanly); see GET /scans/{id}/collection for which one.
+    degraded: bool
+    assets_observed: int
+    asset_lifecycle: dict[str, int]
+    exposures_first_seen: int
+    exposure_events: dict[str, int]
+    certificate_events: dict[str, int]
+    technology_events: dict[str, int]
+    candidates_first_seen: int
 
 
 class MonitoringNotificationResponse(BaseModel):
@@ -534,6 +561,14 @@ class ExposureReportEntryResponse(BaseModel):
     risk_reasons: list[str]
 
 
+class RiskFactorResponse(BaseModel):
+    name: str
+    value: str
+    source: Literal["observed", "declared", "unknown"]
+    effect: Literal["escalates", "de-escalates", "caps", "none"]
+    reason: str
+
+
 class ExposureRiskResponse(BaseModel):
     """Fase 21: deterministic, explainable risk/criticality — `level` is
     never returned without `reasons`, the phase's own explicit
@@ -542,6 +577,11 @@ class ExposureRiskResponse(BaseModel):
     exposure_id: str
     level: Literal["low", "medium", "high", "critical"]
     reasons: list[str]
+    # Productization Phase 06: every factor considered — its value, whether
+    # it was observed by Hydra or declared by the organization, and what it
+    # did to the level — plus the signals that could not be assessed.
+    factors: list[RiskFactorResponse] = []
+    unknowns: list[str] = []
 
 
 # Fase 19 (EASM roadmap) — API surface for the domain model Fases 02-18
@@ -864,3 +904,201 @@ class AnalystProvenanceResponse(BaseModel):
     # Per-tool observations from the asset's most recent run (hosts only).
     run_id: str | None = None
     tool_provenance: list[RawToolProvenanceResponse]
+
+
+class ImportSummaryResponse(BaseModel):
+    """What one Nmap/Masscan import did. Imported hosts become candidates or
+    corroborating evidence, never authorized targets."""
+
+    source: Literal["nmap", "masscan"]
+    dry_run: bool
+    # The same bytes were imported before; nothing new was written.
+    already_imported: bool
+    hosts_parsed: int
+    hosts_skipped_invalid_ip: int
+    batch_id: str | None = None
+    observations_recorded_on_known_assets: int = 0
+    candidates_created: int = 0
+    candidates_touched: int = 0
+    malformed_drafts_skipped: int = 0
+
+
+class ImportBatchResponse(BaseModel):
+    batch_id: str
+    source: str
+    imported_at: str
+    imported_by_account_id: str
+    artifact_sha256: str | None = None
+
+
+class FacetCountResponse(BaseModel):
+    value: str
+    count: int
+
+
+class InventoryFacetsResponse(BaseModel):
+    """Counts across the organization's inventory. Technologies count each
+    asset's current technologies only (its latest run); ports are
+    "port/protocol" across known port assets."""
+
+    assets_by_type: dict[str, int]
+    # status -> severity -> count
+    exposures_by_status: dict[str, dict[str, int]]
+    candidates_by_review_status: dict[str, int]
+    technologies: list[FacetCountResponse]
+    open_ports: list[FacetCountResponse]
+
+
+class AssetBusinessContextRequest(BaseModel):
+    """Replaces the asset's declared context; null / empty clears a field.
+    Declared by the organization, never inferred."""
+
+    environment: Literal["production", "staging", "development", "test"] | None = None
+    criticality: Literal["critical", "high", "medium", "low"] | None = None
+    data_handled: list[Literal["identity", "payment", "personal_data"]] = Field(
+        default_factory=list, max_length=3
+    )
+    owner: str | None = Field(default=None, max_length=200)
+
+    @field_validator("owner")
+    @classmethod
+    def _owner_is_plain_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if any(ord(ch) < 32 for ch in value):
+            raise ValueError("owner must not contain control characters")
+        return value or None
+
+
+class AssetBusinessContextResponse(BaseModel):
+    asset_id: str
+    # False when nothing has been declared yet (all fields unknown).
+    declared: bool
+    environment: str | None = None
+    criticality: str | None = None
+    data_handled: list[str] = []
+    owner: str | None = None
+
+
+class AssetContextAuditResponse(BaseModel):
+    audit_id: str
+    actor_account_id: str
+    before: dict[str, object] | None = None
+    after: dict[str, object]
+    created_at: str
+
+
+RemediationState = Literal[
+    "triage", "in_progress", "fixed_pending_verification", "accepted_risk", "false_positive"
+]
+
+
+class RemediationTransitionRequest(BaseModel):
+    to_state: RemediationState
+    # Required for accepted_risk / false_positive.
+    reason: str | None = Field(default=None, max_length=1000)
+    # Required for accepted_risk: an ISO-8601 time with timezone, at most a year ahead.
+    accepted_until: str | None = Field(default=None, max_length=64)
+
+    @field_validator("accepted_until")
+    @classmethod
+    def _utc(cls, value: str | None) -> str | None:
+        return None if value is None else to_utc_iso(value, field="accepted_until")
+
+
+class RemediationFieldsRequest(BaseModel):
+    """Only the fields present in the request change; null clears one."""
+
+    assignee_account_id: str | None = Field(default=None, max_length=64)
+    due_at: str | None = Field(default=None, max_length=64)
+    ticket_url: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("due_at")
+    @classmethod
+    def _due_utc(cls, value: str | None) -> str | None:
+        return None if value is None else to_utc_iso(value, field="due_at")
+
+    @field_validator("ticket_url")
+    @classmethod
+    def _https_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlparse(value)
+        if parsed.scheme != "https" or not parsed.netloc or any(c.isspace() for c in value):
+            raise ValueError("ticket_url must be an https URL")
+        return value
+
+
+class RemediationCommentRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("body")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("comment must not be blank")
+        return value.strip()
+
+
+class RemediationBulkRequest(BaseModel):
+    """Apply one change to up to 100 exposures, all or nothing."""
+
+    exposure_ids: list[str] = Field(min_length=1, max_length=100)
+    transition: RemediationTransitionRequest | None = None
+    fields: RemediationFieldsRequest | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_action(self) -> RemediationBulkRequest:
+        if (self.transition is None) == (self.fields is None):
+            raise ValueError("give exactly one of transition or fields")
+        if len(set(self.exposure_ids)) != len(self.exposure_ids):
+            raise ValueError("exposure_ids must be unique")
+        return self
+
+
+class RemediationResponse(BaseModel):
+    exposure_id: str
+    # What to act on: the stored decision adjusted for what detection saw
+    # since (resolved -> closed, expired acceptance -> triage, re-detected
+    # after a fix claim -> in_progress). `derived_reason` says why.
+    state: Literal[
+        "triage",
+        "in_progress",
+        "fixed_pending_verification",
+        "accepted_risk",
+        "false_positive",
+        "closed",
+    ]
+    stored_state: RemediationState
+    derived_reason: str | None = None
+    state_reason: str | None = None
+    state_changed_at: str | None = None
+    accepted_until: str | None = None
+    assignee_account_id: str | None = None
+    due_at: str
+    sla_due_at: str
+    overdue: bool
+    ticket_url: str | None = None
+    updated_at: str | None = None
+
+
+class WorklistItemResponse(BaseModel):
+    exposure_id: str
+    asset_id: str
+    title: str
+    severity: str
+    exposure_status: str
+    remediation: RemediationResponse
+
+
+class RemediationEventResponse(BaseModel):
+    event_id: str
+    actor_account_id: str
+    event_type: Literal[
+        "state_changed", "assignee_changed", "due_at_changed", "ticket_changed", "comment"
+    ]
+    from_value: str | None = None
+    to_value: str | None = None
+    body: str | None = None
+    created_at: str

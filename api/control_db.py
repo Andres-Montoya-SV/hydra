@@ -52,7 +52,7 @@ from api.observation_identity import (
 )
 from api.relationship_identity import RelationshipDraft
 from api.technology_catalog import parse_technology_detail
-from core.risk_scoring import RiskFactors
+from core.risk_scoring import BusinessContext, RiskFactors
 from core.store import connect_sqlite
 
 _SCHEMA = """
@@ -432,6 +432,69 @@ CREATE TABLE IF NOT EXISTS capability_audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_capability_audit_org
     ON capability_audit_log(organization_id, created_at);
+-- Productization Phase 07: the human remediation workflow for an exposure,
+-- kept apart from detection truth (exposures / exposure_evidence /
+-- exposure_history are never changed by it). No row = default "triage".
+-- The effective state (closed / expired acceptance / failed verification)
+-- is derived on read, see core/remediation.py.
+CREATE TABLE IF NOT EXISTS exposure_remediation (
+    exposure_id TEXT PRIMARY KEY REFERENCES exposures(exposure_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    state TEXT NOT NULL DEFAULT 'triage' CHECK(state IN ('triage', 'in_progress',
+        'fixed_pending_verification', 'accepted_risk', 'false_positive')),
+    state_changed_at TEXT,
+    state_reason TEXT,
+    accepted_until TEXT,
+    assignee_account_id TEXT,
+    due_at TEXT,
+    ticket_url TEXT,
+    updated_by_account_id TEXT,
+    updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_exposure_remediation_org
+    ON exposure_remediation(organization_id, state, assignee_account_id);
+-- Append-only: every state change, assignment, due date, ticket link and
+-- comment, with who and when.
+CREATE TABLE IF NOT EXISTS remediation_events (
+    event_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    exposure_id TEXT NOT NULL REFERENCES exposures(exposure_id),
+    actor_account_id TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN
+        ('state_changed', 'assignee_changed', 'due_at_changed', 'ticket_changed', 'comment')),
+    from_value TEXT,
+    to_value TEXT,
+    body TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_remediation_events
+    ON remediation_events(organization_id, exposure_id, created_at);
+-- Productization Phase 06: business context the organization declares per
+-- asset (never inferred). Feeds the deterministic risk engine. Each change
+-- is appended to asset_business_context_audit in the same transaction.
+CREATE TABLE IF NOT EXISTS asset_business_context (
+    asset_id TEXT PRIMARY KEY REFERENCES assets(asset_id),
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    environment TEXT CHECK(environment IS NULL OR environment IN
+        ('production', 'staging', 'development', 'test')),
+    criticality TEXT CHECK(criticality IS NULL OR criticality IN
+        ('critical', 'high', 'medium', 'low')),
+    data_handled_json TEXT NOT NULL DEFAULT '[]',
+    owner TEXT,
+    updated_by_account_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS asset_business_context_audit (
+    audit_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+    asset_id TEXT NOT NULL REFERENCES assets(asset_id),
+    actor_account_id TEXT NOT NULL,
+    before_json TEXT,
+    after_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_asset_business_context_audit
+    ON asset_business_context_audit(organization_id, asset_id, created_at);
 -- Roadmap v2: targets an organization never wants collected against, in
 -- SCOPE_FILE `!pattern` syntax. Removal is a soft delete (removed_at/by and
 -- the reason stay), so the exclusion history is never lost. At most one
@@ -472,6 +535,9 @@ CREATE TABLE IF NOT EXISTS provider_run_outcomes (
     outcome TEXT NOT NULL,
     output_lines INTEGER NOT NULL DEFAULT 0,
     recorded_at TEXT NOT NULL,
+    -- transient / configuration / unknown for degraded outcomes, NULL
+    -- otherwise (core/provider_contract.py::failure_class).
+    failure_class TEXT,
     PRIMARY KEY (run_id, provider)
 );
 CREATE INDEX IF NOT EXISTS idx_provider_run_outcomes_org
@@ -1331,6 +1397,70 @@ class CapabilityAuditRecord:
 
 
 @dataclass(frozen=True)
+class RunChangeSummary:
+    """What one scan changed for its organization, as counts."""
+
+    assets_observed: int
+    asset_lifecycle: dict[str, int]
+    exposures_first_seen: int
+    exposure_events: dict[str, int]
+    certificate_events: dict[str, int]
+    technology_events: dict[str, int]
+    candidates_first_seen: int
+
+
+@dataclass(frozen=True)
+class InventoryFacets:
+    """Counts across an organization's inventory, for filters and dashboards."""
+
+    assets_by_type: dict[str, int]
+    exposures_by_status: dict[str, dict[str, int]]
+    candidates_by_review_status: dict[str, int]
+    # Most common first, at most `top` entries: (name, asset count).
+    technologies: list[tuple[str, int]]
+    # Most common first, at most `top`: ("443/tcp", port asset count).
+    open_ports: list[tuple[str, int]]
+
+
+@dataclass(frozen=True)
+class AssetContextAuditRecord:
+    audit_id: str
+    actor_account_id: str
+    before: dict[str, object] | None
+    after: dict[str, object]
+    created_at: str
+
+
+@dataclass(frozen=True)
+class RemediationRecord:
+    exposure_id: str
+    state: str
+    state_changed_at: str | None = None
+    state_reason: str | None = None
+    accepted_until: str | None = None
+    assignee_account_id: str | None = None
+    due_at: str | None = None
+    ticket_url: str | None = None
+    updated_by_account_id: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(frozen=True)
+class RemediationEventRecord:
+    event_id: str
+    actor_account_id: str
+    event_type: str
+    from_value: str | None
+    to_value: str | None
+    body: str | None
+    created_at: str
+
+
+class RemediationNotFoundError(LookupError):
+    """One or more exposure ids don't belong to the organization."""
+
+
+@dataclass(frozen=True)
 class ScopeExclusionRecord:
     exclusion_id: str
     organization_id: str
@@ -1371,6 +1501,7 @@ class ProviderRunOutcomeRecord:
     outcome: str
     output_lines: int
     recorded_at: str
+    failure_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1583,6 +1714,7 @@ _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 # Durable-queue fix: an existing `scans` table (every account with a
 # scan predating this fix) needs these three columns added the same way
 # `accounts` needed its email-verification columns added.
+_PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("failure_class", "TEXT"),)
 _SCANS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ("worker_id", "TEXT"),
@@ -1735,6 +1867,9 @@ class ControlDB:
         with self._connect() as conn:
             _migrate_table_columns(conn, "accounts", _ACCOUNTS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "scans", _SCANS_MIGRATION_COLUMNS)
+            _migrate_table_columns(
+                conn, "provider_run_outcomes", _PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS
+            )
             _migrate_table_columns(conn, "subscriptions", _SUBSCRIPTIONS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "candidate_assets", _CANDIDATE_ASSETS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "evidence", _EVIDENCE_MIGRATION_COLUMNS)
@@ -2906,46 +3041,48 @@ class ControlDB:
                 (datetime.fromisoformat(now) - datetime.fromisoformat(exposure.first_seen_at)).days,
             )
 
-        related_to_critical_asset = False
-        related_reason: str | None = None
-        if asset is not None:
-            edges, _truncated = self.relationship_neighborhood(
-                organization_id, exposure.asset_id, max_depth=1
-            )
-            neighbor_asset_ids = {
-                (
-                    edge.target_asset_id
-                    if edge.source_asset_id == exposure.asset_id
-                    else edge.source_asset_id
-                )
-                for edge in edges
-            } - {exposure.asset_id, None}
-            for neighbor_asset_id in sorted(a for a in neighbor_asset_ids if a):
-                neighbor_exposures = self.list_exposures_for_organization(
-                    organization_id, asset_id=neighbor_asset_id, status=None
-                )
-                critical_neighbor = next(
-                    (
-                        e
-                        for e in neighbor_exposures
-                        if e.status in ("open", "reopened") and e.severity in ("high", "critical")
-                    ),
-                    None,
-                )
-                if critical_neighbor is not None:
-                    related_to_critical_asset = True
-                    related_reason = (
-                        f"related to asset {neighbor_asset_id} which has its own open "
-                        f"{critical_neighbor.severity} exposure ({critical_neighbor.title})"
-                    )
-                    break
+        related_reason = (
+            self._critical_neighbor_reason(organization_id, exposure.asset_id)
+            if asset is not None
+            else None
+        )
 
         return RiskFactors(
             severity=exposure.severity,
             domain_verified=domain_verified,
             days_open=days_open,
-            related_to_critical_asset=related_to_critical_asset,
+            related_to_critical_asset=related_reason is not None,
             related_critical_asset_reason=related_reason,
+            context=self.get_asset_business_context(organization_id, exposure.asset_id),
+            confidence_score=exposure.confidence_score,
+            detected_location=exposure.location or None,
+        )
+
+    def _critical_neighbor_reason(self, organization_id: str, asset_id: str) -> str | None:
+        """Why the asset counts as related to a critical one: the first
+        directly related asset (Fase 07 graph, depth 1, in asset_id order)
+        with its own open high/critical exposure, or None. One query for
+        all neighbors, not one per neighbor."""
+        edges, _truncated = self.relationship_neighborhood(organization_id, asset_id, max_depth=1)
+        neighbor_asset_ids = {
+            edge.target_asset_id if edge.source_asset_id == asset_id else edge.source_asset_id
+            for edge in edges
+        } - {asset_id, None}
+        if not neighbor_asset_ids:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT asset_id, severity, title FROM exposures "
+                "WHERE organization_id = ? AND asset_id IN (SELECT value FROM json_each(?)) "
+                "AND status IN ('open', 'reopened') AND severity IN ('high', 'critical') "
+                "ORDER BY asset_id, last_seen_at DESC, exposure_id LIMIT 1",
+                (organization_id, json.dumps(sorted(a for a in neighbor_asset_ids if a))),
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            f"related to asset {row['asset_id']} which has its own open "
+            f"{row['severity']} exposure ({row['title']})"
         )
 
     def list_exposures_for_organization(
@@ -3050,6 +3187,349 @@ class ControlDB:
             )
         return None if previous is None else str(previous["risk_level"])
 
+    def get_asset_business_context(
+        self, organization_id: str, asset_id: str
+    ) -> BusinessContext | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM asset_business_context WHERE organization_id = ? AND asset_id = ?",
+                (organization_id, asset_id),
+            ).fetchone()
+        return None if row is None else _business_context_from_row(row)
+
+    def set_asset_business_context(
+        self,
+        *,
+        organization_id: str,
+        asset_id: str,
+        actor_account_id: str,
+        context: BusinessContext,
+    ) -> bool:
+        """Replaces the asset's declared context. Returns False (and writes
+        nothing, no audit entry) when it is unchanged."""
+        now = _now_iso()
+        with self._connect() as conn:
+            # Take the write lock BEFORE reading the previous state, so the
+            # "unchanged?" check and the audit's `before` are exactly the
+            # state this write replaces, even with concurrent owners.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM asset_business_context WHERE organization_id = ? AND asset_id = ?",
+                (organization_id, asset_id),
+            ).fetchone()
+            previous = None if row is None else _business_context_from_row(row)
+            if previous == context:
+                return False
+            conn.execute(
+                "INSERT INTO asset_business_context (asset_id, organization_id, environment, "
+                "criticality, data_handled_json, owner, updated_by_account_id, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(asset_id) DO UPDATE SET "
+                "environment = excluded.environment, criticality = excluded.criticality, "
+                "data_handled_json = excluded.data_handled_json, owner = excluded.owner, "
+                "updated_by_account_id = excluded.updated_by_account_id, "
+                "updated_at = excluded.updated_at",
+                (
+                    asset_id,
+                    organization_id,
+                    context.environment,
+                    context.criticality,
+                    json.dumps(sorted(context.data_handled)),
+                    context.owner,
+                    actor_account_id,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO asset_business_context_audit (audit_id, organization_id, asset_id, "
+                "actor_account_id, before_json, after_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    secrets.token_hex(16),
+                    organization_id,
+                    asset_id,
+                    actor_account_id,
+                    None if previous is None else json.dumps(_context_dict(previous)),
+                    json.dumps(_context_dict(context)),
+                    now,
+                ),
+            )
+        return True
+
+    def list_asset_business_context_audit(
+        self, organization_id: str, asset_id: str, *, limit: int, offset: int
+    ) -> list[AssetContextAuditRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM asset_business_context_audit WHERE organization_id = ? "
+                "AND asset_id = ? ORDER BY created_at DESC, audit_id LIMIT ? OFFSET ?",
+                (organization_id, asset_id, limit, offset),
+            ).fetchall()
+        return [
+            AssetContextAuditRecord(
+                audit_id=row["audit_id"],
+                actor_account_id=row["actor_account_id"],
+                before=None if row["before_json"] is None else json.loads(row["before_json"]),
+                after=json.loads(row["after_json"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def get_remediation(self, organization_id: str, exposure_id: str) -> RemediationRecord:
+        """The stored remediation record ("triage" when none exists yet)."""
+        with self._connect() as conn:
+            return _remediation_row(conn, organization_id, exposure_id)
+
+    def transition_remediation(
+        self,
+        *,
+        organization_id: str,
+        exposure_ids: list[str],
+        actor_account_id: str,
+        target: str,
+        reason: str | None,
+        accepted_until: str | None,
+        now: datetime,
+    ) -> None:
+        """Moves every exposure to `target`, all or nothing, in one
+        write-locked transaction. Raises RemediationNotFoundError for an id
+        outside the organization and TransitionError (naming each exposure)
+        for a transition the workflow doesn't allow."""
+        from core.remediation import check_transitions, to_utc_iso
+
+        until = (
+            None if accepted_until is None else to_utc_iso(accepted_until, field="accepted_until")
+        )
+        reason = (reason or "").strip() or None
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _effective_states(conn, organization_id, exposure_ids, now)
+            check_transitions(current, target, reason=reason, accepted_until=until, now=now)
+            for exposure_id in exposure_ids:
+                _store_transition(
+                    conn,
+                    organization_id,
+                    exposure_id,
+                    actor_account_id,
+                    from_state=current[exposure_id],
+                    target=target,
+                    reason=reason,
+                    accepted_until=until,
+                    stamp=now.isoformat(),
+                )
+
+    def update_remediation_fields(
+        self,
+        *,
+        organization_id: str,
+        exposure_ids: list[str],
+        actor_account_id: str,
+        changes: dict[str, str | None],
+        now: datetime,
+    ) -> None:
+        """Sets assignee_account_id / due_at / ticket_url (only the keys
+        given; None clears) on every exposure, all or nothing. An assignee
+        must be a member of the organization. Unchanged values add no event."""
+        stamp = now.isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _effective_states(conn, organization_id, exposure_ids, now)  # tenancy check
+            assignee = changes.get("assignee_account_id")
+            if assignee is not None and _role(conn, assignee, organization_id) is None:
+                raise ValueError("assignee is not a member of this organization")
+            for exposure_id in exposure_ids:
+                before = _remediation_row(conn, organization_id, exposure_id)
+                for field, value in changes.items():
+                    old = getattr(before, field)
+                    if old == value:
+                        continue
+                    _set_remediation_field(
+                        conn, organization_id, exposure_id, field, value, actor_account_id, stamp
+                    )
+                    _remediation_event(
+                        conn,
+                        organization_id,
+                        exposure_id,
+                        actor_account_id,
+                        _FIELD_EVENTS[field],
+                        old,
+                        value,
+                        None,
+                        stamp,
+                    )
+
+    def add_remediation_comment(
+        self, *, organization_id: str, exposure_id: str, actor_account_id: str, body: str
+    ) -> None:
+        now = _now_iso()
+        with self._connect() as conn:
+            _require_exposures(conn, organization_id, [exposure_id])
+            _remediation_event(
+                conn,
+                organization_id,
+                exposure_id,
+                actor_account_id,
+                "comment",
+                None,
+                None,
+                body,
+                now,
+            )
+
+    def list_remediation_events(
+        self, organization_id: str, exposure_id: str, *, limit: int, offset: int
+    ) -> list[RemediationEventRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM remediation_events WHERE organization_id = ? AND exposure_id = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+                (organization_id, exposure_id, limit, offset),
+            ).fetchall()
+        return [
+            RemediationEventRecord(
+                event_id=row["event_id"],
+                actor_account_id=row["actor_account_id"],
+                event_type=row["event_type"],
+                from_value=row["from_value"],
+                to_value=row["to_value"],
+                body=row["body"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def remediation_worklist(
+        self,
+        organization_id: str,
+        *,
+        now: datetime,
+        state: str | None = None,
+        assignee_account_id: str | None = None,
+        overdue: bool | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[tuple[ExposureRecord, RemediationRecord, str]]:
+        """Exposures with their remediation, soonest due first, filtered on
+        the EFFECTIVE state. The CASE mirrors core/remediation.py's rule
+        and SLA_DAYS; a test keeps the two in lockstep."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                _WORKLIST_SQL,
+                {
+                    "org": organization_id,
+                    "now": now.isoformat(),
+                    "state": state,
+                    "assignee": assignee_account_id,
+                    "overdue": None if overdue is None else int(overdue),
+                    "limit": limit,
+                    "offset": offset,
+                },
+            ).fetchall()
+            return [
+                (
+                    _exposure_record_from_row(row),
+                    _remediation_row(conn, organization_id, row["exposure_id"]),
+                    str(row["effective_state"]),
+                )
+                for row in rows
+            ]
+
+    def export_assets_page(
+        self, organization_id: str, *, after: str, limit: int
+    ) -> list[AssetRecord]:
+        """Keyset page (asset_id > `after`): stable under concurrent writes,
+        unlike OFFSET over a mutable sort column."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM assets WHERE organization_id = ? AND asset_id > ? "
+                "ORDER BY asset_id LIMIT ?",
+                (organization_id, after, limit),
+            ).fetchall()
+        return [_asset_record_from_row(row) for row in rows]
+
+    def export_exposures_page(
+        self, organization_id: str, *, after: str, limit: int
+    ) -> list[ExposureRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM exposures WHERE organization_id = ? AND exposure_id > ? "
+                "ORDER BY exposure_id LIMIT ?",
+                (organization_id, after, limit),
+            ).fetchall()
+        return [_exposure_record_from_row(row) for row in rows]
+
+    def inventory_facets(self, organization_id: str, *, top: int) -> InventoryFacets:
+        with self._connect() as conn:
+            by_type = conn.execute(
+                "SELECT asset_type, COUNT(*) FROM assets WHERE organization_id = ? "
+                "GROUP BY asset_type",
+                (organization_id,),
+            ).fetchall()
+            exposures: dict[str, dict[str, int]] = {}
+            for status, severity, count in conn.execute(
+                "SELECT status, severity, COUNT(*) FROM exposures WHERE organization_id = ? "
+                "GROUP BY status, severity",
+                (organization_id,),
+            ):
+                exposures.setdefault(str(status), {})[str(severity)] = int(count)
+            candidates = conn.execute(
+                "SELECT review_status, COUNT(*) FROM candidate_assets WHERE organization_id = ? "
+                "GROUP BY review_status",
+                (organization_id,),
+            ).fetchall()
+            technologies = _technology_facet(conn, organization_id, top)
+            ports = _port_facet(conn, organization_id, top)
+        return InventoryFacets(
+            assets_by_type={str(t): int(c) for t, c in by_type},
+            exposures_by_status=exposures,
+            candidates_by_review_status={str(r): int(c) for r, c in candidates},
+            technologies=technologies,
+            open_ports=ports,
+        )
+
+    def run_change_summary(self, organization_id: str, run_id: str) -> RunChangeSummary:
+        """Aggregate counts over the per-run EASM tables, all scoped to the
+        organization (a foreign run id yields zeros)."""
+        params = (organization_id, run_id)
+        with self._connect() as conn:
+
+            def count(sql: str) -> int:
+                return int(conn.execute(sql, params).fetchone()[0])
+
+            def grouped(sql: str) -> dict[str, int]:
+                return {str(row[0]): int(row[1]) for row in conn.execute(sql, params)}
+
+            return RunChangeSummary(
+                assets_observed=count(
+                    "SELECT COUNT(DISTINCT asset_id) FROM observations "
+                    "WHERE organization_id = ? AND run_id = ?"
+                ),
+                asset_lifecycle=grouped(
+                    "SELECT new_state, COUNT(*) FROM change_events "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY new_state"
+                ),
+                exposures_first_seen=count(
+                    "SELECT COUNT(*) FROM exposures "
+                    "WHERE organization_id = ? AND first_seen_run_id = ?"
+                ),
+                exposure_events=grouped(
+                    "SELECT event_type, COUNT(DISTINCT exposure_id) FROM exposure_history "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY event_type"
+                ),
+                certificate_events=grouped(
+                    "SELECT event_type, COUNT(*) FROM certificate_events "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY event_type"
+                ),
+                technology_events=grouped(
+                    "SELECT event_type, COUNT(*) FROM technology_events "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY event_type"
+                ),
+                candidates_first_seen=count(
+                    "SELECT COUNT(*) FROM candidate_assets "
+                    "WHERE organization_id = ? AND first_seen_run_id = ?"
+                ),
+            )
+
     def list_exposure_history_for_run(
         self, organization_id: str, run_id: str
     ) -> list[ExposureHistoryRecord]:
@@ -3071,20 +3551,11 @@ class ControlDB:
         account_id: str,
         run_id: str,
         outcomes: list[tuple[str, str, int]],
+        failure_classes: dict[str, str] | None = None,
     ) -> None:
-        """Persist Fase-09 provider outcomes as durable operational evidence."""
-        allowed_outcomes = {
-            "success_with_results",
-            "success_no_results",
-            "partial",
-            "blocked_by_scope",
-            "skipped",
-            "unavailable",
-            "failed",
-        }
-        for provider, outcome, _output_lines in outcomes:
-            if not provider.strip() or outcome not in allowed_outcomes:
-                raise ValueError("invalid provider execution outcome")
+        """Persist Fase-09 provider outcomes as durable operational evidence.
+        `failure_classes` (provider -> class) is set for degraded outcomes."""
+        _validate_provider_outcomes(outcomes)
         with self._connect() as conn:
             scan = conn.execute(
                 "SELECT account_id, organization_id FROM scans WHERE scan_id = ?",
@@ -3099,12 +3570,12 @@ class ControlDB:
             now = _now_iso()
             for provider, outcome, output_lines in outcomes:
                 conn.execute(
-                    "INSERT INTO provider_run_outcomes "
-                    "(organization_id, account_id, run_id, provider, outcome, output_lines, recorded_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "INSERT INTO provider_run_outcomes (organization_id, account_id, run_id, "
+                    "provider, outcome, output_lines, recorded_at, failure_class) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(run_id, provider) DO UPDATE SET "
                     "outcome=excluded.outcome, output_lines=excluded.output_lines, "
-                    "recorded_at=excluded.recorded_at",
+                    "recorded_at=excluded.recorded_at, failure_class=excluded.failure_class",
                     (
                         organization_id,
                         account_id,
@@ -3113,6 +3584,7 @@ class ControlDB:
                         outcome,
                         max(0, int(output_lines)),
                         now,
+                        (failure_classes or {}).get(provider),
                     ),
                 )
 
@@ -3607,13 +4079,13 @@ class ControlDB:
         return None if row is None else _observation_batch_record_from_row(row)
 
     def list_observation_batches_for_organization(
-        self, organization_id: str
+        self, organization_id: str, *, limit: int | None = None, offset: int = 0
     ) -> list[ObservationBatchRecord]:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM observation_batches WHERE organization_id = ? "
-                "ORDER BY imported_at, batch_id",
-                (organization_id,),
+                "ORDER BY imported_at, batch_id LIMIT ? OFFSET ?",
+                (organization_id, _sql_limit(limit), offset),
             ).fetchall()
         return [_observation_batch_record_from_row(row) for row in rows]
 
@@ -5800,6 +6272,295 @@ def _sql_limit(limit: int | None) -> int:
     return -1 if limit is None else limit
 
 
+def _technology_facet(
+    conn: sqlite3.Connection, organization_id: str, top: int
+) -> list[tuple[str, int]]:
+    """Assets per technology, counting only each asset's CURRENT
+    technologies: those observed in its latest technology run, where the
+    latest run is the one whose earliest observation is newest (ties by
+    run_id), exactly `_latest_run_id_among`. The name is the evidence
+    detail up to "@", exactly `parse_technology_detail`."""
+    rows = conn.execute(
+        "WITH runs AS ("
+        "  SELECT asset_id, run_id, MIN(observed_at) AS started FROM observations"
+        "  WHERE organization_id = ? AND observation_type = ? GROUP BY asset_id, run_id"
+        "), latest AS ("
+        "  SELECT asset_id, run_id FROM ("
+        "    SELECT asset_id, run_id, ROW_NUMBER() OVER ("
+        "      PARTITION BY asset_id ORDER BY started DESC, run_id DESC) AS rn FROM runs"
+        "  ) WHERE rn = 1"
+        ") "
+        "SELECT CASE WHEN instr(e.detail, '@') > 0 "
+        "  THEN substr(e.detail, 1, instr(e.detail, '@') - 1) ELSE e.detail END AS name, "
+        "  COUNT(DISTINCT o.asset_id) AS assets "
+        "FROM observations o "
+        "JOIN latest l ON l.asset_id = o.asset_id AND l.run_id = o.run_id "
+        "JOIN evidence e ON e.evidence_id = o.evidence_id "
+        "WHERE o.organization_id = ? AND o.observation_type = ? "
+        "GROUP BY name ORDER BY assets DESC, name LIMIT ?",
+        (
+            organization_id,
+            OBSERVATION_TYPE_TECHNOLOGY_DETECTED,
+            organization_id,
+            OBSERVATION_TYPE_TECHNOLOGY_DETECTED,
+            top,
+        ),
+    ).fetchall()
+    return [(str(name), int(count)) for name, count in rows]
+
+
+def _port_facet(conn: sqlite3.Connection, organization_id: str, top: int) -> list[tuple[str, int]]:
+    """Port assets per "port/protocol". The identity key is
+    `port:<host>:<port>:<protocol>` and an IPv6 host contains colons, so
+    it is split from the right; only that one column is read."""
+    counts: dict[str, int] = {}
+    for (identity_key,) in conn.execute(
+        "SELECT identity_key FROM assets WHERE organization_id = ? AND asset_type = 'port'",
+        (organization_id,),
+    ):
+        parts = str(identity_key).rsplit(":", 2)
+        if len(parts) == 3:
+            label = f"{parts[1]}/{parts[2]}"
+            counts[label] = counts.get(label, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:top]
+
+
+_RECORDABLE_OUTCOMES = frozenset(
+    {
+        "success_with_results",
+        "success_no_results",
+        "partial",
+        "blocked_by_scope",
+        "skipped",
+        "unavailable",
+        "failed",
+    }
+)
+
+
+def _validate_provider_outcomes(outcomes: list[tuple[str, str, int]]) -> None:
+    for provider, outcome, _output_lines in outcomes:
+        if not provider.strip() or outcome not in _RECORDABLE_OUTCOMES:
+            raise ValueError("invalid provider execution outcome")
+
+
+def _business_context_from_row(row: sqlite3.Row) -> BusinessContext:
+    return BusinessContext(
+        environment=row["environment"],
+        criticality=row["criticality"],
+        data_handled=frozenset(json.loads(row["data_handled_json"] or "[]")),
+        owner=row["owner"],
+    )
+
+
+def _context_dict(context: BusinessContext) -> dict[str, object]:
+    return {
+        "environment": context.environment,
+        "criticality": context.criticality,
+        "data_handled": sorted(context.data_handled),
+        "owner": context.owner,
+    }
+
+
+_WORKLIST_SQL = (
+    "WITH w AS ("
+    " SELECT e.*, r.assignee_account_id AS assignee,"
+    "  CASE"
+    "   WHEN e.status = 'resolved' THEN 'closed'"
+    "   WHEN r.state = 'accepted_risk' AND r.accepted_until IS NOT NULL"
+    "        AND julianday(r.accepted_until) <= julianday(:now) THEN 'triage'"
+    "   WHEN r.state = 'fixed_pending_verification' AND r.state_changed_at IS NOT NULL"
+    "        AND julianday(e.last_seen_at) > julianday(r.state_changed_at) THEN 'in_progress'"
+    "   ELSE COALESCE(r.state, 'triage')"
+    "  END AS effective_state,"
+    "  COALESCE(r.due_at, strftime('%Y-%m-%dT%H:%M:%S+00:00', e.first_seen_at,"
+    "   CASE e.severity WHEN 'critical' THEN '+7 days' WHEN 'high' THEN '+30 days'"
+    "    WHEN 'medium' THEN '+90 days' ELSE '+180 days' END)) AS effective_due"
+    " FROM exposures e LEFT JOIN exposure_remediation r ON r.exposure_id = e.exposure_id"
+    " WHERE e.organization_id = :org"
+    ") "
+    "SELECT * FROM w"
+    " WHERE (:state IS NULL OR effective_state = :state)"
+    "  AND (:assignee IS NULL OR assignee = :assignee)"
+    "  AND (:overdue IS NULL OR (effective_state IN ('triage', 'in_progress')"
+    "       AND julianday(effective_due) < julianday(:now)) = :overdue)"
+    " ORDER BY julianday(effective_due), exposure_id LIMIT :limit OFFSET :offset"
+)
+
+_FIELD_EVENTS = {
+    "assignee_account_id": "assignee_changed",
+    "due_at": "due_at_changed",
+    "ticket_url": "ticket_changed",
+}
+
+
+def _remediation_row(
+    conn: sqlite3.Connection, organization_id: str, exposure_id: str
+) -> RemediationRecord:
+    row = conn.execute(
+        "SELECT * FROM exposure_remediation WHERE organization_id = ? AND exposure_id = ?",
+        (organization_id, exposure_id),
+    ).fetchone()
+    if row is None:
+        return RemediationRecord(exposure_id=exposure_id, state="triage")
+    return RemediationRecord(**{k: row[k] for k in row.keys() if k != "organization_id"})
+
+
+def _role(conn: sqlite3.Connection, account_id: str, organization_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT role FROM account_organization_roles WHERE account_id = ? AND organization_id = ?",
+        (account_id, organization_id),
+    ).fetchone()
+    return None if row is None else str(row["role"])
+
+
+def _require_exposures(
+    conn: sqlite3.Connection, organization_id: str, exposure_ids: list[str]
+) -> None:
+    found = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT exposure_id FROM exposures WHERE organization_id = ? "
+            "AND exposure_id IN (SELECT value FROM json_each(?))",
+            (organization_id, json.dumps(exposure_ids)),
+        )
+    }
+    if not exposure_ids or found != set(exposure_ids):
+        raise RemediationNotFoundError("exposure not found")
+
+
+def _effective_states(
+    conn: sqlite3.Connection, organization_id: str, exposure_ids: list[str], now: datetime
+) -> dict[str, str]:
+    """Effective remediation state per exposure (core/remediation.py rule),
+    after checking every id belongs to the organization."""
+    from core.remediation import RemediationFacts, effective_remediation
+
+    _require_exposures(conn, organization_id, exposure_ids)
+    states: dict[str, str] = {}
+    for exposure_id in exposure_ids:
+        exposure = conn.execute(
+            "SELECT status, last_seen_at, first_seen_at, severity FROM exposures "
+            "WHERE exposure_id = ?",
+            (exposure_id,),
+        ).fetchone()
+        record = _remediation_row(conn, organization_id, exposure_id)
+        states[exposure_id] = effective_remediation(
+            RemediationFacts(
+                stored_state=record.state,
+                state_changed_at=record.state_changed_at,
+                accepted_until=record.accepted_until,
+                exposure_status=exposure["status"],
+                exposure_last_seen_at=exposure["last_seen_at"],
+                first_seen_at=exposure["first_seen_at"],
+                severity=exposure["severity"],
+                due_at=record.due_at,
+            ),
+            now=now,
+        ).state
+    return states
+
+
+def _set_remediation_field(
+    conn: sqlite3.Connection,
+    organization_id: str,
+    exposure_id: str,
+    field: str,
+    value: str | None,
+    actor_account_id: str,
+    stamp: str,
+) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO exposure_remediation (exposure_id, organization_id) VALUES (?, ?)",
+        (exposure_id, organization_id),
+    )
+    # `field` is one of three fixed column names, mapped to fixed statements.
+    conn.execute(_FIELD_UPDATES[field], (value, actor_account_id, stamp, exposure_id))
+
+
+_FIELD_UPDATES = {
+    "assignee_account_id": "UPDATE exposure_remediation SET assignee_account_id = ?, "
+    "updated_by_account_id = ?, updated_at = ? WHERE exposure_id = ?",
+    "due_at": "UPDATE exposure_remediation SET due_at = ?, "
+    "updated_by_account_id = ?, updated_at = ? WHERE exposure_id = ?",
+    "ticket_url": "UPDATE exposure_remediation SET ticket_url = ?, "
+    "updated_by_account_id = ?, updated_at = ? WHERE exposure_id = ?",
+}
+
+
+def _store_transition(
+    conn: sqlite3.Connection,
+    organization_id: str,
+    exposure_id: str,
+    actor_account_id: str,
+    *,
+    from_state: str,
+    target: str,
+    reason: str | None,
+    accepted_until: str | None,
+    stamp: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO exposure_remediation (exposure_id, organization_id, state, "
+        "state_changed_at, state_reason, accepted_until, updated_by_account_id, "
+        "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(exposure_id) DO "
+        "UPDATE SET state = excluded.state, state_changed_at = excluded.state_changed_at, "
+        "state_reason = excluded.state_reason, accepted_until = excluded.accepted_until, "
+        "updated_by_account_id = excluded.updated_by_account_id, "
+        "updated_at = excluded.updated_at",
+        (
+            exposure_id,
+            organization_id,
+            target,
+            stamp,
+            reason,
+            accepted_until,
+            actor_account_id,
+            stamp,
+        ),
+    )
+    _remediation_event(
+        conn,
+        organization_id,
+        exposure_id,
+        actor_account_id,
+        "state_changed",
+        from_state,
+        target,
+        reason,
+        stamp,
+    )
+
+
+def _remediation_event(
+    conn: sqlite3.Connection,
+    organization_id: str,
+    exposure_id: str,
+    actor_account_id: str,
+    event_type: str,
+    from_value: str | None,
+    to_value: str | None,
+    body: str | None,
+    stamp: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO remediation_events (event_id, organization_id, exposure_id, "
+        "actor_account_id, event_type, from_value, to_value, body, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            secrets.token_hex(16),
+            organization_id,
+            exposure_id,
+            actor_account_id,
+            event_type,
+            from_value,
+            to_value,
+            body,
+            stamp,
+        ),
+    )
+
+
 def _audit_scan_override(
     conn: sqlite3.Connection,
     organization_id: str,
@@ -5957,6 +6718,7 @@ def _provider_run_outcome_record_from_row(row: sqlite3.Row) -> ProviderRunOutcom
         outcome=row["outcome"],
         output_lines=int(row["output_lines"]),
         recorded_at=row["recorded_at"],
+        failure_class=row["failure_class"],
     )
 
 
