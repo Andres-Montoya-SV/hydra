@@ -746,22 +746,18 @@ async def cmd_check_tools(settings: Settings) -> int:
     manager = ToolManager(settings)
     reports = await manager.dependency_service.analyze_all()
     render_dependency_report(reports)
-    await _print_provider_qualification(reports)
+    _print_provider_qualification(reports)
 
     return 0 if manager.dependency_service.mandatory_satisfied(reports) else 1
 
 
-async def _print_provider_qualification(reports: dict) -> None:
+def _print_provider_qualification(reports: dict) -> None:
     """Productization Phase 09: whether each installed, profiled provider
     matches the version and flags Hydra's parsers were qualified against."""
-    from core.provider_qualification import PROFILES, qualify_installed
+    from core.provider_qualification import PROFILES, qualify_report
     from ui.dependency_report import render_qualification_report
 
-    results = []
-    for name in PROFILES:
-        report = reports.get(name)
-        binary = str(report.resolved_path) if report and report.resolved_path else None
-        results.append(await qualify_installed(name, binary, report.version if report else None))
+    results = [qualify_report(name, reports.get(name)) for name in PROFILES]
     render_qualification_report(results)
 
 

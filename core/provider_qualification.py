@@ -30,6 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from core.dependencies.models import ToolReport
 from core.dependencies.registry import known_incompatible_version
 
 QualificationStatus = Literal[
@@ -228,36 +229,13 @@ def qualify(tool: str, *, installed: bool, version: str | None, help_text: str) 
     return Qualification(tool, "qualified", version, (f"{profile.binary} {version} qualified",))
 
 
-HELP_PROBE_TIMEOUT_SECONDS = 10.0
-
-
-async def read_help(tool: str, binary: str) -> str:
-    """The binary's help output (stdout + stderr) from the tool's registered
-    help commands; the first non-empty one wins. No shell; bounded by a
-    timeout. Empty string if nothing could be read."""
-    import asyncio
-
-    from core.dependencies.registry import get_tool_definition
-
-    for args in get_tool_definition(tool).health_commands:
-        try:
-            process = await asyncio.create_subprocess_exec(
-                binary,
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            output, _ = await asyncio.wait_for(process.communicate(), HELP_PROBE_TIMEOUT_SECONDS)
-        except (OSError, asyncio.TimeoutError):
-            continue
-        text = output.decode("utf-8", errors="replace")
-        if text.strip():
-            return text
-    return ""
-
-
-async def qualify_installed(tool: str, binary: str | None, version: str | None) -> Qualification:
-    """`qualify()` for an installed binary, reading its help output."""
-    if not binary:
+def qualify_report(tool: str, report: ToolReport | None) -> Qualification:
+    """`qualify()` from the dependency report the service already built:
+    its identity-verified binary, detected version, and the help output
+    its health probe captured (`ValidationResult.probe_output`). No
+    process of its own is started here."""
+    runnable = report is not None and report.resolved_path is not None and report.is_runnable
+    if report is None or not runnable:
         return qualify(tool, installed=False, version=None, help_text="")
-    return qualify(tool, installed=True, version=version, help_text=await read_help(tool, binary))
+    help_text = report.validation.probe_output if report.validation else ""
+    return qualify(tool, installed=True, version=report.version, help_text=help_text)

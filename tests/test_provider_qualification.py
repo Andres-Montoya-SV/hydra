@@ -18,15 +18,15 @@ import ast
 import asyncio
 import os
 import re
-import stat
 from pathlib import Path
 
 import pytest
 
 from config.settings import Settings
+from core.dependencies.models import ToolHealth, ToolReport, ValidationResult
 from core.dependencies.service import DependencyService
 from core.models import PipelineContext, ToolInfo, ToolStatus
-from core.provider_qualification import PROFILES, qualify, qualify_installed
+from core.provider_qualification import PROFILES, qualify, qualify_report
 from core.tool_manager import ToolManager
 
 REPO = Path(__file__).resolve().parent.parent
@@ -126,8 +126,8 @@ class TestDockerfilePins:
             )
 
 
-def _resolved(tool: str) -> tuple[str, str | None]:
-    """The identity-verified binary and its detected version, resolved the
+def _resolved(tool: str) -> ToolReport:
+    """The dependency report for the identity-verified binary, resolved the
     way production does (DependencyService), never a bare PATH lookup: in
     the image, PATH's `httpx` is the Python httpx package's console script,
     not ProjectDiscovery's (see requirements-dev.txt).
@@ -142,53 +142,54 @@ def _resolved(tool: str) -> tuple[str, str | None]:
     report = asyncio.run(DependencyService({tool: configured}).analyze_all())[tool]
     if report.resolved_path is None or not report.is_runnable:
         pytest.fail(f"HYDRA_REQUIRE_IMAGE_TOOLS=1 but {configured} is not runnable")
-    return str(report.resolved_path), report.version
+    return report
 
 
 class TestInstalledBinariesQualify:
     @pytest.mark.parametrize("tool", sorted(PROFILES))
     def test_the_installed_binary_qualifies(self, tool: str) -> None:
-        binary, version = _resolved(tool)
-
-        result = asyncio.run(qualify_installed(tool, binary, version))
+        result = qualify_report(tool, _resolved(tool))
 
         assert result.status == "qualified", result.reasons
 
 
-def _fake_binary(tmp_path: Path, name: str, help_text: str) -> Path:
-    path = tmp_path / name
-    path.write_text(f"#!/bin/sh\ncat <<'HELP'\n{help_text}\nHELP\n")
-    path.chmod(path.stat().st_mode | stat.S_IEXEC)
-    return path
+def _report(tool: str, version: str, help_text: str) -> ToolReport:
+    """What DependencyService would report: runnable, with the help output
+    its health probe captured."""
+    return ToolReport(
+        name=tool,
+        display_name=tool,
+        required=False,
+        health=ToolHealth.HEALTHY,
+        configured_path=tool,
+        resolved_path=Path(f"/usr/local/bin/{tool}"),
+        version=version,
+        can_execute=True,
+        validation=ValidationResult(can_execute=True, version=version, probe_output=help_text),
+    )
 
 
-def _context_with(tmp_path: Path, tool: str, binary: Path, version: str) -> PipelineContext:
+def _preflight(tmp_path: Path, tool: str, version: str, help_text: str) -> PipelineContext:
+    manager = ToolManager(Settings(project_root=tmp_path))
+    manager._reports[tool] = _report(tool, version, help_text)
     context = PipelineContext(output_dir=tmp_path)
-    info = ToolInfo(
+    context.tool_states[tool] = ToolInfo(
         name=tool, display_name=tool, required=False, enabled=True, status=ToolStatus.READY
     )
-    info.version = version
-    context.tool_states[tool] = info
-    context.resolved_binaries[tool] = binary
+    manager._qualify_providers(context)
     return context
 
 
 class TestPreflight:
     def test_a_binary_that_lost_a_flag_is_made_unavailable(self, tmp_path: Path) -> None:
-        binary = _fake_binary(tmp_path, "katana", _help_with("katana", drop="-jsonl"))
-        context = _context_with(tmp_path, "katana", binary, "1.7.0")
-
-        asyncio.run(ToolManager(Settings(project_root=tmp_path))._qualify_providers(context))
+        context = _preflight(tmp_path, "katana", "1.7.0", _help_with("katana", drop="-jsonl"))
 
         assert context.tool_states["katana"].status is ToolStatus.UNAVAILABLE
         assert context.metadata["provider_qualification"]["katana"]["status"] == "missing_flags"
         assert any("-jsonl" in w for w in context.warnings)
 
     def test_an_unverified_version_runs_with_a_warning(self, tmp_path: Path) -> None:
-        binary = _fake_binary(tmp_path, "katana", _help_with("katana"))
-        context = _context_with(tmp_path, "katana", binary, "1.8.0")
-
-        asyncio.run(ToolManager(Settings(project_root=tmp_path))._qualify_providers(context))
+        context = _preflight(tmp_path, "katana", "1.8.0", _help_with("katana"))
 
         assert context.tool_states["katana"].status is ToolStatus.READY
         assert context.metadata["provider_qualification"]["katana"]["status"] == (
@@ -197,10 +198,10 @@ class TestPreflight:
         assert any("not a qualified version" in w for w in context.warnings)
 
     def test_a_qualified_binary_is_untouched(self, tmp_path: Path) -> None:
-        binary = _fake_binary(tmp_path, "katana", _help_with("katana"))
-        context = _context_with(tmp_path, "katana", binary, "1.7.0")
-
-        asyncio.run(ToolManager(Settings(project_root=tmp_path))._qualify_providers(context))
+        context = _preflight(tmp_path, "katana", "1.7.0", _help_with("katana"))
 
         assert context.tool_states["katana"].status is ToolStatus.READY
         assert context.warnings == []
+
+    def test_no_report_means_not_installed_never_qualified(self) -> None:
+        assert qualify_report("katana", None).status == "not_installed"

@@ -144,25 +144,24 @@ class ToolManager:
                     if report.health == ToolHealth.MISSING:
                         context.add_warning(f"{plugin.display_name}: {report.status_reason}")
 
-        await self._qualify_providers(context)
+        self._qualify_providers(context)
         return mandatory_ok
 
-    async def _qualify_providers(self, context: PipelineContext) -> None:
+    def _qualify_providers(self, context: PipelineContext) -> None:
         """Productization Phase 09: qualify every ready, profiled provider
         against the binary actually installed (core/provider_qualification.py)
         and record the result in the run's metadata. A binary that no longer
         accepts a flag Hydra passes, or a confirmed-incompatible version, is
         made UNAVAILABLE (coverage visibly missing, never garbage output); an
         unverified or undetectable version runs, with a warning."""
-        from core.provider_qualification import PROFILES, qualify_installed
+        from core.provider_qualification import PROFILES, qualify_report
 
         results: dict[str, dict[str, object]] = {}
         for name in PROFILES:
             info = context.tool_states.get(name)
-            binary = context.resolved_binaries.get(name)
-            if info is None or info.status is not ToolStatus.READY or binary is None:
+            if info is None or info.status is not ToolStatus.READY:
                 continue
-            outcome = await qualify_installed(name, str(binary), info.version)
+            outcome = qualify_report(name, self._reports.get(name))
             results[name] = {
                 "status": outcome.status,
                 "version": outcome.version,
