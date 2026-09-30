@@ -1334,6 +1334,19 @@ class CapabilityAuditRecord:
 
 
 @dataclass(frozen=True)
+class RunChangeSummary:
+    """What one scan changed for its organization, as counts."""
+
+    assets_observed: int
+    asset_lifecycle: dict[str, int]
+    exposures_first_seen: int
+    exposure_events: dict[str, int]
+    certificate_events: dict[str, int]
+    technology_events: dict[str, int]
+    candidates_first_seen: int
+
+
+@dataclass(frozen=True)
 class ScopeExclusionRecord:
     exclusion_id: str
     organization_id: str
@@ -3057,6 +3070,49 @@ class ControlDB:
                 (exposure_id, organization_id, run_id, risk_level, json.dumps(reasons), _now_iso()),
             )
         return None if previous is None else str(previous["risk_level"])
+
+    def run_change_summary(self, organization_id: str, run_id: str) -> RunChangeSummary:
+        """Aggregate counts over the per-run EASM tables, all scoped to the
+        organization (a foreign run id yields zeros)."""
+        params = (organization_id, run_id)
+        with self._connect() as conn:
+
+            def count(sql: str) -> int:
+                return int(conn.execute(sql, params).fetchone()[0])
+
+            def grouped(sql: str) -> dict[str, int]:
+                return {str(row[0]): int(row[1]) for row in conn.execute(sql, params)}
+
+            return RunChangeSummary(
+                assets_observed=count(
+                    "SELECT COUNT(DISTINCT asset_id) FROM observations "
+                    "WHERE organization_id = ? AND run_id = ?"
+                ),
+                asset_lifecycle=grouped(
+                    "SELECT new_state, COUNT(*) FROM change_events "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY new_state"
+                ),
+                exposures_first_seen=count(
+                    "SELECT COUNT(*) FROM exposures "
+                    "WHERE organization_id = ? AND first_seen_run_id = ?"
+                ),
+                exposure_events=grouped(
+                    "SELECT event_type, COUNT(DISTINCT exposure_id) FROM exposure_history "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY event_type"
+                ),
+                certificate_events=grouped(
+                    "SELECT event_type, COUNT(*) FROM certificate_events "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY event_type"
+                ),
+                technology_events=grouped(
+                    "SELECT event_type, COUNT(*) FROM technology_events "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY event_type"
+                ),
+                candidates_first_seen=count(
+                    "SELECT COUNT(*) FROM candidate_assets "
+                    "WHERE organization_id = ? AND first_seen_run_id = ?"
+                ),
+            )
 
     def list_exposure_history_for_run(
         self, organization_id: str, run_id: str

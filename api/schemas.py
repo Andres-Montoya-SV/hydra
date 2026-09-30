@@ -247,6 +247,25 @@ class ScanCollectionResponse(BaseModel):
     outcomes: list[ProviderRunOutcomeResponse]
 
 
+class ScanChangeSummaryResponse(BaseModel):
+    """What this scan changed, as counts. Lifecycle keys are the change
+    detector's states (new, changed, disappeared, reappeared); exposure keys
+    are history events (observed, reopened, resolved)."""
+
+    scan_id: str
+    status: str
+    # A degraded scan's counts can under-report (a collector didn't run
+    # cleanly); see GET /scans/{id}/collection for which one.
+    degraded: bool
+    assets_observed: int
+    asset_lifecycle: dict[str, int]
+    exposures_first_seen: int
+    exposure_events: dict[str, int]
+    certificate_events: dict[str, int]
+    technology_events: dict[str, int]
+    candidates_first_seen: int
+
+
 class MonitoringNotificationResponse(BaseModel):
     notification_id: str
     speed: Literal["passive", "active"]

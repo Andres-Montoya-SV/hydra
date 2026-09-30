@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from dataclasses import asdict
 from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -28,6 +29,7 @@ from api.schemas import (
     CreateScanResponse,
     ProviderOutcome,
     ProviderRunOutcomeResponse,
+    ScanChangeSummaryResponse,
     ScanCollectionResponse,
     ScanStatusResponse,
 )
@@ -244,6 +246,29 @@ def get_scan_status(
         effective_providers=(
             None if scan.effective_providers is None else list(scan.effective_providers)
         ),
+    )
+
+
+@router.get("/{scan_id}/summary", response_model=ScanChangeSummaryResponse)
+def get_scan_summary(
+    scan_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_api_key),
+) -> ScanChangeSummaryResponse:
+    """What this scan changed for its organization: assets observed, new /
+    changed / disappeared / reappeared, exposures first seen and their
+    lifecycle events, certificate and technology events, and new
+    candidates. All zeros until the scan has completed and been processed."""
+    control_db = _control_db(request)
+    scan = _owned_scan_or_404(control_db, scan_id, auth.account_id)
+    organization_id = scan.organization_id or ""
+    summary = control_db.run_change_summary(organization_id, scan_id)
+    outcomes = control_db.list_provider_run_outcomes(organization_id, scan_id)
+    return ScanChangeSummaryResponse(
+        scan_id=scan_id,
+        status=scan.status,
+        degraded=any(row.outcome in DEGRADED_OUTCOMES for row in outcomes),
+        **asdict(summary),
     )
 
 
