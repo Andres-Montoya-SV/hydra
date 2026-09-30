@@ -1347,6 +1347,19 @@ class RunChangeSummary:
 
 
 @dataclass(frozen=True)
+class InventoryFacets:
+    """Counts across an organization's inventory, for filters and dashboards."""
+
+    assets_by_type: dict[str, int]
+    exposures_by_status: dict[str, dict[str, int]]
+    candidates_by_review_status: dict[str, int]
+    # Most common first, at most `top` entries: (name, asset count).
+    technologies: list[tuple[str, int]]
+    # Most common first, at most `top`: ("443/tcp", port asset count).
+    open_ports: list[tuple[str, int]]
+
+
+@dataclass(frozen=True)
 class ScopeExclusionRecord:
     exclusion_id: str
     organization_id: str
@@ -3070,6 +3083,35 @@ class ControlDB:
                 (exposure_id, organization_id, run_id, risk_level, json.dumps(reasons), _now_iso()),
             )
         return None if previous is None else str(previous["risk_level"])
+
+    def inventory_facets(self, organization_id: str, *, top: int) -> InventoryFacets:
+        with self._connect() as conn:
+            by_type = conn.execute(
+                "SELECT asset_type, COUNT(*) FROM assets WHERE organization_id = ? "
+                "GROUP BY asset_type",
+                (organization_id,),
+            ).fetchall()
+            exposures: dict[str, dict[str, int]] = {}
+            for status, severity, count in conn.execute(
+                "SELECT status, severity, COUNT(*) FROM exposures WHERE organization_id = ? "
+                "GROUP BY status, severity",
+                (organization_id,),
+            ):
+                exposures.setdefault(str(status), {})[str(severity)] = int(count)
+            candidates = conn.execute(
+                "SELECT review_status, COUNT(*) FROM candidate_assets WHERE organization_id = ? "
+                "GROUP BY review_status",
+                (organization_id,),
+            ).fetchall()
+            technologies = _technology_facet(conn, organization_id, top)
+            ports = _port_facet(conn, organization_id, top)
+        return InventoryFacets(
+            assets_by_type={str(t): int(c) for t, c in by_type},
+            exposures_by_status=exposures,
+            candidates_by_review_status={str(r): int(c) for r, c in candidates},
+            technologies=technologies,
+            open_ports=ports,
+        )
 
     def run_change_summary(self, organization_id: str, run_id: str) -> RunChangeSummary:
         """Aggregate counts over the per-run EASM tables, all scoped to the
@@ -5865,6 +5907,59 @@ def _json_tuple(raw: str | None) -> tuple[str, ...] | None:
 def _sql_limit(limit: int | None) -> int:
     """A LIMIT value for a literal `LIMIT ?`: SQLite reads -1 as "no limit"."""
     return -1 if limit is None else limit
+
+
+def _technology_facet(
+    conn: sqlite3.Connection, organization_id: str, top: int
+) -> list[tuple[str, int]]:
+    """Assets per technology, counting only each asset's CURRENT
+    technologies: those observed in its latest technology run, where the
+    latest run is the one whose earliest observation is newest (ties by
+    run_id), exactly `_latest_run_id_among`. The name is the evidence
+    detail up to "@", exactly `parse_technology_detail`."""
+    rows = conn.execute(
+        "WITH runs AS ("
+        "  SELECT asset_id, run_id, MIN(observed_at) AS started FROM observations"
+        "  WHERE organization_id = ? AND observation_type = ? GROUP BY asset_id, run_id"
+        "), latest AS ("
+        "  SELECT asset_id, run_id FROM ("
+        "    SELECT asset_id, run_id, ROW_NUMBER() OVER ("
+        "      PARTITION BY asset_id ORDER BY started DESC, run_id DESC) AS rn FROM runs"
+        "  ) WHERE rn = 1"
+        ") "
+        "SELECT CASE WHEN instr(e.detail, '@') > 0 "
+        "  THEN substr(e.detail, 1, instr(e.detail, '@') - 1) ELSE e.detail END AS name, "
+        "  COUNT(DISTINCT o.asset_id) AS assets "
+        "FROM observations o "
+        "JOIN latest l ON l.asset_id = o.asset_id AND l.run_id = o.run_id "
+        "JOIN evidence e ON e.evidence_id = o.evidence_id "
+        "WHERE o.organization_id = ? AND o.observation_type = ? "
+        "GROUP BY name ORDER BY assets DESC, name LIMIT ?",
+        (
+            organization_id,
+            OBSERVATION_TYPE_TECHNOLOGY_DETECTED,
+            organization_id,
+            OBSERVATION_TYPE_TECHNOLOGY_DETECTED,
+            top,
+        ),
+    ).fetchall()
+    return [(str(name), int(count)) for name, count in rows]
+
+
+def _port_facet(conn: sqlite3.Connection, organization_id: str, top: int) -> list[tuple[str, int]]:
+    """Port assets per "port/protocol". The identity key is
+    `port:<host>:<port>:<protocol>` and an IPv6 host contains colons, so
+    it is split from the right; only that one column is read."""
+    counts: dict[str, int] = {}
+    for (identity_key,) in conn.execute(
+        "SELECT identity_key FROM assets WHERE organization_id = ? AND asset_type = 'port'",
+        (organization_id,),
+    ):
+        parts = str(identity_key).rsplit(":", 2)
+        if len(parts) == 3:
+            label = f"{parts[1]}/{parts[2]}"
+            counts[label] = counts.get(label, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:top]
 
 
 def _audit_scan_override(

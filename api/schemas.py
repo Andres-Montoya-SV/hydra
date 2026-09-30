@@ -913,3 +913,21 @@ class ImportBatchResponse(BaseModel):
     imported_at: str
     imported_by_account_id: str
     artifact_sha256: str | None = None
+
+
+class FacetCountResponse(BaseModel):
+    value: str
+    count: int
+
+
+class InventoryFacetsResponse(BaseModel):
+    """Counts across the organization's inventory. Technologies count each
+    asset's current technologies only (its latest run); ports are
+    "port/protocol" across known port assets."""
+
+    assets_by_type: dict[str, int]
+    # status -> severity -> count
+    exposures_by_status: dict[str, dict[str, int]]
+    candidates_by_review_status: dict[str, int]
+    technologies: list[FacetCountResponse]
+    open_ports: list[FacetCountResponse]
