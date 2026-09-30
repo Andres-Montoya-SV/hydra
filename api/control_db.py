@@ -3205,18 +3205,7 @@ class ControlDB:
     ) -> None:
         """Persist Fase-09 provider outcomes as durable operational evidence.
         `failure_classes` (provider -> class) is set for degraded outcomes."""
-        allowed_outcomes = {
-            "success_with_results",
-            "success_no_results",
-            "partial",
-            "blocked_by_scope",
-            "skipped",
-            "unavailable",
-            "failed",
-        }
-        for provider, outcome, _output_lines in outcomes:
-            if not provider.strip() or outcome not in allowed_outcomes:
-                raise ValueError("invalid provider execution outcome")
+        _validate_provider_outcomes(outcomes)
         with self._connect() as conn:
             scan = conn.execute(
                 "SELECT account_id, organization_id FROM scans WHERE scan_id = ?",
@@ -5984,6 +5973,25 @@ def _port_facet(conn: sqlite3.Connection, organization_id: str, top: int) -> lis
             label = f"{parts[1]}/{parts[2]}"
             counts[label] = counts.get(label, 0) + 1
     return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:top]
+
+
+_RECORDABLE_OUTCOMES = frozenset(
+    {
+        "success_with_results",
+        "success_no_results",
+        "partial",
+        "blocked_by_scope",
+        "skipped",
+        "unavailable",
+        "failed",
+    }
+)
+
+
+def _validate_provider_outcomes(outcomes: list[tuple[str, str, int]]) -> None:
+    for provider, outcome, _output_lines in outcomes:
+        if not provider.strip() or outcome not in _RECORDABLE_OUTCOMES:
+            raise ValueError("invalid provider execution outcome")
 
 
 def _audit_scan_override(
