@@ -59,3 +59,9 @@ sentry-sdk==2.70.0
 # HYDRA_API_SECRETS_KEYS — see api/secrets_box.py. Same pin as
 # requirements-optional.txt.
 cryptography==50.0.1
+# PostgreSQL control plane (Productization Phase 10, api/db.py): psycopg 3
+# with its bundled libpq (the [binary] extra — no system libpq needed) and
+# its connection pool. Only imported when HYDRA_API_DATABASE_URL is set;
+# unset keeps the SQLite control-db file.
+psycopg[binary]==3.3.6
+psycopg-pool==3.3.3

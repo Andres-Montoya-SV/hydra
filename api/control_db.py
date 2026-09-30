@@ -22,10 +22,11 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from api.asset_identity import (
     ASSET_TYPE_DOMAIN,
@@ -38,6 +39,13 @@ from api.asset_identity import (
 from api.candidate_assets import CandidateAssetDraft, candidate_signal_hash
 from api.certificate_events import parse_certificate_snapshot
 from api.change_detection import host_for_asset
+from api.db import (
+    Backend,
+    PostgresBackend,
+    PostgresDialect,
+    SqliteBackend,
+    SqliteDialect,
+)
 from api.domain_verification import domain_is_covered
 from api.exposure_identity import ExposureDraft
 from api.external_observation import (
@@ -54,7 +62,6 @@ from api.relationship_identity import RelationshipDraft
 from api.secrets_box import SEALED_PREFIX, SecretBox, SecretsUnavailableError, reveal
 from api.technology_catalog import parse_technology_detail
 from core.risk_scoring import BusinessContext, RiskFactors
-from core.store import connect_sqlite
 
 _SCHEMA = """
 -- `email`/`email_verified_at`/`email_verification_token`/
@@ -1908,29 +1915,44 @@ _MONITORING_PENDING_NOTIFICATIONS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...]
 )
 
 
+# Additive column migrations for tables created before a column existed,
+# applied in this order on every start (idempotent).
+_COLUMN_MIGRATIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("accounts", _ACCOUNTS_MIGRATION_COLUMNS),
+    ("scans", _SCANS_MIGRATION_COLUMNS),
+    ("webhooks", _WEBHOOKS_MIGRATION_COLUMNS),
+    ("integration_deliveries", _INTEGRATION_DELIVERIES_MIGRATION_COLUMNS),
+    ("provider_run_outcomes", _PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS),
+    ("subscriptions", _SUBSCRIPTIONS_MIGRATION_COLUMNS),
+    ("candidate_assets", _CANDIDATE_ASSETS_MIGRATION_COLUMNS),
+    ("evidence", _EVIDENCE_MIGRATION_COLUMNS),
+    ("observation_batches", _OBSERVATION_BATCHES_MIGRATION_COLUMNS),
+    ("monitoring_pending_notifications", _MONITORING_PENDING_NOTIFICATIONS_MIGRATION_COLUMNS),
+)
+
+
+def _resolve_backend(db_path: Path, database_url: str | None) -> Backend:
+    """Postgres when a database URL is configured, else the SQLite file.
+    (The test suite patches this to run every ControlDB on Postgres.)"""
+    if database_url:
+        return PostgresBackend(database_url)
+    return SqliteBackend(db_path)
+
+
 def _migrate_table_columns(
-    conn: sqlite3.Connection, table: str, columns: tuple[tuple[str, str], ...]
+    dialect: SqliteDialect | PostgresDialect,
+    conn: Any,
+    table: str,
+    columns: tuple[tuple[str, str], ...],
 ) -> None:
     """`CREATE TABLE IF NOT EXISTS` never adds columns to a table that
-    already exists on disk — generalized from the accounts-table-only
-    version this project's own Hallazgo 1 fix originally wrote (single
-    caller became two, so this is now a shared helper rather than a
-    second, drifting copy of the same four lines). `table`/`columns`
-    are always literal, module-level constants below, never external
-    input. A brand-new database never reaches the `ALTER TABLE` branch
-    with any work to do (the table doesn't exist yet, so there's
-    nothing to migrate) — checked explicitly rather than assumed, since
-    running `ALTER TABLE` on a table that was never created would
-    itself fail."""
-    table_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-    ).fetchone()
-    if table_exists is None:
+    already exists — this adds any missing ones. `table`/`columns` are
+    always literal, module-level constants below, never external input. A
+    table that doesn't exist yet has no columns, so there is nothing to
+    migrate (the schema script creates it complete)."""
+    existing_columns = dialect.columns(conn, table)
+    if not existing_columns:
         return
-    existing_columns = {
-        row["name"]
-        for row in conn.execute(f"PRAGMA table_info({table})")  # noqa: S608  # nosec B608
-    }
     for column, column_type in columns:
         if column not in existing_columns:
             conn.execute(
@@ -1995,37 +2017,33 @@ class ControlDB:
     whole service allowed to have rows belonging to more than one
     account; every other database is per-account (`api/tenancy.py`)."""
 
-    def __init__(self, db_path: Path, *, secret_box: SecretBox | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        secret_box: SecretBox | None = None,
+        database_url: str | None = None,
+    ) -> None:
+        """`database_url` (Productization Phase 10): a PostgreSQL URL runs
+        the control plane on Postgres (api/db.py); unset, it's the SQLite
+        file at `db_path`, as before."""
         self.db_path = db_path
+        self.backend = _resolve_backend(db_path, database_url)
+        self.dialect = self.backend.dialect
         # Productization Phase 08b: seals stored third-party secrets
         # (api/secrets_box.py). None = no key configured: webhook secrets
         # stay plaintext as before, ticketing integrations are refused.
         self.secret_box = secret_box
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(self.backend, SqliteBackend):
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
-            _migrate_table_columns(conn, "accounts", _ACCOUNTS_MIGRATION_COLUMNS)
-            _migrate_table_columns(conn, "scans", _SCANS_MIGRATION_COLUMNS)
-            _migrate_table_columns(conn, "webhooks", _WEBHOOKS_MIGRATION_COLUMNS)
-            _migrate_table_columns(
-                conn, "integration_deliveries", _INTEGRATION_DELIVERIES_MIGRATION_COLUMNS
-            )
-            _migrate_table_columns(
-                conn, "provider_run_outcomes", _PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS
-            )
-            _migrate_table_columns(conn, "subscriptions", _SUBSCRIPTIONS_MIGRATION_COLUMNS)
-            _migrate_table_columns(conn, "candidate_assets", _CANDIDATE_ASSETS_MIGRATION_COLUMNS)
-            _migrate_table_columns(conn, "evidence", _EVIDENCE_MIGRATION_COLUMNS)
-            _migrate_table_columns(
-                conn, "observation_batches", _OBSERVATION_BATCHES_MIGRATION_COLUMNS
-            )
-            _migrate_table_columns(
-                conn,
-                "monitoring_pending_notifications",
-                _MONITORING_PENDING_NOTIFICATIONS_MIGRATION_COLUMNS,
-            )
+            for table, columns in _COLUMN_MIGRATIONS:
+                _migrate_table_columns(self.dialect, conn, table, columns)
             for table in _ORGANIZATION_SCOPED_TABLES:
-                _migrate_table_columns(conn, table, _ORGANIZATION_ID_MIGRATION_COLUMNS)
-            conn.executescript(_SCHEMA)
+                _migrate_table_columns(
+                    self.dialect, conn, table, _ORGANIZATION_ID_MIGRATION_COLUMNS
+                )
+            conn.executescript(self.dialect.schema(_SCHEMA))
             _backfill_organizations(conn)
         for suffix in ("", "-wal", "-shm"):
             path = Path(f"{self.db_path}{suffix}")
@@ -2035,8 +2053,10 @@ class ControlDB:
                 except OSError:
                     pass
 
-    def _connect(self) -> sqlite3.Connection:
-        return connect_sqlite(self.db_path)
+    def _connect(self) -> AbstractContextManager[Any]:
+        """A connection that commits on success, rolls back on error, and is
+        closed (SQLite) or returned to the pool (Postgres) afterwards."""
+        return self.backend.connect()
 
     def ping(self) -> None:
         """`GET /health`'s (`api/health.py`) real reachability check —
@@ -2057,7 +2077,7 @@ class ControlDB:
         (`sqlite3.DatabaseError: file is not a database`) against a
         corrupted file — confirmed directly, not assumed."""
         with self._connect() as conn:
-            conn.execute("SELECT count(*) FROM sqlite_master")
+            conn.execute(self.dialect.ping_sql)
 
     # --- accounts ---------------------------------------------------
 
@@ -2114,7 +2134,7 @@ class ControlDB:
                     "(account_id, organization_id, role, created_at) VALUES (?, ?, 'owner', ?)",
                     (account_id, organization_id, now),
                 )
-        except sqlite3.IntegrityError as exc:
+        except self.dialect.integrity_errors as exc:
             raise DuplicateEmailError(f"{email!r} is already registered") from exc
         return account_id
 
@@ -2461,9 +2481,10 @@ class ControlDB:
                     )
                 for identifier_type, identifier_value in decision.identifiers:
                     conn.execute(
-                        "INSERT OR IGNORE INTO asset_identifiers "
+                        "INSERT INTO asset_identifiers "
                         "(asset_id, organization_id, identifier_type, identifier_value, "
-                        "first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        "first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT DO NOTHING",
                         (
                             decision.asset_id,
                             organization_id,
@@ -2529,7 +2550,9 @@ class ControlDB:
             clauses.append("asset_type = ?")
             params.append(asset_type)
         if q is not None:
-            clauses.append("identity_key LIKE ? ESCAPE '\\'")
+            # lower() on both sides: SQLite's LIKE ignores ASCII case,
+            # Postgres's does not.
+            clauses.append("lower(identity_key) LIKE lower(?) ESCAPE '\\'")
             escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             params.append(f"%{escaped}%")
         where = " AND ".join(clauses)
@@ -3024,9 +3047,10 @@ class ControlDB:
 
             exposure_evidence_id = secrets.token_hex(16)
             cursor = conn.execute(
-                "INSERT OR IGNORE INTO exposure_evidence "
+                "INSERT INTO exposure_evidence "
                 "(exposure_evidence_id, exposure_id, organization_id, account_id, "
-                "run_id, finding_id, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "run_id, finding_id, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
                 (
                     exposure_evidence_id,
                     exposure_id,
@@ -3040,9 +3064,10 @@ class ControlDB:
             evidence_created = bool(cursor.rowcount)
             if evidence_created:
                 conn.execute(
-                    "INSERT OR IGNORE INTO exposure_history "
+                    "INSERT INTO exposure_history "
                     "(event_id, exposure_id, organization_id, event_type, happened_at, run_id, reason) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT DO NOTHING",
                     (
                         secrets.token_hex(16),
                         exposure_id,
@@ -3209,10 +3234,7 @@ class ControlDB:
             return None
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT asset_id, severity, title FROM exposures "
-                "WHERE organization_id = ? AND asset_id IN (SELECT value FROM json_each(?)) "
-                "AND status IN ('open', 'reopened') AND severity IN ('high', 'critical') "
-                "ORDER BY asset_id, last_seen_at DESC, exposure_id LIMIT 1",
+                _CRITICAL_NEIGHBOR_SQL[self.dialect.name],
                 (organization_id, json.dumps(sorted(a for a in neighbor_asset_ids if a))),
             ).fetchone()
         if row is None:
@@ -3317,9 +3339,11 @@ class ControlDB:
                 (organization_id, exposure_id, run_id),
             ).fetchone()
             conn.execute(
-                "INSERT OR REPLACE INTO exposure_risk_snapshots "
+                "INSERT INTO exposure_risk_snapshots "
                 "(exposure_id, organization_id, run_id, risk_level, reasons_json, computed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (exposure_id, run_id) DO UPDATE SET "
+                "risk_level = excluded.risk_level, reasons_json = excluded.reasons_json, "
+                "computed_at = excluded.computed_at",
                 (exposure_id, organization_id, run_id, risk_level, json.dumps(reasons), _now_iso()),
             )
         return None if previous is None else str(previous["risk_level"])
@@ -3349,7 +3373,7 @@ class ControlDB:
             # Take the write lock BEFORE reading the previous state, so the
             # "unchanged?" check and the audit's `before` are exactly the
             # state this write replaces, even with concurrent owners.
-            conn.execute("BEGIN IMMEDIATE")
+            self.dialect.begin_write(conn, f"asset_context:{organization_id}:{asset_id}")
             row = conn.execute(
                 "SELECT * FROM asset_business_context WHERE organization_id = ? AND asset_id = ?",
                 (organization_id, asset_id),
@@ -3439,8 +3463,8 @@ class ControlDB:
         )
         reason = (reason or "").strip() or None
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            current = _effective_states(conn, organization_id, exposure_ids, now)
+            self.dialect.begin_write(conn, f"remediation:{organization_id}")
+            current = _effective_states(self.dialect, conn, organization_id, exposure_ids, now)
             check_transitions(current, target, reason=reason, accepted_until=until, now=now)
             for exposure_id in exposure_ids:
                 event_id = _store_transition(
@@ -3482,8 +3506,8 @@ class ControlDB:
         must be a member of the organization. Unchanged values add no event."""
         stamp = now.isoformat()
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            _effective_states(conn, organization_id, exposure_ids, now)  # tenancy check
+            self.dialect.begin_write(conn, f"remediation:{organization_id}")
+            _effective_states(self.dialect, conn, organization_id, exposure_ids, now)  # tenancy
             assignee = changes.get("assignee_account_id")
             if assignee is not None and _role(conn, assignee, organization_id) is None:
                 raise ValueError("assignee is not a member of this organization")
@@ -3523,7 +3547,7 @@ class ControlDB:
     ) -> None:
         now = _now_iso()
         with self._connect() as conn:
-            _require_exposures(conn, organization_id, [exposure_id])
+            _require_exposures(self.dialect, conn, organization_id, [exposure_id])
             _remediation_event(
                 conn,
                 organization_id,
@@ -3542,7 +3566,7 @@ class ControlDB:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM remediation_events WHERE organization_id = ? AND exposure_id = ? "
-                "ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+                "ORDER BY created_at DESC, event_id DESC LIMIT ? OFFSET ?",
                 (organization_id, exposure_id, limit, offset),
             ).fetchall()
         return [
@@ -3574,7 +3598,7 @@ class ControlDB:
         and SLA_DAYS; a test keeps the two in lockstep."""
         with self._connect() as conn:
             rows = conn.execute(
-                _WORKLIST_SQL,
+                _WORKLIST_SQL[self.dialect.name],
                 {
                     "org": organization_id,
                     "now": now.isoformat(),
@@ -3675,7 +3699,7 @@ class ControlDB:
         stamp = now.isoformat()
         lease = (now + timedelta(seconds=lease_seconds)).isoformat()
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            self.dialect.begin_write(conn, "integration_delivery_claim")
             rows = conn.execute(
                 "SELECT d.delivery_id, d.attempts, d.webhook_id, d.destination_type, e.* "
                 "FROM integration_deliveries d "
@@ -3846,11 +3870,12 @@ class ControlDB:
         stamp = _now_iso()
         actor = f"integration:{integration_id}"
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            self.dialect.begin_write(conn, f"remediation:{organization_id}")
             conn.execute(
-                "INSERT OR IGNORE INTO ticketing_links (integration_id, exposure_id, "
+                "INSERT INTO ticketing_links (integration_id, exposure_id, "
                 "organization_id, external_key, external_url, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
                 (integration_id, exposure_id, organization_id, external_key, external_url, stamp),
             )
             if _remediation_row(conn, organization_id, exposure_id).ticket_url is None:
@@ -4195,10 +4220,11 @@ class ControlDB:
 
             relationship_evidence_id = secrets.token_hex(16)
             cursor = conn.execute(
-                "INSERT OR IGNORE INTO relationship_evidence "
+                "INSERT INTO relationship_evidence "
                 "(relationship_evidence_id, relationship_id, organization_id, run_id, "
                 "source_evidence_id, source, collector, reason, metadata_json, observed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
                 (
                     relationship_evidence_id,
                     relationship_id,
@@ -4295,14 +4321,7 @@ class ControlDB:
                 for offset in range(0, len(ordered), 200):
                     chunk = ordered[offset : offset + 200]
                     rows = conn.execute(
-                        "WITH frontier AS (SELECT value FROM json_each(?)) "
-                        "SELECT r.* FROM relationships r WHERE r.organization_id = ? "
-                        "AND (r.source_entity IN (SELECT value FROM frontier) "
-                        "OR r.target_entity IN (SELECT value FROM frontier)) "
-                        "AND EXISTS (SELECT 1 FROM relationship_evidence e "
-                        "WHERE e.relationship_id = r.relationship_id "
-                        "AND e.organization_id = r.organization_id) "
-                        "ORDER BY r.relationship_id LIMIT ?",
+                        _NEIGHBORHOOD_SQL[self.dialect.name],
                         (json.dumps(chunk), organization_id, max_edges + 1),
                     ).fetchall()
                     for row in rows:
@@ -4369,7 +4388,7 @@ class ControlDB:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT evidence_id FROM evidence WHERE organization_id = ? AND asset_id = ? "
-                "AND source = ? AND detail = ? AND confidence_score IS ?",
+                "AND source = ? AND detail = ? AND confidence_score IS NOT DISTINCT FROM ?",
                 (
                     organization_id,
                     asset_id,
@@ -4435,9 +4454,10 @@ class ControlDB:
         observation_id = secrets.token_hex(16)
         with self._connect() as conn:
             cursor = conn.execute(
-                "INSERT OR IGNORE INTO observations (observation_id, organization_id, asset_id, "
+                "INSERT INTO observations (observation_id, organization_id, asset_id, "
                 "run_id, account_id, observation_type, evidence_id, observed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
                 (
                     observation_id,
                     organization_id,
@@ -4474,8 +4494,7 @@ class ControlDB:
                 "FROM observations o JOIN evidence e ON o.evidence_id = e.evidence_id "
                 "WHERE o.asset_id = ? ORDER BY o.observed_at DESC, o.observation_id DESC "
                 "LIMIT ?",
-                # SQLite: a negative LIMIT means no limit.
-                (asset_id, -1 if newest is None else newest),
+                (asset_id, _sql_limit(newest)),
             ).fetchall()
         return [_observation_with_evidence_from_row(row) for row in reversed(rows)]
 
@@ -4661,9 +4680,10 @@ class ControlDB:
         change_event_id = secrets.token_hex(16)
         with self._connect() as conn:
             cursor = conn.execute(
-                "INSERT OR IGNORE INTO change_events (change_event_id, organization_id, "
+                "INSERT INTO change_events (change_event_id, organization_id, "
                 "asset_id, run_id, previous_state, new_state, reason, previous_digest, "
-                "new_digest, detected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "new_digest, detected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
                 (
                     change_event_id,
                     organization_id,
@@ -4725,10 +4745,11 @@ class ControlDB:
         certificate_event_id = secrets.token_hex(16)
         with self._connect() as conn:
             cursor = conn.execute(
-                "INSERT OR IGNORE INTO certificate_events (certificate_event_id, "
+                "INSERT INTO certificate_events (certificate_event_id, "
                 "organization_id, asset_id, run_id, event_type, reason, "
                 "previous_fingerprint, new_fingerprint, detected_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
                 (
                     certificate_event_id,
                     organization_id,
@@ -4786,9 +4807,10 @@ class ControlDB:
         technology_event_id = secrets.token_hex(16)
         with self._connect() as conn:
             cursor = conn.execute(
-                "INSERT OR IGNORE INTO technology_events (technology_event_id, "
+                "INSERT INTO technology_events (technology_event_id, "
                 "organization_id, asset_id, run_id, event_type, technology_name, "
-                "reason, detected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "reason, detected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
                 (
                     technology_event_id,
                     organization_id,
@@ -4984,27 +5006,24 @@ class ControlDB:
         about, by `tests/test_scan_queue_durability.py`."""
         now = _now_iso()
         with self._connect() as conn:
+            # min(capacity, refilled) written as CASE: SQLite's two-argument
+            # MIN() and Postgres's LEAST() don't exist on the other backend.
             cursor = conn.execute(
                 "INSERT INTO rate_limit_buckets (key_id, tokens, last_refill_at) "
-                "VALUES (?, ? - 1, ?) "
+                "VALUES (:key, :cap - 1, :now) "
                 "ON CONFLICT(key_id) DO UPDATE SET "
-                "    tokens = MIN(?, tokens + (julianday(?) - julianday(last_refill_at)) "
-                "        * 86400.0 * ?) - 1, "
-                "    last_refill_at = ? "
-                "WHERE MIN(?, tokens + (julianday(?) - julianday(last_refill_at)) "
-                "    * 86400.0 * ?) >= 1.0",
-                (
-                    key_id,
-                    capacity,
-                    now,
-                    capacity,
-                    now,
-                    refill_rate_per_second,
-                    now,
-                    capacity,
-                    now,
-                    refill_rate_per_second,
-                ),
+                "tokens = CASE WHEN rate_limit_buckets.tokens + (julianday(:now) - "
+                "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate < :cap "
+                "THEN rate_limit_buckets.tokens + (julianday(:now) - "
+                "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate "
+                "ELSE :cap END - 1, "
+                "last_refill_at = :now "
+                "WHERE (CASE WHEN rate_limit_buckets.tokens + (julianday(:now) - "
+                "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate < :cap "
+                "THEN rate_limit_buckets.tokens + (julianday(:now) - "
+                "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate "
+                "ELSE :cap END) >= 1.0",
+                {"key": key_id, "cap": capacity, "now": now, "rate": refill_rate_per_second},
             )
         return cursor.rowcount == 1
 
@@ -5247,7 +5266,7 @@ class ControlDB:
                         record.created_at,
                     ),
                 )
-        except sqlite3.IntegrityError as exc:
+        except self.dialect.integrity_errors as exc:
             raise DuplicateExclusionError(pattern) from exc
         return record
 
@@ -5268,7 +5287,7 @@ class ControlDB:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM organization_scope_exclusions WHERE organization_id = ? "
-                "AND (? OR removed_at IS NULL) ORDER BY pattern, created_at",
+                "AND (? = 1 OR removed_at IS NULL) ORDER BY pattern, created_at",
                 (organization_id, include_removed),
             ).fetchall()
         return [ScopeExclusionRecord(**dict(row)) for row in rows]
@@ -5618,7 +5637,7 @@ class ControlDB:
                 set_next_active = speed2_enabled and not existing["speed2_enabled"]
                 conn.execute(
                     "UPDATE monitored_domains SET speed2_enabled = ?, "
-                    "next_active_due_at = CASE WHEN ? THEN ? ELSE next_active_due_at END, "
+                    "next_active_due_at = CASE WHEN ? = 1 THEN ? ELSE next_active_due_at END, "
                     "updated_at = ? WHERE monitoring_id = ?",
                     (
                         int(speed2_enabled),
@@ -6024,7 +6043,7 @@ class ControlDB:
             return 0
         sealed = 0
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            self.dialect.begin_write(conn, "seal_webhook_secrets")
             rows = conn.execute(
                 "SELECT webhook_id, secret FROM webhooks "
                 "WHERE secret != '' AND substr(secret, 1, ?) != ?",
@@ -6439,24 +6458,16 @@ class ControlDB:
                 "INSERT INTO monthly_usage (account_id, period_key, scans_used) "
                 "VALUES (?, ?, 1) "
                 "ON CONFLICT(account_id, period_key) "
-                "DO UPDATE SET scans_used = scans_used + 1",
+                "DO UPDATE SET scans_used = monthly_usage.scans_used + 1",
                 (account_id, period_key),
             )
 
     def add_llm_spend(
         self, account_id: str, period_key: str, *, feature: str, amount_usd: float
     ) -> None:
-        # column is one of exactly two hardcoded literals chosen above,
-        # never external input — same "identifier is a literal, values
-        # are bound params" shape as core/store.py::get_findings's own
-        # dynamic-column query (also suppressed below for the same reason).
-        column = "reportability_spend_usd" if feature == "reportability" else "hypotheses_spend_usd"
         with self._connect() as conn:
             conn.execute(
-                f"INSERT INTO monthly_usage (account_id, period_key, {column}) "  # noqa: S608  # nosec B608
-                f"VALUES (?, ?, ?) "
-                f"ON CONFLICT(account_id, period_key) "
-                f"DO UPDATE SET {column} = {column} + excluded.{column}",
+                _ADD_LLM_SPEND_SQL[feature == "reportability"],
                 (account_id, period_key, amount_usd),
             )
 
@@ -6785,9 +6796,28 @@ def _json_tuple(raw: str | None) -> tuple[str, ...] | None:
     return None if raw is None else tuple(json.loads(raw))
 
 
+# Portable "no limit" for a literal `LIMIT ?`: SQLite reads -1 as no limit
+# but Postgres rejects negative limits; this is larger than any table.
+# One complete statement per spend column (keyed by "is it the
+# reportability feature"); the existing row's value is table-qualified, as
+# Postgres requires next to `excluded`.
+_ADD_LLM_SPEND_SQL = {
+    True: "INSERT INTO monthly_usage (account_id, period_key, reportability_spend_usd) "
+    "VALUES (?, ?, ?) ON CONFLICT(account_id, period_key) DO UPDATE SET "
+    "reportability_spend_usd = monthly_usage.reportability_spend_usd "
+    "+ excluded.reportability_spend_usd",
+    False: "INSERT INTO monthly_usage (account_id, period_key, hypotheses_spend_usd) "
+    "VALUES (?, ?, ?) ON CONFLICT(account_id, period_key) DO UPDATE SET "
+    "hypotheses_spend_usd = monthly_usage.hypotheses_spend_usd "
+    "+ excluded.hypotheses_spend_usd",
+}
+
+_NO_LIMIT = 2**62
+
+
 def _sql_limit(limit: int | None) -> int:
-    """A LIMIT value for a literal `LIMIT ?`: SQLite reads -1 as "no limit"."""
-    return -1 if limit is None else limit
+    """A LIMIT value for a literal `LIMIT ?` (None = no limit)."""
+    return _NO_LIMIT if limit is None else limit
 
 
 def _technology_facet(
@@ -6880,30 +6910,111 @@ def _context_dict(context: BusinessContext) -> dict[str, object]:
     }
 
 
-_WORKLIST_SQL = (
-    "WITH w AS ("
-    " SELECT e.*, r.assignee_account_id AS assignee,"
-    "  CASE"
-    "   WHEN e.status = 'resolved' THEN 'closed'"
-    "   WHEN r.state = 'accepted_risk' AND r.accepted_until IS NOT NULL"
-    "        AND julianday(r.accepted_until) <= julianday(:now) THEN 'triage'"
-    "   WHEN r.state = 'fixed_pending_verification' AND r.state_changed_at IS NOT NULL"
-    "        AND julianday(e.last_seen_at) > julianday(r.state_changed_at) THEN 'in_progress'"
-    "   ELSE COALESCE(r.state, 'triage')"
-    "  END AS effective_state,"
-    "  COALESCE(r.due_at, strftime('%Y-%m-%dT%H:%M:%S+00:00', e.first_seen_at,"
-    "   CASE e.severity WHEN 'critical' THEN '+7 days' WHEN 'high' THEN '+30 days'"
-    "    WHEN 'medium' THEN '+90 days' ELSE '+180 days' END)) AS effective_due"
-    " FROM exposures e LEFT JOIN exposure_remediation r ON r.exposure_id = e.exposure_id"
-    " WHERE e.organization_id = :org"
-    ") "
-    "SELECT * FROM w"
-    " WHERE (:state IS NULL OR effective_state = :state)"
-    "  AND (:assignee IS NULL OR assignee = :assignee)"
-    "  AND (:overdue IS NULL OR (effective_state IN ('triage', 'in_progress')"
-    "       AND julianday(effective_due) < julianday(:now)) = :overdue)"
-    " ORDER BY julianday(effective_due), exposure_id LIMIT :limit OFFSET :offset"
-)
+# Statements whose SQL can't be shared: each has one complete literal
+# variant per backend (api/db.py), selected by dialect name.
+_CRITICAL_NEIGHBOR_SQL = {
+    "sqlite": (
+        "SELECT asset_id, severity, title FROM exposures "
+        "WHERE organization_id = ? AND asset_id IN (SELECT value FROM json_each(?)) "
+        "AND status IN ('open', 'reopened') AND severity IN ('high', 'critical') "
+        "ORDER BY asset_id, last_seen_at DESC, exposure_id LIMIT 1"
+    ),
+    "postgres": (
+        "SELECT asset_id, severity, title FROM exposures "
+        "WHERE organization_id = ? AND asset_id IN (SELECT jsonb_array_elements_text(?::jsonb)) "
+        "AND status IN ('open', 'reopened') AND severity IN ('high', 'critical') "
+        "ORDER BY asset_id, last_seen_at DESC, exposure_id LIMIT 1"
+    ),
+}
+_NEIGHBORHOOD_SQL = {
+    "sqlite": (
+        "WITH frontier AS (SELECT value FROM json_each(?)) "
+        "SELECT r.* FROM relationships r WHERE r.organization_id = ? "
+        "AND (r.source_entity IN (SELECT value FROM frontier) "
+        "OR r.target_entity IN (SELECT value FROM frontier)) "
+        "AND EXISTS (SELECT 1 FROM relationship_evidence e "
+        "WHERE e.relationship_id = r.relationship_id "
+        "AND e.organization_id = r.organization_id) "
+        "ORDER BY r.relationship_id LIMIT ?"
+    ),
+    "postgres": (
+        "WITH frontier AS (SELECT jsonb_array_elements_text(?::jsonb) AS value) "
+        "SELECT r.* FROM relationships r WHERE r.organization_id = ? "
+        "AND (r.source_entity IN (SELECT value FROM frontier) "
+        "OR r.target_entity IN (SELECT value FROM frontier)) "
+        "AND EXISTS (SELECT 1 FROM relationship_evidence e "
+        "WHERE e.relationship_id = r.relationship_id "
+        "AND e.organization_id = r.organization_id) "
+        "ORDER BY r.relationship_id LIMIT ?"
+    ),
+}
+_EXPOSURES_IN_SQL = {
+    "sqlite": (
+        "SELECT exposure_id FROM exposures WHERE organization_id = ? "
+        "AND exposure_id IN (SELECT value FROM json_each(?))"
+    ),
+    "postgres": (
+        "SELECT exposure_id FROM exposures WHERE organization_id = ? "
+        "AND exposure_id IN (SELECT jsonb_array_elements_text(?::jsonb))"
+    ),
+}
+
+
+# The only backend difference is the default due date (first seen + the
+# severity SLA): SQLite date modifiers vs a Postgres interval, both
+# rendered as ISO-8601 UTC text. The CASE mirrors core/remediation.py's
+# rule and SLA_DAYS; tests keep the three in lockstep.
+_WORKLIST_SQL = {
+    "sqlite": (
+        "WITH w AS ("
+        " SELECT e.*, r.assignee_account_id AS assignee,"
+        "  CASE"
+        "   WHEN e.status = 'resolved' THEN 'closed'"
+        "   WHEN r.state = 'accepted_risk' AND r.accepted_until IS NOT NULL"
+        "        AND julianday(r.accepted_until) <= julianday(:now) THEN 'triage'"
+        "   WHEN r.state = 'fixed_pending_verification' AND r.state_changed_at IS NOT NULL"
+        "        AND julianday(e.last_seen_at) > julianday(r.state_changed_at) THEN 'in_progress'"
+        "   ELSE COALESCE(r.state, 'triage')"
+        "  END AS effective_state,"
+        "  COALESCE(r.due_at, strftime('%Y-%m-%dT%H:%M:%S+00:00', e.first_seen_at,"
+        "   CASE e.severity WHEN 'critical' THEN '+7 days' WHEN 'high' THEN '+30 days'"
+        "    WHEN 'medium' THEN '+90 days' ELSE '+180 days' END)) AS effective_due"
+        " FROM exposures e LEFT JOIN exposure_remediation r ON r.exposure_id = e.exposure_id"
+        " WHERE e.organization_id = :org"
+        ") "
+        "SELECT * FROM w"
+        " WHERE (:state IS NULL OR effective_state = :state)"
+        "  AND (:assignee IS NULL OR assignee = :assignee)"
+        "  AND (:overdue IS NULL OR (CASE WHEN effective_state IN ('triage', 'in_progress')"
+        "       AND julianday(effective_due) < julianday(:now) THEN 1 ELSE 0 END) = :overdue)"
+        " ORDER BY julianday(effective_due), exposure_id LIMIT :limit OFFSET :offset"
+    ),
+    "postgres": (
+        "WITH w AS ("
+        " SELECT e.*, r.assignee_account_id AS assignee,"
+        "  CASE"
+        "   WHEN e.status = 'resolved' THEN 'closed'"
+        "   WHEN r.state = 'accepted_risk' AND r.accepted_until IS NOT NULL"
+        "        AND julianday(r.accepted_until) <= julianday(:now) THEN 'triage'"
+        "   WHEN r.state = 'fixed_pending_verification' AND r.state_changed_at IS NOT NULL"
+        "        AND julianday(e.last_seen_at) > julianday(r.state_changed_at) THEN 'in_progress'"
+        "   ELSE COALESCE(r.state, 'triage')"
+        "  END AS effective_state,"
+        "  COALESCE(r.due_at, to_char((e.first_seen_at::timestamptz +"
+        "   (CASE e.severity WHEN 'critical' THEN '7 days' WHEN 'high' THEN '30 days'"
+        "    WHEN 'medium' THEN '90 days' ELSE '180 days' END)::interval) AT TIME ZONE 'UTC',"
+        '   \'YYYY-MM-DD"T"HH24:MI:SS"+00:00"\')) AS effective_due'
+        " FROM exposures e LEFT JOIN exposure_remediation r ON r.exposure_id = e.exposure_id"
+        " WHERE e.organization_id = :org"
+        ") "
+        "SELECT * FROM w"
+        " WHERE (:state IS NULL OR effective_state = :state)"
+        "  AND (:assignee IS NULL OR assignee = :assignee)"
+        "  AND (:overdue IS NULL OR (CASE WHEN effective_state IN ('triage', 'in_progress')"
+        "       AND julianday(effective_due) < julianday(:now) THEN 1 ELSE 0 END) = :overdue)"
+        " ORDER BY julianday(effective_due), exposure_id LIMIT :limit OFFSET :offset"
+    ),
+}
 
 _FIELD_EVENTS = {
     "assignee_account_id": "assignee_changed",
@@ -6933,14 +7044,15 @@ def _role(conn: sqlite3.Connection, account_id: str, organization_id: str) -> st
 
 
 def _require_exposures(
-    conn: sqlite3.Connection, organization_id: str, exposure_ids: list[str]
+    dialect: SqliteDialect | PostgresDialect,
+    conn: Any,
+    organization_id: str,
+    exposure_ids: list[str],
 ) -> None:
     found = {
         str(row[0])
         for row in conn.execute(
-            "SELECT exposure_id FROM exposures WHERE organization_id = ? "
-            "AND exposure_id IN (SELECT value FROM json_each(?))",
-            (organization_id, json.dumps(exposure_ids)),
+            _EXPOSURES_IN_SQL[dialect.name], (organization_id, json.dumps(exposure_ids))
         )
     }
     if not exposure_ids or found != set(exposure_ids):
@@ -6948,13 +7060,17 @@ def _require_exposures(
 
 
 def _effective_states(
-    conn: sqlite3.Connection, organization_id: str, exposure_ids: list[str], now: datetime
+    dialect: SqliteDialect | PostgresDialect,
+    conn: Any,
+    organization_id: str,
+    exposure_ids: list[str],
+    now: datetime,
 ) -> dict[str, str]:
     """Effective remediation state per exposure (core/remediation.py rule),
     after checking every id belongs to the organization."""
     from core.remediation import RemediationFacts, effective_remediation
 
-    _require_exposures(conn, organization_id, exposure_ids)
+    _require_exposures(dialect, conn, organization_id, exposure_ids)
     states: dict[str, str] = {}
     for exposure_id in exposure_ids:
         exposure = conn.execute(
@@ -6989,7 +7105,8 @@ def _set_remediation_field(
     stamp: str,
 ) -> None:
     conn.execute(
-        "INSERT OR IGNORE INTO exposure_remediation (exposure_id, organization_id) VALUES (?, ?)",
+        "INSERT INTO exposure_remediation (exposure_id, organization_id) VALUES (?, ?) "
+        "ON CONFLICT DO NOTHING",
         (exposure_id, organization_id),
     )
     # `field` is one of three fixed column names, mapped to fixed statements.
@@ -7098,8 +7215,9 @@ def _enqueue_integration_event(
     event without one, of the account)."""
     event_id = secrets.token_hex(16)
     cursor = conn.execute(
-        "INSERT OR IGNORE INTO integration_events (event_id, organization_id, account_id, "
-        "event_type, payload_json, dedup_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO integration_events (event_id, organization_id, account_id, "
+        "event_type, payload_json, dedup_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT DO NOTHING",
         (
             event_id,
             organization_id,

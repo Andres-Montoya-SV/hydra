@@ -7,8 +7,8 @@ for internal calls.
 
 from __future__ import annotations
 
+import json
 import secrets
-import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -100,7 +100,7 @@ def _make_due(control_db: ControlDB, monitoring_id: str) -> None:
     the same file/connection `ControlDB` itself uses to simulate "this
     domain's cadence has already elapsed" without waiting in real time."""
     past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-    with sqlite3.connect(control_db.db_path) as conn:
+    with control_db._connect() as conn:
         conn.execute(
             "UPDATE monitored_domains SET next_passive_due_at = ?, next_active_due_at = ? "
             "WHERE monitoring_id = ?",
@@ -868,12 +868,13 @@ class TestEmailAndIntegrationEventsShareTheSameOutboxRow:
 
     @staticmethod
     def _outbox(control_db: ControlDB) -> list[tuple[str, str, str, str]]:
-        with sqlite3.connect(control_db.db_path) as conn:
-            return conn.execute(
-                "SELECT e.account_id, e.event_type, json_extract(e.payload_json, '$.domain'), "
+        with control_db._connect() as conn:
+            rows = conn.execute(
+                "SELECT e.account_id, e.event_type, e.payload_json, "
                 "d.webhook_id FROM integration_events e "
                 "JOIN integration_deliveries d ON d.event_id = e.event_id ORDER BY e.created_at"
             ).fetchall()
+        return [(r[0], r[1], json.loads(r[2]).get("domain"), r[3]) for r in rows]
 
     def test_one_outcome_is_one_email_and_one_queued_delivery(
         self, control_db: ControlDB, api_settings: APISettings, sender: _RecordingEmailSender

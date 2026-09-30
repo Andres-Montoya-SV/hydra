@@ -164,6 +164,8 @@ def _seed_pre_fase_02_account_with_real_data(db_path: Path) -> str:
     return account_id
 
 
+# Upgrades a hand-built pre-Fase-02 SQLite control-db file.
+@pytest.mark.sqlite_only
 class TestMigrationAgainstRealPreExistingData:
     def test_a_legacy_account_gets_a_1to1_organization_automatically(self, tmp_path: Path) -> None:
         db_path = tmp_path / "control.db"

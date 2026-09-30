@@ -8,7 +8,6 @@ in the worklist SQL."""
 
 from __future__ import annotations
 
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -156,7 +155,7 @@ def _redetect(client: TestClient, account_id: str, org: str, run_id: str) -> Non
 
 def _detection_snapshot(client: TestClient) -> list:
     """Every detection-truth row, to prove remediation never changes one."""
-    with sqlite3.connect(client.app.state.control_db.db_path) as conn:
+    with client.app.state.control_db._connect() as conn:
         return [
             conn.execute("SELECT * FROM exposures ORDER BY exposure_id").fetchall(),
             conn.execute("SELECT * FROM exposure_evidence ORDER BY 1").fetchall(),
@@ -417,7 +416,7 @@ class TestBulkAndWorklist:
             _move(client, key, org, ids[0], to_state="fixed_pending_verification")
             _redetect(client, account_id, org, "run-b")  # re-detects ids[0]'s finding
             db = client.app.state.control_db
-            with sqlite3.connect(db.db_path) as conn:  # an already-expired acceptance
+            with db._connect() as conn:  # an already-expired acceptance
                 conn.execute(
                     "INSERT INTO exposure_remediation (exposure_id, organization_id, state, "
                     "accepted_until) VALUES (?, ?, 'accepted_risk', '2026-01-01T00:00:00+00:00')",
@@ -447,10 +446,12 @@ class TestBulkAndWorklist:
             assert python_states == {ids[0]: "in_progress", ids[1]: "triage"}
 
     def test_the_sql_sla_matches_the_python_table(self) -> None:
-        for severity, days in SLA_DAYS.items():
-            if severity != "low":
-                assert f"WHEN '{severity}' THEN '+{days} days'" in _WORKLIST_SQL
-        assert f"ELSE '+{SLA_DAYS['low']} days'" in _WORKLIST_SQL
+        for dialect, prefix in (("sqlite", "+"), ("postgres", "")):
+            sql = _WORKLIST_SQL[dialect]
+            for severity, days in SLA_DAYS.items():
+                if severity != "low":
+                    assert f"WHEN '{severity}' THEN '{prefix}{days} days'" in sql
+            assert f"ELSE '{prefix}{SLA_DAYS['low']} days'" in sql
 
 
 class TestRolesAndTenancy:

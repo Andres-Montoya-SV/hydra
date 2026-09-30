@@ -9,7 +9,6 @@ an account in a different worker process.
 from __future__ import annotations
 
 import secrets
-import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -50,7 +49,7 @@ def _set_scan_created_at(control_db: ControlDB, scan_id: str, created_at: str) -
     directly (same file/connection `ControlDB` itself uses) purely to
     simulate "this scan was actually created N days ago" without
     needing to wait N real days."""
-    with sqlite3.connect(control_db.db_path) as conn:
+    with control_db._connect() as conn:
         conn.execute("UPDATE scans SET created_at = ? WHERE scan_id = ?", (created_at, scan_id))
 
 
@@ -332,6 +331,8 @@ class TestRetentionPurgeJob:
         assert output_dir.exists()
         assert any("DRY RUN" in record.message for record in caplog.records)
 
+    # Asserts control.db is in the file snapshot (SQLite only).
+    @pytest.mark.sqlite_only
     def test_a_real_backup_snapshot_is_never_touched_by_a_retention_purge_cycle(
         self, tmp_path: Path
     ) -> None:

@@ -321,6 +321,9 @@ class TestKillAndRelaunchAgainstARealSeparateProcess:
     on-disk control.db, not a simulated restart inside one test
     process."""
 
+    # The API runs in a separate process, outside the test's per-schema
+    # Postgres mapping (tests/_pg_mode.py), so both sides must share the SQLite file.
+    @pytest.mark.sqlite_only
     def test_a_scan_interrupted_by_a_real_process_kill_is_requeued_and_completes(
         self, tmp_path: Path
     ) -> None:

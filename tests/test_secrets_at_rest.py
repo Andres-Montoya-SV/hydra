@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import secrets
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -69,8 +68,11 @@ def _account(db: ControlDB) -> str:
 
 
 def _raw_secrets(db: ControlDB) -> list[str]:
-    with sqlite3.connect(db.db_path) as conn:
-        return [row[0] for row in conn.execute("SELECT secret FROM webhooks ORDER BY rowid")]
+    with db._connect() as conn:
+        return [
+            row[0]
+            for row in conn.execute("SELECT secret FROM webhooks ORDER BY created_at, webhook_id")
+        ]
 
 
 class TestWebhookSecretsAtRest:

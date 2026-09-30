@@ -87,7 +87,9 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.api_settings = settings
         app.state.control_db = ControlDB(
-            settings.control_db_path, secret_box=box_from_keys(settings.secrets_keys)
+            settings.control_db_path,
+            secret_box=box_from_keys(settings.secrets_keys),
+            database_url=settings.database_url,
         )
         sealed = app.state.control_db.seal_plaintext_secrets()
         if sealed:

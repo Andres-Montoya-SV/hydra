@@ -5,10 +5,11 @@ is pointed at loopback, as there."""
 
 from __future__ import annotations
 
+import json
 import secrets
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _verified_account import create_verified_account
@@ -104,15 +105,14 @@ def _enqueue(
     )
 
 
-def _deliveries(control_db: ControlDB) -> list[sqlite3.Row]:
-    with sqlite3.connect(control_db.db_path) as conn:
-        conn.row_factory = sqlite3.Row
+def _deliveries(control_db: ControlDB) -> list[Any]:
+    with control_db._connect() as conn:
         return conn.execute("SELECT * FROM integration_deliveries ORDER BY created_at").fetchall()
 
 
 def _make_due(control_db: ControlDB) -> None:
     past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    with sqlite3.connect(control_db.db_path) as conn:
+    with control_db._connect() as conn:
         conn.execute(
             "UPDATE integration_deliveries SET next_attempt_at = ? " "WHERE status = 'pending'",
             (past,),
@@ -262,7 +262,7 @@ class TestDelivery:
         )  # ...and then it crashed
 
         while_leased = _cycle(control_db)
-        with sqlite3.connect(control_db.db_path) as conn:  # the lease runs out
+        with control_db._connect() as conn:  # the lease runs out
             conn.execute(
                 "UPDATE integration_deliveries SET lease_until = ?",
                 ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),),
@@ -386,12 +386,13 @@ class TestProducers:
 
     @staticmethod
     def _events(client: TestClient) -> list[tuple[str, str]]:
-        with sqlite3.connect(client.app.state.control_db.db_path) as conn:
-            return conn.execute(
-                "SELECT e.event_type, json_extract(e.payload_json, '$.exposure_id') "
+        with client.app.state.control_db._connect() as conn:
+            rows = conn.execute(
+                "SELECT e.event_type, e.payload_json "
                 "FROM integration_events e JOIN integration_deliveries d "
                 "ON d.event_id = e.event_id ORDER BY e.created_at, e.event_type"
             ).fetchall()
+        return [(row[0], json.loads(row[1]).get("exposure_id")) for row in rows]
 
     def test_exposure_lifecycle_events_are_enqueued_once(self, tmp_path: Path) -> None:
         with _client(tmp_path) as client:

@@ -95,6 +95,8 @@ def _seed_full_easm_state(
 
 
 class TestBackupRestoreCoversEveryEasmTable:
+    # Backs up and restores the SQLite control-db file (Postgres: Phase 10c).
+    @pytest.mark.sqlite_only
     def test_a_real_backup_and_restore_round_trips_every_easm_row(
         self, control_db: ControlDB, api_settings: APISettings, tmp_path: Path
     ) -> None:
@@ -182,6 +184,8 @@ class TestFullBackfillIdempotency:
 
 
 class TestRestoreReferentialIntegrityCheck:
+    # Edits a SQLite control-db snapshot file directly.
+    @pytest.mark.sqlite_only
     def test_a_corrupted_snapshot_missing_an_asset_is_detected_never_silently_fixed(
         self, control_db: ControlDB, api_settings: APISettings, tmp_path: Path
     ) -> None:
@@ -272,7 +276,7 @@ class TestObservationRetentionNeverBreaksAssetOrExposureTraceability:
             store.create_run(ScanRun(run_id=scan_id, started_at=historical_time))
             store.upsert_host(scan_id, Host(domain="example.com", discovery_sources=["dnsx"]))
             control_db.update_scan_status(scan_id, "completed")
-            with sqlite3.connect(api_settings.control_db_path) as conn:
+            with control_db._connect() as conn:
                 conn.execute(
                     "UPDATE scans SET created_at = ?, updated_at = ? WHERE scan_id = ?",
                     (historical_time, historical_time, scan_id),
@@ -320,7 +324,7 @@ class TestObservationRetentionNeverBreaksAssetOrExposureTraceability:
         store.create_run(ScanRun(run_id=scan_id, started_at="2020-01-01T00:00:00+00:00"))
         store.upsert_host(scan_id, Host(domain="example.com", discovery_sources=["dnsx"]))
         control_db.update_scan_status(scan_id, "completed")
-        with sqlite3.connect(api_settings.control_db_path) as conn:
+        with control_db._connect() as conn:
             conn.execute(
                 "UPDATE scans SET created_at = ?, updated_at = ? WHERE scan_id = ?",
                 ("2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", scan_id),
@@ -365,7 +369,7 @@ class TestObservationRetentionNeverBreaksAssetOrExposureTraceability:
         store.create_run(ScanRun(run_id=scan_id, started_at="2020-01-01T00:00:00+00:00"))
         store.upsert_host(scan_id, Host(domain="example.com", discovery_sources=["dnsx"]))
         control_db.update_scan_status(scan_id, "completed")
-        with sqlite3.connect(api_settings.control_db_path) as conn:
+        with control_db._connect() as conn:
             conn.execute(
                 "UPDATE scans SET created_at = ?, updated_at = ? WHERE scan_id = ?",
                 ("2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", scan_id),

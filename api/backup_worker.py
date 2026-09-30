@@ -196,6 +196,20 @@ def _upload_snapshot_to_s3(
     )
 
 
+def _backup_control_db(
+    api_settings: APISettings, control_db: ControlDB, snapshot_dir: Path
+) -> bool:
+    """Copies control.db into the snapshot; False when the control plane is
+    on PostgreSQL (Productization Phase 10) — the managed database's own
+    snapshots / point-in-time recovery back it up, and only the per-account
+    SQLite files are copied here."""
+    if control_db.dialect.name != "sqlite":
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        return False
+    backup_sqlite_file(api_settings.control_db_path, snapshot_dir / "control.db")
+    return True
+
+
 def run_backup_job(*, api_settings: APISettings, control_db: ControlDB) -> Path:
     """Backs up `control.db` and every account's `recon.db` into one new
     local snapshot directory, optionally uploads it to S3-compatible
@@ -207,8 +221,7 @@ def run_backup_job(*, api_settings: APISettings, control_db: ControlDB) -> Path:
     never destructive, so there's nothing a rehearsal mode would be
     protecting against."""
     snapshot_dir = api_settings.backup_root / _timestamp()
-
-    backup_sqlite_file(api_settings.control_db_path, snapshot_dir / "control.db")
+    control_on_sqlite = _backup_control_db(api_settings, control_db, snapshot_dir)
 
     account_count = 0
     for account_id in control_db.list_account_ids():
@@ -220,8 +233,9 @@ def run_backup_job(*, api_settings: APISettings, control_db: ControlDB) -> Path:
         account_count += 1
 
     logger.info(
-        "Local backup created at %s (control.db + %d account recon.db file(s)).",
+        "Local backup created at %s (%s%d account recon.db file(s)).",
         snapshot_dir,
+        "control.db + " if control_on_sqlite else "",
         account_count,
     )
 

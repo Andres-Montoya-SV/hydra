@@ -7,7 +7,6 @@ listed as unknowns, and with no new inputs the Fase 21 result is unchanged."""
 from __future__ import annotations
 
 import json
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -281,16 +280,20 @@ class TestContextAuditUnderConcurrency:
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(save, owners))
 
-        with sqlite3.connect(db.db_path) as conn:
-            chain = [
+        with db._connect() as conn:
+            rows = [
                 (None if b is None else json.loads(b), json.loads(a))
                 for b, a in conn.execute(
-                    "SELECT before_json, after_json FROM asset_business_context_audit "
-                    "ORDER BY rowid"
+                    "SELECT before_json, after_json FROM asset_business_context_audit"
                 )
             ]
-        assert chain[0][0] is None
-        assert all(chain[i][0] == chain[i - 1][1] for i in range(1, len(chain)))
+        # Every write saw the previous one's result: starting from the
+        # first (no before), each row's after is exactly one other row's
+        # before, and following those links visits every row.
+        chain = [next(row for row in rows if row[0] is None)]
+        while len(chain) < len(rows):
+            chain.append(next(row for row in rows if row[0] == chain[-1][1]))
+        assert len(rows) == len(owners) * 3
         assert chain[-1][1]["owner"] == db.get_asset_business_context(org, "asset-r").owner
 
 

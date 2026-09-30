@@ -22,6 +22,14 @@ from config.settings import Settings  # noqa: E402
 # package fails instead of skipping. See tests/_optional_deps.py.
 install_strict_importorskip()
 
+# Productization Phase 10: HYDRA_TEST_DATABASE_URL (a disposable local
+# Postgres, never a real deployment) runs every ControlDB in the suite on
+# Postgres, each in its own schema; tests that reach into the SQLite file
+# directly are marked `sqlite_only` and skipped. See tests/_pg_mode.py.
+from _pg_mode import install_postgres_mode  # noqa: E402
+
+install_postgres_mode()
+
 # See docs/PAID_API_DESIGN.md's "Round 1 implemented" section for the
 # full incident writeup: the Python `httpx` PyPI package (a test-only
 # dependency, requirements-dev.txt, needed for fastapi.testclient) always
@@ -68,3 +76,27 @@ def targets_file(project_root: Path) -> Path:
     path = project_root / "targets.txt"
     path.write_text("example.com\nexample.org\n", encoding="utf-8")
     return path
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", "sqlite_only: reads/writes the SQLite control-db file directly"
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    from _pg_mode import POSTGRES_URL
+
+    if not POSTGRES_URL:
+        return
+    skip = pytest.mark.skip(reason="reads the SQLite control-db file directly")
+    for item in items:
+        if item.get_closest_marker("sqlite_only"):
+            item.add_marker(skip)
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    del session, exitstatus
+    from _pg_mode import drop_test_schemas
+
+    drop_test_schemas()

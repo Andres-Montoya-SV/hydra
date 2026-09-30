@@ -8,7 +8,6 @@ drives the real `run_monitoring_cycle`."""
 from __future__ import annotations
 
 import secrets
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -277,7 +276,7 @@ class TestRiskChangeAlerts:
         db, account_id, org, exposure_id = self._setup(tmp_path)
         _risk_change_citations(db, org, "run-1")
         aged = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
-        with sqlite3.connect(db.db_path) as conn:
+        with db._connect() as conn:
             conn.execute(
                 "UPDATE exposures SET first_seen_at = ? WHERE exposure_id = ?", (aged, exposure_id)
             )
@@ -325,7 +324,7 @@ def _monitored(db: ControlDB, settings: APISettings) -> tuple[str, str]:
 def _cycle(db: ControlDB, settings: APISettings, ids: tuple[str, str], svc: HttpService) -> None:
     account_id, monitoring_id = ids
     past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-    with sqlite3.connect(db.db_path) as conn:
+    with db._connect() as conn:
         conn.execute(
             "UPDATE monitored_domains SET next_passive_due_at = ? " "WHERE monitoring_id = ?",
             (past, monitoring_id),

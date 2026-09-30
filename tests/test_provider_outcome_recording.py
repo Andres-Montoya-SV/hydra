@@ -168,6 +168,8 @@ class TestCollectionEndpointAndMigration:
                 "subfinder": None,
             }
 
+    # Upgrades an existing SQLite control-db file.
+    @pytest.mark.sqlite_only
     def test_an_existing_database_gains_the_column(self, tmp_path: Path) -> None:
         path = tmp_path / "control.db"
         ControlDB(path)
