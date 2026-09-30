@@ -116,3 +116,32 @@ def _discovered_to_report(discovered: DiscoveredTool) -> ToolReport:
         recommendation=discovered.recommendation,
         install_hint=discovered.install_hint,
     )
+
+
+_QUALIFICATION_STYLE = {
+    "qualified": "green",
+    "unverified_version": "yellow",
+    "version_unknown": "yellow",
+    "not_installed": "dim",
+    "missing_flags": "red",
+    "known_incompatible": "red",
+}
+
+
+def render_qualification_report(results: list) -> None:
+    """Print provider qualification (core/provider_qualification.py)."""
+    console = Console()
+    table = Table(title="Provider Qualification", show_header=True, header_style="bold cyan")
+    table.add_column("Status", width=20)
+    table.add_column("Tool", width=14)
+    table.add_column("Version", max_width=20)
+    table.add_column("Why", overflow="fold")
+    for result in results:
+        style = _QUALIFICATION_STYLE.get(result.status, "white")
+        table.add_row(
+            f"[{style}]{result.status}[/{style}]",
+            result.tool,
+            result.version or "-",
+            "; ".join(result.reasons),
+        )
+    console.print(table)
