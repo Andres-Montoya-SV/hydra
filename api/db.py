@@ -265,18 +265,26 @@ class SqliteBackend(Backend):
             conn.close()
 
 
+# Creates the schema named by the transaction-local setting
+# `hydra.new_schema` (set from a bound parameter just before).
+_CREATE_SCHEMA_SQL = """
+DO $$ BEGIN
+    EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I', current_setting('hydra.new_schema'));
+END $$
+"""
+
+
 class PostgresBackend(Backend):
     def __init__(self, url: str, *, schema: str = "public") -> None:
         super().__init__(PostgresDialect())
         self.url = url
         self.schema = _ident(schema)
         if self.schema != "public":
-            from psycopg import sql
-
             with _pool(url).connection() as conn:
-                conn.execute(
-                    sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema))
-                )
+                # The name travels as a bound parameter; the server quotes it
+                # (format %I). No SQL is composed client-side.
+                conn.execute("SELECT set_config('hydra.new_schema', %s, true)", (self.schema,))
+                conn.execute(_CREATE_SCHEMA_SQL)
 
     @contextmanager
     def connect(self) -> Iterator[Any]:

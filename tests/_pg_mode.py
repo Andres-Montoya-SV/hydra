@@ -13,6 +13,20 @@ from pathlib import Path
 
 POSTGRES_URL = os.getenv("HYDRA_TEST_DATABASE_URL") or None
 
+# Drops every per-test schema (api.db.schema_for_path names them t_<hex>);
+# the names come from the catalog and are quoted by the server (format %I).
+_DROP_TEST_SCHEMAS_SQL = """
+DO $$
+DECLARE name text;
+BEGIN
+    FOR name IN SELECT nspname FROM pg_namespace WHERE nspname ~ '^t_[0-9a-f]{24}$' LOOP
+        EXECUTE format('DROP SCHEMA %I CASCADE', name);
+        COMMIT;  -- one schema per transaction: thousands of tables otherwise
+                 -- exhaust max_locks_per_transaction
+    END LOOP;
+END $$
+"""
+
 
 def install_postgres_mode() -> None:
     if not POSTGRES_URL:
@@ -32,14 +46,6 @@ def drop_test_schemas() -> None:
     if not POSTGRES_URL:
         return
     import psycopg
-    from psycopg import sql
 
     with psycopg.connect(POSTGRES_URL, autocommit=True) as conn:
-        names = [
-            row[0]
-            for row in conn.execute(
-                "SELECT nspname FROM pg_namespace WHERE nspname LIKE 't\\_%%'"
-            ).fetchall()
-        ]
-        for name in names:
-            conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(name)))
+        conn.execute(_DROP_TEST_SCHEMAS_SQL)
