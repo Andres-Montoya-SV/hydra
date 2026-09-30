@@ -9,7 +9,6 @@ from __future__ import annotations
 import base64
 import json
 import secrets
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -306,7 +305,7 @@ class TestEndToEnd:
             reset_webhook_test_state(status=401, body=b'{"errorMessages": ["unauthorized"]}')
 
             first = _cycle(client)
-            with sqlite3.connect(db.db_path) as conn:
+            with db._connect() as conn:
                 conn.execute("UPDATE integration_deliveries SET next_attempt_at = '2000-01-01'")
             second = _cycle(client)
             log = client.get(
@@ -330,13 +329,13 @@ class TestApiAndSecrets:
             created = _connect_jira(client, headers, org, jira_site)
             integration_id = created.json()["integration_id"]
             db = client.app.state.control_db
-            with sqlite3.connect(db.db_path) as conn:
+            with db._connect() as conn:
                 stored = conn.execute("SELECT credential FROM ticketing_integrations").fetchone()[0]
 
             removed = client.delete(
                 f"/organizations/{org}/integrations/{integration_id}", headers=headers
             )
-            with sqlite3.connect(db.db_path) as conn:
+            with db._connect() as conn:
                 after = conn.execute(
                     "SELECT credential, status FROM ticketing_integrations"
                 ).fetchone()
@@ -345,7 +344,7 @@ class TestApiAndSecrets:
             assert "DO-NOT-LEAK" not in created.text and "credential" not in created.json()
             assert stored.startswith("enc:v1:") and "DO-NOT-LEAK" not in stored
             assert removed.status_code == 204
-            assert after == ("", "disabled")
+            assert tuple(after) == ("", "disabled")
 
     def test_no_server_key_means_no_integrations(self, tmp_path: Path, jira_site: str) -> None:
         with _client(tmp_path, keys=None) as client:
@@ -437,11 +436,11 @@ def test_organization_events_reach_only_that_organizations_integrations(tmp_path
         dedup_key="x",
     )
 
-    with sqlite3.connect(db.db_path) as conn:
+    with db._connect() as conn:
         routed = conn.execute(
             "SELECT webhook_id, destination_type FROM integration_deliveries"
         ).fetchall()
-    assert routed == [(mine.integration_id, "ticketing")]
+    assert [tuple(row) for row in routed] == [(mine.integration_id, "ticketing")]
 
 
 class TestReviewFollowUps:
@@ -459,7 +458,7 @@ class TestReviewFollowUps:
             finally:
                 WebhookTestHandler.extra_headers = {}
 
-            with sqlite3.connect(db.db_path) as conn:
+            with db._connect() as conn:
                 row = conn.execute(
                     "SELECT last_error, next_attempt_at FROM integration_deliveries"
                 ).fetchone()
@@ -499,7 +498,7 @@ class TestReviewFollowUps:
             secret=generate_webhook_secret(),
             event_types=("monitoring.changed",),
         )
-        with sqlite3.connect(db.db_path) as conn:
+        with db._connect() as conn:
             before = conn.execute("SELECT secret FROM webhooks").fetchone()[0]
             conn.execute(
                 "INSERT INTO webhooks (webhook_id, account_id, url, secret, "
@@ -509,7 +508,7 @@ class TestReviewFollowUps:
             )
 
         assert db.seal_plaintext_secrets() == 1
-        with sqlite3.connect(db.db_path) as conn:
+        with db._connect() as conn:
             rows = dict(conn.execute("SELECT webhook_id, secret FROM webhooks").fetchall())
         assert rows[sealed_hook.webhook_id] == before  # never re-sealed
         assert box.reveal(rows["legacy"]) == "plain"

@@ -51,6 +51,8 @@ class TestHealthCheckPureFunction:
     control_db — a real corrupted SQLite file, not a mock standing in
     for "unreachable"."""
 
+    # Corrupts the SQLite control-db file on disk.
+    @pytest.mark.sqlite_only
     def test_a_genuinely_corrupted_control_db_reports_503_with_a_real_reason(
         self, tmp_path: Path, api_settings: APISettings
     ) -> None:

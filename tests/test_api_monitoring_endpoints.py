@@ -7,7 +7,6 @@ methods, exercise the real endpoint under test" split
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -148,7 +147,7 @@ class TestAcknowledge:
         client.app.state.control_db.set_tier(account_id, "pro")
         client.post(f"/domains/{DOMAIN}/monitoring", json={}, headers=_auth(api_key))
         control_db = client.app.state.control_db
-        with sqlite3.connect(control_db.db_path) as conn:
+        with control_db._connect() as conn:
             conn.execute(
                 "UPDATE monitored_domains SET status = 'needs_review', needs_review = 1 "
                 "WHERE account_id = ? AND domain = ?",

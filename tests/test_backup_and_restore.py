@@ -24,6 +24,10 @@ from api.control_db import ControlDB
 from api.restore_backup import RestoreTargetExistsError, restore_backup
 from api.settings import APISettings
 
+# The control-db file backup/restore path; on Postgres the managed
+# database's own backups apply (Phase 10c).
+pytestmark = pytest.mark.sqlite_only
+
 pytest.importorskip("boto3")
 
 from _fake_s3_server import (  # noqa: E402

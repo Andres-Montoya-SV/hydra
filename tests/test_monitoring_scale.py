@@ -27,6 +27,9 @@ import pytest
 
 from api.control_db import ControlDB
 
+# Seeds and times SQLite writes (WAL) directly on the control-db file.
+pytestmark = pytest.mark.sqlite_only
+
 ROW_COUNT = 300_000
 PAGE_SIZE = 1_000
 

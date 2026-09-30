@@ -196,35 +196,23 @@ def _upload_snapshot_to_s3(
     )
 
 
-def run_backup_job(*, api_settings: APISettings, control_db: ControlDB) -> Path:
-    """Backs up `control.db` and every account's `recon.db` into one new
-    local snapshot directory, optionally uploads it to S3-compatible
-    storage if configured, then rotates old local snapshots. Returns the
-    new snapshot directory's path.
-
-    Runs as an ordinary, real backup with real consequences — there is
-    no dry-run mode here (unlike the retention-purge job): backing up is
-    never destructive, so there's nothing a rehearsal mode would be
-    protecting against."""
-    snapshot_dir = api_settings.backup_root / _timestamp()
-
+def _backup_control_db(
+    api_settings: APISettings, control_db: ControlDB, snapshot_dir: Path
+) -> bool:
+    """Copies control.db into the snapshot; False when the control plane is
+    on PostgreSQL (Productization Phase 10) — the managed database's own
+    snapshots / point-in-time recovery back it up, and only the per-account
+    SQLite files are copied here."""
+    if control_db.dialect.name != "sqlite":
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        return False
     backup_sqlite_file(api_settings.control_db_path, snapshot_dir / "control.db")
+    return True
 
-    account_count = 0
-    for account_id in control_db.list_account_ids():
-        source = _recon_db_path(api_settings, account_id)
-        if not source.exists():
-            continue  # never scanned yet — nothing to back up
-        dest = snapshot_dir / "accounts" / account_id / "output" / "recon.db"
-        backup_sqlite_file(source, dest)
-        account_count += 1
 
-    logger.info(
-        "Local backup created at %s (control.db + %d account recon.db file(s)).",
-        snapshot_dir,
-        account_count,
-    )
-
+def _upload_snapshot_to_s3_if_configured(api_settings: APISettings, snapshot_dir: Path) -> None:
+    """Uploads the snapshot when a bucket is configured. A remote failure
+    is logged, never raised: the local backup already succeeded."""
     if api_settings.backup_s3_bucket:
         try:
             _upload_snapshot_to_s3(
@@ -260,6 +248,38 @@ def run_backup_job(*, api_settings: APISettings, control_db: ControlDB) -> Path:
             "would not survive this host's disk failing. Configure remote upload once a "
             "bucket is provisioned."
         )
+
+
+def run_backup_job(*, api_settings: APISettings, control_db: ControlDB) -> Path:
+    """Backs up `control.db` and every account's `recon.db` into one new
+    local snapshot directory, optionally uploads it to S3-compatible
+    storage if configured, then rotates old local snapshots. Returns the
+    new snapshot directory's path.
+
+    Runs as an ordinary, real backup with real consequences — there is
+    no dry-run mode here (unlike the retention-purge job): backing up is
+    never destructive, so there's nothing a rehearsal mode would be
+    protecting against."""
+    snapshot_dir = api_settings.backup_root / _timestamp()
+    control_on_sqlite = _backup_control_db(api_settings, control_db, snapshot_dir)
+
+    account_count = 0
+    for account_id in control_db.list_account_ids():
+        source = _recon_db_path(api_settings, account_id)
+        if not source.exists():
+            continue  # never scanned yet — nothing to back up
+        dest = snapshot_dir / "accounts" / account_id / "output" / "recon.db"
+        backup_sqlite_file(source, dest)
+        account_count += 1
+
+    logger.info(
+        "Local backup created at %s (%s%d account recon.db file(s)).",
+        snapshot_dir,
+        "control.db + " if control_on_sqlite else "",
+        account_count,
+    )
+
+    _upload_snapshot_to_s3_if_configured(api_settings, snapshot_dir)
 
     deleted = rotate_backups(
         api_settings.backup_root, keep_count=api_settings.backup_retention_count
