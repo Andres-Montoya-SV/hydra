@@ -40,6 +40,7 @@ from api.routers import (
     imports,
     keys,
     monitoring,
+    remediation,
     reportability,
     scans,
     scope,
@@ -254,6 +255,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(keys.router)
     app.include_router(domains.router)
     app.include_router(exposures.router)
+    app.include_router(remediation.router)
     app.include_router(easm.router)
     app.include_router(asset_context.router)
     app.include_router(explanations.router)

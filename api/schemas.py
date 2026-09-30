@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import re
 from typing import Literal
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from core.remediation import to_utc_iso
 
 # A minimal, pragmatic format check — not full RFC 5322 validation
 # (pydantic's `EmailStr` would need the `email-validator` extra, a new
@@ -983,4 +986,119 @@ class AssetContextAuditResponse(BaseModel):
     actor_account_id: str
     before: dict[str, object] | None = None
     after: dict[str, object]
+    created_at: str
+
+
+RemediationState = Literal[
+    "triage", "in_progress", "fixed_pending_verification", "accepted_risk", "false_positive"
+]
+
+
+class RemediationTransitionRequest(BaseModel):
+    to_state: RemediationState
+    # Required for accepted_risk / false_positive.
+    reason: str | None = Field(default=None, max_length=1000)
+    # Required for accepted_risk: an ISO-8601 time with timezone, at most a year ahead.
+    accepted_until: str | None = Field(default=None, max_length=64)
+
+    @field_validator("accepted_until")
+    @classmethod
+    def _utc(cls, value: str | None) -> str | None:
+        return None if value is None else to_utc_iso(value, field="accepted_until")
+
+
+class RemediationFieldsRequest(BaseModel):
+    """Only the fields present in the request change; null clears one."""
+
+    assignee_account_id: str | None = Field(default=None, max_length=64)
+    due_at: str | None = Field(default=None, max_length=64)
+    ticket_url: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("due_at")
+    @classmethod
+    def _due_utc(cls, value: str | None) -> str | None:
+        return None if value is None else to_utc_iso(value, field="due_at")
+
+    @field_validator("ticket_url")
+    @classmethod
+    def _https_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlparse(value)
+        if parsed.scheme != "https" or not parsed.netloc or any(c.isspace() for c in value):
+            raise ValueError("ticket_url must be an https URL")
+        return value
+
+
+class RemediationCommentRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("body")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("comment must not be blank")
+        return value.strip()
+
+
+class RemediationBulkRequest(BaseModel):
+    """Apply one change to up to 100 exposures, all or nothing."""
+
+    exposure_ids: list[str] = Field(min_length=1, max_length=100)
+    transition: RemediationTransitionRequest | None = None
+    fields: RemediationFieldsRequest | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_action(self) -> RemediationBulkRequest:
+        if (self.transition is None) == (self.fields is None):
+            raise ValueError("give exactly one of transition or fields")
+        if len(set(self.exposure_ids)) != len(self.exposure_ids):
+            raise ValueError("exposure_ids must be unique")
+        return self
+
+
+class RemediationResponse(BaseModel):
+    exposure_id: str
+    # What to act on: the stored decision adjusted for what detection saw
+    # since (resolved -> closed, expired acceptance -> triage, re-detected
+    # after a fix claim -> in_progress). `derived_reason` says why.
+    state: Literal[
+        "triage",
+        "in_progress",
+        "fixed_pending_verification",
+        "accepted_risk",
+        "false_positive",
+        "closed",
+    ]
+    stored_state: RemediationState
+    derived_reason: str | None = None
+    state_reason: str | None = None
+    state_changed_at: str | None = None
+    accepted_until: str | None = None
+    assignee_account_id: str | None = None
+    due_at: str
+    sla_due_at: str
+    overdue: bool
+    ticket_url: str | None = None
+    updated_at: str | None = None
+
+
+class WorklistItemResponse(BaseModel):
+    exposure_id: str
+    asset_id: str
+    title: str
+    severity: str
+    exposure_status: str
+    remediation: RemediationResponse
+
+
+class RemediationEventResponse(BaseModel):
+    event_id: str
+    actor_account_id: str
+    event_type: Literal[
+        "state_changed", "assignee_changed", "due_at_changed", "ticket_changed", "comment"
+    ]
+    from_value: str | None = None
+    to_value: str | None = None
+    body: str | None = None
     created_at: str
