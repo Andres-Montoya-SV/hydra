@@ -37,7 +37,12 @@ from api.webhooks import (
 )
 
 if TYPE_CHECKING:
-    from api.control_db import ControlDB, DeliveryWork, IntegrationEventRecord
+    from api.control_db import (
+        ControlDB,
+        DeliveryWork,
+        IntegrationEventRecord,
+        TicketingIntegrationRecord,
+    )
     from api.health import LoopHeartbeats
     from api.settings import APISettings
 
@@ -120,30 +125,92 @@ def next_attempt(attempts_before: int, now: datetime) -> datetime | None:
 
 
 async def _deliver_one(control_db: ControlDB, work: DeliveryWork, *, verify: bool) -> str:
+    if work.ticketing is not None:
+        return await _deliver_ticket(control_db, work, work.ticketing, verify=verify)
+    webhook = work.webhook
+    if webhook is None:  # claim always sets one destination; fail visibly if not
+        return _record(control_db, work, "delivery has no destination")
     ok, error, _retryable = await attempt_delivery(
-        work.webhook,
-        body=render_body(work.webhook.kind, work.event),
+        webhook,
+        body=render_body(webhook.kind, work.event),
         event_type=work.event.event_type,
         verify=verify,
         extra_headers={EVENT_ID_HEADER: work.event.event_id, DELIVERY_ID_HEADER: work.delivery_id},
     )
+    outcome = _record(control_db, work, None if ok else error)
+    if outcome == "delivered":
+        control_db.record_webhook_delivery_success(webhook.webhook_id)
+    elif outcome == "dead":
+        control_db.record_webhook_delivery_failure(
+            webhook.webhook_id, error=error, disable_after=DISABLE_AFTER_CONSECUTIVE_FAILURES
+        )
+    return outcome
+
+
+async def _deliver_ticket(
+    control_db: ControlDB,
+    work: DeliveryWork,
+    integration: TicketingIntegrationRecord,
+    *,
+    verify: bool,
+) -> str:
+    """One ticket per (integration, exposure): an existing link means this
+    event was already turned into a ticket (e.g. a retry after the ticket
+    was created but before the delivery was marked), so nothing is sent."""
+    from api.secrets_box import SecretsUnavailableError, reveal
+    from api.ticketing import create_ticket
+
+    exposure_id = str(work.event.payload.get("exposure_id") or "")
+    if not exposure_id or control_db.get_ticket_link(integration.integration_id, exposure_id):
+        return _record(control_db, work, None)
+    try:
+        credential = json.loads(reveal(integration.sealed_credential, control_db.secret_box))
+        key, url = await create_ticket(
+            integration.provider,
+            integration.config,
+            credential,
+            work.event.event_type,
+            work.event.payload,
+            verify=verify,
+        )
+    except (ValueError, SecretsUnavailableError) as exc:
+        error = str(exc) or type(exc).__name__
+        outcome = _record(control_db, work, error)
+        if outcome == "dead":
+            control_db.record_ticketing_outcome(
+                integration.integration_id,
+                error=error,
+                disable_after=DISABLE_AFTER_CONSECUTIVE_FAILURES,
+            )
+        return outcome
+    control_db.link_ticket(
+        organization_id=integration.organization_id,
+        integration_id=integration.integration_id,
+        exposure_id=exposure_id,
+        external_key=key,
+        external_url=url,
+    )
+    control_db.record_ticketing_outcome(
+        integration.integration_id, error=None, disable_after=DISABLE_AFTER_CONSECUTIVE_FAILURES
+    )
+    return _record(control_db, work, None)
+
+
+def _record(control_db: ControlDB, work: DeliveryWork, error: str | None) -> str:
+    """Records one attempt's result: delivered, retrying (with backoff), or
+    dead once MAX_ATTEMPTS is reached."""
     now = datetime.now(timezone.utc)
-    if ok:
+    if error is None:
         control_db.record_delivery_attempt(work.delivery_id, error=None, now=now, retry_at=None)
-        control_db.record_webhook_delivery_success(work.webhook.webhook_id)
         return "delivered"
     retry_at = next_attempt(work.attempts, now)
     control_db.record_delivery_attempt(work.delivery_id, error=error, now=now, retry_at=retry_at)
     if retry_at is not None:
         return "retrying"
-    control_db.record_webhook_delivery_failure(
-        work.webhook.webhook_id, error=error, disable_after=DISABLE_AFTER_CONSECUTIVE_FAILURES
-    )
     logger.warning(
-        "Delivery %s of %s to webhook %s is dead after %d attempts: %s",
+        "Delivery %s of %s is dead after %d attempts: %s",
         work.delivery_id,
         work.event.event_type,
-        work.webhook.webhook_id,
         MAX_ATTEMPTS,
         error,
     )

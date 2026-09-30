@@ -1,4 +1,4 @@
-# Product Phase 08 — Integrations (part A: the canonical event outbox)
+# Product Phase 08 — Integrations
 
 Branch: `productization/08-integrations-outbox`. Base: `main` @ `8120cf3`
 (after PR #105).
@@ -147,3 +147,91 @@ account's webhook or delivery returns 404.
   review.
 - **Assignment reminders and overdue alerts:** these need a scheduled
   producer, which is a small addition on this outbox.
+
+
+---
+
+# Part B — ticketing and secrets at rest
+
+Branch: `productization/08b-ticketing`. Base: `main` @ `920dab7` (after
+PRs #106 and #107).
+
+## Secrets at rest (`api/secrets_box.py`)
+
+**Before:** webhook signing secrets were stored in plaintext, and there was
+nowhere safe to keep a third-party API token.
+
+**Now:**
+
+- **Encryption:** secrets are sealed with Fernet (authenticated encryption)
+  under `HYDRA_API_SECRETS_KEYS`.
+- **Rotation:** the setting holds comma-separated keys. The first key
+  encrypts and every key can decrypt, so a key is rotated by putting the
+  new one first.
+- **Format:** sealed values carry an `enc:v1:` prefix. Legacy plaintext is
+  still read correctly. A sealed value that no configured key can decrypt
+  fails closed. A malformed key fails startup.
+- **Webhook secrets** are sealed on write inside ControlDB and revealed
+  only when a record is built for signing, so the signing path is
+  unchanged. With a key configured, startup seals any plaintext secret left
+  from before; this is idempotent.
+- **Ticketing credentials require a key.** Without one, connecting an
+  integration returns `503 secrets_key_not_configured`. Hydra never stores
+  a third-party token in plaintext.
+- **Dependency:** `cryptography` moved into `requirements-api`, with the
+  same audited pin as before.
+
+## Ticketing (`api/ticketing.py`)
+
+| Provider | Request | Auth | Config / credential |
+|---|---|---|---|
+| Jira Cloud | `POST {site_url}/rest/api/3/issue`, description in Atlassian Document Format | Basic (email + API token) | `site_url`, `project_key`, optional `issue_type` / `email`, `api_token` |
+| Linear | GraphQL `issueCreate` at `https://api.linear.app/graphql` | API key | `team_id` / `api_key` |
+| ServiceNow | Table API `POST {instance_url}/api/now/table/incident`, urgency from severity | Basic | `instance_url` / `username`, `password` |
+
+### Behavior
+
+- **Events.** An integration subscribes to `exposure.opened` (the default)
+  and optionally `exposure.reopened`, delivered through the Part A outbox.
+- **Retries and failures** follow the same schedule as webhooks: retry
+  with backoff, dead after 7 attempts. Five consecutive dead deliveries
+  disable the integration automatically.
+- **One ticket per exposure.** `ticketing_links` records the ticket created
+  for each (integration, exposure). A later event for the same exposure (a
+  retry, or a reopen) sends nothing.
+  - Remaining risk: a request that times out after the provider created the
+    issue can't be told apart from a failure. None of these APIs offers an
+    idempotency key, so that one case may produce a duplicate issue.
+- **Link back.** The created ticket fills the exposure's remediation
+  `ticket_url` if it's empty, recorded as a remediation event by
+  `integration:<id>`. A link someone set by hand is never overwritten.
+- **SSRF protection.** A customer-supplied Jira or ServiceNow host goes
+  through the same SSRF / DNS-rebinding gate as a webhook URL, both when
+  the integration is created and on every attempt. Linear's API host is
+  fixed.
+- **Wire formats** are pure functions, tested against each provider's
+  documented request and response shapes. End-to-end tests point a Jira
+  integration at a real local HTTPS server. No real service is called.
+
+### API
+
+| Endpoint | Who |
+|---|---|
+| `GET /organizations/{org}/integrations` | member (credentials never returned) |
+| `POST /organizations/{org}/integrations` | owner |
+| `DELETE /organizations/{org}/integrations/{id}` | owner: disables the integration and erases its credential; its ticket links stay |
+| `GET /organizations/{org}/integrations/{id}/deliveries` | member |
+
+- **Limit:** at most 10 active integrations per organization.
+- **Errors:** invalid config returns 422; a refused host returns 422;
+  another organization returns 404.
+- **Credential safety:** tests check that the credential never appears in
+  any response, delivery log or error.
+
+## Not done
+
+- **Comments on an existing ticket for reopen or resolve events.** For now
+  a reopen reuses the linked ticket silently.
+- **Two-way sync** (closing an exposure when its ticket closes). That
+  needs inbound provider webhooks, a separate authenticated surface.
+- **Microsoft Teams bot or Slack app** (as opposed to incoming webhooks).

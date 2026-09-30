@@ -265,18 +265,36 @@ async def _post_to_pinned_ip(
     verify: bool = True,
     extra_headers: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
-    """The actual delivery attempt — connects to `connect_ip` (already
-    validated), never lets the HTTP client re-resolve `hostname` itself.
-    `verify` (real TLS certificate verification against `sni_hostname`,
-    not the IP literal — a receiver whose certificate doesn't match the
-    registered hostname fails closed exactly as it should) defaults to
-    `True` and stays `True` on every real code path in this codebase;
-    it exists as a parameter ONLY so this module's own tests can point
-    delivery at a real local HTTPS server using a self-signed
-    certificate without needing a CA this project doesn't control —
-    the same "explicit override, production never passes it" shape
-    `api/domain_verification.py`'s injectable `client`/`base_url`
-    parameters already established for the same reason."""
+    """A signed webhook POST to an already-validated IP: `(ok, error)`."""
+    status, _content, error = await send_pinned(
+        url=url,
+        connect_ip=connect_ip,
+        hostname=hostname,
+        body=body,
+        headers={_SIGNATURE_HEADER: signature, _EVENT_HEADER: event_type, **(extra_headers or {})},
+        verify=verify,
+    )
+    if status is None:
+        return False, error
+    if 200 <= status < 300:
+        return True, ""
+    return False, f"HTTP {status}"
+
+
+async def send_pinned(
+    *,
+    url: str,
+    connect_ip: str,
+    hostname: str,
+    body: bytes,
+    headers: dict[str, str],
+    verify: bool = True,
+) -> tuple[int | None, bytes, str]:
+    """POSTs JSON to `connect_ip` (already validated), never letting the
+    HTTP client re-resolve `hostname` itself: `(status, body, error)`,
+    status None on a transport error. TLS is verified against the real
+    hostname via SNI (`verify` is True on every production path; tests
+    pass False to reach a local self-signed server)."""
     import httpx
 
     parsed = urlparse(url)
@@ -285,29 +303,39 @@ async def _post_to_pinned_ip(
     if parsed.query:
         path = f"{path}?{parsed.query}"
     pinned_url = f"https://{connect_ip}:{port}{path}"
-
     try:
         async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS, verify=verify) as client:
             request = client.build_request(
                 "POST",
                 pinned_url,
                 content=body,
-                headers={
-                    "Host": hostname,
-                    "Content-Type": "application/json",
-                    _SIGNATURE_HEADER: signature,
-                    _EVENT_HEADER: event_type,
-                    **(extra_headers or {}),
-                },
+                headers={"Host": hostname, "Content-Type": "application/json", **headers},
                 extensions={"sni_hostname": hostname},
             )
             response = await client.send(request)
     except httpx.RequestError as exc:
-        return False, f"{type(exc).__name__}: {exc}"
+        return None, b"", f"{type(exc).__name__}: {exc}"
+    return response.status_code, response.content, ""
 
-    if 200 <= response.status_code < 300:
-        return True, ""
-    return False, f"HTTP {response.status_code}"
+
+async def post_json_safely(
+    url: str, *, body: bytes, headers: dict[str, str], verify: bool = True
+) -> tuple[int | None, bytes, str]:
+    """`send_pinned` behind the same destination check every webhook
+    attempt gets (SSRF / DNS rebinding), for callers with their own URL:
+    ticketing APIs at a customer-supplied Jira or ServiceNow host."""
+    allowed, reason, connect_ip = await validate_webhook_destination(url)
+    hostname = urlparse(url).hostname
+    if not allowed or hostname is None:
+        return None, b"", reason or "URL has no host."
+    return await send_pinned(
+        url=url,
+        connect_ip=connect_ip,
+        hostname=hostname,
+        body=body,
+        headers=headers,
+        verify=verify,
+    )
 
 
 async def attempt_delivery(

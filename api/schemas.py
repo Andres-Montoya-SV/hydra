@@ -1121,3 +1121,46 @@ class DeliveryResponse(BaseModel):
     last_error: str | None = None
     delivered_at: str | None = None
     created_at: str
+
+
+TicketingEvent = Literal["exposure.opened", "exposure.reopened"]
+TicketingProvider = Literal["jira", "linear", "servicenow"]
+
+
+def _default_ticketing_events() -> list[TicketingEvent]:
+    return ["exposure.opened"]
+
+
+class CreateTicketingIntegrationRequest(BaseModel):
+    """`config` is non-secret (Jira: site_url, project_key, optional
+    issue_type; Linear: team_id; ServiceNow: instance_url). `credential` is
+    sealed at rest and never returned (Jira: email, api_token; Linear:
+    api_key; ServiceNow: username, password)."""
+
+    provider: TicketingProvider
+    name: str = Field(min_length=1, max_length=100)
+    config: dict[str, str] = Field(max_length=10)
+    credential: dict[str, str] = Field(max_length=5)
+    event_types: list[TicketingEvent] = Field(
+        default_factory=_default_ticketing_events, min_length=1
+    )
+
+    @field_validator("config", "credential")
+    @classmethod
+    def _bounded_values(cls, value: dict[str, str]) -> dict[str, str]:
+        if any(len(k) > 64 or len(v) > 1000 for k, v in value.items()):
+            raise ValueError("keys must be <= 64 and values <= 1000 characters")
+        return value
+
+
+class TicketingIntegrationResponse(BaseModel):
+    integration_id: str
+    provider: TicketingProvider
+    name: str
+    config: dict[str, str]
+    event_types: list[str]
+    status: Literal["active", "disabled"]
+    consecutive_failures: int
+    last_error: str | None = None
+    created_by_account_id: str
+    created_at: str

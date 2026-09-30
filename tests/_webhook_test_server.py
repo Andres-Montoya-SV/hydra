@@ -32,6 +32,9 @@ from typing import Any
 class WebhookTestHandler(http.server.BaseHTTPRequestHandler):
     requests: list[dict[str, Any]] = []
     response_status = 200
+    # What the server answers with (a ticketing API's created-issue JSON,
+    # for instance); the default empty object suits plain webhooks.
+    response_body = b"{}"
     # Set to a positive number to make the handler sleep before
     # responding — used to exercise the client's own timeout.
     delay_seconds = 0.0
@@ -48,6 +51,7 @@ class WebhookTestHandler(http.server.BaseHTTPRequestHandler):
             time.sleep(self.delay_seconds)
         WebhookTestHandler.requests.append(
             {
+                "path": self.path,
                 "headers": dict(self.headers.items()),
                 "raw_body": raw,
                 "body": json.loads(raw.decode("utf-8")) if raw else None,
@@ -56,13 +60,16 @@ class WebhookTestHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(self.response_status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b"{}")
+        self.wfile.write(self.response_body)
 
 
-def reset_webhook_test_state(*, status: int = 200, delay_seconds: float = 0.0) -> None:
+def reset_webhook_test_state(
+    *, status: int = 200, delay_seconds: float = 0.0, body: bytes = b"{}"
+) -> None:
     WebhookTestHandler.requests = []
     WebhookTestHandler.response_status = status
     WebhookTestHandler.delay_seconds = delay_seconds
+    WebhookTestHandler.response_body = body
 
 
 def _generate_self_signed_cert(cert_path: Path, key_path: Path) -> None:
