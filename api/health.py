@@ -72,6 +72,7 @@ _MONITORED_LOOPS: tuple[tuple[str, str], ...] = (
     ("reconciliation", "reconciliation_interval_seconds"),
     ("backup", "backup_interval_seconds"),
     ("monitoring", "monitoring_poll_interval_seconds"),
+    ("integration_delivery", "integration_delivery_interval_seconds"),
 )
 
 

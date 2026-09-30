@@ -16,7 +16,7 @@ This module is that missing piece: one function,
 `api/scan_orchestrator.py::execute_scan()` right after a scan completes,
 in its own try/except (a backfill bug must never retroactively fail an
 already-completed scan — the same isolation
-`_deliver_high_severity_findings_webhook` already gets there).
+`_enqueue_high_severity_findings_event` already gets there).
 
 **Known, pre-existing scaling characteristic, not introduced by this
 phase**: every one of these backfill functions replays ALL of an
@@ -111,7 +111,7 @@ def run_easm_backfill_for_organization_safely(
 ) -> EasmBackfillSummary | None:
     """The exact call `execute_scan()` makes — never raises. A backfill
     failure is logged and swallowed, same isolation
-    `_deliver_high_severity_findings_webhook` already gets in that same
+    `_enqueue_high_severity_findings_event` already gets in that same
     function: a bug here must never turn an already-successfully-
     completed scan into a failed one from the client's point of view."""
     try:

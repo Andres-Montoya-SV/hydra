@@ -541,42 +541,27 @@ def _try_enqueue_one(
     control_db.mark_monitoring_scan_enqueued(row.monitoring_id, speed=speed, scan_id=scan_id)
 
 
-_background_webhook_tasks: set[asyncio.Task] = set()
+def _enqueue_integration_events(
+    control_db: ControlDB, pairs: list[tuple[MonitoringRunOutcome, str]]
+) -> None:
+    """Productization Phase 08: each notify-worthy outcome becomes one event
+    on the canonical integration outbox (delivered to webhooks, Slack and
+    Teams by api/integration_worker.py). It is the same significance
+    decision that put the outcome on the email outbox, reused verbatim via
+    `event_for_monitoring_outcome`. Enqueued BEFORE the email is sent and
+    the notification marked sent, keyed on the notification id, so a crash
+    anywhere in between re-enqueues nothing twice and loses nothing."""
+    from api.webhooks import event_for_monitoring_outcome
 
-
-def _deliver_webhooks_for_outcome(control_db: ControlDB, outcome: MonitoringRunOutcome) -> None:
-    """The exact same significance decision that already put `outcome`
-    on the durable notification outbox (i.e. it was worth an email) is
-    reused here, verbatim — `api/webhooks.py::event_for_monitoring_outcome`
-    derives its event type from `outcome.needs_review`, never a second
-    "is this worth alerting" computation.
-
-    Bridges this module's own synchronous call shape (`run_monitoring_cycle`
-    is a plain sync function, called both directly by tests and from
-    inside `run_monitoring_loop`'s real `asyncio` loop) to webhook
-    delivery's genuinely async HTTP calls: when a real event loop IS
-    running (production), delivery is scheduled as a background task —
-    never blocking the rest of this cycle's own per-account processing
-    on a slow/unreachable webhook receiver, which is exactly the "one
-    account's failing webhook never blocks another account's delivery"
-    requirement. When no loop is running (every existing synchronous
-    test), it runs to completion immediately via `asyncio.run` — the
-    same deterministic, awaited-for-real behavior those tests already
-    rely on for the email path."""
-    from api.webhooks import deliver_event_to_subscribers, event_for_monitoring_outcome
-
-    event = event_for_monitoring_outcome(outcome)
-    coro = deliver_event_to_subscribers(
-        control_db=control_db, account_id=outcome.account_id, event=event
-    )
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.run(coro)
-        return
-    task = loop.create_task(coro)
-    _background_webhook_tasks.add(task)
-    task.add_done_callback(_background_webhook_tasks.discard)
+    for outcome, notification_id in pairs:
+        event = event_for_monitoring_outcome(outcome)
+        control_db.enqueue_integration_event(
+            account_id=outcome.account_id,
+            organization_id=None,  # account-level: the account's own webhooks
+            event_type=event.event_type,
+            data=event.payload,
+            dedup_key=f"monitoring:{notification_id}",
+        )
 
 
 def _flush_pending_notifications(
@@ -596,15 +581,13 @@ def _flush_pending_notifications(
     re-sends it — at most one duplicate, never a silent loss. Returns
     the number of accounts actually notified, for the caller's stats.
 
-    Webhook delivery (`_deliver_webhooks_for_outcome`) is driven by the
-    SAME outbox rows as the email, one call per outcome, never a second
-    independent "is this worth alerting" decision — this is what
-    guarantees email and webhook notifications can never disagree about
-    which changes were significant. It runs AFTER the email attempt (or
-    after marking sent, for an account with no email on file) so that a
-    webhook-delivery failure can never prevent or delay the email; each
-    call has its own `try`/`except` so one outcome's failing webhook
-    never blocks another outcome's, or another account's, delivery."""
+    Integration delivery (webhooks, Slack, Teams) is driven by the SAME
+    outbox rows as the email, never a second "is this worth alerting"
+    decision: `_enqueue_integration_events` puts each outcome on the
+    durable integration outbox before the email is attempted, so neither
+    an email failure nor a crash can drop it, and delivery itself happens
+    later in api/integration_worker.py, where a slow or failing receiver
+    can never delay the email."""
     pending = control_db.list_unsent_notifications()
     if not pending:
         return 0
@@ -612,17 +595,6 @@ def _flush_pending_notifications(
     by_account: dict[str, list[dict]] = {}
     for row in pending:
         by_account.setdefault(row["account_id"], []).append(row)
-
-    def _deliver_webhooks_for_pairs(pairs: list[tuple[MonitoringRunOutcome, str]]) -> None:
-        for outcome, _notification_id in pairs:
-            try:
-                _deliver_webhooks_for_outcome(control_db, outcome)
-            except Exception:
-                logger.exception(
-                    "Error scheduling webhook delivery for account %s domain %s",
-                    outcome.account_id,
-                    outcome.domain,
-                )
 
     notified_accounts = 0
     for account_id, rows in by_account.items():
@@ -655,10 +627,11 @@ def _flush_pending_notifications(
                 account_id,
                 len(rows),
             )
+            _enqueue_integration_events(control_db, pairs)
             control_db.mark_notifications_sent([r["notification_id"] for r in rows])
-            _deliver_webhooks_for_pairs(pairs)
             continue
 
+        _enqueue_integration_events(control_db, pairs)
         ordered_pairs = sorted(pairs, key=lambda pair: significance_rank(pair[0]))
         cap = api_settings.monitoring_max_domains_per_email
         shown_pairs, truncated_pairs = ordered_pairs[:cap], ordered_pairs[cap:]
@@ -677,7 +650,6 @@ def _flush_pending_notifications(
             [notification_id for _, notification_id in ordered_pairs]
         )
         notified_accounts += 1
-        _deliver_webhooks_for_pairs(ordered_pairs)
     return notified_accounts
 
 

@@ -59,7 +59,29 @@ _HIGH_SEVERITY_LEVELS = frozenset({"critical", "high"})
 _MAX_FINDINGS_PER_WEBHOOK = 20
 
 
-async def _deliver_high_severity_findings_webhook(
+async def _enqueue_scan_events(
+    *,
+    api_settings: APISettings,
+    control_db: ControlDB,
+    account_id: str,
+    domain: str,
+    scan_id: str,
+    organization_id: str | None,
+) -> None:
+    """Productization Phase 08: this completed scan's integration events —
+    high-severity findings, and the exposures it opened or reopened."""
+    await _enqueue_high_severity_findings_event(
+        api_settings=api_settings,
+        control_db=control_db,
+        account_id=account_id,
+        domain=domain,
+        scan_id=scan_id,
+    )
+    if organization_id:
+        control_db.enqueue_exposure_lifecycle_events(organization_id, scan_id)
+
+
+async def _enqueue_high_severity_findings_event(
     *, api_settings: APISettings, control_db: ControlDB, account_id: str, domain: str, scan_id: str
 ) -> None:
     """`finding.high_severity` — the one webhook event type this task
@@ -70,7 +92,7 @@ async def _deliver_high_severity_findings_webhook(
     "is this finding severe" for this event — `api/webhooks.py::
     event_for_high_severity_findings` only shapes the already-filtered
     list into a payload, it never re-derives severity itself."""
-    from api.webhooks import deliver_event_to_subscribers, event_for_high_severity_findings
+    from api.webhooks import event_for_high_severity_findings
     from core.store import AssetStore
 
     store = AssetStore(account_db_path(api_settings, account_id))
@@ -90,7 +112,15 @@ async def _deliver_high_severity_findings_webhook(
     if not findings:
         return
     event = event_for_high_severity_findings(domain=domain, scan_id=scan_id, findings=findings)
-    await deliver_event_to_subscribers(control_db=control_db, account_id=account_id, event=event)
+    # Productization Phase 08: onto the durable integration outbox (delivered
+    # by api/integration_worker.py), once per scan.
+    control_db.enqueue_integration_event(
+        account_id=account_id,
+        organization_id=None,  # account-level: the account's own webhooks
+        event_type=event.event_type,
+        data=event.payload,
+        dedup_key=f"finding.high_severity:{scan_id}",
+    )
 
 
 def _apply_collection_capabilities(
@@ -258,16 +288,17 @@ async def execute_scan(
             # retroactively turn an already-successfully-completed scan
             # into a "failed" one from the client's point of view.
             try:
-                await _deliver_high_severity_findings_webhook(
+                await _enqueue_scan_events(
                     api_settings=api_settings,
                     control_db=control_db,
                     account_id=account_id,
                     domain=domain,
                     scan_id=scan_id,
+                    organization_id=scan_record.organization_id if scan_record else None,
                 )
             except Exception:
-                logging.getLogger("hydra.api.webhooks").exception(
-                    "Error delivering finding.high_severity webhook for account %s scan %s",
+                logging.getLogger("hydra.api.integrations").exception(
+                    "Error enqueueing integration events for account %s scan %s",
                     account_id,
                     scan_id,
                 )
