@@ -232,6 +232,11 @@ class ProviderRunOutcomeResponse(BaseModel):
     outcome: ProviderOutcome
     output_lines: int
     recorded_at: str
+    # For degraded outcomes: "transient" (re-running is likely to help),
+    # "configuration" (enabled but not installed: fix setup first) or
+    # "unknown". None when the collector didn't fail. Scans recorded before
+    # this field existed report None.
+    failure_class: Literal["transient", "configuration", "unknown"] | None = None
 
 
 class ScanCollectionResponse(BaseModel):
@@ -240,6 +245,25 @@ class ScanCollectionResponse(BaseModel):
     # ran — a completed scan is not necessarily a clean one.
     degraded: bool
     outcomes: list[ProviderRunOutcomeResponse]
+
+
+class ScanChangeSummaryResponse(BaseModel):
+    """What this scan changed, as counts. Lifecycle keys are the change
+    detector's states (new, changed, disappeared, reappeared); exposure keys
+    are history events (observed, reopened, resolved)."""
+
+    scan_id: str
+    status: str
+    # A degraded scan's counts can under-report (a collector didn't run
+    # cleanly); see GET /scans/{id}/collection for which one.
+    degraded: bool
+    assets_observed: int
+    asset_lifecycle: dict[str, int]
+    exposures_first_seen: int
+    exposure_events: dict[str, int]
+    certificate_events: dict[str, int]
+    technology_events: dict[str, int]
+    candidates_first_seen: int
 
 
 class MonitoringNotificationResponse(BaseModel):
@@ -864,3 +888,46 @@ class AnalystProvenanceResponse(BaseModel):
     # Per-tool observations from the asset's most recent run (hosts only).
     run_id: str | None = None
     tool_provenance: list[RawToolProvenanceResponse]
+
+
+class ImportSummaryResponse(BaseModel):
+    """What one Nmap/Masscan import did. Imported hosts become candidates or
+    corroborating evidence, never authorized targets."""
+
+    source: Literal["nmap", "masscan"]
+    dry_run: bool
+    # The same bytes were imported before; nothing new was written.
+    already_imported: bool
+    hosts_parsed: int
+    hosts_skipped_invalid_ip: int
+    batch_id: str | None = None
+    observations_recorded_on_known_assets: int = 0
+    candidates_created: int = 0
+    candidates_touched: int = 0
+    malformed_drafts_skipped: int = 0
+
+
+class ImportBatchResponse(BaseModel):
+    batch_id: str
+    source: str
+    imported_at: str
+    imported_by_account_id: str
+    artifact_sha256: str | None = None
+
+
+class FacetCountResponse(BaseModel):
+    value: str
+    count: int
+
+
+class InventoryFacetsResponse(BaseModel):
+    """Counts across the organization's inventory. Technologies count each
+    asset's current technologies only (its latest run); ports are
+    "port/protocol" across known port assets."""
+
+    assets_by_type: dict[str, int]
+    # status -> severity -> count
+    exposures_by_status: dict[str, dict[str, int]]
+    candidates_by_review_status: dict[str, int]
+    technologies: list[FacetCountResponse]
+    open_ports: list[FacetCountResponse]

@@ -69,7 +69,9 @@ from api.schemas import (
     CurrentTechnologyResponse,
     DiscardCandidateAssetRequest,
     EvidenceResponse,
+    FacetCountResponse,
     GeoLocationResponse,
+    InventoryFacetsResponse,
     NetworkIntelligenceResponse,
     ObservationResponse,
     OrganizationMemberResponse,
@@ -676,6 +678,28 @@ def get_asset_raw_provenance(
         observations=observations,
         run_id=located[2] if located is not None else None,
         tool_provenance=tool_provenance,
+    )
+
+
+@router.get("/{organization_id}/inventory/facets", response_model=InventoryFacetsResponse)
+def get_inventory_facets(
+    organization_id: str,
+    request: Request,
+    top: int = Query(default=25, ge=1, le=200),
+    auth: AuthContext = Depends(require_api_key),
+) -> InventoryFacetsResponse:
+    """Inventory counts for filters and dashboards: assets by type,
+    exposures by status and severity, candidates by review status, and
+    the `top` most common current technologies and open ports."""
+    db = _db(request)
+    _require_member(db, auth.account_id, organization_id)
+    facets = db.inventory_facets(organization_id, top=top)
+    return InventoryFacetsResponse(
+        assets_by_type=facets.assets_by_type,
+        exposures_by_status=facets.exposures_by_status,
+        candidates_by_review_status=facets.candidates_by_review_status,
+        technologies=[FacetCountResponse(value=v, count=c) for v, c in facets.technologies],
+        open_ports=[FacetCountResponse(value=v, count=c) for v, c in facets.open_ports],
     )
 
 

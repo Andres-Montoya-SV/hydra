@@ -12,12 +12,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from enum import Enum
+from typing import Literal
 
 import modules  # noqa: F401  # register ReconPlugin subclasses
 from core.capabilities import Capability, capability_for
 from core.collection.crawler_proxy import PROXY_VERIFIED_TOOLS
 from core.dependencies.registry import get_tool_definition
-from core.models import ToolStatus
+from core.models import ToolInfo, ToolStatus
 from core.plugin_base import PluginResult, ReconPlugin
 
 
@@ -213,3 +214,53 @@ def execution_status_for_result(result: PluginResult) -> ToolStatus:
     if result.lines_produced > 0:
         return ToolStatus.SUCCESS_WITH_RESULTS
     return ToolStatus.SUCCESS_NO_RESULTS
+
+
+# States a tool can still be in when a run ends without ever having run it:
+# its prerequisite input never appeared (e.g. no host resolved, so httpx
+# and naabu were never called). "Not executed" is SKIPPED, never a success.
+_NEVER_EXECUTED = frozenset({ToolStatus.PENDING, ToolStatus.CHECKING, ToolStatus.READY})
+
+FailureClass = Literal["transient", "configuration", "unknown"]
+
+
+def recorded_outcome(info: ToolInfo) -> ToolStatus:
+    """The execution outcome to record for a tool's end-of-run state.
+    Every lifecycle or legacy state maps to one of the terminal outcomes
+    the provider ledger accepts."""
+    if info.status in _NEVER_EXECUTED:
+        return ToolStatus.SKIPPED
+    if info.status is ToolStatus.MISSING:
+        # Enabled but not installed: coverage is missing, the same meaning
+        # ToolManager gives an optional tool it can't run.
+        return ToolStatus.UNAVAILABLE
+    if info.status is ToolStatus.RUNNING:
+        return ToolStatus.FAILED  # the run ended while this tool was mid-flight
+    if info.status is ToolStatus.COMPLETED:
+        return (
+            ToolStatus.SUCCESS_WITH_RESULTS
+            if info.output_lines > 0
+            else ToolStatus.SUCCESS_NO_RESULTS
+        )
+    return info.status
+
+
+def failure_class(info: ToolInfo) -> FailureClass | None:
+    """Whether re-running is likely to help, from signals the pipeline
+    already records, never from error text:
+
+    - `transient`: the upstream was unreachable (UNAVAILABLE), only some
+      queries failed (PARTIAL), or a FAILED run hit timeouts/rate limits.
+    - `configuration`: the tool is enabled but not installed; re-running
+      changes nothing until someone installs or disables it.
+    - `unknown`: any other failure. Not guessed.
+    - `None`: not a failure (success, intentional skip, scope block).
+    """
+    if info.status is ToolStatus.MISSING:
+        return "configuration"
+    outcome = recorded_outcome(info)
+    if outcome in (ToolStatus.UNAVAILABLE, ToolStatus.PARTIAL):
+        return "transient"
+    if outcome is ToolStatus.FAILED:
+        return "transient" if info.timeouts or info.rate_limits else "unknown"
+    return None

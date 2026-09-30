@@ -472,6 +472,9 @@ CREATE TABLE IF NOT EXISTS provider_run_outcomes (
     outcome TEXT NOT NULL,
     output_lines INTEGER NOT NULL DEFAULT 0,
     recorded_at TEXT NOT NULL,
+    -- transient / configuration / unknown for degraded outcomes, NULL
+    -- otherwise (core/provider_contract.py::failure_class).
+    failure_class TEXT,
     PRIMARY KEY (run_id, provider)
 );
 CREATE INDEX IF NOT EXISTS idx_provider_run_outcomes_org
@@ -1331,6 +1334,32 @@ class CapabilityAuditRecord:
 
 
 @dataclass(frozen=True)
+class RunChangeSummary:
+    """What one scan changed for its organization, as counts."""
+
+    assets_observed: int
+    asset_lifecycle: dict[str, int]
+    exposures_first_seen: int
+    exposure_events: dict[str, int]
+    certificate_events: dict[str, int]
+    technology_events: dict[str, int]
+    candidates_first_seen: int
+
+
+@dataclass(frozen=True)
+class InventoryFacets:
+    """Counts across an organization's inventory, for filters and dashboards."""
+
+    assets_by_type: dict[str, int]
+    exposures_by_status: dict[str, dict[str, int]]
+    candidates_by_review_status: dict[str, int]
+    # Most common first, at most `top` entries: (name, asset count).
+    technologies: list[tuple[str, int]]
+    # Most common first, at most `top`: ("443/tcp", port asset count).
+    open_ports: list[tuple[str, int]]
+
+
+@dataclass(frozen=True)
 class ScopeExclusionRecord:
     exclusion_id: str
     organization_id: str
@@ -1371,6 +1400,7 @@ class ProviderRunOutcomeRecord:
     outcome: str
     output_lines: int
     recorded_at: str
+    failure_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1583,6 +1613,7 @@ _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 # Durable-queue fix: an existing `scans` table (every account with a
 # scan predating this fix) needs these three columns added the same way
 # `accounts` needed its email-verification columns added.
+_PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("failure_class", "TEXT"),)
 _SCANS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ("worker_id", "TEXT"),
@@ -1735,6 +1766,9 @@ class ControlDB:
         with self._connect() as conn:
             _migrate_table_columns(conn, "accounts", _ACCOUNTS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "scans", _SCANS_MIGRATION_COLUMNS)
+            _migrate_table_columns(
+                conn, "provider_run_outcomes", _PROVIDER_RUN_OUTCOMES_MIGRATION_COLUMNS
+            )
             _migrate_table_columns(conn, "subscriptions", _SUBSCRIPTIONS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "candidate_assets", _CANDIDATE_ASSETS_MIGRATION_COLUMNS)
             _migrate_table_columns(conn, "evidence", _EVIDENCE_MIGRATION_COLUMNS)
@@ -3050,6 +3084,102 @@ class ControlDB:
             )
         return None if previous is None else str(previous["risk_level"])
 
+    def export_assets_page(
+        self, organization_id: str, *, after: str, limit: int
+    ) -> list[AssetRecord]:
+        """Keyset page (asset_id > `after`): stable under concurrent writes,
+        unlike OFFSET over a mutable sort column."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM assets WHERE organization_id = ? AND asset_id > ? "
+                "ORDER BY asset_id LIMIT ?",
+                (organization_id, after, limit),
+            ).fetchall()
+        return [_asset_record_from_row(row) for row in rows]
+
+    def export_exposures_page(
+        self, organization_id: str, *, after: str, limit: int
+    ) -> list[ExposureRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM exposures WHERE organization_id = ? AND exposure_id > ? "
+                "ORDER BY exposure_id LIMIT ?",
+                (organization_id, after, limit),
+            ).fetchall()
+        return [_exposure_record_from_row(row) for row in rows]
+
+    def inventory_facets(self, organization_id: str, *, top: int) -> InventoryFacets:
+        with self._connect() as conn:
+            by_type = conn.execute(
+                "SELECT asset_type, COUNT(*) FROM assets WHERE organization_id = ? "
+                "GROUP BY asset_type",
+                (organization_id,),
+            ).fetchall()
+            exposures: dict[str, dict[str, int]] = {}
+            for status, severity, count in conn.execute(
+                "SELECT status, severity, COUNT(*) FROM exposures WHERE organization_id = ? "
+                "GROUP BY status, severity",
+                (organization_id,),
+            ):
+                exposures.setdefault(str(status), {})[str(severity)] = int(count)
+            candidates = conn.execute(
+                "SELECT review_status, COUNT(*) FROM candidate_assets WHERE organization_id = ? "
+                "GROUP BY review_status",
+                (organization_id,),
+            ).fetchall()
+            technologies = _technology_facet(conn, organization_id, top)
+            ports = _port_facet(conn, organization_id, top)
+        return InventoryFacets(
+            assets_by_type={str(t): int(c) for t, c in by_type},
+            exposures_by_status=exposures,
+            candidates_by_review_status={str(r): int(c) for r, c in candidates},
+            technologies=technologies,
+            open_ports=ports,
+        )
+
+    def run_change_summary(self, organization_id: str, run_id: str) -> RunChangeSummary:
+        """Aggregate counts over the per-run EASM tables, all scoped to the
+        organization (a foreign run id yields zeros)."""
+        params = (organization_id, run_id)
+        with self._connect() as conn:
+
+            def count(sql: str) -> int:
+                return int(conn.execute(sql, params).fetchone()[0])
+
+            def grouped(sql: str) -> dict[str, int]:
+                return {str(row[0]): int(row[1]) for row in conn.execute(sql, params)}
+
+            return RunChangeSummary(
+                assets_observed=count(
+                    "SELECT COUNT(DISTINCT asset_id) FROM observations "
+                    "WHERE organization_id = ? AND run_id = ?"
+                ),
+                asset_lifecycle=grouped(
+                    "SELECT new_state, COUNT(*) FROM change_events "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY new_state"
+                ),
+                exposures_first_seen=count(
+                    "SELECT COUNT(*) FROM exposures "
+                    "WHERE organization_id = ? AND first_seen_run_id = ?"
+                ),
+                exposure_events=grouped(
+                    "SELECT event_type, COUNT(DISTINCT exposure_id) FROM exposure_history "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY event_type"
+                ),
+                certificate_events=grouped(
+                    "SELECT event_type, COUNT(*) FROM certificate_events "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY event_type"
+                ),
+                technology_events=grouped(
+                    "SELECT event_type, COUNT(*) FROM technology_events "
+                    "WHERE organization_id = ? AND run_id = ? GROUP BY event_type"
+                ),
+                candidates_first_seen=count(
+                    "SELECT COUNT(*) FROM candidate_assets "
+                    "WHERE organization_id = ? AND first_seen_run_id = ?"
+                ),
+            )
+
     def list_exposure_history_for_run(
         self, organization_id: str, run_id: str
     ) -> list[ExposureHistoryRecord]:
@@ -3071,20 +3201,11 @@ class ControlDB:
         account_id: str,
         run_id: str,
         outcomes: list[tuple[str, str, int]],
+        failure_classes: dict[str, str] | None = None,
     ) -> None:
-        """Persist Fase-09 provider outcomes as durable operational evidence."""
-        allowed_outcomes = {
-            "success_with_results",
-            "success_no_results",
-            "partial",
-            "blocked_by_scope",
-            "skipped",
-            "unavailable",
-            "failed",
-        }
-        for provider, outcome, _output_lines in outcomes:
-            if not provider.strip() or outcome not in allowed_outcomes:
-                raise ValueError("invalid provider execution outcome")
+        """Persist Fase-09 provider outcomes as durable operational evidence.
+        `failure_classes` (provider -> class) is set for degraded outcomes."""
+        _validate_provider_outcomes(outcomes)
         with self._connect() as conn:
             scan = conn.execute(
                 "SELECT account_id, organization_id FROM scans WHERE scan_id = ?",
@@ -3099,12 +3220,12 @@ class ControlDB:
             now = _now_iso()
             for provider, outcome, output_lines in outcomes:
                 conn.execute(
-                    "INSERT INTO provider_run_outcomes "
-                    "(organization_id, account_id, run_id, provider, outcome, output_lines, recorded_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "INSERT INTO provider_run_outcomes (organization_id, account_id, run_id, "
+                    "provider, outcome, output_lines, recorded_at, failure_class) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(run_id, provider) DO UPDATE SET "
                     "outcome=excluded.outcome, output_lines=excluded.output_lines, "
-                    "recorded_at=excluded.recorded_at",
+                    "recorded_at=excluded.recorded_at, failure_class=excluded.failure_class",
                     (
                         organization_id,
                         account_id,
@@ -3113,6 +3234,7 @@ class ControlDB:
                         outcome,
                         max(0, int(output_lines)),
                         now,
+                        (failure_classes or {}).get(provider),
                     ),
                 )
 
@@ -3607,13 +3729,13 @@ class ControlDB:
         return None if row is None else _observation_batch_record_from_row(row)
 
     def list_observation_batches_for_organization(
-        self, organization_id: str
+        self, organization_id: str, *, limit: int | None = None, offset: int = 0
     ) -> list[ObservationBatchRecord]:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM observation_batches WHERE organization_id = ? "
-                "ORDER BY imported_at, batch_id",
-                (organization_id,),
+                "ORDER BY imported_at, batch_id LIMIT ? OFFSET ?",
+                (organization_id, _sql_limit(limit), offset),
             ).fetchall()
         return [_observation_batch_record_from_row(row) for row in rows]
 
@@ -5800,6 +5922,78 @@ def _sql_limit(limit: int | None) -> int:
     return -1 if limit is None else limit
 
 
+def _technology_facet(
+    conn: sqlite3.Connection, organization_id: str, top: int
+) -> list[tuple[str, int]]:
+    """Assets per technology, counting only each asset's CURRENT
+    technologies: those observed in its latest technology run, where the
+    latest run is the one whose earliest observation is newest (ties by
+    run_id), exactly `_latest_run_id_among`. The name is the evidence
+    detail up to "@", exactly `parse_technology_detail`."""
+    rows = conn.execute(
+        "WITH runs AS ("
+        "  SELECT asset_id, run_id, MIN(observed_at) AS started FROM observations"
+        "  WHERE organization_id = ? AND observation_type = ? GROUP BY asset_id, run_id"
+        "), latest AS ("
+        "  SELECT asset_id, run_id FROM ("
+        "    SELECT asset_id, run_id, ROW_NUMBER() OVER ("
+        "      PARTITION BY asset_id ORDER BY started DESC, run_id DESC) AS rn FROM runs"
+        "  ) WHERE rn = 1"
+        ") "
+        "SELECT CASE WHEN instr(e.detail, '@') > 0 "
+        "  THEN substr(e.detail, 1, instr(e.detail, '@') - 1) ELSE e.detail END AS name, "
+        "  COUNT(DISTINCT o.asset_id) AS assets "
+        "FROM observations o "
+        "JOIN latest l ON l.asset_id = o.asset_id AND l.run_id = o.run_id "
+        "JOIN evidence e ON e.evidence_id = o.evidence_id "
+        "WHERE o.organization_id = ? AND o.observation_type = ? "
+        "GROUP BY name ORDER BY assets DESC, name LIMIT ?",
+        (
+            organization_id,
+            OBSERVATION_TYPE_TECHNOLOGY_DETECTED,
+            organization_id,
+            OBSERVATION_TYPE_TECHNOLOGY_DETECTED,
+            top,
+        ),
+    ).fetchall()
+    return [(str(name), int(count)) for name, count in rows]
+
+
+def _port_facet(conn: sqlite3.Connection, organization_id: str, top: int) -> list[tuple[str, int]]:
+    """Port assets per "port/protocol". The identity key is
+    `port:<host>:<port>:<protocol>` and an IPv6 host contains colons, so
+    it is split from the right; only that one column is read."""
+    counts: dict[str, int] = {}
+    for (identity_key,) in conn.execute(
+        "SELECT identity_key FROM assets WHERE organization_id = ? AND asset_type = 'port'",
+        (organization_id,),
+    ):
+        parts = str(identity_key).rsplit(":", 2)
+        if len(parts) == 3:
+            label = f"{parts[1]}/{parts[2]}"
+            counts[label] = counts.get(label, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:top]
+
+
+_RECORDABLE_OUTCOMES = frozenset(
+    {
+        "success_with_results",
+        "success_no_results",
+        "partial",
+        "blocked_by_scope",
+        "skipped",
+        "unavailable",
+        "failed",
+    }
+)
+
+
+def _validate_provider_outcomes(outcomes: list[tuple[str, str, int]]) -> None:
+    for provider, outcome, _output_lines in outcomes:
+        if not provider.strip() or outcome not in _RECORDABLE_OUTCOMES:
+            raise ValueError("invalid provider execution outcome")
+
+
 def _audit_scan_override(
     conn: sqlite3.Connection,
     organization_id: str,
@@ -5957,6 +6151,7 @@ def _provider_run_outcome_record_from_row(row: sqlite3.Row) -> ProviderRunOutcom
         outcome=row["outcome"],
         output_lines=int(row["output_lines"]),
         recorded_at=row["recorded_at"],
+        failure_class=row["failure_class"],
     )
 
 

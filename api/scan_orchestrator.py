@@ -45,6 +45,7 @@ from api.tenancy import account_db_path, account_settings
 if TYPE_CHECKING:
     from api.settings import APISettings
     from config.settings import Settings
+    from core.models import PipelineContext
 
 # Matches this codebase's own existing severity vocabulary
 # (core/assets.py::RiskLevel; every parser in core/parsers/registry.py
@@ -165,6 +166,31 @@ def _scan_settings(
     return settings
 
 
+def _record_provider_outcomes(
+    control_db: ControlDB,
+    organization_id: str,
+    account_id: str,
+    scan_id: str,
+    context: PipelineContext,
+) -> None:
+    """Every tool's end-of-run state as a terminal execution outcome, with
+    its failure class. A tool the run never reached (no input for it) is
+    SKIPPED; recording its raw `ready` state used to raise and flip a clean
+    scan to failed."""
+    from core.provider_contract import failure_class, recorded_outcome
+
+    states = sorted(context.tool_states.items())
+    control_db.record_provider_run_outcomes(
+        organization_id=organization_id,
+        account_id=account_id,
+        run_id=scan_id,
+        outcomes=[(name, recorded_outcome(info).value, info.output_lines) for name, info in states],
+        failure_classes={
+            name: cls for name, info in states if (cls := failure_class(info)) is not None
+        },
+    )
+
+
 async def execute_scan(
     *,
     api_settings: APISettings,
@@ -204,14 +230,8 @@ async def execute_scan(
             # alone is not proof of exhaustive per-asset coverage.
             scan_record = control_db.get_owned_scan(scan_id, account_id)
             if scan_record is not None and scan_record.organization_id:
-                control_db.record_provider_run_outcomes(
-                    organization_id=scan_record.organization_id,
-                    account_id=account_id,
-                    run_id=scan_id,
-                    outcomes=[
-                        (name, info.status.value, info.output_lines)
-                        for name, info in sorted(context.tool_states.items())
-                    ],
+                _record_provider_outcomes(
+                    control_db, scan_record.organization_id, account_id, scan_id, context
                 )
                 # Fase 18 (EASM roadmap): the missing wiring found while
                 # building monitoring integration -- without this call,
