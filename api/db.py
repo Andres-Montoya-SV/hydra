@@ -43,7 +43,6 @@ from typing import Any
 from core.store import connect_sqlite
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
-_NAMED_PARAM = re.compile(r"[A-Za-z_]\w*")
 
 
 # SQLite built-ins the shared SQL uses, defined in Postgres with SQLite's
@@ -120,35 +119,43 @@ def _ident(name: str) -> str:
     return name
 
 
+# SQL tokens that can contain a `?` or `:name` that is NOT a placeholder
+# (string literals, quoted identifiers, comments, dollar-quoted bodies),
+# then the tokens that are translated. Anything else is copied as is.
+_SQL_TOKEN = re.compile(
+    r"""
+    (?P<skip>
+        '(?:[^']|'')*'                                  # string literal
+      | "(?:[^"]|"")*"                                  # quoted identifier
+      | --[^\n]*                                        # line comment
+      | /\*.*?\*/                                        # block comment
+      | \$(?P<tag>(?:[A-Za-z_]\w*)?)\$.*?\$(?P=tag)\$    # dollar-quoted body
+    )
+    | (?P<cast>::)
+    | (?P<qmark>\?)
+    | :(?P<named>[A-Za-z_]\w*)
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+
+
+def _translate_token(match: re.Match[str]) -> str:
+    if match.group("skip") is not None:
+        return match.group("skip")
+    if match.group("cast") is not None:
+        return "::"
+    if match.group("qmark") is not None:
+        return "%s"
+    return f"%({match.group('named')})s"
+
+
 @lru_cache(maxsize=4096)
 def translate_placeholders(sql: str) -> str:
-    """`?` -> `%s`, `:name` -> `%(name)s`, `%` -> `%%`, outside quoted
-    strings; `::` casts are kept."""
-    out: list[str] = []
-    i, quote = 0, ""
-    while i < len(sql):
-        ch = sql[i]
-        if quote:
-            out.append("%%" if ch == "%" else ch)
-            if ch == quote:
-                quote = ""
-        elif ch in ("'", '"'):
-            quote = ch
-            out.append(ch)
-        elif ch == "?":
-            out.append("%s")
-        elif ch == "%":
-            out.append("%%")
-        elif ch == ":" and sql[i + 1 : i + 2] == ":":
-            out.append("::")
-            i += 1
-        elif ch == ":" and (named := _NAMED_PARAM.match(sql, i + 1)):
-            out.append(f"%({named.group(0)})s")
-            i += len(named.group(0))
-        else:
-            out.append(ch)
-        i += 1
-    return "".join(out)
+    """`?` -> `%s`, `:name` -> `%(name)s`, outside string literals, quoted
+    identifiers, comments and dollar-quoted bodies; `::` casts are kept.
+    Every literal `%` (anywhere: psycopg scans the whole text) becomes
+    `%%`."""
+    return _SQL_TOKEN.sub(_translate_token, sql.replace("%", "%%"))
 
 
 class Row:

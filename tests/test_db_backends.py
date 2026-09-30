@@ -34,6 +34,22 @@ class TestPlaceholderTranslation:
             ("SELECT a FROM t WHERE b LIKE '%' || ?", "SELECT a FROM t WHERE b LIKE '%%' || %s"),
             ('SELECT "col?" FROM t', 'SELECT "col?" FROM t'),
             ("SELECT x % 2 FROM t", "SELECT x %% 2 FROM t"),
+            # Comments: a `?` / `:name` inside is text, not a parameter.
+            (
+                "SELECT a -- why? :later\nFROM t WHERE b = ?",
+                "SELECT a -- why? :later\nFROM t WHERE b = %s",
+            ),
+            (
+                "SELECT /* is it? :x */ a FROM t WHERE b = :b",
+                "SELECT /* is it? :x */ a FROM t WHERE b = %(b)s",
+            ),
+            ("SELECT /* 100% */ ?", "SELECT /* 100%% */ %s"),
+            # Escaped quote inside a literal does not end it.
+            ("SELECT 'it''s ?' FROM t WHERE a = ?", "SELECT 'it''s ?' FROM t WHERE a = %s"),
+            # Dollar-quoted bodies (anonymous and tagged).
+            ("DO $$ SELECT ?; $$", "DO $$ SELECT ?; $$"),
+            ("SELECT $fn$ :x ? $fn$, ?", "SELECT $fn$ :x ? $fn$, %s"),
+            ("SELECT ':a::b' || ?::text", "SELECT ':a::b' || %s::text"),
         ],
     )
     def test_translates_outside_quotes_only(self, sql: str, expected: str) -> None:
