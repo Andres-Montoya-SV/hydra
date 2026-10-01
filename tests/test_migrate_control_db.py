@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 from _pg_mode import POSTGRES_URL
 
 import api.migrate_control_db as migrate
+import api.pg_transfer as pg_transfer
 from api.asset_identity import ReconciliationDecision
 from api.control_db import ControlDB
 from api.db import SqliteBackend
@@ -84,7 +86,7 @@ def _sha256(path: Path) -> str:
 
 def _sqlite_tables(path: Path) -> dict[str, set[str]]:
     """table -> the tables it references."""
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         names = [
             row[0]
             for row in conn.execute(
@@ -104,17 +106,17 @@ def _sqlite_tables(path: Path) -> dict[str, set[str]]:
 class TestTableCatalog:
     def test_covers_exactly_the_current_schema(self, tmp_path: Path) -> None:
         _sqlite_control_db(tmp_path / "control.db")
-        assert set(migrate._SOURCE_SELECTS) == set(_sqlite_tables(tmp_path / "control.db"))
+        assert set(pg_transfer.SQLITE_TABLE_READS) == set(_sqlite_tables(tmp_path / "control.db"))
 
     def test_parents_come_before_children(self, tmp_path: Path) -> None:
         _sqlite_control_db(tmp_path / "control.db")
-        order = list(migrate._SOURCE_SELECTS)
+        order = list(pg_transfer.SQLITE_TABLE_READS)
         for table, parents in _sqlite_tables(tmp_path / "control.db").items():
             for parent in parents:
                 assert order.index(parent) < order.index(table), (parent, table)
 
     def test_every_statement_is_a_plain_literal_read_of_its_own_table(self) -> None:
-        for table, statement in migrate._SOURCE_SELECTS.items():
+        for table, statement in pg_transfer.SQLITE_TABLE_READS.items():
             assert re.fullmatch(r"[a-z_]+", table)
             assert statement.split() == ["SELECT", "*", "FROM", table]
 
@@ -122,7 +124,11 @@ class TestTableCatalog:
 class TestDigest:
     def test_is_order_independent_and_content_sensitive(self) -> None:
         rows = [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]
-        forward, backward, changed = migrate._Digest(), migrate._Digest(), migrate._Digest()
+        forward, backward, changed = (
+            pg_transfer.Digest(),
+            pg_transfer.Digest(),
+            pg_transfer.Digest(),
+        )
         for row in rows:
             forward.add(row)
         for row in reversed(rows):
@@ -133,14 +139,14 @@ class TestDigest:
         assert changed.hexdigest != forward.hexdigest
 
     def test_integral_floats_equal_ints(self) -> None:
-        a, b = migrate._Digest(), migrate._Digest()
+        a, b = pg_transfer.Digest(), pg_transfer.Digest()
         a.add({"score": 5.0})
         b.add({"score": 5})
         assert a.hexdigest == b.hexdigest
 
     def test_nan_is_refused_not_hashed(self) -> None:
         with pytest.raises(ValueError):
-            migrate._Digest().add({"score": float("nan")})
+            pg_transfer.Digest().add({"score": float("nan")})
 
 
 class TestReport:
@@ -243,7 +249,7 @@ class TestCopyOnPostgres:
         source_path = tmp_path / "source.db"
         _seed(_sqlite_control_db(source_path))
         # SQLite accepts text in an INTEGER column; Postgres does not.
-        with sqlite3.connect(source_path) as conn:
+        with closing(sqlite3.connect(source_path)) as conn, conn:  # commits, then closes
             conn.execute("UPDATE monthly_usage SET scans_used = 'lots'")
         target = ControlDB(tmp_path / "target.db")
 
@@ -254,7 +260,7 @@ class TestCopyOnPostgres:
     def test_an_unknown_source_table_is_refused(self, tmp_path: Path) -> None:
         source_path = tmp_path / "source.db"
         _seed(_sqlite_control_db(source_path))
-        with sqlite3.connect(source_path) as conn:
+        with closing(sqlite3.connect(source_path)) as conn, conn:  # commits, then closes
             conn.execute("CREATE TABLE legacy_things (id TEXT)")
         with pytest.raises(MigrationError, match="legacy_things"):
             copy_control_db(source_path, ControlDB(tmp_path / "target.db"))
@@ -262,7 +268,7 @@ class TestCopyOnPostgres:
     def test_a_source_column_postgres_lacks_is_refused(self, tmp_path: Path) -> None:
         source_path = tmp_path / "source.db"
         _seed(_sqlite_control_db(source_path))
-        with sqlite3.connect(source_path) as conn:
+        with closing(sqlite3.connect(source_path)) as conn, conn:  # commits, then closes
             conn.execute("ALTER TABLE accounts ADD COLUMN legacy_flag TEXT")
         with pytest.raises(MigrationError, match="accounts.legacy_flag"):
             copy_control_db(source_path, ControlDB(tmp_path / "target.db"))

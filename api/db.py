@@ -260,6 +260,7 @@ class _PgConnection:
 
     def __init__(self, conn: Any) -> None:
         self._conn = conn
+        self._streams = 0
 
     def execute(self, sql: str, params: Any = None) -> Any:
         if params is None or (not isinstance(params, dict) and len(params) == 0):
@@ -273,6 +274,15 @@ class _PgConnection:
 
     def executescript(self, script: str) -> None:
         self._conn.execute(script)
+
+    def stream(self, sql: str, params: Any, batch_rows: int) -> Iterator[list[Any]]:
+        """Rows in batches through a server-side cursor, so a large table is
+        never held in memory at once."""
+        self._streams += 1
+        with self._conn.cursor(name=f"hydra_stream_{self._streams}") as cursor:
+            cursor.execute(translate_placeholders(sql), params)
+            while batch := cursor.fetchmany(batch_rows):
+                yield batch
 
 
 def _row_factory(cursor: Any) -> Any:
@@ -328,7 +338,9 @@ class Backend:
         self.dialect = dialect
 
     @contextmanager
-    def connect(self) -> Iterator[Any]:
+    def connect(self, *, snapshot: bool = False) -> Iterator[Any]:
+        """One transaction. `snapshot`: every read in it sees the database
+        as of its start (a consistent backup)."""
         raise NotImplementedError
 
 
@@ -338,7 +350,8 @@ class SqliteBackend(Backend):
         self.path = path
 
     @contextmanager
-    def connect(self) -> Iterator[Any]:
+    def connect(self, *, snapshot: bool = False) -> Iterator[Any]:
+        del snapshot  # SQLite backups use its online backup API instead
         conn = connect_sqlite(self.path)
         try:
             yield conn
@@ -373,19 +386,28 @@ class PostgresBackend(Backend):
                 conn.execute(_CREATE_SCHEMA_SQL)
 
     @contextmanager
-    def connect(self) -> Iterator[Any]:
+    def connect(self, *, snapshot: bool = False) -> Iterator[Any]:
         # One explicit transaction per connect(): committed when the caller's
         # block ends normally, rolled back if it raises (checked from an
         # independent session in tests/test_db_backends.py).
-        with _pool(self.url, self.pool).connection() as conn, conn.transaction():
-            # Transaction-local (`true`): nothing leaks to the connection's
-            # next user — also behind a transaction-mode pooler (PgBouncer).
-            conn.execute(
-                "SELECT set_config('search_path', %s, true), "
-                "set_config('hydra.organization_id', %s, true)",
-                (self.schema, request_organization() or ""),
-            )
-            yield _PgConnection(conn)
+        with _pool(self.url, self.pool).connection() as conn:
+            if snapshot:
+                import psycopg
+
+                conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+            try:
+                with conn.transaction():
+                    # Transaction-local (`true`): nothing leaks to the
+                    # connection's next user — also behind a
+                    # transaction-mode pooler (PgBouncer).
+                    conn.execute(
+                        "SELECT set_config('search_path', %s, true), "
+                        "set_config('hydra.organization_id', %s, true)",
+                        (self.schema, request_organization() or ""),
+                    )
+                    yield _PgConnection(conn)
+            finally:
+                conn.isolation_level = None
 
 
 def schema_for_path(path: Path) -> str:
