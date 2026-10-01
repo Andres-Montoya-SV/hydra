@@ -2023,12 +2023,14 @@ class ControlDB:
         *,
         secret_box: SecretBox | None = None,
         database_url: str | None = None,
+        backend: Backend | None = None,
     ) -> None:
         """`database_url` (Productization Phase 10): a PostgreSQL URL runs
         the control plane on Postgres (api/db.py); unset, it's the SQLite
-        file at `db_path`, as before."""
+        file at `db_path`, as before. `backend` overrides both (the
+        migration tool opens a SQLite copy explicitly)."""
         self.db_path = db_path
-        self.backend = _resolve_backend(db_path, database_url)
+        self.backend = backend or _resolve_backend(db_path, database_url)
         self.dialect = self.backend.dialect
         # Productization Phase 08b: seals stored third-party secrets
         # (api/secrets_box.py). None = no key configured: webhook secrets
