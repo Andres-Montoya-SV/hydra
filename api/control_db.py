@@ -84,7 +84,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     email TEXT,
     email_verified_at TEXT,
     email_verification_token TEXT,
-    email_verification_token_expires_at TEXT
+    email_verification_token_expires_at TEXT,
+    -- Productization Phase 11b: may call the admin endpoints. Set only from
+    -- the host (python -m api.operators), never through the API.
+    is_operator INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email)
     WHERE email IS NOT NULL;
@@ -1195,6 +1198,30 @@ CREATE TABLE IF NOT EXISTS wompi_unmatched_payments (
     resolved_at TEXT,
     resolved_account_id TEXT
 );
+
+-- Productization Phase 11b: the security audit log. Append-only (the
+-- application never updates or deletes a row). `organization_id` is set for
+-- organization events (and is then covered by row-level security);
+-- `subject_account_id` is the account whose security an event concerns
+-- (key owner, member). No foreign keys: a row outlives what it describes.
+CREATE TABLE IF NOT EXISTS security_audit_log (
+    event_id TEXT PRIMARY KEY,
+    occurred_at TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor_type TEXT NOT NULL,
+    actor_account_id TEXT,
+    subject_account_id TEXT,
+    organization_id TEXT,
+    target_type TEXT,
+    target_id TEXT,
+    request_id TEXT,
+    client_ip TEXT,
+    details_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_security_audit_org
+    ON security_audit_log(organization_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_security_audit_subject
+    ON security_audit_log(subject_account_id, occurred_at);
 """
 
 
@@ -1270,6 +1297,24 @@ class AccountRecord:
     @property
     def is_email_verified(self) -> bool:
         return self.email_verified_at is not None
+
+
+@dataclass(frozen=True)
+class SecurityEvent:
+    """One security audit log row (Productization Phase 11b)."""
+
+    event_id: str
+    occurred_at: str
+    action: str
+    actor_type: str  # "account", "operator", "host", "anonymous"
+    actor_account_id: str | None
+    subject_account_id: str | None
+    organization_id: str | None
+    target_type: str | None
+    target_id: str | None
+    request_id: str | None
+    client_ip: str | None
+    details_json: str
 
 
 @dataclass(frozen=True)
@@ -1848,6 +1893,7 @@ _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("email_verified_at", "TEXT"),
     ("email_verification_token", "TEXT"),
     ("email_verification_token_expires_at", "TEXT"),
+    ("is_operator", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 # Durable-queue fix: an existing `scans` table (every account with a
@@ -5028,6 +5074,99 @@ class ControlDB:
                 {"key": key_id, "cap": capacity, "now": now, "rate": refill_rate_per_second},
             )
         return cursor.rowcount == 1
+
+    # --- security audit log and operators (Phase 11b) -----------------
+
+    def record_security_event(self, event: SecurityEvent) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO security_audit_log (event_id, occurred_at, action, actor_type, "
+                "actor_account_id, subject_account_id, organization_id, target_type, "
+                "target_id, request_id, client_ip, details_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.event_id,
+                    event.occurred_at,
+                    event.action,
+                    event.actor_type,
+                    event.actor_account_id,
+                    event.subject_account_id,
+                    event.organization_id,
+                    event.target_type,
+                    event.target_id,
+                    event.request_id,
+                    event.client_ip,
+                    event.details_json,
+                ),
+            )
+
+    def list_security_events_for_organization(
+        self, organization_id: str, *, limit: int, offset: int
+    ) -> list[SecurityEvent]:
+        """Newest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM security_audit_log WHERE organization_id = ? "
+                "ORDER BY occurred_at DESC, event_id DESC LIMIT ? OFFSET ?",
+                (organization_id, limit, offset),
+            ).fetchall()
+        return [SecurityEvent(**dict(row)) for row in rows]
+
+    def list_security_events_for_account(
+        self, account_id: str, *, limit: int, offset: int
+    ) -> list[SecurityEvent]:
+        """Events about this account's own keys and memberships, newest
+        first. (Failed sign-ins can't be tied to an account; operators see
+        them through list_security_events.)"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM security_audit_log WHERE subject_account_id = ? "
+                "ORDER BY occurred_at DESC, event_id DESC LIMIT ? OFFSET ?",
+                (account_id, limit, offset),
+            ).fetchall()
+        return [SecurityEvent(**dict(row)) for row in rows]
+
+    def list_security_events(self, *, limit: int, offset: int) -> list[SecurityEvent]:
+        """Every event, newest first (the operator view)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM security_audit_log "
+                "ORDER BY occurred_at DESC, event_id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return [SecurityEvent(**dict(row)) for row in rows]
+
+    def is_operator(self, account_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT is_operator FROM accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        return bool(row and row[0])
+
+    def set_operator(self, account_id: str, operator: bool) -> bool:
+        """Returns False when the account does not exist."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE accounts SET is_operator = ? WHERE account_id = ?",
+                (1 if operator else 0, account_id),
+            )
+        return cursor.rowcount == 1
+
+    def list_operator_account_ids(self) -> list[tuple[str, str | None]]:
+        """(account_id, email) of every operator."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT account_id, email FROM accounts WHERE is_operator = 1 "
+                "ORDER BY created_at, account_id"
+            ).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
+    def account_id_for_email(self, email: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT account_id FROM accounts WHERE lower(email) = ?", (email.strip().lower(),)
+            ).fetchone()
+        return None if row is None else str(row[0])
 
     # --- api keys -----------------------------------------------------
 

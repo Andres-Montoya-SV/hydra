@@ -47,6 +47,7 @@ from api.routers import (
     reportability,
     scans,
     scope,
+    security_events,
     subscription,
     webhooks,
 )
@@ -298,6 +299,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(hypotheses.router)
     app.include_router(subscription.router)
     app.include_router(webhooks.router)
+    app.include_router(security_events.router)
     install_edge(app, settings)
     return app
 

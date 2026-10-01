@@ -1096,11 +1096,11 @@ exactly as the task's fallback instructed:
 3. **No match → `wompi_unmatched_payments`, never discarded, never
    guessed** (Task 3's non-negotiable) — `GET /admin/wompi/unmatched`
    lists them, `POST /admin/wompi/reconcile` links one to an account by
-   hand. The admin endpoints are gated by a single static
-   `HYDRA_API_ADMIN_TOKEN` — an honestly-temporary MVP mechanism (no
-   real operator/admin auth system exists yet, the same kind of stated
-   gap Round 1's unauthenticated `POST /accounts` already has), not a
-   production-grade admin auth system.
+   hand. The admin endpoints were first gated by a single static
+   `HYDRA_API_ADMIN_TOKEN`; since Productization Phase 11b they require
+   the API key of an operator account (granted on the host with
+   `python -m api.operators`), and every call is in the security audit
+   log (docs/productization/11b_audit_and_operators.md).
 
 ### Task 3, attempted confirmation against a real sandbox — 2026-09-22, still unconfirmed
 

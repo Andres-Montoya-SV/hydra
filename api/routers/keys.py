@@ -13,6 +13,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from api import security_audit as audit
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB
 from api.schemas import RotateKeyResponse
@@ -58,6 +59,17 @@ def rotate_key(
         prefix=prefix,
     )
 
+    audit.record(
+        control_db,
+        request,
+        audit.AuditEvent(
+            audit.KEY_ROTATED,
+            actor_account_id=auth.account_id,
+            subject_account_id=auth.account_id,
+            target=("api_key", key_id),
+            details={"new_key_id": new_key_id, "old_key_valid_until": old_key_valid_until},
+        ),
+    )
     return RotateKeyResponse(
         old_key_id=key_id,
         old_key_valid_until=old_key_valid_until,
@@ -76,3 +88,13 @@ def revoke_key(
     revoked = control_db.revoke_key(key_id, auth.account_id)
     if not revoked:
         raise HTTPException(status_code=404, detail="API key not found")
+    audit.record(
+        control_db,
+        request,
+        audit.AuditEvent(
+            audit.KEY_REVOKED,
+            actor_account_id=auth.account_id,
+            subject_account_id=auth.account_id,
+            target=("api_key", key_id),
+        ),
+    )

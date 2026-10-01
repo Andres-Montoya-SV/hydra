@@ -50,6 +50,7 @@ from typing import Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from api import security_audit as audit
 from api.auth import AuthContext, require_api_key
 from api.control_db import AssetRecord, ControlDB, LastOwnerError, RelationshipRecord
 from api.routers.org_access import control_db as _db
@@ -201,6 +202,17 @@ def create_organization(
         # isn't stripped under `python -O` and reads clearly as a defensive
         # check, not a static rule to silence.
         raise RuntimeError(f"organization {organization_id!r} vanished immediately after creation")
+    audit.record(
+        db,
+        request,
+        audit.AuditEvent(
+            audit.ORGANIZATION_CREATED,
+            actor_account_id=auth.account_id,
+            subject_account_id=auth.account_id,
+            organization_id=organization_id,
+            target=("organization", organization_id),
+        ),
+    )
     return OrganizationResponse(
         organization_id=org.organization_id,
         name=org.name,
@@ -246,9 +258,20 @@ def add_organization_member(
     _require_member_manager(db, auth.account_id, organization_id)
     if not db.account_exists(body.account_id):
         raise HTTPException(status_code=404, detail="Account not found")
+    previous = db.get_role_for_account_organization(body.account_id, organization_id)
     db.add_account_organization_role(
         account_id=body.account_id, organization_id=organization_id, role=body.role
     )
+    if previous != body.role:
+        _audit_member(
+            db,
+            request,
+            audit.MEMBER_ADDED if previous is None else audit.MEMBER_ROLE_CHANGED,
+            auth.account_id,
+            organization_id,
+            body.account_id,
+            {"role": body.role, "previous_role": previous},
+        )
     role, created_at = next(
         (r, c)
         for a, r, c in db.list_members_for_organization(organization_id)
@@ -271,10 +294,44 @@ def remove_organization_member(
     remove themselves as long as at least one other owner remains."""
     db = _db(request)
     _require_member_manager(db, auth.account_id, organization_id)
+    previous = db.get_role_for_account_organization(account_id, organization_id)
     try:
         db.remove_account_organization_role(account_id=account_id, organization_id=organization_id)
     except LastOwnerError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if previous is not None:
+        _audit_member(
+            db,
+            request,
+            audit.MEMBER_REMOVED,
+            auth.account_id,
+            organization_id,
+            account_id,
+            {"previous_role": previous},
+        )
+
+
+def _audit_member(
+    db: ControlDB,
+    request: Request,
+    action: str,
+    actor_account_id: str,
+    organization_id: str,
+    member_account_id: str,
+    details: dict[str, str | None],
+) -> None:
+    audit.record(
+        db,
+        request,
+        audit.AuditEvent(
+            action,
+            actor_account_id=actor_account_id,
+            subject_account_id=member_account_id,
+            organization_id=organization_id,
+            target=("account", member_account_id),
+            details=details,
+        ),
+    )
 
 
 @router.get("/{organization_id}/assets", response_model=list[AssetResponse])

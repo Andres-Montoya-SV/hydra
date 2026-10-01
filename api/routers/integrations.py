@@ -14,8 +14,9 @@ from typing import Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
+from api import security_audit as audit
 from api.auth import AuthContext, require_api_key
-from api.control_db import TicketingIntegrationRecord
+from api.control_db import ControlDB, TicketingIntegrationRecord
 from api.routers.delivery_logs import Page, delivery_responses, page
 from api.routers.org_access import control_db, require_member, require_owner
 from api.schemas import (
@@ -109,7 +110,39 @@ async def create_integration(
                 "stored safely.",
             },
         ) from exc
+    _audit_integration(
+        db,
+        request,
+        audit.INTEGRATION_CREATED,
+        auth.account_id,
+        organization_id,
+        record.integration_id,
+        # Never the credential or the provider configuration.
+        {"provider": body.provider, "name": record.name, "event_types": list(record.event_types)},
+    )
     return _response(record)
+
+
+def _audit_integration(
+    db: ControlDB,
+    request: Request,
+    action: str,
+    actor_account_id: str,
+    organization_id: str,
+    integration_id: str,
+    details: dict[str, object] | None = None,
+) -> None:
+    audit.record(
+        db,
+        request,
+        audit.AuditEvent(
+            action,
+            actor_account_id=actor_account_id,
+            organization_id=organization_id,
+            target=("ticketing_integration", integration_id),
+            details=details,
+        ),
+    )
 
 
 @router.delete("/{organization_id}/integrations/{integration_id}", status_code=204)
@@ -124,6 +157,9 @@ def remove_integration(
     require_owner(db, auth.account_id, organization_id)
     if not db.remove_ticketing_integration(organization_id, integration_id):
         raise HTTPException(status_code=404, detail="Integration not found")
+    _audit_integration(
+        db, request, audit.INTEGRATION_REMOVED, auth.account_id, organization_id, integration_id
+    )
     return Response(status_code=204)
 
 

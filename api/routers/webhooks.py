@@ -7,8 +7,11 @@ no second authorization system.
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
+from api import security_audit as audit
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, WebhookRecord
 from api.routers.delivery_logs import Page, delivery_responses, page
@@ -73,6 +76,15 @@ async def register_webhook(
         event_types=tuple(body.event_types),
         kind=body.kind,
     )
+    _audit_webhook(
+        control_db,
+        request,
+        audit.WEBHOOK_CREATED,
+        auth.account_id,
+        record.webhook_id,
+        # The host only: Slack/Teams URLs carry a secret in their path.
+        {"host": urlparse(body.url).hostname, "kind": body.kind},
+    )
     return WebhookCreatedResponse(**_to_response_fields(record), secret=record.secret)
 
 
@@ -88,12 +100,14 @@ def list_webhooks(
 def delete_webhook(
     webhook_id: str, request: Request, auth: AuthContext = Depends(require_api_key)
 ) -> None:
-    deleted = _control_db(request).delete_webhook(webhook_id, auth.account_id)
+    control_db = _control_db(request)
+    deleted = control_db.delete_webhook(webhook_id, auth.account_id)
     if not deleted:
         # Part F.3: a webhook_id belonging to a different account reads
         # identically to one that doesn't exist — never a 403, which
         # would confirm its existence to a non-owner.
         raise HTTPException(status_code=404, detail=f"{webhook_id!r} not found")
+    _audit_webhook(control_db, request, audit.WEBHOOK_DELETED, auth.account_id, webhook_id)
 
 
 @router.get("/{webhook_id}/deliveries", response_model=list[DeliveryResponse])
@@ -123,9 +137,39 @@ def redeliver(
 ) -> Response:
     """Queues a dead (or already delivered) delivery again, due now. The
     receiver gets the same event id, so it can recognize a repeat."""
-    if not _control_db(request).redeliver(webhook_id, delivery_id, auth.account_id):
+    control_db = _control_db(request)
+    if not control_db.redeliver(webhook_id, delivery_id, auth.account_id):
         raise HTTPException(status_code=404, detail="Delivery not found or already queued")
+    _audit_webhook(
+        control_db,
+        request,
+        audit.WEBHOOK_REDELIVERED,
+        auth.account_id,
+        webhook_id,
+        {"delivery_id": delivery_id},
+    )
     return Response(status_code=202)
+
+
+def _audit_webhook(
+    control_db: ControlDB,
+    request: Request,
+    action: str,
+    account_id: str,
+    webhook_id: str,
+    details: dict[str, object] | None = None,
+) -> None:
+    audit.record(
+        control_db,
+        request,
+        audit.AuditEvent(
+            action,
+            actor_account_id=account_id,
+            subject_account_id=account_id,
+            target=("webhook", webhook_id),
+            details=details,
+        ),
+    )
 
 
 def _to_response_fields(record: WebhookRecord) -> dict:

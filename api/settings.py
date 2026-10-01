@@ -9,6 +9,7 @@ never touches the pipeline's own config surface.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -69,13 +70,6 @@ class APISettings:
     wompi_link_url_medium: str | None = None
     wompi_link_url_pro: str | None = None
     wompi_link_url_ultra: str | None = None
-    # A temporary, MVP-only admin credential for the manual-reconciliation
-    # endpoint (`POST /admin/wompi/reconcile`) — no real operator/admin
-    # auth system exists yet (same honestly-stated gap as
-    # `api/routers/accounts.py`'s unauthenticated `POST /accounts` in
-    # Round 1). `None` means the endpoint refuses every request (fail
-    # closed), never "admin auth is optional."
-    admin_token: str | None = None
     # Productization Phase 08b: comma-separated Fernet keys sealing stored
     # third-party secrets (api/secrets_box.py); first key encrypts, all
     # decrypt (rotation). Unset: ticketing integrations can't be created.
@@ -359,6 +353,11 @@ def _load_platform_settings(settings: APISettings) -> None:
     """Database (Phase 10) and HTTP edge (Phase 11a) settings."""
     _load_database_settings(settings)
     _load_edge_settings(settings)
+    if os.getenv("HYDRA_API_ADMIN_TOKEN"):
+        logging.getLogger("hydra.api").warning(
+            "HYDRA_API_ADMIN_TOKEN is set but no longer used: admin endpoints need an "
+            "operator account's API key (python -m api.operators grant <email>)."
+        )
 
 
 def load_api_settings() -> APISettings:
@@ -400,7 +399,6 @@ def load_api_settings() -> APISettings:
     settings.wompi_link_url_medium = os.getenv("HYDRA_WOMPI_LINK_URL_MEDIUM") or None
     settings.wompi_link_url_pro = os.getenv("HYDRA_WOMPI_LINK_URL_PRO") or None
     settings.wompi_link_url_ultra = os.getenv("HYDRA_WOMPI_LINK_URL_ULTRA") or None
-    settings.admin_token = os.getenv("HYDRA_API_ADMIN_TOKEN") or None
     rate_limit_per_ip = os.getenv("HYDRA_API_ACCOUNT_CREATION_RATE_LIMIT_PER_IP_PER_DAY")
     if rate_limit_per_ip:
         settings.account_creation_rate_limit_per_ip_per_day = int(rate_limit_per_ip)
