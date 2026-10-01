@@ -226,6 +226,41 @@ class TestSweepRequeueAndRetryCeiling:
         assert control_db.get_owned_scan("done", account_id).status == "completed"
 
 
+class TestRateLimiterUnderOutOfOrderCommits:
+    """Each caller takes its timestamp before it waits for the write, so a
+    caller can commit after one holding a LATER timestamp (the CI flake
+    `assert 4 == 5` in the concurrent test below). Reproduced
+    deterministically: its elapsed time must count as zero, not as
+    negative, and the bucket's clock must never move backwards."""
+
+    def test_an_earlier_timestamp_committing_late_is_not_penalized(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import api.control_db as control_db_module
+
+        control_db = ControlDB(tmp_path / "control.db")
+        clock = iter(
+            [
+                "2026-10-01T10:00:10.000000+00:00",  # first caller: 2 -> 1 token
+                "2026-10-01T10:00:09.000000+00:00",  # took its time 1 s earlier
+                "2026-10-01T10:00:09.500000+00:00",  # bucket now empty
+            ]
+        )
+        monkeypatch.setattr(control_db_module, "_now_iso", lambda: next(clock))
+
+        def consume() -> bool:
+            return control_db.check_and_consume_rate_limit_token(
+                "late-key", capacity=2, refill_rate_per_second=0.5
+            )
+
+        assert [consume(), consume(), consume()] == [True, True, False]
+        with control_db._connect() as conn:
+            row = conn.execute(
+                "SELECT last_refill_at FROM rate_limit_buckets WHERE key_id = 'late-key'"
+            ).fetchone()
+        assert row[0] == "2026-10-01T10:00:10.000000+00:00"
+
+
 class TestPersistedRateLimiterCrossProcess:
     """Task's own explicit requirement: two APISettings-backed app
     instances (simulating two worker processes) sharing one control.db

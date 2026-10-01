@@ -5023,23 +5023,8 @@ class ControlDB:
         about, by `tests/test_scan_queue_durability.py`."""
         now = _now_iso()
         with self._connect() as conn:
-            # min(capacity, refilled) written as CASE: SQLite's two-argument
-            # MIN() and Postgres's LEAST() don't exist on the other backend.
             cursor = conn.execute(
-                "INSERT INTO rate_limit_buckets (key_id, tokens, last_refill_at) "
-                "VALUES (:key, :cap - 1, :now) "
-                "ON CONFLICT(key_id) DO UPDATE SET "
-                "tokens = CASE WHEN rate_limit_buckets.tokens + (julianday(:now) - "
-                "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate < :cap "
-                "THEN rate_limit_buckets.tokens + (julianday(:now) - "
-                "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate "
-                "ELSE :cap END - 1, "
-                "last_refill_at = :now "
-                "WHERE (CASE WHEN rate_limit_buckets.tokens + (julianday(:now) - "
-                "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate < :cap "
-                "THEN rate_limit_buckets.tokens + (julianday(:now) - "
-                "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate "
-                "ELSE :cap END) >= 1.0",
+                _RATE_LIMIT_CONSUME_SQL,
                 {"key": key_id, "cap": capacity, "now": now, "rate": refill_rate_per_second},
             )
         return cursor.rowcount == 1
@@ -6828,6 +6813,37 @@ _ADD_LLM_SPEND_SQL = {
     "hypotheses_spend_usd = monthly_usage.hypotheses_spend_usd "
     "+ excluded.hypotheses_spend_usd",
 }
+
+# The refill-then-consume decision as one statement (see
+# check_and_consume_rate_limit_token). Each caller takes its timestamp
+# before it waits for the write, so under contention a caller can commit
+# after one holding a LATER timestamp: the refill is clamped at zero and
+# last_refill_at never moves backwards, or that caller would see its
+# elapsed time as negative, lose a fraction of a token, and be wrongly
+# denied. min(capacity, refilled) is written as CASE: SQLite's
+# two-argument MIN() and Postgres's LEAST() don't exist on the other
+# backend.
+_RATE_LIMIT_CONSUME_SQL = (
+    "INSERT INTO rate_limit_buckets (key_id, tokens, last_refill_at) "
+    "VALUES (:key, :cap - 1, :now) "
+    "ON CONFLICT(key_id) DO UPDATE SET "
+    "tokens = CASE WHEN rate_limit_buckets.tokens + (CASE WHEN julianday(:now) > "
+    "julianday(rate_limit_buckets.last_refill_at) THEN (julianday(:now) - "
+    "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate ELSE 0 END) < :cap "
+    "THEN rate_limit_buckets.tokens + (CASE WHEN julianday(:now) > "
+    "julianday(rate_limit_buckets.last_refill_at) THEN (julianday(:now) - "
+    "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate ELSE 0 END) "
+    "ELSE :cap END - 1, "
+    "last_refill_at = CASE WHEN julianday(:now) > julianday(rate_limit_buckets.last_refill_at) "
+    "THEN :now ELSE rate_limit_buckets.last_refill_at END "
+    "WHERE (CASE WHEN rate_limit_buckets.tokens + (CASE WHEN julianday(:now) > "
+    "julianday(rate_limit_buckets.last_refill_at) THEN (julianday(:now) - "
+    "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate ELSE 0 END) < :cap "
+    "THEN rate_limit_buckets.tokens + (CASE WHEN julianday(:now) > "
+    "julianday(rate_limit_buckets.last_refill_at) THEN (julianday(:now) - "
+    "julianday(rate_limit_buckets.last_refill_at)) * 86400.0 * :rate ELSE 0 END) "
+    "ELSE :cap END) >= 1.0"
+)
 
 _NO_LIMIT = 2**62
 
