@@ -366,6 +366,8 @@ class PostgresBackend(Backend):
         self.schema = _ident(schema)
         self.pool = pool or PoolConfig()
         if self.schema != "public":
+            # pool.connection() commits on normal exit, rolls back on an
+            # exception (psycopg_pool wraps the block in `with conn:`).
             with _pool(url, self.pool).connection() as conn:
                 # The name travels as a bound parameter; the server quotes it
                 # (format %I). No SQL is composed client-side.
@@ -374,6 +376,10 @@ class PostgresBackend(Backend):
 
     @contextmanager
     def connect(self) -> Iterator[Any]:
+        # One transaction per connect(): pool.connection() commits when the
+        # caller's block ends normally and rolls back if it raises (psycopg_pool
+        # wraps the block in `with conn:`) — tests/test_db_backends.py checks
+        # the commit from an independent session.
         with _pool(self.url, self.pool).connection() as conn:
             # Transaction-local (`true`): every connect() is one transaction,
             # and nothing leaks to the connection's next user — also behind

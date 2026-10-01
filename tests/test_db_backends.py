@@ -128,6 +128,31 @@ class TestOnPostgres:
         assert first.get_account(account_id) is not None
         assert second.get_account(account_id) is None
 
+    def test_writes_are_committed_when_the_block_ends(self, tmp_path: Path) -> None:
+        """Seen from an independent session (a pooled one could see its own
+        uncommitted work): connect() commits on a normal exit, rolls back
+        on an exception."""
+        import psycopg
+
+        db = ControlDB(tmp_path / "d.db")
+        committed = db.create_account(email="committed@example.com")
+        with pytest.raises(RuntimeError), db._connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET email = 'rolled-back@example.com' WHERE account_id = ?",
+                (committed,),
+            )
+            raise RuntimeError("abort")
+
+        backend = db.backend
+        if not isinstance(backend, PostgresBackend):
+            pytest.fail("expected the Postgres backend")
+        with psycopg.connect(str(POSTGRES_URL)) as other:
+            other.execute("SELECT set_config('search_path', %s, true)", (backend.schema,))
+            row = other.execute(
+                "SELECT email FROM accounts WHERE account_id = %s", (committed,)
+            ).fetchone()
+        assert row == ("committed@example.com",)
+
     def test_null_safe_equality_and_booleans_round_trip(self, tmp_path: Path) -> None:
         db = ControlDB(tmp_path / "c.db")
         with db._connect() as conn:
