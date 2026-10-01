@@ -5295,6 +5295,31 @@ class ControlDB:
                 conn.execute(statement, params)
         return deleted
 
+    # --- operational aggregates for /metrics (Phase 11d) -----------------
+
+    def scan_status_counts(self) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT status, count(*) FROM scans GROUP BY status").fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def delivery_status_counts(self) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, count(*) FROM integration_deliveries GROUP BY status"
+            ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def pending_deletion_counts(self) -> dict[str, int]:
+        with self._connect() as conn:
+            organizations = conn.execute(
+                "SELECT count(*) FROM organizations WHERE deletion_due_at IS NOT NULL"
+            ).fetchone()[0]
+            accounts = conn.execute(
+                "SELECT count(*) FROM accounts "
+                "WHERE deletion_due_at IS NOT NULL AND deleted_at IS NULL"
+            ).fetchone()[0]
+        return {"organization": int(organizations), "account": int(accounts)}
+
     def is_operator(self, account_id: str) -> bool:
         with self._connect() as conn:
             row = conn.execute(

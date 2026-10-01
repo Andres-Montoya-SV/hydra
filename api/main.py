@@ -24,6 +24,7 @@ from api.edge import install_edge
 from api.email_sender import ConsoleEmailSender, EmailSender, PostmarkEmailSender
 from api.health import LoopHeartbeats
 from api.integration_worker import run_integration_delivery_loop
+from api.metrics import install_metrics
 from api.monitoring_worker import run_monitoring_loop
 from api.observability import configure_logging, init_sentry
 from api.rate_limit import PersistentTokenBucketLimiter
@@ -42,6 +43,7 @@ from api.routers import (
     imports,
     integrations,
     keys,
+    metrics,
     monitoring,
     remediation,
     reportability,
@@ -302,6 +304,8 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(webhooks.router)
     app.include_router(security_events.router)
     app.include_router(tenant_lifecycle.router)
+    app.include_router(metrics.router)
+    install_metrics(app)
     install_edge(app, settings)
     return app
 
