@@ -330,6 +330,41 @@ async def send_pinned(
     )
 
 
+async def get_pinned(
+    *, url: str, connect_ip: str, hostname: str, max_bytes: int, verify: bool = True
+) -> PinnedResponse:
+    """GETs `url` from `connect_ip` (already validated) with the same
+    pinning as `send_pinned`: no re-resolution, TLS checked against the
+    real hostname, no redirects. Reads at most `max_bytes` of the body,
+    so a hostile server cannot make the API buffer an unbounded response."""
+    import httpx
+
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    pinned_url = f"https://{connect_ip}:{parsed.port or 443}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS, verify=verify) as client:
+            request = client.build_request(
+                "GET",
+                pinned_url,
+                headers={"Host": hostname},
+                extensions={"sni_hostname": hostname},
+            )
+            response = await client.send(request, stream=True)
+            try:
+                body = b""
+                async for chunk in response.aiter_bytes():
+                    body += chunk
+                    if len(body) > max_bytes:
+                        body = body[:max_bytes]
+                        break
+            finally:
+                await response.aclose()
+    except httpx.RequestError as exc:
+        return PinnedResponse(None, b"", f"{type(exc).__name__}: {exc}", None)
+    return PinnedResponse(response.status_code, body, "", None)
+
+
 def _retry_after_seconds(value: str | None) -> int | None:
     """A numeric `Retry-After` (seconds). The HTTP-date form is ignored:
     the retry schedule then applies as usual."""

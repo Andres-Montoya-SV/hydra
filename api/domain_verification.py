@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import secrets
 from typing import TYPE_CHECKING, Literal
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     import dns.asyncresolver
@@ -147,6 +148,8 @@ async def verify_well_known_file(
 
     path = well_known_file_path(token)
     url = f"{base_url or f'https://{normalize_domain(domain)}'}{path}"
+    if base_url is None and client is None:
+        return await _verify_well_known_file_pinned(url, token)
 
     owns_client = client is None
     http_client = client or httpx.AsyncClient(timeout=10.0)
@@ -165,6 +168,35 @@ async def verify_well_known_file(
     if body != token:
         return False, f"{url} exists but its content does not match the expected token"
 
+    return True, f"Found matching file at {url}"
+
+
+# The verification file holds one token; anything much larger is not it.
+_WELL_KNOWN_MAX_BYTES = 4096
+
+
+async def _verify_well_known_file_pinned(url: str, token: str) -> tuple[bool, str]:
+    """Productization Phase 11a: the production path. The domain is
+    caller-supplied, so the fetch goes through the same SSRF gate as
+    webhook deliveries (api/webhooks.py): resolved once, refused unless
+    every address is public, then fetched from that pinned address (no
+    re-resolution, so no DNS rebinding), without redirects, reading at
+    most a few KB."""
+    from api.webhooks import get_pinned, validate_webhook_destination
+
+    allowed, reason, connect_ip = await validate_webhook_destination(url)
+    if not allowed:
+        return False, f"Could not verify {url}: {reason}"
+    hostname = urlparse(url).hostname or ""
+    response = await get_pinned(
+        url=url, connect_ip=connect_ip, hostname=hostname, max_bytes=_WELL_KNOWN_MAX_BYTES
+    )
+    if response.status is None:
+        return False, f"Could not reach {url}: {response.error}"
+    if response.status != 200:
+        return False, f"{url} returned HTTP {response.status}, expected 200"
+    if response.content.decode("utf-8", errors="replace").strip() != token:
+        return False, f"{url} exists but its content does not match the expected token"
     return True, f"Found matching file at {url}"
 
 

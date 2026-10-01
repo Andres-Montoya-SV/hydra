@@ -20,6 +20,7 @@ from fastapi import FastAPI
 
 from api.backup_worker import run_backup_loop
 from api.control_db import ControlDB
+from api.edge import install_edge
 from api.email_sender import ConsoleEmailSender, EmailSender, PostmarkEmailSender
 from api.health import LoopHeartbeats
 from api.integration_worker import run_integration_delivery_loop
@@ -297,6 +298,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(hypotheses.router)
     app.include_router(subscription.router)
     app.include_router(webhooks.router)
+    install_edge(app, settings)
     return app
 
 
