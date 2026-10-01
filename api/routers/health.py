@@ -30,3 +30,16 @@ def health(request: Request) -> JSONResponse:
         status_code=200 if healthy else 503,
         content={"status": "ok" if healthy else "unhealthy", "checks": checks},
     )
+
+
+@router.get("/ready")
+def ready(request: Request) -> JSONResponse:
+    """Readiness (Phase 11a): can this process serve requests right now —
+    its control database answers. `/health` adds the background loops'
+    heartbeats; a load balancer should route on `/ready`."""
+    control_db: ControlDB = request.app.state.control_db
+    try:
+        control_db.ping()
+    except Exception:  # any failure to reach the database means "not ready"
+        return JSONResponse(status_code=503, content={"status": "not ready"})
+    return JSONResponse(status_code=200, content={"status": "ready"})

@@ -66,6 +66,20 @@ class WebhookTestHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(self.response_body)
 
+    def do_GET(self) -> None:  # noqa: N802
+        WebhookTestHandler.requests.append(
+            {
+                "path": self.path,
+                "headers": dict(self.headers.items()),
+                "raw_body": b"",
+                "body": None,
+            }
+        )
+        self.send_response(self.response_status)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(self.response_body)
+
 
 def reset_webhook_test_state(
     *, status: int = 200, delay_seconds: float = 0.0, body: bytes = b"{}"

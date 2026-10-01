@@ -146,10 +146,24 @@ class JsonFormatter(logging.Formatter):
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
+            # Phase 11a: the request this record belongs to ("-" outside one).
+            "request_id": getattr(record, "request_id", "-"),
         }
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload)
+
+
+class _TextFormatter(logging.Formatter):
+    """The human-readable default, with the request id (Phase 11a)."""
+
+    def __init__(self) -> None:
+        super().__init__("%(asctime)s %(levelname)s %(name)s [%(request_id)s]: %(message)s")
+
+    def format(self, record: logging.LogRecord) -> str:
+        if not hasattr(record, "request_id"):
+            record.request_id = "-"  # a record that bypassed RequestIdFilter
+        return super().format(record)
 
 
 def configure_logging(log_format: str) -> None:
@@ -163,10 +177,13 @@ def configure_logging(log_format: str) -> None:
     root = logging.getLogger()
     if root.handlers:
         return
+    from api.edge import RequestIdFilter
+
     handler = logging.StreamHandler()
+    handler.addFilter(RequestIdFilter())
     if log_format == "json":
         handler.setFormatter(JsonFormatter())
     else:
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        handler.setFormatter(_TextFormatter())
     root.addHandler(handler)
     root.setLevel(logging.INFO)

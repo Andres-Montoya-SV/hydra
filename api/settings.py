@@ -10,6 +10,7 @@ never touches the pipeline's own config surface.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -85,6 +86,12 @@ class APISettings:
     database_url: str | None = None
     # Phase 10c: HYDRA_API_DATABASE_POOL_MIN / _MAX / _TIMEOUT (seconds).
     database_pool: PoolConfig = PoolConfig()
+    # Phase 11a (api/edge.py): HYDRA_API_MAX_BODY_BYTES (non-import
+    # requests), HYDRA_API_CORS_ORIGINS (comma-separated; empty = no CORS),
+    # HYDRA_API_HSTS_SECONDS (0 = off; set once TLS terminates in front).
+    max_body_bytes: int = 1024 * 1024
+    cors_origins: tuple[str, ...] = ()
+    hsts_seconds: int = 0
 
     # Hallazgo 1 (account-creation abuse) fix. `account_creation_rate_
     # limit_per_ip_per_day`: a rolling 24h window, not a calendar day
@@ -323,6 +330,37 @@ def _load_database_settings(settings: APISettings) -> None:
     settings.database_pool = pool
 
 
+_CORS_ORIGIN = re.compile(r"^(https://[a-z0-9.-]+|http://(localhost|127\.0\.0\.1))(:\d{1,5})?$")
+
+
+def _load_edge_settings(settings: APISettings) -> None:
+    max_body = os.getenv("HYDRA_API_MAX_BODY_BYTES")
+    if max_body:
+        settings.max_body_bytes = int(max_body)
+    hsts = os.getenv("HYDRA_API_HSTS_SECONDS")
+    if hsts:
+        settings.hsts_seconds = int(hsts)
+    origins = tuple(
+        origin.strip().rstrip("/").lower()
+        for origin in (os.getenv("HYDRA_API_CORS_ORIGINS") or "").split(",")
+        if origin.strip()
+    )
+    invalid = [origin for origin in origins if not _CORS_ORIGIN.match(origin)]
+    if invalid or settings.max_body_bytes < 1024 or settings.hsts_seconds < 0:
+        raise ValueError(
+            "HYDRA_API_CORS_ORIGINS must list exact https:// origins (http:// only for "
+            "localhost), MAX_BODY_BYTES >= 1024, HSTS_SECONDS >= 0; refused: "
+            f"{invalid or [str(settings.max_body_bytes), str(settings.hsts_seconds)]}"
+        )
+    settings.cors_origins = origins
+
+
+def _load_platform_settings(settings: APISettings) -> None:
+    """Database (Phase 10) and HTTP edge (Phase 11a) settings."""
+    _load_database_settings(settings)
+    _load_edge_settings(settings)
+
+
 def load_api_settings() -> APISettings:
     """A real gap this round's own live demonstration surfaced, fixed
     here: this function used to read only `os.environ` directly, never
@@ -356,7 +394,7 @@ def load_api_settings() -> APISettings:
     settings.wompi_client_id = os.getenv("WOMPI_CLIENT_ID") or None
     settings.wompi_client_secret = os.getenv("WOMPI_CLIENT_SECRET") or None
     settings.secrets_keys = os.getenv("HYDRA_API_SECRETS_KEYS") or None
-    _load_database_settings(settings)
+    _load_platform_settings(settings)
     settings.dev_wompi_id_base_url = os.getenv("HYDRA_API_DEV_WOMPI_ID_BASE_URL") or None
     settings.dev_wompi_api_base_url = os.getenv("HYDRA_API_DEV_WOMPI_API_BASE_URL") or None
     settings.wompi_link_url_medium = os.getenv("HYDRA_WOMPI_LINK_URL_MEDIUM") or None

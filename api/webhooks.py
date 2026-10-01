@@ -288,6 +288,17 @@ async def _post_to_pinned_ip(
     return False, f"HTTP {response.status}"
 
 
+def pinned_url_for(url: str, connect_ip: str) -> str:
+    """`url` addressed to `connect_ip` instead of its hostname: same port,
+    path and query; an IPv6 address in brackets, as URLs require."""
+    parsed = urlparse(url)
+    host = f"[{connect_ip}]" if ":" in connect_ip else connect_ip
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    return f"https://{host}:{parsed.port or 443}{path}"
+
+
 async def send_pinned(
     *,
     url: str,
@@ -304,12 +315,7 @@ async def send_pinned(
     a local self-signed server)."""
     import httpx
 
-    parsed = urlparse(url)
-    port = parsed.port or 443
-    path = parsed.path or "/"
-    if parsed.query:
-        path = f"{path}?{parsed.query}"
-    pinned_url = f"https://{connect_ip}:{port}{path}"
+    pinned_url = pinned_url_for(url, connect_ip)
     try:
         async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS, verify=verify) as client:
             request = client.build_request(
@@ -328,6 +334,39 @@ async def send_pinned(
         "",
         _retry_after_seconds(response.headers.get("Retry-After")),
     )
+
+
+async def get_pinned(
+    *, url: str, connect_ip: str, hostname: str, max_bytes: int, verify: bool = True
+) -> PinnedResponse:
+    """GETs `url` from `connect_ip` (already validated) with the same
+    pinning as `send_pinned`: no re-resolution, TLS checked against the
+    real hostname, no redirects. Reads at most `max_bytes` of the body,
+    so a hostile server cannot make the API buffer an unbounded response."""
+    import httpx
+
+    pinned_url = pinned_url_for(url, connect_ip)
+    try:
+        async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS, verify=verify) as client:
+            request = client.build_request(
+                "GET",
+                pinned_url,
+                headers={"Host": hostname},
+                extensions={"sni_hostname": hostname},
+            )
+            response = await client.send(request, stream=True)
+            try:
+                body = b""
+                async for chunk in response.aiter_bytes():
+                    body += chunk
+                    if len(body) > max_bytes:
+                        body = body[:max_bytes]
+                        break
+            finally:
+                await response.aclose()
+    except httpx.RequestError as exc:
+        return PinnedResponse(None, b"", f"{type(exc).__name__}: {exc}", None)
+    return PinnedResponse(response.status_code, body, "", None)
 
 
 def _retry_after_seconds(value: str | None) -> int | None:
