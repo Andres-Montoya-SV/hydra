@@ -19,7 +19,7 @@ from _webhook_test_server import (
 import api.webhooks as webhooks_module
 import core.collection.ssrf as ssrf_module
 from api.domain_verification import verify_well_known_file
-from api.webhooks import PinnedResponse, get_pinned
+from api.webhooks import PinnedResponse, get_pinned, pinned_url_for
 
 
 def _resolving_to(monkeypatch: pytest.MonkeyPatch, *addresses: str) -> None:
@@ -107,6 +107,25 @@ class TestPinnedFetch:
         assert not ok and expected in detail
 
 
+class TestPinnedUrl:
+    @pytest.mark.parametrize(
+        ("url", "connect_ip", "expected"),
+        [
+            (
+                "https://h.example/a/b?x=1&y=2",
+                "93.184.216.34",
+                "https://93.184.216.34:443/a/b?x=1&y=2",
+            ),
+            ("https://h.example:8443", "93.184.216.34", "https://93.184.216.34:8443/"),
+            ("https://h.example/p", "2606:2800:220:1::248", "https://[2606:2800:220:1::248]:443/p"),
+        ],
+    )
+    def test_keeps_port_path_and_query_and_brackets_ipv6(
+        self, url: str, connect_ip: str, expected: str
+    ) -> None:
+        assert pinned_url_for(url, connect_ip) == expected
+
+
 class TestGetPinned:
     @pytest.fixture
     def server(self) -> Iterator[int]:
@@ -131,6 +150,19 @@ class TestGetPinned:
         request = WebhookTestHandler.requests[0]
         assert request["path"] == "/.well-known/f.txt"
         assert request["headers"]["Host"] == "victim.example"
+
+    def test_keeps_the_query_string(self, server: int) -> None:
+        reset_webhook_test_state(body=b"ok")
+        asyncio.run(
+            get_pinned(
+                url=f"https://victim.example:{server}/f.txt?v=2&k=a",
+                connect_ip="127.0.0.1",
+                hostname="victim.example",
+                max_bytes=10,
+                verify=False,
+            )
+        )
+        assert WebhookTestHandler.requests[0]["path"] == "/f.txt?v=2&k=a"
 
     def test_does_not_follow_redirects(self, server: int) -> None:
         reset_webhook_test_state(status=302, body=b"")

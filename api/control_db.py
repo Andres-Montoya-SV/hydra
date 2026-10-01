@@ -6815,7 +6815,9 @@ _ADD_LLM_SPEND_SQL = {
 }
 
 # The refill-then-consume decision as one statement (see
-# check_and_consume_rate_limit_token). Each caller takes its timestamp
+# check_and_consume_rate_limit_token). Portable as written: on Postgres,
+# julianday() is the SQLite-compatible function api/db.py installs with
+# the schema (_PG_COMPAT_FUNCTIONS); the CI postgres job runs this. Each caller takes its timestamp
 # before it waits for the write, so under contention a caller can commit
 # after one holding a LATER timestamp: the refill is clamped at zero and
 # last_refill_at never moves backwards, or that caller would see its

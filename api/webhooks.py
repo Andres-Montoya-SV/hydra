@@ -288,6 +288,17 @@ async def _post_to_pinned_ip(
     return False, f"HTTP {response.status}"
 
 
+def pinned_url_for(url: str, connect_ip: str) -> str:
+    """`url` addressed to `connect_ip` instead of its hostname: same port,
+    path and query; an IPv6 address in brackets, as URLs require."""
+    parsed = urlparse(url)
+    host = f"[{connect_ip}]" if ":" in connect_ip else connect_ip
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    return f"https://{host}:{parsed.port or 443}{path}"
+
+
 async def send_pinned(
     *,
     url: str,
@@ -304,12 +315,7 @@ async def send_pinned(
     a local self-signed server)."""
     import httpx
 
-    parsed = urlparse(url)
-    port = parsed.port or 443
-    path = parsed.path or "/"
-    if parsed.query:
-        path = f"{path}?{parsed.query}"
-    pinned_url = f"https://{connect_ip}:{port}{path}"
+    pinned_url = pinned_url_for(url, connect_ip)
     try:
         async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS, verify=verify) as client:
             request = client.build_request(
@@ -339,9 +345,7 @@ async def get_pinned(
     so a hostile server cannot make the API buffer an unbounded response."""
     import httpx
 
-    parsed = urlparse(url)
-    path = parsed.path or "/"
-    pinned_url = f"https://{connect_ip}:{parsed.port or 443}{path}"
+    pinned_url = pinned_url_for(url, connect_ip)
     try:
         async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS, verify=verify) as client:
             request = client.build_request(
