@@ -25,6 +25,7 @@ SQLITE_TABLE_READS: dict[str, str] = {
     "accounts": "SELECT * FROM accounts",
     "organizations": "SELECT * FROM organizations",
     "rate_limit_buckets": "SELECT * FROM rate_limit_buckets",
+    "security_audit_log": "SELECT * FROM security_audit_log",
     "wompi_unmatched_payments": "SELECT * FROM wompi_unmatched_payments",
     "wompi_webhook_events": "SELECT * FROM wompi_webhook_events",
     "account_organization_roles": "SELECT * FROM account_organization_roles",

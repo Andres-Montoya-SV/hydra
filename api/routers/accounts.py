@@ -43,6 +43,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from api import security_audit as audit
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, DuplicateEmailError
 from api.email_sender import EmailSender
@@ -147,8 +148,26 @@ def create_account(body: CreateAccountRequest, request: Request) -> CreateAccoun
     _email_sender(request).send_verification_email(
         to=body.email, account_id=account_id, token=token
     )
+    _audit_new_account(control_db, request, account_id, key_id)
 
     return CreateAccountResponse(account_id=account_id, api_key=raw_key, key_id=key_id)
+
+
+def _audit_new_account(
+    control_db: ControlDB, request: Request, account_id: str, key_id: str
+) -> None:
+    for action, target in (
+        (audit.ACCOUNT_CREATED, ("account", account_id)),
+        (audit.KEY_CREATED, ("api_key", key_id)),
+    ):
+        audit.record(
+            control_db,
+            request,
+            action,
+            actor_account_id=account_id,
+            subject_account_id=account_id,
+            target=target,
+        )
 
 
 @router.post("/verify-email", response_model=VerifyEmailResponse)

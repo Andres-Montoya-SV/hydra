@@ -19,8 +19,9 @@ import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
+from api import security_audit as audit
 from api import subscriptions
-from api.auth import AuthContext, require_api_key
+from api.auth import AuthContext, require_api_key, require_operator
 from api.control_db import ControlDB
 from api.schemas import (
     BrandingResponse,
@@ -381,24 +382,31 @@ async def wompi_webhook(
 # --- Manual reconciliation (admin) ---------------------------------------
 
 
-def _require_admin(request: Request, x_admin_token: str | None = Header(default=None)) -> None:
-    api_settings = _api_settings(request)
-    if not api_settings.admin_token or x_admin_token != api_settings.admin_token:
-        raise HTTPException(status_code=401, detail="Missing or invalid admin token.")
-
-
-@router.get("/admin/wompi/unmatched", dependencies=[Depends(_require_admin)])
-def list_unmatched_payments(request: Request) -> list[dict]:
-    return _control_db(request).get_unresolved_payments()
+@router.get("/admin/wompi/unmatched")
+def list_unmatched_payments(
+    request: Request, operator: AuthContext = Depends(require_operator)
+) -> list[dict]:
+    control_db = _control_db(request)
+    payments = control_db.get_unresolved_payments()
+    audit.record(
+        control_db,
+        request,
+        audit.ADMIN_PAYMENTS_LISTED,
+        actor_type="operator",
+        actor_account_id=operator.account_id,
+        details={"count": len(payments)},
+    )
+    return payments
 
 
 @router.post(
     "/admin/wompi/reconcile",
     response_model=WompiReconcileResponse,
-    dependencies=[Depends(_require_admin)],
 )
 def reconcile_unmatched_payment(
-    body: WompiReconcileRequest, request: Request
+    body: WompiReconcileRequest,
+    request: Request,
+    operator: AuthContext = Depends(require_operator),
 ) -> WompiReconcileResponse:
     control_db = _control_db(request)
     if not control_db.account_exists(body.account_id):
@@ -407,6 +415,16 @@ def reconcile_unmatched_payment(
     if not resolved:
         raise HTTPException(status_code=404, detail="unmatched_id not found or already resolved.")
     subscriptions.apply_tier_change(control_db, body.account_id, body.tier)
+    audit.record(
+        control_db,
+        request,
+        audit.ADMIN_PAYMENT_RECONCILED,
+        actor_type="operator",
+        actor_account_id=operator.account_id,
+        subject_account_id=body.account_id,
+        target=("unmatched_payment", body.unmatched_id),
+        details={"tier": body.tier},
+    )
     return WompiReconcileResponse(
         unmatched_id=body.unmatched_id,
         account_id=body.account_id,

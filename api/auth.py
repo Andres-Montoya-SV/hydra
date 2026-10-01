@@ -8,12 +8,14 @@ SQLite lookups are blocking calls (see `api/control_db.py`).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NoReturn
 
-from fastapi import Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException, Request
 
 from api.control_db import ControlDB
 from api.rate_limit import RateLimitExceededError, TokenBucketLimiter
 from api.security import is_currently_valid, lookup_hash_for, verify_key
+from api.security_audit import record_auth_failure
 
 
 @dataclass(frozen=True)
@@ -30,27 +32,33 @@ def _rate_limiter(request: Request) -> TokenBucketLimiter:
     return request.app.state.rate_limiter  # type: ignore[no-any-return]
 
 
+def _refuse(control_db: ControlDB, request: Request, reason: str, detail: str) -> NoReturn:
+    """401, recorded in the security audit log (throttled; Phase 11b)."""
+    record_auth_failure(control_db, request, reason)
+    raise HTTPException(status_code=401, detail=detail)
+
+
 def require_api_key(
     request: Request,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> AuthContext:
-    if not x_api_key:
-        raise HTTPException(status_code=401, detail="Missing X-API-Key header")
-
     control_db = _control_db(request)
+    if not x_api_key:
+        _refuse(control_db, request, "missing", "Missing X-API-Key header")
+
     found = control_db.find_key_by_lookup_hash(lookup_hash_for(x_api_key))
     if found is None:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        _refuse(control_db, request, "invalid", "Invalid API key")
     record, verify_hash = found
 
     if not verify_key(x_api_key, verify_hash):
         # Extremely unlikely (would mean a lookup_hash collision), but
         # the actual authentication decision is always the Argon2id
         # match, never the fast lookup alone.
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        _refuse(control_db, request, "invalid", "Invalid API key")
 
     if not is_currently_valid(record):
-        raise HTTPException(status_code=401, detail="API key revoked or expired")
+        _refuse(control_db, request, "revoked_or_expired", "API key revoked or expired")
 
     try:
         _rate_limiter(request).check(record.key_id)
@@ -59,3 +67,15 @@ def require_api_key(
 
     control_db.touch_key_last_used(record.key_id)
     return AuthContext(account_id=record.account_id, key_id=record.key_id)
+
+
+_AUTHENTICATED = Depends(require_api_key)
+
+
+def require_operator(request: Request, auth: AuthContext = _AUTHENTICATED) -> AuthContext:
+    """Admin endpoints (Phase 11b): a valid API key whose account is an
+    operator (granted from the host, `python -m api.operators`). Anyone
+    else gets 404, so the admin surface is not discoverable."""
+    if not _control_db(request).is_operator(auth.account_id):
+        raise HTTPException(status_code=404, detail="Not Found")
+    return auth

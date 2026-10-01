@@ -7,7 +7,7 @@ evolve independently of the engine's internals.
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -1164,3 +1164,21 @@ class TicketingIntegrationResponse(BaseModel):
     last_error: str | None = None
     created_by_account_id: str
     created_at: str
+
+
+class SecurityEventResponse(BaseModel):
+    """One security audit log event (Productization Phase 11b). `details`
+    never contains keys, secrets or credentials."""
+
+    event_id: str
+    occurred_at: str
+    action: str
+    actor_type: Literal["account", "operator", "host", "anonymous"]
+    actor_account_id: str | None = None
+    subject_account_id: str | None = None
+    organization_id: str | None = None
+    target_type: str | None = None
+    target_id: str | None = None
+    request_id: str | None = None
+    client_ip: str | None = None
+    details: dict[str, Any]

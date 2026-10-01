@@ -10,9 +10,9 @@ order of the remaining work.
 |---|---|---|---|
 | Secrets management | **in place** | Secrets come only from the environment. Stored third-party secrets are sealed (`api/secrets_box.py`, Fernet, key rotation). Sentry scrubs secrets. | — |
 | Rate / request limits | **partial** | Per-key request rate limit and per-IP account creation limit exist. **No request body limit outside imports.** | **11a** |
-| Auth / session strategy | **in place** | API keys only: Argon2id hash plus a lookup index; no sessions. The admin endpoints use a static bearer token. | 11b (admin) |
+| Auth / session strategy | **in place** | API keys only: Argon2id hash plus a lookup index; no sessions. Admin endpoints now take an operator account's API key; the static token is gone. | **11b** (done) |
 | API keys + rotation | **in place** | `POST /keys/{id}/rotate`, `/revoke` | — |
-| Audit logs | **partial** | Domain audits exist: capability changes, business context, remediation events, scope exclusions. **No security audit log** for key create/rotate/revoke, membership and role changes, integration and webhook changes, or admin actions. | 11b |
+| Audit logs | **in place** | Domain audits (capability changes, business context, remediation, scope exclusions), plus the security audit log for keys, failed sign-ins, members, integrations and admin actions. | **11b** (done, [doc](11b_audit_and_operators.md)) |
 | Dependency scanning | **in place** | `pip-audit` in CI over all requirement sets; Go tools pinned in the Dockerfile. | 11d (image scan) |
 | SBOM | **missing** | | 11d |
 | Container security | **partial** | Multi-stage build, runs as `USER hydra`. No image vulnerability scan, no read-only root filesystem guidance. | 11d |

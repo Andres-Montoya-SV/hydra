@@ -57,7 +57,6 @@ def wompi_backed_client(tmp_path: Path):
         wompi_link_url_medium="https://pay.example/medium",
         wompi_link_url_pro="https://pay.example/pro",
         wompi_link_url_ultra="https://pay.example/ultra",
-        admin_token="admin-secret",  # noqa: S106 - test fixture, not a real secret
     )
     try:
         with TestClient(create_app(settings)) as client:
@@ -68,6 +67,15 @@ def wompi_backed_client(tmp_path: Path):
 
 def _create_account(client: TestClient) -> tuple[str, str]:
     return create_verified_account(client)
+
+
+def _operator_headers(client: TestClient) -> dict[str, str]:
+    """An operator's own API key (Phase 11b), granted the way the host does."""
+    from api.operators import set_operator
+
+    api_key, account_id = _create_account(client)
+    set_operator(client.app.state.control_db, account_id, True)
+    return {"X-API-Key": api_key}
 
 
 def _sign(body: bytes) -> str:
@@ -332,9 +340,8 @@ class TestWompiWebhook:
         ).json()
         assert sub["tier"] == "free"
 
-        unmatched = wompi_backed_client.get(
-            "/admin/wompi/unmatched", headers={"X-Admin-Token": "admin-secret"}
-        ).json()
+        operator = _operator_headers(wompi_backed_client)
+        unmatched = wompi_backed_client.get("/admin/wompi/unmatched", headers=operator).json()
         assert len(unmatched) == 1
         assert unmatched[0]["transaction_id"] == "txn-104"
 
@@ -345,7 +352,7 @@ class TestWompiWebhook:
                 "account_id": account_id,
                 "tier": "ultra",
             },
-            headers={"X-Admin-Token": "admin-secret"},
+            headers=operator,
         )
         assert reconcile.status_code == 200
         sub_after = wompi_backed_client.get(
@@ -353,13 +360,23 @@ class TestWompiWebhook:
         ).json()
         assert sub_after["tier"] == "ultra"
 
-    def test_admin_endpoints_require_the_admin_token(self, wompi_backed_client: TestClient) -> None:
-        resp = wompi_backed_client.get("/admin/wompi/unmatched")
-        assert resp.status_code == 401
-        resp2 = wompi_backed_client.get(
-            "/admin/wompi/unmatched", headers={"X-Admin-Token": "wrong"}
+    def test_admin_endpoints_require_an_operator(self, wompi_backed_client: TestClient) -> None:
+        assert wompi_backed_client.get("/admin/wompi/unmatched").status_code == 401
+        # The old static token header means nothing any more.
+        resp = wompi_backed_client.get(
+            "/admin/wompi/unmatched", headers={"X-Admin-Token": "admin-secret"}
         )
-        assert resp2.status_code == 401
+        assert resp.status_code == 401
+        # A valid key of a non-operator account: not even told the route exists.
+        api_key, _ = _create_account(wompi_backed_client)
+        resp = wompi_backed_client.get("/admin/wompi/unmatched", headers={"X-API-Key": api_key})
+        assert resp.status_code == 404
+        resp = wompi_backed_client.post(
+            "/admin/wompi/reconcile",
+            json={"unmatched_id": "x", "account_id": "y", "tier": "ultra"},
+            headers={"X-API-Key": api_key},
+        )
+        assert resp.status_code == 404
 
     def test_a_transaction_check_failure_prevents_activation(
         self, wompi_backed_client: TestClient
