@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 
 from api.health import LoopHeartbeats
 from api.subscriptions import get_or_create_subscription, grace_period_expired
+from api.tenant_lifecycle import run_tenant_deletion_job
 from api.tiers import retention_days_for, tier_limits
 
 if TYPE_CHECKING:
@@ -272,6 +273,7 @@ async def run_reconciliation_loop(
         observations_purged, evidence_purged = run_observation_retention_purge_job(
             api_settings=api_settings, control_db=control_db
         )
+        run_tenant_deletion_job(api_settings=api_settings, control_db=control_db)
         logger.info(
             "Reconciliation cycle complete: %d account(s) suspended (grace period "
             "expired), %d scan(s) purged, %d observation(s)/%d evidence row(s) purged%s.",

@@ -1182,3 +1182,21 @@ class SecurityEventResponse(BaseModel):
     request_id: str | None = None
     client_ip: str | None = None
     details: dict[str, Any]
+
+
+class DeletionScheduledResponse(BaseModel):
+    """Productization Phase 11c: when a requested deletion takes effect.
+    Until then it can be cancelled; after it, the data is gone."""
+
+    deletion_due_at: str
+
+
+class AccountExportResponse(BaseModel):
+    """Productization Phase 11c: what this service holds about the calling
+    account itself (organization data is in the organization export)."""
+
+    account: dict[str, Any]
+    subscription: dict[str, Any] | None
+    api_keys: list[dict[str, Any]]
+    memberships: list[dict[str, Any]]
+    security_events: list[dict[str, Any]]

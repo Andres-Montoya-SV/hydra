@@ -10,6 +10,8 @@ Routers record an event after a security-relevant change succeeds:
   removed; a delivery is redelivered.
 - **Administration:** every admin endpoint call, and every operator grant
   or revoke made from the host CLI.
+- **Tenant lifecycle (Phase 11c):** exports, deletion requests and
+  cancellations, purges.
 
 Each event names its actor, the account whose security it concerns, the
 organization, the target, the request id (api/edge.py) and the client
@@ -54,6 +56,15 @@ ADMIN_PAYMENT_RECONCILED = "admin.payment_reconciled"
 ADMIN_EVENTS_LISTED = "admin.security_events_listed"
 OPERATOR_GRANTED = "operator.granted"
 OPERATOR_REVOKED = "operator.revoked"
+# Phase 11c: tenant export and deletion.
+ORGANIZATION_EXPORTED = "organization.exported"
+ORGANIZATION_DELETION_REQUESTED = "organization.deletion_requested"
+ORGANIZATION_DELETION_CANCELLED = "organization.deletion_cancelled"
+ORGANIZATION_PURGED = "organization.purged"
+ACCOUNT_EXPORTED = "account.exported"
+ACCOUNT_DELETION_REQUESTED = "account.deletion_requested"
+ACCOUNT_DELETION_CANCELLED = "account.deletion_cancelled"
+ACCOUNT_PURGED = "account.purged"
 
 # One failed-sign-in event per client address per minute.
 _AUTH_FAILURE_EVENTS_PER_SECOND = 1 / 60

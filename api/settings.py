@@ -86,6 +86,10 @@ class APISettings:
     max_body_bytes: int = 1024 * 1024
     cors_origins: tuple[str, ...] = ()
     hsts_seconds: int = 0
+    # Phase 11c: largest organization export served over HTTP
+    # (HYDRA_API_EXPORT_MAX_BYTES); operators export without a limit from
+    # the host (python -m api.tenants export-organization).
+    export_max_bytes: int = 100 * 1024 * 1024
 
     # Hallazgo 1 (account-creation abuse) fix. `account_creation_rate_
     # limit_per_ip_per_day`: a rolling 24h window, not a calendar day
@@ -334,6 +338,9 @@ def _load_edge_settings(settings: APISettings) -> None:
     hsts = os.getenv("HYDRA_API_HSTS_SECONDS")
     if hsts:
         settings.hsts_seconds = int(hsts)
+    export_max = os.getenv("HYDRA_API_EXPORT_MAX_BYTES")
+    if export_max:
+        settings.export_max_bytes = int(export_max)
     origins = tuple(
         origin.strip().rstrip("/").lower()
         for origin in (os.getenv("HYDRA_API_CORS_ORIGINS") or "").split(",")

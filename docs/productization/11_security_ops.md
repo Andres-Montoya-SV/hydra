@@ -24,7 +24,7 @@ order of the remaining work.
 | Worker heartbeats | **in place** | `LoopHeartbeats` for every background loop | — |
 | Stuck-job recovery | **in place** | Orphaned-scan requeue; outbox lease reclaim | — |
 | Data-retention controls | **in place** | Tier retention purge (reconciliation loop), observation retention | — |
-| Tenant deletion / export | **missing** | Per-organization exports exist for some datasets; **no account deletion and no complete tenant export.** | 11c |
+| Tenant deletion / export | **in place** | Self-service deletion with a 30-day grace period (audit and billing kept, pseudonymized) and a complete organization archive. | **11c** (done, [doc](11c_tenant_export_deletion.md)) |
 | Security headers | **missing** | | **11a** |
 | CORS | **missing** (implicitly none) | | **11a** (explicit allowlist) |
 | Upload size / type limits | **partial** | Imports are bounded at 25 MB and parsed by type; other endpoints are unbounded. | **11a** |
