@@ -196,18 +196,20 @@ def _upload_snapshot_to_s3(
     )
 
 
-def _backup_control_db(
-    api_settings: APISettings, control_db: ControlDB, snapshot_dir: Path
-) -> bool:
-    """Copies control.db into the snapshot; False when the control plane is
-    on PostgreSQL (Productization Phase 10) — the managed database's own
-    snapshots / point-in-time recovery back it up, and only the per-account
-    SQLite files are copied here."""
+def _backup_control_db(api_settings: APISettings, control_db: ControlDB, snapshot_dir: Path) -> str:
+    """The control plane into the snapshot; returns what was written. On
+    PostgreSQL (Productization Phase 10d) a consistent logical export
+    (`control/`, api/control_export.py), in addition to the managed
+    database's own snapshots and point-in-time recovery."""
     if control_db.dialect.name != "sqlite":
+        from api.control_export import export_control_plane
+
         snapshot_dir.mkdir(parents=True, exist_ok=True)
-        return False
+        manifest = export_control_plane(control_db, snapshot_dir / "control")
+        rows = sum(table.rows for table in manifest.tables)
+        return f"control-plane export ({rows} rows)"
     backup_sqlite_file(api_settings.control_db_path, snapshot_dir / "control.db")
-    return True
+    return "control.db"
 
 
 def _upload_snapshot_to_s3_if_configured(api_settings: APISettings, snapshot_dir: Path) -> None:
@@ -261,7 +263,7 @@ def run_backup_job(*, api_settings: APISettings, control_db: ControlDB) -> Path:
     never destructive, so there's nothing a rehearsal mode would be
     protecting against."""
     snapshot_dir = api_settings.backup_root / _timestamp()
-    control_on_sqlite = _backup_control_db(api_settings, control_db, snapshot_dir)
+    control_backup = _backup_control_db(api_settings, control_db, snapshot_dir)
 
     account_count = 0
     for account_id in control_db.list_account_ids():
@@ -273,9 +275,9 @@ def run_backup_job(*, api_settings: APISettings, control_db: ControlDB) -> Path:
         account_count += 1
 
     logger.info(
-        "Local backup created at %s (%s%d account recon.db file(s)).",
+        "Local backup created at %s (%s + %d account recon.db file(s)).",
         snapshot_dir,
-        "control.db + " if control_on_sqlite else "",
+        control_backup,
         account_count,
     )
 

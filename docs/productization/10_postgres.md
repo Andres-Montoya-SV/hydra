@@ -14,7 +14,7 @@ to PostgreSQL. It is split in three PRs:
 | **10a** (this) | backend abstraction, portable SQL, Postgres schema, dual-backend CI |
 | 10b | SQLite → Postgres migration tool (per-table row counts) and rollback plan — [runbook](10b_migration_runbook.md) |
 | 10c | row-level security and connection pool — [doc](10c_pool_and_rls.md) |
-| 10d | backup / PITR restore rehearsal on the managed database |
+| 10d | backup and restore on Postgres, rehearsals — [doc](10d_backup_restore.md) |
 
 Decisions:
 
@@ -75,10 +75,10 @@ Connections come from one `psycopg_pool.ConnectionPool` per URL
 ## Operations
 
 - **Backups.** On Postgres the control plane is backed up by the managed
-  database (daily snapshots, point-in-time recovery). The backup loop then
-  copies only the per-account `recon.db` files. `api/restore_backup.py`
-  and `api/restore_integrity.py` restore SQLite snapshots and are
-  unchanged; the Postgres restore path is rehearsed in 10c.
+  database (daily snapshots, point-in-time recovery). Since 10d, each
+  backup cycle also writes a consistent logical export of it next to the
+  per-account `recon.db` files, and `api/restore_backup.py` restores
+  either kind of snapshot. See [10d](10d_backup_restore.md).
 - **Configuration:** `HYDRA_API_DATABASE_URL` (see `api/.env.example`).
   Unset keeps `control.db` under the API data directory.
 
