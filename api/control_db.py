@@ -20,6 +20,7 @@ identically to "not found").
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 from contextlib import AbstractContextManager
@@ -41,6 +42,7 @@ from api.certificate_events import parse_certificate_snapshot
 from api.change_detection import host_for_asset
 from api.db import (
     Backend,
+    PoolConfig,
     PostgresBackend,
     PostgresDialect,
     SqliteBackend,
@@ -62,6 +64,8 @@ from api.relationship_identity import RelationshipDraft
 from api.secrets_box import SEALED_PREFIX, SecretBox, SecretsUnavailableError, reveal
 from api.technology_catalog import parse_technology_detail
 from core.risk_scoring import BusinessContext, RiskFactors
+
+logger = logging.getLogger("hydra.api.control_db")
 
 _SCHEMA = """
 -- `email`/`email_verified_at`/`email_verification_token`/
@@ -1931,11 +1935,13 @@ _COLUMN_MIGRATIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
 )
 
 
-def _resolve_backend(db_path: Path, database_url: str | None) -> Backend:
+def _resolve_backend(
+    db_path: Path, database_url: str | None, pool: PoolConfig | None = None
+) -> Backend:
     """Postgres when a database URL is configured, else the SQLite file.
     (The test suite patches this to run every ControlDB on Postgres.)"""
     if database_url:
-        return PostgresBackend(database_url)
+        return PostgresBackend(database_url, pool=pool)
     return SqliteBackend(db_path)
 
 
@@ -2024,13 +2030,14 @@ class ControlDB:
         secret_box: SecretBox | None = None,
         database_url: str | None = None,
         backend: Backend | None = None,
+        pool: PoolConfig | None = None,
     ) -> None:
         """`database_url` (Productization Phase 10): a PostgreSQL URL runs
         the control plane on Postgres (api/db.py); unset, it's the SQLite
         file at `db_path`, as before. `backend` overrides both (the
         migration tool opens a SQLite copy explicitly)."""
         self.db_path = db_path
-        self.backend = backend or _resolve_backend(db_path, database_url)
+        self.backend = backend or _resolve_backend(db_path, database_url, pool)
         self.dialect = self.backend.dialect
         # Productization Phase 08b: seals stored third-party secrets
         # (api/secrets_box.py). None = no key configured: webhook secrets
@@ -2047,6 +2054,14 @@ class ControlDB:
                 )
             conn.executescript(self.dialect.schema(_SCHEMA))
             _backfill_organizations(conn)
+            if isinstance(self.dialect, PostgresDialect) and not (
+                self.dialect.row_security_enforced(conn)
+            ):
+                logger.warning(
+                    "The database role bypasses row-level security (superuser or "
+                    "BYPASSRLS): organization isolation rests on the application's "
+                    "checks alone. Run the API as a dedicated non-superuser role."
+                )
         for suffix in ("", "-wal", "-shm"):
             path = Path(f"{self.db_path}{suffix}")
             if path.exists():

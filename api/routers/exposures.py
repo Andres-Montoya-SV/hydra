@@ -42,10 +42,7 @@ def _require_owner_and_exposure(
 ) -> None:
     """Lifecycle mutations are owner-only; a non-member and an unknown
     exposure are both a 404, so neither reveals what exists."""
-    role = db.get_role_for_account_organization(account_id, organization_id)
-    if role is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
-    if role != "owner":
+    if _require_member(db, account_id, organization_id) != "owner":
         raise HTTPException(status_code=403, detail="Owner role required")
     if db.get_exposure_for_organization(organization_id, exposure_id) is None:
         raise HTTPException(status_code=404, detail="Exposure not found")
