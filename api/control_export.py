@@ -247,7 +247,8 @@ def inspect_control_plane(control_db: ControlDB) -> list[TableState]:
     restore, confirms what the recovered database actually holds."""
     _require_postgres(control_db)
     states = []
-    with control_db.backend.connect() as conn:
+    # One snapshot: every count and timestamp is from the same instant.
+    with control_db.backend.connect(snapshot=True) as conn:
         conn.executescript(PG_HELPERS)
         for table in CONTROL_TABLES:
             rows = conn.execute("SELECT pg_temp.hydra_count(?)", (table,)).fetchone()[0]
