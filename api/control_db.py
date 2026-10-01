@@ -87,7 +87,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     email_verification_token_expires_at TEXT,
     -- Productization Phase 11b: may call the admin endpoints. Set only from
     -- the host (python -m api.operators), never through the API.
-    is_operator INTEGER NOT NULL DEFAULT 0
+    is_operator INTEGER NOT NULL DEFAULT 0,
+    -- Productization Phase 11c: a requested deletion (purged at
+    -- deletion_due_at unless cancelled), and the tombstone once purged.
+    deletion_requested_at TEXT,
+    deletion_due_at TEXT,
+    deleted_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email)
     WHERE email IS NOT NULL;
@@ -107,7 +112,12 @@ CREATE TABLE IF NOT EXISTS organizations (
     organization_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    -- Productization Phase 11c: a requested deletion, purged at
+    -- deletion_due_at unless cancelled first.
+    deletion_requested_at TEXT,
+    deletion_due_at TEXT,
+    deletion_requested_by TEXT
 );
 
 -- One row per (account, organization) the account has a role on.
@@ -1894,6 +1904,15 @@ _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("email_verification_token", "TEXT"),
     ("email_verification_token_expires_at", "TEXT"),
     ("is_operator", "INTEGER NOT NULL DEFAULT 0"),
+    ("deletion_requested_at", "TEXT"),
+    ("deletion_due_at", "TEXT"),
+    ("deleted_at", "TEXT"),
+)
+
+_ORGANIZATIONS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("deletion_requested_at", "TEXT"),
+    ("deletion_due_at", "TEXT"),
+    ("deletion_requested_by", "TEXT"),
 )
 
 # Durable-queue fix: an existing `scans` table (every account with a
@@ -1969,6 +1988,7 @@ _MONITORING_PENDING_NOTIFICATIONS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...]
 # applied in this order on every start (idempotent).
 _COLUMN_MIGRATIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ("accounts", _ACCOUNTS_MIGRATION_COLUMNS),
+    ("organizations", _ORGANIZATIONS_MIGRATION_COLUMNS),
     ("scans", _SCANS_MIGRATION_COLUMNS),
     ("webhooks", _WEBHOOKS_MIGRATION_COLUMNS),
     ("integration_deliveries", _INTEGRATION_DELIVERIES_MIGRATION_COLUMNS),
@@ -2204,14 +2224,14 @@ class ControlDB:
     def account_exists(self, account_id: str) -> bool:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM accounts WHERE account_id = ?", (account_id,)
+                "SELECT 1 FROM accounts WHERE account_id = ? AND deleted_at IS NULL", (account_id,)
             ).fetchone()
         return row is not None
 
     def get_account(self, account_id: str) -> AccountRecord | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
+                "SELECT * FROM accounts WHERE account_id = ? AND deleted_at IS NULL", (account_id,)
             ).fetchone()
         return None if row is None else _account_record_from_row(row)
 
@@ -5136,6 +5156,145 @@ class ControlDB:
             ).fetchall()
         return [SecurityEvent(**dict(row)) for row in rows]
 
+    # --- tenant deletion (Phase 11c) ------------------------------------
+
+    def request_organization_deletion(
+        self, organization_id: str, *, actor_account_id: str, due_at: str
+    ) -> str:
+        """Schedules the purge; returns when it is due. Idempotent: an
+        already-pending request keeps its original date."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT deletion_due_at FROM organizations WHERE organization_id = ?",
+                (organization_id,),
+            ).fetchone()
+            if row is not None and row[0]:
+                return str(row[0])
+            conn.execute(
+                "UPDATE organizations SET deletion_requested_at = ?, deletion_due_at = ?, "
+                "deletion_requested_by = ? WHERE organization_id = ?",
+                (_now_iso(), due_at, actor_account_id, organization_id),
+            )
+        return due_at
+
+    def cancel_organization_deletion(self, organization_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE organizations SET deletion_requested_at = NULL, deletion_due_at = NULL, "
+                "deletion_requested_by = NULL "
+                "WHERE organization_id = ? AND deletion_due_at IS NOT NULL",
+                (organization_id,),
+            )
+        return cursor.rowcount == 1
+
+    def organization_deletion_due_at(self, organization_id: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT deletion_due_at FROM organizations WHERE organization_id = ?",
+                (organization_id,),
+            ).fetchone()
+        return None if row is None or row[0] is None else str(row[0])
+
+    def due_organization_deletions(self, now: str) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT organization_id FROM organizations "
+                "WHERE deletion_due_at IS NOT NULL AND deletion_due_at <= ? "
+                "ORDER BY deletion_due_at",
+                (now,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def request_account_deletion(self, account_id: str, *, due_at: str) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT deletion_due_at FROM accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+            if row is not None and row[0]:
+                return str(row[0])
+            conn.execute(
+                "UPDATE accounts SET deletion_requested_at = ?, deletion_due_at = ? "
+                "WHERE account_id = ? AND deleted_at IS NULL",
+                (_now_iso(), due_at, account_id),
+            )
+        return due_at
+
+    def cancel_account_deletion(self, account_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE accounts SET deletion_requested_at = NULL, deletion_due_at = NULL "
+                "WHERE account_id = ? AND deletion_due_at IS NOT NULL",
+                (account_id,),
+            )
+        return cursor.rowcount == 1
+
+    def account_deletion_due_at(self, account_id: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT deletion_due_at FROM accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        return None if row is None or row[0] is None else str(row[0])
+
+    def due_account_deletions(self, now: str) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT account_id FROM accounts WHERE deleted_at IS NULL "
+                "AND deletion_due_at IS NOT NULL AND deletion_due_at <= ? "
+                "ORDER BY deletion_due_at",
+                (now,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def organization_scans(self, organization_id: str) -> list[tuple[str, str]]:
+        """(account_id, scan_id) of every scan of the organization."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT account_id, scan_id FROM scans WHERE organization_id = ?",
+                (organization_id,),
+            ).fetchall()
+        return [(str(row[0]), str(row[1])) for row in rows]
+
+    def sole_owned_organizations(self, account_id: str) -> list[str]:
+        """Organizations this account owns with no other owner: they go
+        with the account (nobody else could administer them)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT r.organization_id FROM account_organization_roles r "
+                "WHERE r.account_id = ? AND r.role = 'owner' AND NOT EXISTS ("
+                "SELECT 1 FROM account_organization_roles o "
+                "WHERE o.organization_id = r.organization_id AND o.role = 'owner' "
+                "AND o.account_id <> r.account_id) ORDER BY r.organization_id",
+                (account_id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def purge_organization(self, organization_id: str) -> int:
+        """Deletes every row of the organization in one transaction (the
+        security audit log is kept, without client addresses). Returns
+        the number of rows deleted."""
+        deleted = 0
+        with self._connect() as conn:
+            for _table, statement in _ORGANIZATION_PURGE_STATEMENTS:
+                deleted += conn.execute(statement, (organization_id,)).rowcount
+            conn.execute(
+                "UPDATE security_audit_log SET client_ip = NULL WHERE organization_id = ?",
+                (organization_id,),
+            )
+        return deleted
+
+    def purge_account(self, account_id: str) -> int:
+        """Deletes the account's own rows and leaves a tombstone, in one
+        transaction (sole-owned organizations are purged first, by the
+        caller). Returns the number of rows deleted."""
+        params = {"account": account_id, "now": _now_iso()}
+        deleted = 0
+        with self._connect() as conn:
+            for _table, statement in _ACCOUNT_PURGE_STATEMENTS:
+                deleted += conn.execute(statement, params).rowcount
+            for statement in _ACCOUNT_PSEUDONYMIZE_STATEMENTS:
+                conn.execute(statement, params)
+        return deleted
+
     def is_operator(self, account_id: str) -> bool:
         with self._connect() as conn:
             row = conn.execute(
@@ -5202,6 +5361,16 @@ class ControlDB:
                 (key_id, account_id),
             ).fetchone()
         return None if row is None else _key_record_from_row(row)
+
+    def list_keys_for_account(self, account_id: str) -> list[ApiKeyRecord]:
+        """Every key of the account, with metadata only (never the hashes)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT key_id, account_id, prefix, created_at, revoked_at, expires_at, "
+                "last_used_at FROM api_keys WHERE account_id = ? ORDER BY created_at, key_id",
+                (account_id,),
+            ).fetchall()
+        return [ApiKeyRecord(**dict(row)) for row in rows]
 
     def touch_key_last_used(self, key_id: str) -> None:
         with self._connect() as conn:
@@ -6438,7 +6607,9 @@ class ControlDB:
 
     def list_account_ids(self) -> list[str]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT account_id FROM accounts").fetchall()
+            rows = conn.execute(
+                "SELECT account_id FROM accounts WHERE deleted_at IS NULL"
+            ).fetchall()
         return [row["account_id"] for row in rows]
 
     def list_all_organization_ids(self) -> list[str]:
@@ -6952,6 +7123,111 @@ _ADD_LLM_SPEND_SQL = {
     "hypotheses_spend_usd = monthly_usage.hypotheses_spend_usd "
     "+ excluded.hypotheses_spend_usd",
 }
+
+# Productization Phase 11c: purging an organization. Every table holding
+# its rows, children before parents, each with its literal statement
+# (tests/test_tenant_lifecycle.py pins this to the schema). The security
+# audit log is kept (pseudonymized below), as decided for retention.
+_ORGANIZATION_PURGE_STATEMENTS: tuple[tuple[str, str], ...] = (
+    (
+        "integration_deliveries",
+        "DELETE FROM integration_deliveries WHERE event_id IN "
+        "(SELECT event_id FROM integration_events WHERE organization_id = ?)",
+    ),
+    ("ticketing_links", "DELETE FROM ticketing_links WHERE organization_id = ?"),
+    ("remediation_events", "DELETE FROM remediation_events WHERE organization_id = ?"),
+    ("relationship_evidence", "DELETE FROM relationship_evidence WHERE organization_id = ?"),
+    ("observations", "DELETE FROM observations WHERE organization_id = ?"),
+    ("exposure_risk_snapshots", "DELETE FROM exposure_risk_snapshots WHERE organization_id = ?"),
+    ("exposure_remediation", "DELETE FROM exposure_remediation WHERE organization_id = ?"),
+    ("exposure_history", "DELETE FROM exposure_history WHERE organization_id = ?"),
+    ("exposure_evidence", "DELETE FROM exposure_evidence WHERE organization_id = ?"),
+    ("candidate_asset_reviews", "DELETE FROM candidate_asset_reviews WHERE organization_id = ?"),
+    ("technology_events", "DELETE FROM technology_events WHERE organization_id = ?"),
+    ("relationships", "DELETE FROM relationships WHERE organization_id = ?"),
+    ("exposures", "DELETE FROM exposures WHERE organization_id = ?"),
+    ("evidence", "DELETE FROM evidence WHERE organization_id = ?"),
+    ("change_events", "DELETE FROM change_events WHERE organization_id = ?"),
+    ("certificate_events", "DELETE FROM certificate_events WHERE organization_id = ?"),
+    ("candidate_assets", "DELETE FROM candidate_assets WHERE organization_id = ?"),
+    ("asset_identifiers", "DELETE FROM asset_identifiers WHERE organization_id = ?"),
+    (
+        "asset_business_context_audit",
+        "DELETE FROM asset_business_context_audit WHERE organization_id = ?",
+    ),
+    ("asset_business_context", "DELETE FROM asset_business_context WHERE organization_id = ?"),
+    ("webhooks", "DELETE FROM webhooks WHERE organization_id = ?"),
+    ("ticketing_integrations", "DELETE FROM ticketing_integrations WHERE organization_id = ?"),
+    ("scans", "DELETE FROM scans WHERE organization_id = ?"),
+    ("provider_run_outcomes", "DELETE FROM provider_run_outcomes WHERE organization_id = ?"),
+    (
+        "organization_scope_exclusions",
+        "DELETE FROM organization_scope_exclusions WHERE organization_id = ?",
+    ),
+    (
+        "organization_collection_settings",
+        "DELETE FROM organization_collection_settings WHERE organization_id = ?",
+    ),
+    ("observation_batches", "DELETE FROM observation_batches WHERE organization_id = ?"),
+    ("monitored_domains", "DELETE FROM monitored_domains WHERE organization_id = ?"),
+    ("integration_events", "DELETE FROM integration_events WHERE organization_id = ?"),
+    ("domain_verifications", "DELETE FROM domain_verifications WHERE organization_id = ?"),
+    ("capability_audit_log", "DELETE FROM capability_audit_log WHERE organization_id = ?"),
+    ("assets", "DELETE FROM assets WHERE organization_id = ?"),
+    (
+        "account_organization_roles",
+        "DELETE FROM account_organization_roles WHERE organization_id = ?",
+    ),
+    ("organizations", "DELETE FROM organizations WHERE organization_id = ?"),
+)
+
+# Purging an account, after its sole-owned organizations are purged: its
+# own operational rows go; history other members still rely on (scans,
+# events in surviving organizations) stays, pointing at the tombstone.
+_ACCOUNT_PURGE_STATEMENTS: tuple[tuple[str, str], ...] = (
+    (
+        "rate_limit_buckets",
+        "DELETE FROM rate_limit_buckets WHERE key_id IN "
+        "(SELECT key_id FROM api_keys WHERE account_id = :account)",
+    ),
+    ("integration_deliveries", "DELETE FROM integration_deliveries WHERE account_id = :account"),
+    (
+        "monitoring_pending_notifications",
+        "DELETE FROM monitoring_pending_notifications WHERE account_id = :account",
+    ),
+    ("cost_estimates", "DELETE FROM cost_estimates WHERE account_id = :account"),
+    ("monthly_usage", "DELETE FROM monthly_usage WHERE account_id = :account"),
+    (
+        "wompi_pending_enrollments",
+        "DELETE FROM wompi_pending_enrollments WHERE account_id = :account",
+    ),
+    ("webhooks", "DELETE FROM webhooks WHERE account_id = :account"),
+    ("monitored_domains", "DELETE FROM monitored_domains WHERE account_id = :account"),
+    ("domain_verifications", "DELETE FROM domain_verifications WHERE account_id = :account"),
+    (
+        "account_organization_roles",
+        "DELETE FROM account_organization_roles WHERE account_id = :account",
+    ),
+    ("api_keys", "DELETE FROM api_keys WHERE account_id = :account"),
+)
+
+# What is kept of a purged account, without anything identifying a person:
+# the account row becomes a tombstone (no email, no tokens), billing and
+# security records keep their amounts, dates and ids but lose emails, raw
+# payment payloads and client addresses.
+_ACCOUNT_PSEUDONYMIZE_STATEMENTS: tuple[str, ...] = (
+    "UPDATE accounts SET email = NULL, email_verified_at = NULL, "
+    "email_verification_token = NULL, email_verification_token_expires_at = NULL, "
+    "is_operator = 0, deletion_requested_at = NULL, deletion_due_at = NULL, "
+    "deleted_at = :now WHERE account_id = :account",
+    "UPDATE subscriptions SET billing_email = NULL, white_label_company_name = NULL "
+    "WHERE account_id = :account",
+    "UPDATE wompi_unmatched_payments SET payer_email = NULL, raw_body = '{}' "
+    "WHERE resolved_account_id = :account",
+    "UPDATE wompi_webhook_events SET raw_body = '{}' WHERE matched_account_id = :account",
+    "UPDATE security_audit_log SET client_ip = NULL "
+    "WHERE actor_account_id = :account OR subject_account_id = :account",
+)
 
 # The refill-then-consume decision as one statement (see
 # check_and_consume_rate_limit_token). Portable as written: on Postgres,

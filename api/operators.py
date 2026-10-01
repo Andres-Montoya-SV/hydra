@@ -33,7 +33,7 @@ def _control_db() -> ControlDB:
     )
 
 
-def _resolve(db: ControlDB, who: str) -> str | None:
+def resolve_account(db: ControlDB, who: str) -> str | None:
     if "@" in who:
         return db.account_id_for_email(who)
     return who if db.account_exists(who) else None
@@ -42,7 +42,7 @@ def _resolve(db: ControlDB, who: str) -> str | None:
 def set_operator(db: ControlDB, who: str, operator: bool) -> str:
     """Grants or revokes; returns the account id. Raises LookupError for an
     unknown account."""
-    account_id = _resolve(db, who)
+    account_id = resolve_account(db, who)
     if account_id is None or not db.set_operator(account_id, operator):
         raise LookupError(f"no account {who!r}")
     audit.record(

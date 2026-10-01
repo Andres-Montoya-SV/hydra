@@ -49,6 +49,7 @@ from api.routers import (
     scope,
     security_events,
     subscription,
+    tenant_lifecycle,
     webhooks,
 )
 from api.scan_worker import generate_worker_id, run_worker_loop
@@ -300,6 +301,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(subscription.router)
     app.include_router(webhooks.router)
     app.include_router(security_events.router)
+    app.include_router(tenant_lifecycle.router)
     install_edge(app, settings)
     return app
 

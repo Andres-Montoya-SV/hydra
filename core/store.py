@@ -730,6 +730,43 @@ def configure_sqlite(conn: sqlite3.Connection) -> sqlite3.Connection:
     return conn
 
 
+# Every table holding a run's data, children before parents (foreign keys),
+# with its literal delete (Productization Phase 11c: deleting a tenant
+# deletes its runs). tests/test_tenant_lifecycle.py pins this to the schema.
+RUN_PURGE_STATEMENTS: tuple[tuple[str, str], ...] = (
+    ("intel_hypotheses", "DELETE FROM intel_hypotheses WHERE run_id = ?"),
+    ("intel_relationships", "DELETE FROM intel_relationships WHERE run_id = ?"),
+    (
+        "reportability_adversarial_reviews",
+        "DELETE FROM reportability_adversarial_reviews WHERE run_id = ?",
+    ),
+    ("intel_evidence", "DELETE FROM intel_evidence WHERE run_id = ?"),
+    ("reportability_assessments", "DELETE FROM reportability_assessments WHERE run_id = ?"),
+    ("intel_observations", "DELETE FROM intel_observations WHERE run_id = ?"),
+    ("intel_llm_hypothesis_evidence", "DELETE FROM intel_llm_hypothesis_evidence WHERE run_id = ?"),
+    ("verification_flags", "DELETE FROM verification_flags WHERE run_id = ?"),
+    ("urls", "DELETE FROM urls WHERE run_id = ?"),
+    ("typosquat_candidates", "DELETE FROM typosquat_candidates WHERE run_id = ?"),
+    ("tls_certificates", "DELETE FROM tls_certificates WHERE run_id = ?"),
+    ("provenance", "DELETE FROM provenance WHERE run_id = ?"),
+    ("ports", "DELETE FROM ports WHERE run_id = ?"),
+    ("intel_network_requests", "DELETE FROM intel_network_requests WHERE run_id = ?"),
+    ("intel_llm_hypotheses", "DELETE FROM intel_llm_hypotheses WHERE run_id = ?"),
+    ("intel_indicators", "DELETE FROM intel_indicators WHERE run_id = ?"),
+    ("intel_entities", "DELETE FROM intel_entities WHERE run_id = ?"),
+    ("intel_collection_attempts", "DELETE FROM intel_collection_attempts WHERE run_id = ?"),
+    ("http_services", "DELETE FROM http_services WHERE run_id = ?"),
+    ("hosts", "DELETE FROM hosts WHERE run_id = ?"),
+    ("graph_nodes", "DELETE FROM graph_nodes WHERE run_id = ?"),
+    ("graph_edges", "DELETE FROM graph_edges WHERE run_id = ?"),
+    ("findings", "DELETE FROM findings WHERE run_id = ?"),
+    ("dns_records", "DELETE FROM dns_records WHERE run_id = ?"),
+    ("clusters", "DELETE FROM clusters WHERE run_id = ?"),
+    ("cloud_resources", "DELETE FROM cloud_resources WHERE run_id = ?"),
+    ("runs", "DELETE FROM runs WHERE run_id = ?"),
+)
+
+
 def connect_sqlite(db_path: Path, *, timeout: float = 30) -> sqlite3.Connection:
     """Open a SQLite connection with WAL and foreign keys enabled."""
     return configure_sqlite(sqlite3.connect(db_path, timeout=timeout))
@@ -2541,6 +2578,15 @@ class AssetStore:
                     for a in attempts
                 ],
             )
+
+    def purge_run(self, run_id: str) -> int:
+        """Deletes everything this run recorded, in one transaction; returns
+        the number of rows deleted (0 for an unknown run)."""
+        deleted = 0
+        with self._connect() as conn:
+            for _table, statement in RUN_PURGE_STATEMENTS:
+                deleted += conn.execute(statement, (run_id,)).rowcount
+        return deleted
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
