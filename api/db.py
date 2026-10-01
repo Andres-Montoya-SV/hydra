@@ -385,6 +385,10 @@ class PostgresBackend(Backend):
                 conn.execute("SELECT set_config('hydra.new_schema', %s, true)", (self.schema,))
                 conn.execute(_CREATE_SCHEMA_SQL)
 
+    def pool_stats(self) -> dict[str, int]:
+        """The connection pool's own counters (size, available, waiting...)."""
+        return dict(_pool(self.url, self.pool).get_stats())
+
     @contextmanager
     def connect(self, *, snapshot: bool = False) -> Iterator[Any]:
         # One explicit transaction per connect(): committed when the caller's

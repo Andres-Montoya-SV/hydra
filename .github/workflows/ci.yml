@@ -113,6 +113,32 @@ jobs:
         run: >-
           docker run --rm -e HYDRA_REQUIRE_OPTIONAL_DEPS=1 -e HYDRA_REQUIRE_IMAGE_TOOLS=1
           hydra:ci pytest tests/ -q
+      # Productization Phase 11d: what is in the image (SBOM) and whether any
+      # of it has a known, fixable Critical/High vulnerability. Syft and Grype
+      # run from their official images, pinned by digest. The gate
+      # (scripts/vuln_gate.py) fails on any such finding not covered by a
+      # reasoned, dated entry in security/vulnerability-allowlist.json.
+      - name: SBOM (CycloneDX)
+        run: >-
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out"
+          anchore/syft@sha256:500e2d872ac019436926e8322b4fc1f39441d94d21f6f4046c6ff29b30e8cb02
+          docker:hydra:ci -o cyclonedx-json=/out/sbom.cdx.json -q
+      - name: Vulnerability scan
+        run: >-
+          docker run --rm -v "$PWD:/in"
+          anchore/grype@sha256:8c2c9234a345577a6d321a4753aa3ee1276d8975c8452d2344a56b57733ecad3
+          sbom:/in/sbom.cdx.json -o json > grype.json
+      - name: Vulnerability gate
+        run: python3 scripts/vuln_gate.py grype.json --allowlist security/vulnerability-allowlist.json
+      - name: Keep the SBOM and the scan report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hydra-image-sbom-and-scan
+          path: |
+            sbom.cdx.json
+            grype.json
+          if-no-files-found: warn
       - name: ruff inside container
         run: docker run --rm hydra:ci ruff check .
       - name: black inside container

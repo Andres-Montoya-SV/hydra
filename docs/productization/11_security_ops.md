@@ -13,11 +13,11 @@ order of the remaining work.
 | Auth / session strategy | **in place** | API keys only: Argon2id hash plus a lookup index; no sessions. Admin endpoints now take an operator account's API key; the static token is gone. | **11b** (done) |
 | API keys + rotation | **in place** | `POST /keys/{id}/rotate`, `/revoke` | — |
 | Audit logs | **in place** | Domain audits (capability changes, business context, remediation, scope exclusions), plus the security audit log for keys, failed sign-ins, members, integrations and admin actions. | **11b** (done, [doc](11b_audit_and_operators.md)) |
-| Dependency scanning | **in place** | `pip-audit` in CI over all requirement sets; Go tools pinned in the Dockerfile. | 11d (image scan) |
-| SBOM | **missing** | | 11d |
-| Container security | **partial** | Multi-stage build, runs as `USER hydra`. No image vulnerability scan, no read-only root filesystem guidance. | 11d |
+| Dependency scanning | **in place** | `pip-audit` in CI over all requirement sets, plus an image scan (Grype) gating fixable Critical/High findings. | **11d** (done) |
+| SBOM | **in place** | CycloneDX SBOM of the image, built in CI (Syft), kept as an artifact. | **11d** (done, [doc](11d_supply_chain_metrics.md)) |
+| Container security | **partial** | Multi-stage build, non-root user, image vulnerability gate. 52 Go-module findings in the pinned recon binaries are allowlisted until 2026-11-15 and await the recon-tool dependency refresh. | 11d (gate), tool refresh pending |
 | Backups / restore drills / DR | **in place** | Phase 10d: logical export, verified restore, rehearsals, DigitalOcean PITR procedure. | — |
-| Monitoring / metrics | **partial** | Sentry (opt-in) and heartbeats in `/health`. **No metrics endpoint.** | 11d |
+| Monitoring / metrics | **in place** | Sentry (opt-in), heartbeats, and Prometheus `/metrics` (operators). | **11d** (done) |
 | Structured logs | **in place** | `HYDRA_API_LOG_FORMAT=json` (`api/observability.py`) | — |
 | Correlation IDs | **missing** | | **11a** |
 | Health / readiness | **partial** | `/health` (database plus loop heartbeats). **No readiness probe.** | **11a** |
@@ -29,9 +29,9 @@ order of the remaining work.
 | CORS | **missing** (implicitly none) | | **11a** (explicit allowlist) |
 | Upload size / type limits | **partial** | Imports are bounded at 25 MB and parsed by type; other endpoints are unbounded. | **11a** |
 | SSRF boundaries | **gap found** | Webhooks and ticketing are pinned to public addresses. **The well-known-file domain verification fetched the caller's domain with a plain client:** a domain resolving to `127.0.0.1`, a private range or `169.254.169.254` made the API fetch it. | **11a** (fixed) |
-| Path traversal / SQLi / BOLA / IDOR | **in place** | Parameterized SQL only (no runtime composition, 10a–10d); IDOR tests on every endpoint; Postgres RLS (10c). | 11f (retest) |
-| Operator pipeline config for API scans | **gap** | `api/tenancy.py::account_settings` ignores the operator's `.env` (tool paths, timeouts, rate limits) for API scans. That's deliberate isolation, but it also drops operator safety settings. Fix with an allowlist. | 11e |
-| Adversarial security re-test | pending | | 11f, last |
+| Path traversal / SQLi / BOLA / IDOR | **in place** | Parameterized SQL only (no runtime composition, 10a–10d); IDOR tests on every endpoint; Postgres RLS (10c). | 11g (retest) |
+| Operator pipeline config for API scans | **gap** | `api/tenancy.py::account_settings` ignores the operator's `.env` (tool paths, timeouts, rate limits) for API scans. That's deliberate isolation, but it also drops operator safety settings. Fix with an allowlist. | 11f |
+| Adversarial security re-test | pending | | 11g, last |
 
 ## 11a — Edge hardening (this PR)
 
@@ -97,5 +97,6 @@ heartbeats. Load balancers should route on `/ready`.
 | 11b | Security audit log (keys, members and roles, integrations and webhooks, admin actions, auth failures), plus replacing the static admin token |
 | 11c | Tenant export and deletion: complete, verified, with a deletion grace period |
 | 11d | Supply chain and operations: SBOM, image vulnerability scan in CI, metrics endpoint |
-| 11e | Operator pipeline settings for API scans: an allowlist, keeping per-account paths isolated |
-| 11f | Adversarial security re-test of every product endpoint |
+| 11e | Recon-tool dependency refresh: upgrade or rebuild the pinned Go tools, re-qualify (Phase 09), and empty the image-scan allowlist (due before 2026-11-15) |
+| 11f | Operator pipeline settings for API scans: an allowlist, keeping per-account paths isolated |
+| 11g | Adversarial security re-test of every product endpoint |

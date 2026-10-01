@@ -65,3 +65,6 @@ cryptography==50.0.1
 # unset keeps the SQLite control-db file.
 psycopg[binary]==3.3.6
 psycopg-pool==3.3.3
+# Prometheus metrics (Productization Phase 11d, api/metrics.py): the
+# reference client; GET /metrics is operator-only.
+prometheus-client==0.26.0
