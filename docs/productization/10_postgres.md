@@ -13,7 +13,8 @@ to PostgreSQL. It is split in three PRs:
 |---|---|
 | **10a** (this) | backend abstraction, portable SQL, Postgres schema, dual-backend CI |
 | 10b | SQLite → Postgres migration tool (per-table row counts) and rollback plan — [runbook](10b_migration_runbook.md) |
-| 10c | row-level security, pool sizing, backup / PITR restore rehearsal on the managed database |
+| 10c | row-level security and connection pool — [doc](10c_pool_and_rls.md) |
+| 10d | backup / PITR restore rehearsal on the managed database |
 
 Decisions:
 

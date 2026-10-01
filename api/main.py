@@ -90,6 +90,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             settings.control_db_path,
             secret_box=box_from_keys(settings.secrets_keys),
             database_url=settings.database_url,
+            pool=settings.database_pool,
         )
         sealed = app.state.control_db.seal_plaintext_secrets()
         if sealed:

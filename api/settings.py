@@ -15,6 +15,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from api.db import PoolConfig
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -81,6 +83,8 @@ class APISettings:
     # Postgres (api/db.py), e.g. DigitalOcean managed Postgres with
     # ?sslmode=require. Unset: the SQLite file at control_db_path.
     database_url: str | None = None
+    # Phase 10c: HYDRA_API_DATABASE_POOL_MIN / _MAX / _TIMEOUT (seconds).
+    database_pool: PoolConfig = PoolConfig()
 
     # Hallazgo 1 (account-creation abuse) fix. `account_creation_rate_
     # limit_per_ip_per_day`: a rolling 24h window, not a calendar day
@@ -303,6 +307,22 @@ class APISettings:
         return self.data_dir / "accounts" / account_id
 
 
+def _load_database_settings(settings: APISettings) -> None:
+    settings.database_url = os.getenv("HYDRA_API_DATABASE_URL") or None
+    default = PoolConfig()
+    pool = PoolConfig(
+        min_size=int(os.getenv("HYDRA_API_DATABASE_POOL_MIN") or default.min_size),
+        max_size=int(os.getenv("HYDRA_API_DATABASE_POOL_MAX") or default.max_size),
+        timeout=float(os.getenv("HYDRA_API_DATABASE_POOL_TIMEOUT") or default.timeout),
+    )
+    if not 1 <= pool.min_size <= pool.max_size or pool.timeout <= 0:
+        raise ValueError(
+            "HYDRA_API_DATABASE_POOL_*: need 1 <= MIN <= MAX and TIMEOUT > 0, got "
+            f"{pool.min_size}/{pool.max_size}/{pool.timeout}"
+        )
+    settings.database_pool = pool
+
+
 def load_api_settings() -> APISettings:
     """A real gap this round's own live demonstration surfaced, fixed
     here: this function used to read only `os.environ` directly, never
@@ -336,7 +356,7 @@ def load_api_settings() -> APISettings:
     settings.wompi_client_id = os.getenv("WOMPI_CLIENT_ID") or None
     settings.wompi_client_secret = os.getenv("WOMPI_CLIENT_SECRET") or None
     settings.secrets_keys = os.getenv("HYDRA_API_SECRETS_KEYS") or None
-    settings.database_url = os.getenv("HYDRA_API_DATABASE_URL") or None
+    _load_database_settings(settings)
     settings.dev_wompi_id_base_url = os.getenv("HYDRA_API_DEV_WOMPI_ID_BASE_URL") or None
     settings.dev_wompi_api_base_url = os.getenv("HYDRA_API_DEV_WOMPI_API_BASE_URL") or None
     settings.wompi_link_url_medium = os.getenv("HYDRA_WOMPI_LINK_URL_MEDIUM") or None

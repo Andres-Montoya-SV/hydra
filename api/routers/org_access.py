@@ -8,6 +8,7 @@ from __future__ import annotations
 from fastapi import HTTPException, Request
 
 from api.control_db import ControlDB, role_can_modify_scope
+from api.db import set_request_organization
 
 
 def control_db(request: Request) -> ControlDB:
@@ -19,6 +20,9 @@ def require_member(db: ControlDB, account_id: str, organization_id: str) -> str:
     role = db.get_role_for_account_organization(account_id, organization_id)
     if role is None:
         raise HTTPException(status_code=404, detail="Organization not found")
+    # Productization Phase 10c: the rest of this request reads and writes
+    # this organization only, also at the database (row-level security).
+    set_request_organization(organization_id)
     return role
 
 
