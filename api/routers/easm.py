@@ -205,11 +205,13 @@ def create_organization(
     audit.record(
         db,
         request,
-        audit.ORGANIZATION_CREATED,
-        actor_account_id=auth.account_id,
-        subject_account_id=auth.account_id,
-        organization_id=organization_id,
-        target=("organization", organization_id),
+        audit.AuditEvent(
+            audit.ORGANIZATION_CREATED,
+            actor_account_id=auth.account_id,
+            subject_account_id=auth.account_id,
+            organization_id=organization_id,
+            target=("organization", organization_id),
+        ),
     )
     return OrganizationResponse(
         organization_id=org.organization_id,
@@ -321,12 +323,14 @@ def _audit_member(
     audit.record(
         db,
         request,
-        action,
-        actor_account_id=actor_account_id,
-        subject_account_id=member_account_id,
-        organization_id=organization_id,
-        target=("account", member_account_id),
-        details=details,
+        audit.AuditEvent(
+            action,
+            actor_account_id=actor_account_id,
+            subject_account_id=member_account_id,
+            organization_id=organization_id,
+            target=("account", member_account_id),
+            details=details,
+        ),
     )
 
 

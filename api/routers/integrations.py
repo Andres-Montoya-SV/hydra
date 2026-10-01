@@ -135,11 +135,13 @@ def _audit_integration(
     audit.record(
         db,
         request,
-        action,
-        actor_account_id=actor_account_id,
-        organization_id=organization_id,
-        target=("ticketing_integration", integration_id),
-        details=details,
+        audit.AuditEvent(
+            action,
+            actor_account_id=actor_account_id,
+            organization_id=organization_id,
+            target=("ticketing_integration", integration_id),
+            details=details,
+        ),
     )
 
 

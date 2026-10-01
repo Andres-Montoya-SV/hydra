@@ -78,9 +78,11 @@ def all_security_events(
     audit.record(
         db,
         request,
-        audit.ADMIN_EVENTS_LISTED,
-        actor_type="operator",
-        actor_account_id=operator.account_id,
-        details={"limit": paging.limit, "offset": paging.offset},
+        audit.AuditEvent(
+            audit.ADMIN_EVENTS_LISTED,
+            actor_type="operator",
+            actor_account_id=operator.account_id,
+            details={"limit": paging.limit, "offset": paging.offset},
+        ),
     )
     return _responses(events)

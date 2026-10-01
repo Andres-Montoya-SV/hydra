@@ -162,11 +162,13 @@ def _audit_webhook(
     audit.record(
         control_db,
         request,
-        action,
-        actor_account_id=account_id,
-        subject_account_id=account_id,
-        target=("webhook", webhook_id),
-        details=details,
+        audit.AuditEvent(
+            action,
+            actor_account_id=account_id,
+            subject_account_id=account_id,
+            target=("webhook", webhook_id),
+            details=details,
+        ),
     )
 
 

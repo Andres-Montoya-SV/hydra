@@ -391,10 +391,12 @@ def list_unmatched_payments(
     audit.record(
         control_db,
         request,
-        audit.ADMIN_PAYMENTS_LISTED,
-        actor_type="operator",
-        actor_account_id=operator.account_id,
-        details={"count": len(payments)},
+        audit.AuditEvent(
+            audit.ADMIN_PAYMENTS_LISTED,
+            actor_type="operator",
+            actor_account_id=operator.account_id,
+            details={"count": len(payments)},
+        ),
     )
     return payments
 
@@ -418,12 +420,14 @@ def reconcile_unmatched_payment(
     audit.record(
         control_db,
         request,
-        audit.ADMIN_PAYMENT_RECONCILED,
-        actor_type="operator",
-        actor_account_id=operator.account_id,
-        subject_account_id=body.account_id,
-        target=("unmatched_payment", body.unmatched_id),
-        details={"tier": body.tier},
+        audit.AuditEvent(
+            audit.ADMIN_PAYMENT_RECONCILED,
+            actor_type="operator",
+            actor_account_id=operator.account_id,
+            subject_account_id=body.account_id,
+            target=("unmatched_payment", body.unmatched_id),
+            details={"tier": body.tier},
+        ),
     )
     return WompiReconcileResponse(
         unmatched_id=body.unmatched_id,

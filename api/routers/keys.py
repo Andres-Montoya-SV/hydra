@@ -62,11 +62,13 @@ def rotate_key(
     audit.record(
         control_db,
         request,
-        audit.KEY_ROTATED,
-        actor_account_id=auth.account_id,
-        subject_account_id=auth.account_id,
-        target=("api_key", key_id),
-        details={"new_key_id": new_key_id, "old_key_valid_until": old_key_valid_until},
+        audit.AuditEvent(
+            audit.KEY_ROTATED,
+            actor_account_id=auth.account_id,
+            subject_account_id=auth.account_id,
+            target=("api_key", key_id),
+            details={"new_key_id": new_key_id, "old_key_valid_until": old_key_valid_until},
+        ),
     )
     return RotateKeyResponse(
         old_key_id=key_id,
@@ -89,8 +91,10 @@ def revoke_key(
     audit.record(
         control_db,
         request,
-        audit.KEY_REVOKED,
-        actor_account_id=auth.account_id,
-        subject_account_id=auth.account_id,
-        target=("api_key", key_id),
+        audit.AuditEvent(
+            audit.KEY_REVOKED,
+            actor_account_id=auth.account_id,
+            subject_account_id=auth.account_id,
+            target=("api_key", key_id),
+        ),
     )

@@ -48,11 +48,13 @@ def set_operator(db: ControlDB, who: str, operator: bool) -> str:
     audit.record(
         db,
         None,
-        audit.OPERATOR_GRANTED if operator else audit.OPERATOR_REVOKED,
-        actor_type="host",
-        subject_account_id=account_id,
-        target=("account", account_id),
-        details={"host_user": getpass.getuser()},
+        audit.AuditEvent(
+            audit.OPERATOR_GRANTED if operator else audit.OPERATOR_REVOKED,
+            actor_type="host",
+            subject_account_id=account_id,
+            target=("account", account_id),
+            details={"host_user": getpass.getuser()},
+        ),
     )
     return account_id
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -64,35 +65,38 @@ def _client_ip(request: Request | None) -> str | None:
     return request.client.host
 
 
-def record(
-    db: ControlDB,
-    request: Request | None,
-    action: str,
-    *,
-    actor_type: str = "account",
-    actor_account_id: str | None = None,
-    subject_account_id: str | None = None,
-    organization_id: str | None = None,
-    target: tuple[str, str] | None = None,
-    details: dict[str, Any] | None = None,
-) -> None:
-    """Appends one event. `target` is (type, id)."""
-    target_type, target_id = target or (None, None)
+@dataclass(frozen=True)
+class AuditEvent:
+    """What happened, by whom, to what. `target` is (type, id); `details`
+    must never hold a key, secret or credential."""
+
+    action: str
+    actor_type: str = "account"
+    actor_account_id: str | None = None
+    subject_account_id: str | None = None
+    organization_id: str | None = None
+    target: tuple[str, str] | None = None
+    details: dict[str, Any] | None = None
+
+
+def record(db: ControlDB, request: Request | None, event: AuditEvent) -> None:
+    """Appends one event, with the request id and client address."""
+    target_type, target_id = event.target or (None, None)
     request_id = current_request_id()
     db.record_security_event(
         SecurityEvent(
             event_id=secrets.token_hex(16),
             occurred_at=datetime.now(timezone.utc).isoformat(),
-            action=action,
-            actor_type=actor_type,
-            actor_account_id=actor_account_id,
-            subject_account_id=subject_account_id,
-            organization_id=organization_id,
+            action=event.action,
+            actor_type=event.actor_type,
+            actor_account_id=event.actor_account_id,
+            subject_account_id=event.subject_account_id,
+            organization_id=event.organization_id,
             target_type=target_type,
             target_id=target_id,
             request_id=None if request_id == "-" else request_id,
             client_ip=_client_ip(request),
-            details_json=json.dumps(details or {}, sort_keys=True),
+            details_json=json.dumps(event.details or {}, sort_keys=True),
         )
     )
 
@@ -109,7 +113,9 @@ def record_auth_failure(db: ControlDB, request: Request, reason: str) -> None:
         record(
             db,
             request,
-            AUTH_FAILED,
-            actor_type="anonymous",
-            details={"reason": reason, "path": request.url.path},
+            AuditEvent(
+                AUTH_FAILED,
+                actor_type="anonymous",
+                details={"reason": reason, "path": request.url.path},
+            ),
         )

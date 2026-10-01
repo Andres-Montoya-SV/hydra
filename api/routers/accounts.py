@@ -163,10 +163,9 @@ def _audit_new_account(
         audit.record(
             control_db,
             request,
-            action,
-            actor_account_id=account_id,
-            subject_account_id=account_id,
-            target=target,
+            audit.AuditEvent(
+                action, actor_account_id=account_id, subject_account_id=account_id, target=target
+            ),
         )
 
 
