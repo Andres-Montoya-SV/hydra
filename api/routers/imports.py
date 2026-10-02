@@ -112,12 +112,15 @@ async def import_scan_report(
     counted = not dry_run and _reserve_import(db, auth.account_id)
     try:
         summary = _run_import(source, db, organization_id, auth.account_id, raw, dry_run)
-    except ImportValidationError as exc:
+    except Exception as exc:
+        # Nothing was imported, whatever went wrong: the use is given back.
         if counted:
             db.release_usage(auth.account_id, subscriptions.current_period_key(), "imports")
-        raise HTTPException(
-            status_code=422, detail={"error": "invalid_import", "message": str(exc)}
-        ) from exc
+        if isinstance(exc, ImportValidationError):
+            raise HTTPException(
+                status_code=422, detail={"error": "invalid_import", "message": str(exc)}
+            ) from exc
+        raise
     if counted and summary.already_imported:  # nothing new was written
         db.release_usage(auth.account_id, subscriptions.current_period_key(), "imports")
     return _summary_response(source, summary)

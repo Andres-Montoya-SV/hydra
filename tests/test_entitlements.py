@@ -231,3 +231,44 @@ class TestEntitlementsNeverAuthorize:
         response = client.post("/scans", headers=headers, json={"domain": "not-verified.example"})
         assert response.status_code == 403
         assert "is not verified for this account" in response.json()["detail"]
+
+
+class TestReviewFollowUps:
+    def test_a_cap_below_one_refuses_even_the_first_use(self, tmp_path: Path) -> None:
+        db = ControlDB(tmp_path / "control.db")
+        account = db.create_account(email="zero@example.com")
+        period = subscriptions.current_period_key()
+        assert db.reserve_usage(account, period, "imports", 0) is False
+        assert db.get_monthly_usage(account, period).imports_used == 0
+
+    def test_an_import_that_fails_unexpectedly_gives_its_use_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import api.routers.imports as imports_router
+
+        def boom(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("database went away")
+
+        monkeypatch.setattr(imports_router, "_run_import", boom)
+        with TestClient(api_client(tmp_path).app, raise_server_exceptions=False) as client:
+            headers, account, org = verified_owner(client)
+            response = client.post(
+                f"/organizations/{org}/imports/nmap", headers=headers, content=NMAP_XML
+            )
+            usage = client.app.state.control_db.get_monthly_usage(
+                account, subscriptions.current_period_key()
+            )
+        assert response.status_code == 500
+        assert usage.imports_used == 0
+
+    def test_the_message_uses_the_singular_for_one(self) -> None:
+        from api.entitlements import entitlement_error
+
+        assert (
+            "allows 1 organization."
+            in entitlement_error("free", "organizations", 1).detail["message"]
+        )
+        assert (
+            "allows 3 organizations."
+            in entitlement_error("medium", "organizations", 3).detail["message"]
+        )

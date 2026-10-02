@@ -6869,7 +6869,11 @@ class ControlDB:
 
     def reserve_usage(self, account_id: str, period_key: str, counter: str, cap: int) -> bool:
         """Counts one use of `counter` ("scans" or "imports") unless the
-        month's cap is reached; atomic across processes. False = refused."""
+        month's cap is reached; atomic across processes. False = refused.
+        A cap below 1 refuses outright: the statement's cap check applies
+        only once the month's row exists, so the first use is checked here."""
+        if cap < 1:
+            return False
         with self._connect() as conn:
             cursor = conn.execute(
                 _USAGE_RESERVE_SQL[counter],

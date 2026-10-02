@@ -66,6 +66,12 @@ def upgrade_for(tier: Tier, entitlement: str) -> Tier | None:
     return None
 
 
+def _noun(entitlement: str, count: int) -> str:
+    """'1 organization', '3 organizations' (every entitlement name is a
+    regular plural)."""
+    return entitlement[:-1] if count == 1 else entitlement
+
+
 def entitlement_error(tier: Tier, entitlement: str, limit: int) -> HTTPException:
     """A typed 403, never a silent no-op: names what ran out and how to get
     more."""
@@ -79,7 +85,7 @@ def entitlement_error(tier: Tier, entitlement: str, limit: int) -> HTTPException
             "tier": tier,
             "limit": limit,
             "upgrade_to": upgrade,
-            "message": f"Your {tier!r} tier allows {limit} {entitlement}.{hint}",
+            "message": f"Your {tier!r} tier allows {limit} {_noun(entitlement, limit)}.{hint}",
         },
     )
 
