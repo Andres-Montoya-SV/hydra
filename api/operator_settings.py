@@ -33,8 +33,10 @@ unclassified one):
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import os
+from functools import lru_cache
 from pathlib import Path
 
 from config.settings import Settings
@@ -207,9 +209,12 @@ TOGGLES: frozenset[str] = frozenset(
 )
 
 
+@lru_cache(maxsize=1)
 def operator_settings() -> Settings:
     """The operator's pipeline settings: the repo `.env` and the process
-    environment, parsed and validated the way the CLI does."""
+    environment, parsed and validated the way the CLI does. Parsed once per
+    process (first at API startup) and reused by every scan, like the rest
+    of the API's configuration: a change needs a restart."""
     return Settings.from_env(env_file=_ENV_FILE, project_root=_PROJECT_ROOT)
 
 
@@ -218,15 +223,26 @@ def _explicitly_off(toggle: str) -> bool:
     return raw is not None and raw.strip().lower() in {"0", "false", "no", "off"}
 
 
+@lru_cache(maxsize=1)
 def operator_disabled_toggles() -> frozenset[str]:
-    """Toggles the operator environment explicitly sets to false."""
+    """Toggles the operator environment explicitly sets to false (read
+    after the operator .env is loaded)."""
+    operator_settings()
     return frozenset(toggle for toggle in TOGGLES if _explicitly_off(toggle))
 
 
+def reset_operator_settings_cache() -> None:
+    """Forget the parsed operator settings (tests change the environment)."""
+    operator_settings.cache_clear()
+    operator_disabled_toggles.cache_clear()
+
+
 def inherit_operator_settings(settings: Settings, operator: Settings) -> None:
-    """Copies the operator's infrastructure and safety values (INHERITED)."""
+    """Copies the operator's infrastructure and safety values (INHERITED).
+    Copies, not references: the cached operator settings are shared by
+    every scan, so no scan can change a value another one sees."""
     for name in INHERITED:
-        setattr(settings, name, getattr(operator, name))
+        setattr(settings, name, copy.deepcopy(getattr(operator, name)))
 
 
 def apply_operator_disables(settings: Settings) -> frozenset[str]:

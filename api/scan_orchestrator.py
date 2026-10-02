@@ -180,7 +180,9 @@ def _scan_settings(
     # identity or credentials (api/operator_settings.py).
     inherit_operator_settings(settings, operator_settings())
     settings.validate_or_raise()
-    # The service-level offline geo database, as the API was configured.
+    # The API's own configured GeoIP database wins over the operator
+    # environment's: APISettings can be built in code (tests, embedding),
+    # not only from the same environment.
     settings.geoip_db_path = api_settings.geoip_db_path
     _apply_collection_capabilities(control_db, settings, account_id=account_id, scan_id=scan_id)
     scan = control_db.get_owned_scan(scan_id, account_id)

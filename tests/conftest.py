@@ -111,9 +111,14 @@ def _restore_environment() -> Iterator[None]:
     writes a test's temporary .env into os.environ for good; without this,
     one test's ENABLE_*=false silently switched tools off in later tests
     (Phase 11f made API scans honour operator ENABLE_* switches)."""
+    from api.operator_settings import reset_operator_settings_cache
+
     saved = dict(os.environ)
     try:
         yield
     finally:
         os.environ.clear()
         os.environ.update(saved)
+        # Parsed from the environment and cached per process (Phase 11f):
+        # forgotten with it.
+        reset_operator_settings_cache()

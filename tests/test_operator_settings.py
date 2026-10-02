@@ -19,13 +19,20 @@ from core.exceptions import ConfigurationError
 
 @pytest.fixture
 def clean_operator_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
-    """No .env and no toggle variables: only what a test sets."""
+    """No .env and no toggle variables: only what a test sets. The parsed
+    operator settings are cached per process, so the tests below change the
+    environment and then `_reparse()`."""
     empty = tmp_path / "operator.env"
     empty.write_text("")
     monkeypatch.setattr(operator_module, "_ENV_FILE", empty)
     for toggle in TOGGLES:
         monkeypatch.delenv(toggle.upper(), raising=False)
+    operator_module.reset_operator_settings_cache()
     return monkeypatch
+
+
+def _reparse() -> None:
+    operator_module.reset_operator_settings_cache()
 
 
 def _scan(tmp_path: Path) -> tuple[APISettings, ControlDB, str, str]:
@@ -84,6 +91,7 @@ class TestInheritance:
         tool.chmod(0o755)
         clean_operator_env.setenv("SUBFINDER_PATH", str(tool))
 
+        _reparse()
         settings = _settings_for(tmp_path)
 
         assert settings.rate_limit == 7 and settings.timeout == 41
@@ -99,6 +107,7 @@ class TestInheritance:
         clean_operator_env.setenv("OWNED_DOMAINS", "operator.example")
         clean_operator_env.setenv("OUTPUT_DIRECTORY", "/srv/operator-output")
 
+        _reparse()
         settings = _settings_for(tmp_path)
         defaults = Settings()
 
@@ -120,6 +129,7 @@ class TestToggles:
         clean_operator_env.setenv(f"ENABLE_{off.upper()}", "false")
         clean_operator_env.setenv(f"ENABLE_{never.upper()}", "true")
 
+        _reparse()
         enabled = enabled_in_settings(_settings_for(tmp_path / "operator"))
 
         assert enabled == baseline - {off}
@@ -134,6 +144,7 @@ class TestToggles:
             )
         )[0]
         clean_operator_env.setenv(f"ENABLE_{provider.upper()}", "0")
+        _reparse()
         _scan_settings(api_settings, db, account_id=account, scan_id=scan, passive=False)
         record = db.get_owned_scan(scan, account)
         assert record is not None and provider not in (record.effective_providers or ())
@@ -148,6 +159,7 @@ class TestToggles:
         )
         # And where it is on, the operator's "false" switches it off.
         clean_operator_env.setenv("NUCLEI_ENABLE_INTERACTSH", "false")
+        _reparse()
         settings = Settings()
         settings.nuclei_enable_interactsh = True
         assert "nuclei_enable_interactsh" in operator_module.apply_operator_disables(settings)
@@ -159,5 +171,30 @@ class TestStartup:
         self, clean_operator_env: pytest.MonkeyPatch
     ) -> None:
         clean_operator_env.setenv("ENABLE_NUCLEI", "perhaps")
+        _reparse()
         with pytest.raises(ConfigurationError):
             load_api_settings()
+
+
+class TestCaching:
+    def test_parsed_once_per_process(
+        self, tmp_path: Path, clean_operator_env: pytest.MonkeyPatch
+    ) -> None:
+        clean_operator_env.setenv("RATE_LIMIT", "7")
+        _reparse()
+        first = _settings_for(tmp_path / "a")
+        clean_operator_env.setenv("RATE_LIMIT", "99")  # no restart: still the parsed value
+        second = _settings_for(tmp_path / "b")
+        assert first.rate_limit == second.rate_limit == 7
+        assert operator_module.operator_settings() is operator_module.operator_settings()
+
+    def test_scans_get_copies_never_the_shared_cached_values(self) -> None:
+        # Every inherited field is a scalar or a path today; the copy guards
+        # a future mutable one (a list) against one scan changing it for all.
+        field = "ffuf_extensions"
+        operator = Settings()
+        setattr(operator, field, [".php", ".bak"])
+        scan = Settings()
+        operator_module.inherit_operator_settings(scan, operator)
+        assert getattr(scan, field) == [".php", ".bak"]
+        assert getattr(scan, field) is not getattr(operator, field)
