@@ -80,10 +80,15 @@ from typing import TYPE_CHECKING
 
 from api.health import LoopHeartbeats
 from api.scan_orchestrator import execute_scan
+from api.tiers import TIERS
 
 if TYPE_CHECKING:
     from api.control_db import ControlDB, ScanRecord
     from api.settings import APISettings
+
+
+# Productization Phase 12b: the tiers whose scans are claimed first.
+PRIORITY_TIERS: tuple[str, ...] = tuple(t for t, limits in TIERS.items() if limits.priority_queue)
 
 logger = logging.getLogger("hydra.api.scan_worker")
 
@@ -130,6 +135,29 @@ async def _run_claimed_scan(
             await heartbeat_task
 
 
+def _sweep_stale_scans(api_settings: APISettings, control_db: ControlDB) -> None:
+    """Requeue (or, past the retry ceiling, fail) scans whose worker
+    heartbeat stopped."""
+    requeued, failed = control_db.sweep_stale_running_scans(
+        stale_after_seconds=api_settings.scan_stale_after_seconds,
+        max_retries=api_settings.scan_max_retries,
+        reason_prefix="interrupted (worker heartbeat lost)",
+    )
+    if requeued:
+        logger.warning(
+            "Requeued %d stale scan(s) for re-execution: %s",
+            len(requeued),
+            ", ".join(requeued),
+        )
+    if failed:
+        logger.error(
+            "Gave up on %d scan(s) after %d interruptions each: %s",
+            len(failed),
+            api_settings.scan_max_retries,
+            ", ".join(failed),
+        )
+
+
 async def run_worker_loop(
     *,
     api_settings: APISettings,
@@ -162,27 +190,10 @@ async def run_worker_loop(
             # promptly next time around, and a loop that crashed with an
             # unhandled exception stops updating this the moment it dies.
             heartbeats.mark_alive("scan_worker")
-            requeued, failed = control_db.sweep_stale_running_scans(
-                stale_after_seconds=api_settings.scan_stale_after_seconds,
-                max_retries=api_settings.scan_max_retries,
-                reason_prefix="interrupted (worker heartbeat lost)",
-            )
-            if requeued:
-                logger.warning(
-                    "Requeued %d stale scan(s) for re-execution: %s",
-                    len(requeued),
-                    ", ".join(requeued),
-                )
-            if failed:
-                logger.error(
-                    "Gave up on %d scan(s) after %d interruptions each: %s",
-                    len(failed),
-                    api_settings.scan_max_retries,
-                    ", ".join(failed),
-                )
+            _sweep_stale_scans(api_settings, control_db)
 
             while len(active) < api_settings.max_concurrent_scans:
-                scan = control_db.claim_next_queued_scan(worker_id)
+                scan = control_db.claim_next_queued_scan(worker_id, PRIORITY_TIERS)
                 if scan is None:
                     break
                 task = asyncio.create_task(

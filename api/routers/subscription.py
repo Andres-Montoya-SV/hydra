@@ -33,7 +33,7 @@ from api.schemas import (
     WompiReconcileResponse,
 )
 from api.settings import APISettings
-from api.tiers import retention_days_for
+from api.tiers import TierLimits, retention_days_for
 from api.wompi_client import WompiClient, tier_for_product_name, verify_webhook_signature
 
 logger = logging.getLogger("hydra.api.wompi_webhook")
@@ -86,6 +86,20 @@ def get_subscription(
         webhooks_limit=limits.max_integrations,
         members_per_organization_limit=limits.max_members_per_organization,
         integrations_per_organization_limit=limits.max_integrations,
+        unscannable_verified_domains=_unscannable(control_db, auth.account_id, limits),
+        priority_queue=limits.priority_queue,
+    )
+
+
+def _unscannable(control_db: ControlDB, account_id: str, limits: TierLimits) -> list[str]:
+    scannable = {
+        v.verification_id
+        for v in subscriptions.scannable_verifications(control_db, account_id, limits)
+    }
+    return sorted(
+        v.domain
+        for v in control_db.get_verified_domains_for_account(account_id)
+        if v.verification_id not in scannable
     )
 
 

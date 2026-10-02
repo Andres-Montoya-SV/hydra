@@ -80,10 +80,11 @@ from api.monitoring import (
 from api.tenancy import account_db_path, account_settings
 
 if TYPE_CHECKING:
-    from api.control_db import ControlDB, MonitoredDomainRecord
+    from api.control_db import ControlDB, MonitoredDomainRecord, SubscriptionRecord
     from api.email_sender import EmailSender
     from api.health import LoopHeartbeats
     from api.settings import APISettings
+    from api.tiers import TierLimits
     from core.store import AssetStore
 
 logger = logging.getLogger("hydra.api.monitoring")
@@ -470,59 +471,14 @@ def _try_enqueue_one(
     verification that gets renewed an hour later resumes monitoring on
     the very next poll rather than waiting out a full daily/weekly
     cadence."""
-    gate_status, _ = classify_scan_gate(
-        row.domain,
-        active_verifications=control_db.get_verified_domains_for_account(row.account_id),
-        all_verifications=control_db.get_all_verifications_for_account(row.account_id),
-    )
-    if gate_status != "covered":
-        if row.status != "paused_verification_lapsed":
-            control_db.set_monitoring_status(row.monitoring_id, "paused_verification_lapsed")
-            logger.warning(
-                "Monitoring paused for account %s domain %s: verification is %s.",
-                row.account_id,
-                row.domain,
-                gate_status,
-            )
+    subscription = subscriptions.get_or_create_subscription(control_db, row.account_id)
+    limits = subscriptions.effective_limits(subscription)
+    if _skip_for_account_state(subscription, limits, control_db, row):
         return
-
-    if row.status == "paused_verification_lapsed":
-        control_db.set_monitoring_status(row.monitoring_id, "active")
-
-    if speed == "active":
-        subscription = subscriptions.get_or_create_subscription(control_db, row.account_id)
-        limits = subscriptions.effective_limits(subscription)
-        if not limits.monitoring_speed2:
-            # The account's tier changed (downgrade) since opting in —
-            # never silently keep running a feature the current tier no
-            # longer includes; skip this cycle, leave speed2_enabled as
-            # the account's own recorded preference (a later upgrade
-            # resumes it with no action needed), and let a human notice
-            # via GET /domains/{domain}/monitoring rather than emailing
-            # every single skipped weekly cycle.
-            logger.info(
-                "Skipping Speed 2 scan for account %s domain %s: current tier no longer "
-                "includes active monitoring.",
-                row.account_id,
-                row.domain,
-            )
-            return
-        if subscriptions.access_blocked_by_billing(subscription):
-            logger.info(
-                "Skipping Speed 2 scan for account %s domain %s: account is suspended.",
-                row.account_id,
-                row.domain,
-            )
-            return
-        ok, reason = subscriptions.reserve_scan(control_db, row.account_id, limits)
-        if not ok:
-            logger.info(
-                "Skipping Speed 2 scan for account %s domain %s: %s",
-                row.account_id,
-                row.domain,
-                reason,
-            )
-            return
+    if not _verification_gate_open(control_db, row):
+        return
+    if speed == "active" and not _reserve_speed2_scan(control_db, row, limits):
+        return
 
     import secrets
 
@@ -542,6 +498,90 @@ def _try_enqueue_one(
             subscriptions.release_scan(control_db, row.account_id)
         raise
     control_db.mark_monitoring_scan_enqueued(row.monitoring_id, speed=speed, scan_id=scan_id)
+
+
+def _verification_gate_open(control_db: ControlDB, row: MonitoredDomainRecord) -> bool:
+    """The domain's own verification must still cover it. A lapse pauses
+    the row (once); a renewal resumes it."""
+    gate_status, _ = classify_scan_gate(
+        row.domain,
+        active_verifications=control_db.get_verified_domains_for_account(row.account_id),
+        all_verifications=control_db.get_all_verifications_for_account(row.account_id),
+    )
+    if gate_status != "covered":
+        if row.status != "paused_verification_lapsed":
+            control_db.set_monitoring_status(row.monitoring_id, "paused_verification_lapsed")
+            logger.warning(
+                "Monitoring paused for account %s domain %s: verification is %s.",
+                row.account_id,
+                row.domain,
+                gate_status,
+            )
+        return False
+
+    if row.status == "paused_verification_lapsed":
+        control_db.set_monitoring_status(row.monitoring_id, "active")
+    return True
+
+
+def _reserve_speed2_scan(
+    control_db: ControlDB, row: MonitoredDomainRecord, limits: TierLimits
+) -> bool:
+    """Speed 2 needs the current tier to include it and a scan from the
+    monthly quota."""
+    if not limits.monitoring_speed2:
+        # The account's tier changed (downgrade) since opting in —
+        # never silently keep running a feature the current tier no
+        # longer includes; skip this cycle, leave speed2_enabled as
+        # the account's own recorded preference (a later upgrade
+        # resumes it with no action needed), and let a human notice
+        # via GET /domains/{domain}/monitoring rather than emailing
+        # every single skipped weekly cycle.
+        logger.info(
+            "Skipping Speed 2 scan for account %s domain %s: current tier no longer "
+            "includes active monitoring.",
+            row.account_id,
+            row.domain,
+        )
+        return False
+    ok, reason = subscriptions.reserve_scan(control_db, row.account_id, limits)
+    if not ok:
+        logger.info(
+            "Skipping Speed 2 scan for account %s domain %s: %s",
+            row.account_id,
+            row.domain,
+            reason,
+        )
+        return False
+    return True
+
+
+def _skip_for_account_state(
+    subscription: SubscriptionRecord,
+    limits: TierLimits,
+    control_db: ControlDB,
+    row: MonitoredDomainRecord,
+) -> bool:
+    """Productization Phase 12b: no monitoring scan at all, passive
+    included, for a suspended account (read-only), or for a domain beyond
+    the tier's N oldest verifications after a downgrade. The domain stays
+    opted in; it resumes when the account is restored or upgraded."""
+    if subscriptions.access_blocked_by_billing(subscription):
+        logger.info(
+            "Skipping monitoring for account %s domain %s: account is suspended.",
+            row.account_id,
+            row.domain,
+        )
+        return True
+    status, _ = subscriptions.domain_scan_gate(control_db, row.account_id, row.domain, limits)
+    if status == "over_limit":
+        logger.info(
+            "Skipping monitoring for account %s domain %s: beyond the tier's verified domains.",
+            row.account_id,
+            row.domain,
+        )
+        return True
+    return False
 
 
 def _enqueue_integration_events(

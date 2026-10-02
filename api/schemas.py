@@ -337,6 +337,10 @@ class SubscriptionResponse(BaseModel):
     webhooks_limit: int | None = None
     members_per_organization_limit: int | None = None
     integrations_per_organization_limit: int | None = None
+    # Phase 12b: verified domains beyond the tier's N oldest (after a
+    # downgrade) — still verified, not scannable until upgrade or expiry.
+    unscannable_verified_domains: list[str] = Field(default_factory=list)
+    priority_queue: bool = False
 
 
 class CreateSubscriptionRequest(BaseModel):

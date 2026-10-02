@@ -42,6 +42,7 @@ ENTITLEMENT_FIELDS: dict[str, str] = {
     "webhooks": "max_integrations",
     "members": "max_members_per_organization",
     "integrations": "max_integrations",
+    "verified_domains": "max_concurrent_verified_domains",
 }
 _ORDER: tuple[Tier, ...] = ("free", "medium", "pro", "ultra")
 
@@ -69,7 +70,8 @@ def upgrade_for(tier: Tier, entitlement: str) -> Tier | None:
 def _noun(entitlement: str, count: int) -> str:
     """'1 organization', '3 organizations' (every entitlement name is a
     regular plural)."""
-    return entitlement[:-1] if count == 1 else entitlement
+    noun = entitlement.replace("_", " ")
+    return noun[:-1] if count == 1 else noun
 
 
 def entitlement_error(tier: Tier, entitlement: str, limit: int) -> HTTPException:
