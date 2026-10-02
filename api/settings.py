@@ -357,9 +357,14 @@ def _load_edge_settings(settings: APISettings) -> None:
 
 
 def _load_platform_settings(settings: APISettings) -> None:
-    """Database (Phase 10) and HTTP edge (Phase 11a) settings."""
+    """Database (Phase 10) and HTTP edge (Phase 11a) settings; and the
+    operator pipeline settings API scans inherit (Phase 11f), parsed once
+    here so a malformed value stops startup instead of failing scans."""
+    from api.operator_settings import operator_settings
+
     _load_database_settings(settings)
     _load_edge_settings(settings)
+    operator_settings()
     if os.getenv("HYDRA_API_ADMIN_TOKEN"):
         logging.getLogger("hydra.api").warning(
             "HYDRA_API_ADMIN_TOKEN is set but no longer used: admin endpoints need an "

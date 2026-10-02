@@ -40,6 +40,11 @@ import logging
 from typing import TYPE_CHECKING
 
 from api.control_db import ControlDB
+from api.operator_settings import (
+    apply_operator_disables,
+    inherit_operator_settings,
+    operator_settings,
+)
 from api.tenancy import account_db_path, account_settings
 
 if TYPE_CHECKING:
@@ -170,9 +175,14 @@ def _scan_settings(
     from api.collection_capabilities import enabled_in_settings
 
     settings = account_settings(api_settings, account_id)
+    # Phase 11f: the operator's infrastructure and safety settings (tool
+    # paths, rate limits, timeouts, caps, egress), never its scope,
+    # identity or credentials (api/operator_settings.py).
+    inherit_operator_settings(settings, operator_settings())
     settings.validate_or_raise()
-    # Per-account settings don't read .env, so the service-level offline
-    # geo database is handed to each scan explicitly.
+    # The API's own configured GeoIP database wins over the operator
+    # environment's: APISettings can be built in code (tests, embedding),
+    # not only from the same environment.
     settings.geoip_db_path = api_settings.geoip_db_path
     _apply_collection_capabilities(control_db, settings, account_id=account_id, scan_id=scan_id)
     scan = control_db.get_owned_scan(scan_id, account_id)
@@ -190,8 +200,11 @@ def _scan_settings(
         for attr, value in passive_monitoring_settings_overrides(enable_flags).items():
             setattr(settings, attr, value)
 
-    # Recorded AFTER any passive narrowing, so the scan shows exactly
-    # which optional providers were allowed to run.
+    # Last: whatever the operator explicitly switched off stays off.
+    apply_operator_disables(settings)
+
+    # Recorded AFTER any passive narrowing and operator switches, so the
+    # scan shows exactly which optional providers were allowed to run.
     control_db.set_scan_effective_providers(scan_id, enabled_in_settings(settings))
     return settings
 
