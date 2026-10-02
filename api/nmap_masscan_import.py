@@ -157,7 +157,7 @@ def _reject_unsafe_bytes(raw_bytes: bytes) -> None:
     then NUL (Phase 11g): raw or escaped in JSON, it never belongs in a
     report, and PostgreSQL refuses one in text."""
     _reject_if_compressed(raw_bytes)
-    if b"\x00" in raw_bytes or b"\\u0000" in raw_bytes.lower():
+    if b"\x00" in raw_bytes or b"\\u0000" in raw_bytes:
         raise ImportValidationError("the report contains a NUL character")
 
 

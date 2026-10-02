@@ -254,10 +254,14 @@ class TestNulCharacters:
         )
         assert response.status_code == 400
 
-    def test_split_across_streamed_chunks_is_still_found(self) -> None:
+    @pytest.mark.parametrize("cut", range(1, len(b"\\u0000")))
+    def test_split_across_streamed_chunks_at_any_point_is_still_found(self, cut: int) -> None:
+        body = b'{"a": "x\\u0000"}'
+        start = body.index(b"\\u0000") + cut
+
         def chunks() -> Iterator[bytes]:
-            yield b'{"a": "x\\u0'
-            yield b'000"}'
+            yield body[:start]
+            yield body[start:]
 
         response = TestClient(_mini_app()).post("/echo", content=chunks())
         assert response.status_code == 400

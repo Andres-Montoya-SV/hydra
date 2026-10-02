@@ -96,10 +96,15 @@ class _NulCharacterError(HTTPException):
 
 # A raw NUL byte, or one escaped in JSON (`\u0000`, any case).
 _BODY_NUL_MARKERS = (b"\x00", b"\\u0000")
+# Bytes kept from the previous chunk, so a marker split across chunks is
+# still found: one less than the longest marker.
+_NUL_MARKER_OVERLAP = max(len(marker) for marker in _BODY_NUL_MARKERS) - 1
 
 
 def _has_nul_in_target(scope: Scope) -> bool:
-    query = bytes(scope.get("query_string", b"")).lower()
+    # No case to fold: `%00` and NUL have none, and JSON accepts only a
+    # lowercase `\u` escape.
+    query = bytes(scope.get("query_string", b""))
     return "\x00" in scope.get("path", "") or b"%00" in query or b"\x00" in query
 
 
@@ -122,10 +127,10 @@ class _BodyGuard:
             if self.received > self.limit:
                 raise _BodyTooLargeError(self.limit)
             if self.scan_nul:
-                window = (self.tail + chunk).lower()
+                window = self.tail + chunk
                 if any(marker in window for marker in _BODY_NUL_MARKERS):
                     raise _NulCharacterError
-                self.tail = window[-5:]
+                self.tail = window[-_NUL_MARKER_OVERLAP:]
         return message
 
 
