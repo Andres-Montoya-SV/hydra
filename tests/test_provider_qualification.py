@@ -105,9 +105,15 @@ class TestPluginSourceContract:
 
 
 def _dockerfile_pins() -> dict[str, str]:
+    """The image's pinned tool versions. Since Phase 11e they live in the
+    script the Dockerfile runs: `build <name> <module> <package> <version>`."""
+    assert "docker/build-go-tools.sh" in (REPO / "Dockerfile").read_text()
     pins = {}
-    for line in (REPO / "Dockerfile").read_text().splitlines():
-        match = re.search(r"go install -v \S*/([a-z0-9]+)(?:/cmd/[a-z0-9]+)?@v?([0-9][\w.]*)", line)
+    for line in (REPO / "docker" / "build-go-tools.sh").read_text().splitlines():
+        # Tolerant of spacing and a trailing comment, but anchored at the
+        # line start so a commented-out `# build ...` is never read as a pin
+        # (a missed line fails the set-equality assertion below).
+        match = re.match(r"\s*build\s+([a-z0-9]+)\s+\S+\s+\S+\s+v?([0-9][\w.]*)\s*(?:#.*)?$", line)
         if match:
             pins[match.group(1)] = match.group(2)
     return pins

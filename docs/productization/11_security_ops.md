@@ -15,7 +15,7 @@ order of the remaining work.
 | Audit logs | **in place** | Domain audits (capability changes, business context, remediation, scope exclusions), plus the security audit log for keys, failed sign-ins, members, integrations and admin actions. | **11b** (done, [doc](11b_audit_and_operators.md)) |
 | Dependency scanning | **in place** | `pip-audit` in CI over all requirement sets, plus an image scan (Grype) gating fixable Critical/High findings. | **11d** (done) |
 | SBOM | **in place** | CycloneDX SBOM of the image, built in CI (Syft), kept as an artifact. | **11d** (done, [doc](11d_supply_chain_metrics.md)) |
-| Container security | **partial** | Multi-stage build, non-root user, image vulnerability gate. 52 Go-module findings in the pinned recon binaries are allowlisted until 2026-11-15 and await the recon-tool dependency refresh. | 11d (gate), tool refresh pending |
+| Container security | **in place** | Multi-stage build, non-root user, image vulnerability gate; recon tools built with verified dependency floors on a current Go toolchain. One allowlisted finding remains (CPython 3.12, no fix in that line). | **11d** (gate), **11e** (tool refresh, [doc](11e_recon_tool_refresh.md)) |
 | Backups / restore drills / DR | **in place** | Phase 10d: logical export, verified restore, rehearsals, DigitalOcean PITR procedure. | — |
 | Monitoring / metrics | **in place** | Sentry (opt-in), heartbeats, and Prometheus `/metrics` (operators). | **11d** (done) |
 | Structured logs | **in place** | `HYDRA_API_LOG_FORMAT=json` (`api/observability.py`) | — |

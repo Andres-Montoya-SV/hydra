@@ -124,5 +124,5 @@ class TestTheRepositoryAllowlist:
     def test_every_entry_is_reasoned_and_dated(self) -> None:
         raw = json.loads((_ROOT / "security" / "vulnerability-allowlist.json").read_text())
         exceptions = vuln_gate.parse_allowlist(raw)
-        assert exceptions, "the allowlist exists and is non-empty while the tool refresh is pending"
+        assert all(e.reason.strip() for e in exceptions)
         assert len({e.key for e in exceptions}) == len(exceptions)  # no duplicates

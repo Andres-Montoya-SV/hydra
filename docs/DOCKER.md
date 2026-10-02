@@ -16,7 +16,7 @@ EC2/a VM is a separate, later piece of work and is not covered here.
 
 A two-stage build (`Dockerfile`):
 
-1. **`go-builder`** (`golang:1.25.14-bookworm`) compiles the Go-based
+1. **`go-builder`** (`golang:1.26.8-trixie`, `GOTOOLCHAIN=local`) compiles the Go-based
    tools Hydra can orchestrate, each pinned to an explicit released
    version — never `@latest`:
 

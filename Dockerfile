@@ -15,7 +15,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — Go tool builder
 # ---------------------------------------------------------------------------
-FROM golang:1.25.14-trixie AS go-builder
+FROM golang:1.26.8-trixie AS go-builder
 
 # libpcap-dev: naabu links against libpcap (cgo) for its raw-socket scan
 # engine. gcc: the cgo toolchain golang:trixie does not include by default.
@@ -31,23 +31,25 @@ RUN apt-get update && apt-get upgrade -y \
       gcc \
     && rm -rf /var/lib/apt/lists/*
 
+# GOTOOLCHAIN=local (Phase 11e): every tool is compiled by this image's own,
+# current Go patch release. With `auto`, a tool whose go.mod asks for, say,
+# go 1.26.0 made Go download exactly that unpatched toolchain, and every
+# binary inherited its standard-library advisories. A tool needing a newer
+# Go now fails the build loudly instead.
 ENV CGO_ENABLED=1 \
     GOBIN=/out/bin \
-    GOTOOLCHAIN=auto
+    GOTOOLCHAIN=local
 RUN mkdir -p /out/bin
 
-# Every version below is pinned to a real, currently-published release tag,
-# confirmed buildable before being pinned here (see docs/DOCKER.md) — the
-# exact 7 Go tools this task named, not Hydra's full optional tool roster
-# (gau/waybackurls/assetfinder/unfurl/anew/amass), kept out deliberately to
-# hold the image size down; add more with the same pattern if needed.
-RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@v2.16.0
-RUN go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@v1.3.1
-RUN go install -v github.com/projectdiscovery/httpx/cmd/httpx@v1.12.0
-RUN go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@v2.6.1
-RUN go install -v github.com/projectdiscovery/katana/cmd/katana@v1.7.0
-RUN go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@v3.11.1
-RUN go install -v github.com/hakluke/hakrawler@2.1
+# The 7 Go tools Hydra orchestrates, each pinned to a real, published
+# release (never @latest; see docs/DOCKER.md), and Phase-09-qualified
+# (core/provider_qualification.py). Productization Phase 11e: built with
+# security floors on their dependencies, not with plain `go install`, so a
+# fixed advisory in a shared module (x/crypto, x/net, ...) reaches the image
+# without waiting for upstream releases. The script verifies every binary:
+# the tool at exactly its pinned version, every floor met. See the script.
+COPY docker/build-go-tools.sh /usr/local/bin/build-go-tools.sh
+RUN sh /usr/local/bin/build-go-tools.sh
 
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime
