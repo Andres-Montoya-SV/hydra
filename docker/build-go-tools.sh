@@ -58,7 +58,7 @@ build() {
     name=$1 module=$2 package=$3 version=$4
     work=$(mktemp -d)
     cd "$work"
-    go mod init "hydra.build/$name" >/dev/null 2>&1
+    go mod init "hydra.build/$name" >/dev/null
     go get "$package@$version"
     # A floor only ever raises: `go get module@version` sets that exact
     # version, and lowering a module the tool already has newer can drag

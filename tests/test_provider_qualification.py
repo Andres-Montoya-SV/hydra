@@ -110,7 +110,10 @@ def _dockerfile_pins() -> dict[str, str]:
     assert "docker/build-go-tools.sh" in (REPO / "Dockerfile").read_text()
     pins = {}
     for line in (REPO / "docker" / "build-go-tools.sh").read_text().splitlines():
-        match = re.match(r"build ([a-z0-9]+) \S+ \S+ v?([0-9][\w.]*)$", line)
+        # Tolerant of spacing and a trailing comment, but anchored at the
+        # line start so a commented-out `# build ...` is never read as a pin
+        # (a missed line fails the set-equality assertion below).
+        match = re.match(r"\s*build\s+([a-z0-9]+)\s+\S+\s+\S+\s+v?([0-9][\w.]*)\s*(?:#.*)?$", line)
         if match:
             pins[match.group(1)] = match.group(2)
     return pins

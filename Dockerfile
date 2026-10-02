@@ -49,7 +49,7 @@ RUN mkdir -p /out/bin
 # without waiting for upstream releases. The script verifies every binary:
 # the tool at exactly its pinned version, every floor met. See the script.
 COPY docker/build-go-tools.sh /usr/local/bin/build-go-tools.sh
-RUN /usr/local/bin/build-go-tools.sh
+RUN sh /usr/local/bin/build-go-tools.sh
 
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime
