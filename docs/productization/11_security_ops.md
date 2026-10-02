@@ -30,7 +30,7 @@ order of the remaining work.
 | Upload size / type limits | **partial** | Imports are bounded at 25 MB and parsed by type; other endpoints are unbounded. | **11a** |
 | SSRF boundaries | **gap found** | Webhooks and ticketing are pinned to public addresses. **The well-known-file domain verification fetched the caller's domain with a plain client:** a domain resolving to `127.0.0.1`, a private range or `169.254.169.254` made the API fetch it. | **11a** (fixed) |
 | Path traversal / SQLi / BOLA / IDOR | **in place** | Parameterized SQL only (no runtime composition, 10a–10d); IDOR tests on every endpoint; Postgres RLS (10c). | 11g (retest) |
-| Operator pipeline config for API scans | **gap** | `api/tenancy.py::account_settings` ignores the operator's `.env` (tool paths, timeouts, rate limits) for API scans. That's deliberate isolation, but it also drops operator safety settings. Fix with an allowlist. | 11f |
+| Operator pipeline config for API scans | **in place** | API scans inherit the operator's infrastructure and safety settings (classified allowlist, every field), never its scope, identity or credentials; the operator can switch tools off, never on. | **11f** (done, [doc](11f_operator_scan_settings.md)) |
 | Adversarial security re-test | pending | | 11g, last |
 
 ## 11a — Edge hardening (this PR)

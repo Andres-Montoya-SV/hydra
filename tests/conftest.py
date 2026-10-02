@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -100,3 +102,18 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     from _pg_mode import drop_test_schemas
 
     drop_test_schemas()
+
+
+@pytest.fixture(autouse=True)
+def _restore_environment() -> Iterator[None]:
+    """Every test starts and ends with the same process environment.
+    `load_dotenv` (the CLI's Settings.from_env, the API's settings loader)
+    writes a test's temporary .env into os.environ for good; without this,
+    one test's ENABLE_*=false silently switched tools off in later tests
+    (Phase 11f made API scans honour operator ENABLE_* switches)."""
+    saved = dict(os.environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)

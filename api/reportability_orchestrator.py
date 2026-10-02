@@ -15,11 +15,10 @@ config** (docs/PAID_API_DESIGN.md Part B: "Hydra's own Anthropic/OpenAI
 cost, not client price") — `_operator_settings()` below loads
 `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`REPORTABILITY_*` from the real
 repo-root `.env`/environment, deliberately SEPARATE from
-`api/tenancy.py::account_settings()` (which intentionally does NOT
-inherit operator environment config, to keep each account's own
-recon-pipeline settings isolated — changing that function's behavior
-was out of scope for this round and would have risked regressing
-Round 1/2's scan orchestration). Only the per-account `recon.db` path
+`api/tenancy.py::account_settings()`, whose scans inherit only the
+operator's infrastructure and safety settings, never its credentials
+(Productization Phase 11f, `api/operator_settings.py`). Only the
+per-account `recon.db` path
 (via `api/tenancy.py::account_db_path`) is account-specific here; the
 LLM keys and provider choice are shared, with a PER-ACCOUNT spend
 ceiling enforced on top by `api/subscriptions.py`.

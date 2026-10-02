@@ -9,6 +9,11 @@ or `PipelineRunner`. A connection opened against Account A's file cannot
 return Account B's rows because there is no shared file for a bug to
 leak across — this is the isolation guarantee itself, not a convention
 layered on top of a shared database.
+
+`account_settings` itself starts from defaults. API scans then add the
+operator's infrastructure and safety settings, and only those
+(Productization Phase 11f: `api/operator_settings.py`, applied in
+`api/scan_orchestrator.py::_scan_settings`).
 """
 
 from __future__ import annotations
