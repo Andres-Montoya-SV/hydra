@@ -176,60 +176,63 @@ def _call(client: TestClient, route: Route, values: dict[str, str], key: str | N
     return client.request(route.method, path, headers=headers, params=query, json=body)
 
 
+def _seed_victim(client: TestClient) -> tuple[str, dict[str, str]]:
+    """The victim's API key and the real ids of its objects, by path
+    parameter name (ids no object has are random, so they're unknown)."""
+    db: ControlDB = client.app.state.control_db
+    victim_key, victim, org, asset = _seed_account_with_domain_asset(
+        client, email="victim@example.com", domain="victim.example"
+    )
+    exposure = _seed_exposure(client, victim, org, run_id="victim-run")
+    webhook = db.create_webhook(
+        account_id=victim,
+        url="https://hooks.victim.example/x",
+        secret=secrets.token_hex(16),
+        event_types=("monitoring.changed",),
+        organization_id=org,
+    )
+    exclusion = db.add_scope_exclusion(
+        organization_id=org, account_id=victim, pattern="mta.victim.example", reason="r"
+    )
+    return victim_key, {
+        "organization_id": org,
+        "asset_id": asset,
+        "exposure_id": exposure,
+        "candidate_asset_id": _seed_candidate(client, organization_id=org, account_id=victim),
+        "exclusion_id": exclusion.exclusion_id,
+        "scan_id": db.list_scans_for_organization(org)[0].scan_id,
+        "webhook_id": webhook.webhook_id,
+        "key_id": db.list_keys_for_account(victim)[0].key_id,
+        "account_id": victim,
+        "domain": "victim.example",
+        "integration_id": secrets.token_hex(16),
+        "relationship_id": secrets.token_hex(16),
+        "delivery_id": secrets.token_hex(16),
+        "subject_type": "exposure",
+        "subject_id": exposure,
+        "source": "nmap",
+        "dataset": "assets",
+    }
+
+
 @pytest.fixture(scope="module")
 def world(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
-    """A victim tenant with real objects, an attacker tenant, and a plain
-    (non-operator) account."""
-    tmp_path = tmp_path_factory.mktemp("adversarial")
+    """A victim tenant with real objects and an attacker tenant."""
     settings = APISettings(
-        data_dir=tmp_path / "api",
+        data_dir=tmp_path_factory.mktemp("adversarial") / "api",
         max_concurrent_scans=0,
         account_creation_rate_limit_per_ip_per_day=100,
         rate_limit_per_minute=100_000,
     )
     with TestClient(create_app(settings)) as client:
-        db: ControlDB = client.app.state.control_db
-        victim_key, victim, org, asset = _seed_account_with_domain_asset(
-            client, email="victim@example.com", domain="victim.example"
-        )
-        exposure = _seed_exposure(client, victim, org, run_id="victim-run")
-        candidate = _seed_candidate(client, organization_id=org, account_id=victim)
-        exclusion = db.add_scope_exclusion(
-            organization_id=org, account_id=victim, pattern="mta.victim.example", reason="r"
-        ).exclusion_id
-        scan = db.list_scans_for_organization(org)[0].scan_id
-        webhook = db.create_webhook(
-            account_id=victim,
-            url="https://hooks.victim.example/x",
-            secret=secrets.token_hex(16),
-            event_types=("monitoring.changed",),
-            organization_id=org,
-        ).webhook_id
+        victim_key, values = _seed_victim(client)
         attacker_key, _ = create_verified_account(client)
         yield {
             "client": client,
-            "db": db,
+            "db": client.app.state.control_db,
             "victim_key": victim_key,
             "attacker_key": attacker_key,
-            "values": {
-                "organization_id": org,
-                "asset_id": asset,
-                "exposure_id": exposure,
-                "candidate_asset_id": candidate,
-                "exclusion_id": exclusion,
-                "scan_id": scan,
-                "webhook_id": webhook,
-                "key_id": db.list_keys_for_account(victim)[0].key_id,
-                "account_id": victim,
-                "domain": "victim.example",
-                "integration_id": secrets.token_hex(16),
-                "relationship_id": secrets.token_hex(16),
-                "delivery_id": secrets.token_hex(16),
-                "subject_type": "exposure",
-                "subject_id": exposure,
-                "source": "nmap",
-                "dataset": "assets",
-            },
+            "values": values,
         }
 
 
