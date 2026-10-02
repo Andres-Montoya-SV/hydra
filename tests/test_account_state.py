@@ -139,6 +139,27 @@ class TestDowngradeKeepsTheOldestDomainsScannable:
             again = client.post("/scans", headers=headers, json={"domain": "third.example"})
             assert again.status_code == 202  # an upgrade restores it, no re-verification
 
+    def test_monitoring_skips_the_domains_beyond_the_limit(self, tmp_path: Path) -> None:
+        api_settings = APISettings(data_dir=tmp_path / "api_data")
+        db = ControlDB(api_settings.control_db_path)
+        account = db.create_account(email="down@example.com")
+        db.mark_email_verified(account)
+        db.create_default_subscription(account)
+        apply_tier_change(db, account, "medium")
+        for domain in ("first.example", "second.example"):
+            _verify(db, account, domain)
+            _make_due(db, _monitor(db, api_settings, account, domain).monitoring_id)
+        apply_tier_change(db, account, "free")
+
+        run_monitoring_cycle(
+            api_settings=api_settings, control_db=db, email_sender=_RecordingEmailSender()
+        )
+
+        org = db.default_organization_id_for_account(account)
+        assert [s.domain for s in db.list_scans_for_organization(org)] == ["first.example"]
+        second = db.get_monitored_domain(account, "second.example")
+        assert second is not None and second.status == "active"  # still opted in
+
 
 class TestPriorityQueue:
     def test_paid_priority_tiers_are_claimed_first_then_the_oldest(self, tmp_path: Path) -> None:

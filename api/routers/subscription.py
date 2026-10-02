@@ -92,15 +92,9 @@ def get_subscription(
 
 
 def _unscannable(control_db: ControlDB, account_id: str, limits: TierLimits) -> list[str]:
-    scannable = {
-        v.verification_id
-        for v in subscriptions.scannable_verifications(control_db, account_id, limits)
-    }
-    return sorted(
-        v.domain
-        for v in control_db.get_verified_domains_for_account(account_id)
-        if v.verification_id not in scannable
-    )
+    active = control_db.get_verified_domains_for_account(account_id)
+    scannable = {v.verification_id for v in subscriptions.scannable_verifications(active, limits)}
+    return sorted(v.domain for v in active if v.verification_id not in scannable)
 
 
 @router.post("/account/subscription", response_model=CreateSubscriptionResponse)

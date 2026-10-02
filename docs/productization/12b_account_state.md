@@ -92,7 +92,9 @@ stays first in, first out.
   - every allowed write is not 402;
   - reads and both exports stay 200;
   - a due monitoring cycle creates no scan.
-- **Downgrade:** Medium with three domains, then Free:
+- **Downgrade, in the worker:** with two monitored domains, after a
+  downgrade to Free only the oldest is scanned. The other stays opted in.
+- **Downgrade, through the API:** Medium with three domains, then Free:
   - the oldest domain scans;
   - the third gets the structured 403;
   - the second can't be opted into monitoring;
@@ -107,6 +109,18 @@ stays first in, first out.
 | Mutation | Result |
 |---|---|
 | the suspension guard disabled | 33 tests fail |
-| the worker's suspension and downgrade skip disabled | the monitoring test fails |
+| the worker's suspension skip disabled | the suspended-monitoring test fails |
+| the worker's over-limit skip disabled | the worker downgrade test fails |
 | the downgrade rule disabled (`domain_scan_gate` always covered) | the downgrade test fails |
 | the priority `CASE` made constant | the priority test fails |
+
+## Review follow-up
+
+- **Fewer database reads.** `domain_scan_gate` now reads the account's
+  verifications once, and the monitoring worker runs the gate once per
+  domain. Opening a passive monitoring row takes 6 connections: 9 in the
+  first version of this PR, 5 on `main`. The extra one is the
+  subscription read that suspension needs.
+- **No per-account cache across a monitoring cycle.** A suspension, a
+  downgrade or a lapsed verification takes effect on the very next
+  domain, which matters more than saving one read per domain.

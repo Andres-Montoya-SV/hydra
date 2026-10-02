@@ -68,7 +68,6 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Literal
 
 from api import subscriptions
-from api.domain_verification import classify_scan_gate
 from api.monitoring import (
     MonitoringRunOutcome,
     classify_asset_jump,
@@ -473,9 +472,10 @@ def _try_enqueue_one(
     cadence."""
     subscription = subscriptions.get_or_create_subscription(control_db, row.account_id)
     limits = subscriptions.effective_limits(subscription)
-    if _skip_for_account_state(subscription, limits, control_db, row):
+    if _skip_while_suspended(subscription, row):
         return
-    if not _verification_gate_open(control_db, row):
+    gate_status, _ = subscriptions.domain_scan_gate(control_db, row.account_id, row.domain, limits)
+    if not _verification_gate_open(control_db, row, gate_status):
         return
     if speed == "active" and not _reserve_speed2_scan(control_db, row, limits):
         return
@@ -500,14 +500,20 @@ def _try_enqueue_one(
     control_db.mark_monitoring_scan_enqueued(row.monitoring_id, speed=speed, scan_id=scan_id)
 
 
-def _verification_gate_open(control_db: ControlDB, row: MonitoredDomainRecord) -> bool:
-    """The domain's own verification must still cover it. A lapse pauses
-    the row (once); a renewal resumes it."""
-    gate_status, _ = classify_scan_gate(
-        row.domain,
-        active_verifications=control_db.get_verified_domains_for_account(row.account_id),
-        all_verifications=control_db.get_all_verifications_for_account(row.account_id),
-    )
+def _verification_gate_open(
+    control_db: ControlDB, row: MonitoredDomainRecord, gate_status: str
+) -> bool:
+    """The domain's own verification must still cover it: a lapse pauses
+    the row (once), a renewal resumes it. A domain beyond the tier's N
+    oldest verifications after a downgrade (Phase 12b) is skipped quietly
+    and stays opted in; an upgrade resumes it."""
+    if gate_status == "over_limit":
+        logger.info(
+            "Skipping monitoring for account %s domain %s: beyond the tier's verified domains.",
+            row.account_id,
+            row.domain,
+        )
+        return False
     if gate_status != "covered":
         if row.status != "paused_verification_lapsed":
             control_db.set_monitoring_status(row.monitoring_id, "paused_verification_lapsed")
@@ -556,27 +562,13 @@ def _reserve_speed2_scan(
     return True
 
 
-def _skip_for_account_state(
-    subscription: SubscriptionRecord,
-    limits: TierLimits,
-    control_db: ControlDB,
-    row: MonitoredDomainRecord,
-) -> bool:
-    """Productization Phase 12b: no monitoring scan at all, passive
-    included, for a suspended account (read-only), or for a domain beyond
-    the tier's N oldest verifications after a downgrade. The domain stays
-    opted in; it resumes when the account is restored or upgraded."""
+def _skip_while_suspended(subscription: SubscriptionRecord, row: MonitoredDomainRecord) -> bool:
+    """Productization Phase 12b: a suspended account is read-only, so no
+    monitoring scan at all, passive included. The domain stays opted in;
+    it resumes when the account is restored."""
     if subscriptions.access_blocked_by_billing(subscription):
         logger.info(
             "Skipping monitoring for account %s domain %s: account is suspended.",
-            row.account_id,
-            row.domain,
-        )
-        return True
-    status, _ = subscriptions.domain_scan_gate(control_db, row.account_id, row.domain, limits)
-    if status == "over_limit":
-        logger.info(
-            "Skipping monitoring for account %s domain %s: beyond the tier's verified domains.",
             row.account_id,
             row.domain,
         )

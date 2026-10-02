@@ -178,13 +178,12 @@ def release_scan(control_db: ControlDB, account_id: str) -> None:
 
 
 def scannable_verifications(
-    control_db: ControlDB, account_id: str, limits: TierLimits
+    active: list[DomainVerificationRecord], limits: TierLimits
 ) -> list[DomainVerificationRecord]:
     """The active verifications scans and monitoring may use: all of them,
     or after a downgrade the tier's N OLDEST (decision 2026-10-02). The rest
     stay verified but can't be scanned until the account upgrades or an
     older verification expires. Deterministic: verified_at, then domain."""
-    active = control_db.get_verified_domains_for_account(account_id)
     cap = limits.max_concurrent_verified_domains
     if cap is None:
         return active
@@ -195,15 +194,17 @@ def domain_scan_gate(
     control_db: ControlDB, account_id: str, domain: str, limits: TierLimits
 ) -> tuple[str, DomainVerificationRecord | None]:
     """`classify_scan_gate` plus the downgrade rule: "over_limit" when the
-    domain is verified but only by verifications beyond the tier's N."""
+    domain is verified but only by verifications beyond the tier's N. Reads
+    the account's verifications once."""
+    active = control_db.get_verified_domains_for_account(account_id)
     status, record = classify_scan_gate(
         domain,
-        active_verifications=control_db.get_verified_domains_for_account(account_id),
+        active_verifications=active,
         all_verifications=control_db.get_all_verifications_for_account(account_id),
     )
     if status != "covered":
         return status, record
-    scannable = scannable_verifications(control_db, account_id, limits)
+    scannable = scannable_verifications(active, limits)
     within, _ = classify_scan_gate(domain, active_verifications=scannable, all_verifications=[])
     return ("covered", record) if within == "covered" else ("over_limit", record)
 
