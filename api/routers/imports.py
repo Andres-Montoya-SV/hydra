@@ -18,6 +18,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from api import entitlements, subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB
 from api.nmap_masscan_import import (
@@ -108,13 +109,34 @@ async def import_scan_report(
     db = control_db(request)
     require_owner(db, auth.account_id, organization_id)
     raw = await read_bounded_body(request, MAX_ARTIFACT_BYTES)
+    counted = not dry_run and _reserve_import(db, auth.account_id)
     try:
         summary = _run_import(source, db, organization_id, auth.account_id, raw, dry_run)
-    except ImportValidationError as exc:
-        raise HTTPException(
-            status_code=422, detail={"error": "invalid_import", "message": str(exc)}
-        ) from exc
+    except Exception as exc:
+        # Nothing was imported, whatever went wrong: the use is given back.
+        if counted:
+            db.release_usage(auth.account_id, subscriptions.current_period_key(), "imports")
+        if isinstance(exc, ImportValidationError):
+            raise HTTPException(
+                status_code=422, detail={"error": "invalid_import", "message": str(exc)}
+            ) from exc
+        raise
+    if counted and summary.already_imported:  # nothing new was written
+        db.release_usage(auth.account_id, subscriptions.current_period_key(), "imports")
     return _summary_response(source, summary)
+
+
+def _reserve_import(db: ControlDB, account_id: str) -> bool:
+    """Counts one import against this month's entitlement (Phase 12a), or
+    refuses with a structured 403. True when a use was counted."""
+    limits = entitlements.account_limits(db, account_id)
+    if limits.imports_per_month is None:
+        return False
+    if not db.reserve_usage(
+        account_id, subscriptions.current_period_key(), "imports", limits.imports_per_month
+    ):
+        raise entitlements.entitlement_error(limits.tier, "imports", limits.imports_per_month)
+    return True
 
 
 @router.get("/{organization_id}/imports", response_model=list[ImportBatchResponse])

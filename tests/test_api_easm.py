@@ -21,6 +21,7 @@ from api.asset_backfill import backfill_assets_for_organization
 from api.easm_backfill import run_easm_backfill_for_organization
 from api.main import create_app
 from api.settings import APISettings
+from api.subscriptions import apply_tier_change
 from api.tenancy import account_db_path
 from core.assets import Host, TlsCertificate
 from core.store import AssetStore, ScanRun
@@ -205,6 +206,8 @@ class TestOrganizationCreationAndMembers:
         with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
             account = client.post("/accounts", json={"email": "consultant@example.com"}).json()
             headers = {"X-API-Key": account["api_key"]}
+            # A consultant's tier (Phase 12a: Free owns exactly one organization).
+            apply_tier_change(client.app.state.control_db, account["account_id"], "pro")
 
             resp = client.post("/organizations", headers=headers, json={"name": "Client B Inc"})
             assert resp.status_code == 201

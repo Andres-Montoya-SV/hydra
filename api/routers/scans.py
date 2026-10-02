@@ -127,6 +127,8 @@ def _require_billing_and_quota_ok(control_db: ControlDB, account_id: str):
             "POST /account/subscription to resume scanning.",
         )
     limits = subscriptions.effective_limits(subscription)
+    # A cheap early refusal; the authoritative, atomic one is
+    # `reserve_scan`, right before the scan is created.
     ok, reason = subscriptions.check_scan_quota(control_db, account_id, limits)
     if not ok:
         raise HTTPException(status_code=403, detail=reason)
@@ -194,7 +196,7 @@ async def create_scan(
     api_settings = _api_settings(request)
 
     _require_verified_email_or_403(control_db, auth.account_id)
-    _require_billing_and_quota_ok(control_db, auth.account_id)
+    limits = _require_billing_and_quota_ok(control_db, auth.account_id)
     domain = normalize_domain(body.domain)
     _require_verified_domain_or_403(control_db, auth.account_id, domain)
     _require_not_excluded(control_db, auth.account_id, domain)
@@ -204,17 +206,23 @@ async def create_scan(
         else _validated_capability_override(control_db, auth.account_id, body.providers)
     )
 
+    ok, reason = subscriptions.reserve_scan(control_db, auth.account_id, limits)
+    if not ok:
+        raise HTTPException(status_code=403, detail=reason)
     scan_id = secrets.token_hex(16)
     db_path = str(account_settings(api_settings, auth.account_id).project_root)
-    control_db.create_scan(
-        scan_id=scan_id,
-        account_id=auth.account_id,
-        domain=domain,
-        db_path=db_path,
-        collection_profile=body.profile,
-        capability_override=override,
-    )
-    control_db.increment_scan_usage(auth.account_id, subscriptions.current_period_key())
+    try:
+        control_db.create_scan(
+            scan_id=scan_id,
+            account_id=auth.account_id,
+            domain=domain,
+            db_path=db_path,
+            collection_profile=body.profile,
+            capability_override=override,
+        )
+    except Exception:
+        subscriptions.release_scan(control_db, auth.account_id)
+        raise
 
     # The request returns immediately with "queued" — the row just sits
     # in the `scans` table. `api/scan_worker.py`'s worker loop (running

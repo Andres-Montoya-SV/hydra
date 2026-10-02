@@ -101,11 +101,6 @@ EVENT_TYPES: frozenset[str] = frozenset(
 # endpoint, or a chat message for Slack / Microsoft Teams incoming webhooks.
 DESTINATION_KINDS: frozenset[str] = frozenset({"generic", "slack", "teams"})
 
-# A real, enforced cap — an account cannot use webhook registration to
-# fan out an unbounded number of outbound requests from Hydra's own
-# infrastructure.
-MAX_WEBHOOKS_PER_ACCOUNT = 10
-
 # Bounded retries with backoff for one event's delivery to one webhook —
 # never unbounded (a permanently-down endpoint must not tie up the
 # triggering account's own notification path indefinitely). Chosen to

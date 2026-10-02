@@ -66,6 +66,15 @@ class TierLimits:
     # Pro/Ultra's existing "the paying-for-active-usage" tiers
     # (`priority_queue=True` uses the identical Pro/Ultra split already).
     monitoring_speed2: bool
+    # Productization Phase 12a (decision 2026-10-02). None = unlimited.
+    # Account-level: organizations the account owns; webhooks; imports per
+    # month. Organization-level, using the acting owner's tier: members,
+    # ticketing integrations. Existing data over a limit is kept; only new
+    # creations are refused (api/entitlements.py).
+    max_organizations: int | None = None
+    max_members_per_organization: int | None = None
+    imports_per_month: int | None = None
+    max_integrations: int | None = None
 
 
 TIERS: dict[Tier, TierLimits] = {
@@ -81,6 +90,10 @@ TIERS: dict[Tier, TierLimits] = {
         retention_days=7,
         priority_queue=False,
         monitoring_speed2=False,
+        max_organizations=1,
+        max_members_per_organization=2,
+        imports_per_month=2,
+        max_integrations=1,
     ),
     "medium": TierLimits(
         tier="medium",
@@ -99,6 +112,10 @@ TIERS: dict[Tier, TierLimits] = {
         retention_days=90,
         priority_queue=False,
         monitoring_speed2=False,
+        max_organizations=3,
+        max_members_per_organization=5,
+        imports_per_month=20,
+        max_integrations=3,
     ),
     "pro": TierLimits(
         tier="pro",
@@ -123,6 +140,10 @@ TIERS: dict[Tier, TierLimits] = {
         retention_days=365,
         priority_queue=True,
         monitoring_speed2=True,
+        max_organizations=10,
+        max_members_per_organization=20,
+        imports_per_month=100,
+        max_integrations=10,
     ),
     "ultra": TierLimits(
         tier="ultra",
@@ -146,6 +167,10 @@ TIERS: dict[Tier, TierLimits] = {
         retention_days=None,
         priority_queue=True,
         monitoring_speed2=True,
+        max_organizations=None,
+        max_members_per_organization=100,
+        imports_per_month=1000,
+        max_integrations=25,
     ),
 }
 

@@ -26,6 +26,7 @@ from api.monitoring_worker import (
     run_monitoring_cycle,
 )
 from api.settings import APISettings
+from api.subscriptions import apply_tier_change
 from api.tenancy import account_db_path
 from core.assets import Host, HttpService, ScanRun
 from core.store import AssetStore
@@ -141,6 +142,7 @@ class TestVisualEndpoint:
     def test_a_previous_run_of_another_organization_is_never_compared(self, tmp_path: Path) -> None:
         with TestClient(create_app(APISettings(data_dir=tmp_path / "api"))) as client:
             headers, account_id, org = _account(client)
+            apply_tier_change(client.app.state.control_db, account_id, "pro")  # Free owns one org
             other = client.post("/organizations", headers=headers, json={"name": "Other"}).json()
             _record_run(client, account_id, other["organization_id"], "run-1", 1, _svc())
             _record_run(client, account_id, org, "run-2", 2, _svc(favicon="999"))

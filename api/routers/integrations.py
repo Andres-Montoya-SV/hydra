@@ -14,9 +14,15 @@ from typing import Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
+from api import entitlements
 from api import security_audit as audit
 from api.auth import AuthContext, require_api_key
-from api.control_db import ControlDB, TicketingIntegrationRecord
+from api.control_db import (
+    ControlDB,
+    LimitReachedError,
+    NewTicketingIntegration,
+    TicketingIntegrationRecord,
+)
 from api.routers.delivery_logs import Page, delivery_responses, page
 from api.routers.org_access import control_db, require_member, require_owner
 from api.schemas import (
@@ -30,8 +36,6 @@ from api.ticketing import TicketingConfigError, validate
 from api.webhooks import validate_webhook_destination
 
 router = APIRouter(prefix="/organizations", tags=["integrations"])
-
-MAX_INTEGRATIONS_PER_ORGANIZATION = 10
 
 
 def _response(record: TicketingIntegrationRecord) -> TicketingIntegrationResponse:
@@ -87,20 +91,21 @@ async def create_integration(
         raise HTTPException(
             status_code=422, detail={"error": "invalid_integration", "message": str(exc)}
         ) from exc
-    active = [r for r in db.list_ticketing_integrations(organization_id) if r.status == "active"]
-    if len(active) >= MAX_INTEGRATIONS_PER_ORGANIZATION:
-        raise HTTPException(status_code=403, detail="Integration limit reached")
+    # The acting owner's integration entitlement (Phase 12a), before the
+    # outbound destination check.
+    limits = entitlements.account_limits(db, auth.account_id)
+    active = sum(r.status == "active" for r in db.list_ticketing_integrations(organization_id))
+    entitlements.refuse_if_full(limits, "integrations", active)
     await _check_destination(config)
     try:
         record = db.create_ticketing_integration(
             organization_id=organization_id,
             actor_account_id=auth.account_id,
-            provider=body.provider,
-            name=body.name.strip(),
-            config=config,
-            credential=body.credential,
-            event_types=tuple(dict.fromkeys(body.event_types)),
+            integration=_new_integration(body, config),
+            limit=limits.max_integrations,
         )
+    except LimitReachedError as exc:
+        raise entitlements.from_limit_reached(limits.tier, exc) from exc
     except SecretsUnavailableError as exc:
         raise HTTPException(
             status_code=503,
@@ -142,6 +147,18 @@ def _audit_integration(
             target=("ticketing_integration", integration_id),
             details=details,
         ),
+    )
+
+
+def _new_integration(
+    body: CreateTicketingIntegrationRequest, config: dict[str, str]
+) -> NewTicketingIntegration:
+    return NewTicketingIntegration(
+        provider=body.provider,
+        name=body.name.strip(),
+        config=config,
+        credential=body.credential,
+        event_types=tuple(dict.fromkeys(body.event_types)),
     )
 
 

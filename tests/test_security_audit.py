@@ -19,6 +19,7 @@ import api.routers.webhooks as webhooks_router
 from api import operators
 from api.main import create_app
 from api.settings import APISettings
+from api.subscriptions import apply_tier_change
 
 
 @pytest.fixture
@@ -155,7 +156,8 @@ class TestMembers:
         assert response.status_code == 403
 
     def test_a_new_organization_is_recorded_in_it(self, client: TestClient) -> None:
-        owner, _, _ = _account(client)
+        owner, owner_id, _ = _account(client)
+        apply_tier_change(client.app.state.control_db, owner_id, "pro")  # Free owns one org
         org = client.post("/organizations", headers=owner, json={"name": "Client B"}).json()
         events = client.get(
             f"/organizations/{org['organization_id']}/security-events", headers=owner

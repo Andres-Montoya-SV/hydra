@@ -514,7 +514,7 @@ def _try_enqueue_one(
                 row.domain,
             )
             return
-        ok, reason = subscriptions.check_scan_quota(control_db, row.account_id, limits)
+        ok, reason = subscriptions.reserve_scan(control_db, row.account_id, limits)
         if not ok:
             logger.info(
                 "Skipping Speed 2 scan for account %s domain %s: %s",
@@ -529,15 +529,18 @@ def _try_enqueue_one(
     scan_id = secrets.token_hex(16)
     db_path = str(account_settings(api_settings, row.account_id).project_root)
     trigger_source = "scheduled_passive" if speed == "passive" else "scheduled_active"
-    control_db.create_scan(
-        scan_id=scan_id,
-        account_id=row.account_id,
-        domain=row.domain,
-        db_path=db_path,
-        trigger_source=trigger_source,
-    )
-    if speed == "active":
-        control_db.increment_scan_usage(row.account_id, subscriptions.current_period_key())
+    try:
+        control_db.create_scan(
+            scan_id=scan_id,
+            account_id=row.account_id,
+            domain=row.domain,
+            db_path=db_path,
+            trigger_source=trigger_source,
+        )
+    except Exception:
+        if speed == "active":  # the quota slot was reserved above
+            subscriptions.release_scan(control_db, row.account_id)
+        raise
     control_db.mark_monitoring_scan_enqueued(row.monitoring_id, speed=speed, scan_id=scan_id)
 
 
