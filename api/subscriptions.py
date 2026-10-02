@@ -156,6 +156,23 @@ def check_scan_quota(
     )
 
 
+def reserve_scan(
+    control_db: ControlDB, account_id: str, limits: TierLimits
+) -> tuple[bool, str | None]:
+    """Counts one scan against this month's quota unless it is used up —
+    in one atomic step (Productization Phase 12a): a separate check and
+    increment let concurrent requests from several API processes all pass.
+    On refusal, the same message as `check_scan_quota`."""
+    if control_db.reserve_usage(account_id, current_period_key(), "scans", limits.scans_per_month):
+        return True, None
+    return check_scan_quota(control_db, account_id, limits)
+
+
+def release_scan(control_db: ControlDB, account_id: str) -> None:
+    """Gives back a reserved scan whose creation failed."""
+    control_db.release_usage(account_id, current_period_key(), "scans")
+
+
 # --- verified-domain concurrency limit (Part A x Part B) ---------------
 
 

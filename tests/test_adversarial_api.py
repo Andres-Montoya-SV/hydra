@@ -39,6 +39,7 @@ from test_api_exposure_operations import _seed_exposure
 from api.control_db import ControlDB
 from api.main import create_app
 from api.settings import APISettings
+from api.subscriptions import apply_tier_change
 
 # Reachable without an API key, on purpose.
 PUBLIC: frozenset[tuple[str, str]] = frozenset(
@@ -226,7 +227,10 @@ def world(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
     )
     with TestClient(create_app(settings)) as client:
         victim_key, values = _seed_victim(client)
-        attacker_key, _ = create_verified_account(client)
+        attacker_key, attacker = create_verified_account(client)
+        # Pro, so the mass-assignment test can create an organization
+        # (Phase 12a: Free owns exactly one).
+        apply_tier_change(client.app.state.control_db, attacker, "pro")
         yield {
             "client": client,
             "db": client.app.state.control_db,

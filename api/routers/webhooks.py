@@ -11,9 +11,10 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
+from api import entitlements
 from api import security_audit as audit
 from api.auth import AuthContext, require_api_key
-from api.control_db import ControlDB, WebhookRecord
+from api.control_db import ControlDB, LimitReachedError, WebhookRecord
 from api.routers.delivery_logs import Page, delivery_responses, page
 from api.schemas import (
     DeliveryResponse,
@@ -23,7 +24,6 @@ from api.schemas import (
 )
 from api.webhooks import (
     EVENT_TYPES,
-    MAX_WEBHOOKS_PER_ACCOUNT,
     generate_webhook_secret,
     validate_webhook_destination,
     validate_webhook_url_scheme,
@@ -55,27 +55,26 @@ async def register_webhook(
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
 
-    # A real, enforced cap BEFORE the (slower) real DNS/SSRF check below —
-    # cheapest rejection first, same "fail fast on the free check" order
-    # every other gated endpoint in this codebase already uses.
-    if control_db.count_webhooks_for_account(auth.account_id) >= MAX_WEBHOOKS_PER_ACCOUNT:
-        raise HTTPException(
-            status_code=403,
-            detail=f"This account already has the maximum of {MAX_WEBHOOKS_PER_ACCOUNT} "
-            "webhooks registered. Delete one before registering another.",
-        )
+    # The webhook entitlement (Phase 12a) before the slower DNS/SSRF check.
+    limits = entitlements.account_limits(control_db, auth.account_id)
+    count = control_db.count_webhooks_for_account(auth.account_id)
+    entitlements.refuse_if_full(limits, "webhooks", count)
 
     allowed, reason, _connect_ip = await validate_webhook_destination(body.url)
     if not allowed:
         raise HTTPException(status_code=422, detail=reason)
 
-    record = control_db.create_webhook(
-        account_id=auth.account_id,
-        url=body.url,
-        secret=generate_webhook_secret(),
-        event_types=tuple(body.event_types),
-        kind=body.kind,
-    )
+    try:
+        record = control_db.create_webhook(
+            account_id=auth.account_id,
+            url=body.url,
+            secret=generate_webhook_secret(),
+            event_types=tuple(body.event_types),
+            kind=body.kind,
+            limit=limits.max_integrations,
+        )
+    except LimitReachedError as exc:
+        raise entitlements.from_limit_reached(limits.tier, exc) from exc
     _audit_webhook(
         control_db,
         request,

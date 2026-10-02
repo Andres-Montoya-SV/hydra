@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from api.main import create_app  # noqa: E402
 from api.settings import APISettings  # noqa: E402
-from api.webhooks import MAX_WEBHOOKS_PER_ACCOUNT  # noqa: E402
+from api.tiers import TIERS  # noqa: E402
 
 
 @pytest.fixture
@@ -107,7 +107,9 @@ class TestRegistration:
         # cap this test actually targets. Nothing stops an account from
         # registering the same URL more than once; only the count matters.
         api_key, _ = create_verified_account(client)
-        for i in range(MAX_WEBHOOKS_PER_ACCOUNT):
+        cap = TIERS["free"].max_integrations  # Phase 12a: the tier's webhook entitlement
+        assert cap is not None
+        for i in range(cap):
             resp = client.post(
                 "/webhooks",
                 json={"url": "https://example.com/hook", "event_types": ["monitoring.changed"]},
@@ -121,6 +123,8 @@ class TestRegistration:
             headers=_auth(api_key),
         )
         assert over_cap.status_code == 403
+        assert over_cap.json()["detail"]["error"] == "entitlement_exceeded"
+        assert over_cap.json()["detail"]["upgrade_to"] == "medium"
 
 
 class TestListAndDelete:

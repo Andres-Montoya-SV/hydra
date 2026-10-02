@@ -328,6 +328,15 @@ class SubscriptionResponse(BaseModel):
     verified_domains_limit: int | None = None
     grace_period_started_at: str | None = None
     retention_days: int
+    # Productization Phase 12a: the other entitlements (None = unlimited).
+    imports_used_this_period: int = 0
+    imports_limit: int | None = None
+    organizations_owned: int = 0
+    organizations_limit: int | None = None
+    webhooks_count: int = 0
+    webhooks_limit: int | None = None
+    members_per_organization_limit: int | None = None
+    integrations_per_organization_limit: int | None = None
 
 
 class CreateSubscriptionRequest(BaseModel):

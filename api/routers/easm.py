@@ -50,9 +50,16 @@ from typing import Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from api import entitlements
 from api import security_audit as audit
 from api.auth import AuthContext, require_api_key
-from api.control_db import AssetRecord, ControlDB, LastOwnerError, RelationshipRecord
+from api.control_db import (
+    AssetRecord,
+    ControlDB,
+    LastOwnerError,
+    LimitReachedError,
+    RelationshipRecord,
+)
 from api.routers.org_access import control_db as _db
 from api.routers.org_access import require_member as _require_member
 from api.routers.org_access import require_owner as _require_owner
@@ -186,15 +193,17 @@ def create_organization(
     """A SECOND (or later) organization for the calling account — its own
     1:1 default organization already exists from account creation
     (Fase 02), this is the "consultant onboarding a new client" case.
-    Reuses `ControlDB.create_organization`/`add_account_organization_role`
-    exactly as `_backfill_organizations`/`create_account` already do
-    internally — no new persistence, this endpoint is the first HTTP
-    surface over logic Fase 02 already built and tested."""
+    `ControlDB.create_owned_organization` writes the organization and the
+    caller's owner role in one transaction, within the account's
+    organization entitlement (Phase 12a)."""
     db = _db(request)
-    organization_id = db.create_organization(name=body.name)
-    db.add_account_organization_role(
-        account_id=auth.account_id, organization_id=organization_id, role="owner"
-    )
+    limits = entitlements.account_limits(db, auth.account_id)
+    try:
+        organization_id = db.create_owned_organization(
+            account_id=auth.account_id, name=body.name, limit=limits.max_organizations
+        )
+    except LimitReachedError as exc:
+        raise entitlements.from_limit_reached(limits.tier, exc) from exc
     org = db.get_organization(organization_id)
     if org is None:
         # Unreachable in practice (just inserted, same request, same
@@ -259,9 +268,16 @@ def add_organization_member(
     if not db.account_exists(body.account_id):
         raise HTTPException(status_code=404, detail="Account not found")
     previous = db.get_role_for_account_organization(body.account_id, organization_id)
-    db.add_account_organization_role(
-        account_id=body.account_id, organization_id=organization_id, role=body.role
-    )
+    limits = entitlements.account_limits(db, auth.account_id)
+    try:
+        db.add_member_within_limit(
+            account_id=body.account_id,
+            organization_id=organization_id,
+            role=body.role,
+            limit=limits.max_members_per_organization,
+        )
+    except LimitReachedError as exc:
+        raise entitlements.from_limit_reached(limits.tier, exc) from exc
     if previous != body.role:
         _audit_member(
             db,

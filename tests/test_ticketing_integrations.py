@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 from test_api_exposure_operations import _seed_exposure
 
 from api import integration_worker
-from api.control_db import ControlDB
+from api.control_db import ControlDB, NewTicketingIntegration
 from api.integration_worker import run_integration_delivery_cycle
 from api.main import create_app
 from api.secrets_box import SecretBox
@@ -409,23 +409,21 @@ def test_organization_events_reach_only_that_organizations_integrations(tmp_path
     org = db.default_organization_id_for_account(account)
     other = db.create_account(email=f"u-{secrets.token_hex(3)}@example.com")
     other_org = db.default_organization_id_for_account(other)
+
+    def linear(name: str) -> NewTicketingIntegration:
+        return NewTicketingIntegration(
+            provider="linear",
+            name=name,
+            config={"team_id": "t"},
+            credential={"api_key": "k"},
+            event_types=("exposure.opened",),
+        )
+
     mine = db.create_ticketing_integration(
-        organization_id=org,
-        actor_account_id=account,
-        provider="linear",
-        name="L",
-        config={"team_id": "t"},
-        credential={"api_key": "k"},
-        event_types=("exposure.opened",),
+        organization_id=org, actor_account_id=account, integration=linear("L")
     )
     db.create_ticketing_integration(
-        organization_id=other_org,
-        actor_account_id=other,
-        provider="linear",
-        name="L2",
-        config={"team_id": "t"},
-        credential={"api_key": "k"},
-        event_types=("exposure.opened",),
+        organization_id=other_org, actor_account_id=other, integration=linear("L2")
     )
 
     db.enqueue_integration_event(

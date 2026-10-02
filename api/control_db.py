@@ -1129,6 +1129,8 @@ CREATE TABLE IF NOT EXISTS monthly_usage (
     scans_used INTEGER NOT NULL DEFAULT 0,
     reportability_spend_usd REAL NOT NULL DEFAULT 0.0,
     hypotheses_spend_usd REAL NOT NULL DEFAULT 0.0,
+    -- Productization Phase 12a: report imports this month.
+    imports_used INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, period_key)
 );
 
@@ -1243,6 +1245,29 @@ class DuplicateEmailError(Exception):
     """Raised by `ControlDB.create_account` when `email` is already
     registered to a different account (Hallazgo 1's "distinct email per
     account" requirement) — the router turns this into a 409."""
+
+
+class LimitReachedError(Exception):
+    """A tier entitlement is used up (Productization Phase 12a): raised
+    inside the creating transaction, so nothing was written. The router
+    turns it into a structured 403 (api/entitlements.py)."""
+
+    def __init__(self, entitlement: str, limit: int) -> None:
+        super().__init__(f"{entitlement} limit reached ({limit})")
+        self.entitlement = entitlement
+        self.limit = limit
+
+
+@dataclass(frozen=True)
+class NewTicketingIntegration:
+    """What a new ticketing integration consists of (the credential is
+    sealed before it is stored)."""
+
+    provider: str
+    name: str
+    config: dict[str, str]
+    credential: dict[str, str]
+    event_types: tuple[str, ...]
 
 
 class LastOwnerError(Exception):
@@ -1378,6 +1403,7 @@ class MonthlyUsageRecord:
     scans_used: int
     reportability_spend_usd: float
     hypotheses_spend_usd: float
+    imports_used: int = 0
 
 
 @dataclass(frozen=True)
@@ -1909,6 +1935,10 @@ _ACCOUNTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("deleted_at", "TEXT"),
 )
 
+_MONTHLY_USAGE_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("imports_used", "INTEGER NOT NULL DEFAULT 0"),
+)
+
 _ORGANIZATIONS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("deletion_requested_at", "TEXT"),
     ("deletion_due_at", "TEXT"),
@@ -1989,6 +2019,7 @@ _MONITORING_PENDING_NOTIFICATIONS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...]
 _COLUMN_MIGRATIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ("accounts", _ACCOUNTS_MIGRATION_COLUMNS),
     ("organizations", _ORGANIZATIONS_MIGRATION_COLUMNS),
+    ("monthly_usage", _MONTHLY_USAGE_MIGRATION_COLUMNS),
     ("scans", _SCANS_MIGRATION_COLUMNS),
     ("webhooks", _WEBHOOKS_MIGRATION_COLUMNS),
     ("integration_deliveries", _INTEGRATION_DELIVERIES_MIGRATION_COLUMNS),
@@ -2311,6 +2342,26 @@ class ControlDB:
             )
         return organization_id
 
+    def create_owned_organization(self, *, account_id: str, name: str, limit: int | None) -> str:
+        """A new organization owned by `account_id`, refused with
+        LimitReachedError once the account owns `limit` (Phase 12a). The
+        organization and its owner role are written in one transaction."""
+        organization_id = secrets.token_hex(16)
+        now = _now_iso()
+        with self._connect() as conn:
+            _enforce_limit(self.dialect, conn, "organizations", account_id, limit)
+            conn.execute(
+                "INSERT INTO organizations (organization_id, name, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (organization_id, name, now, now),
+            )
+            conn.execute(
+                "INSERT INTO account_organization_roles "
+                "(account_id, organization_id, role, created_at) VALUES (?, ?, 'owner', ?)",
+                (account_id, organization_id, now),
+            )
+        return organization_id
+
     def get_organization(self, organization_id: str) -> OrganizationRecord | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -2336,6 +2387,32 @@ class ControlDB:
         if role not in ("owner", "viewer"):
             raise ValueError(f"unknown organization role: {role!r}")
         with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO account_organization_roles "
+                "(account_id, organization_id, role, created_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(account_id, organization_id) DO UPDATE SET role = excluded.role",
+                (account_id, organization_id, role, _now_iso()),
+            )
+
+    def add_member_within_limit(
+        self, *, account_id: str, organization_id: str, role: str, limit: int | None
+    ) -> None:
+        """`add_account_organization_role`, refusing a NEW member with
+        LimitReachedError once the organization has `limit` (Phase 12a).
+        Changing an existing member's role never counts."""
+        if role not in ("owner", "viewer"):
+            raise ValueError(f"unknown organization role: {role!r}")
+        with self._connect() as conn:
+            self.dialect.begin_write(conn, f"entitlement:members:{organization_id}")
+            existing = conn.execute(
+                "SELECT 1 FROM account_organization_roles "
+                "WHERE account_id = ? AND organization_id = ?",
+                (account_id, organization_id),
+            ).fetchone()
+            if existing is None and limit is not None:
+                count_sql = _ENTITLEMENT_COUNT_SQL["members"]
+                if conn.execute(count_sql, (organization_id,)).fetchone()[0] >= limit:
+                    raise LimitReachedError("members", limit)
             conn.execute(
                 "INSERT INTO account_organization_roles "
                 "(account_id, organization_id, role, created_at) VALUES (?, ?, ?, ?) "
@@ -3840,20 +3917,20 @@ class ControlDB:
         *,
         organization_id: str,
         actor_account_id: str,
-        provider: str,
-        name: str,
-        config: dict[str, str],
-        credential: dict[str, str],
-        event_types: tuple[str, ...],
+        integration: NewTicketingIntegration,
+        limit: int | None = None,
     ) -> TicketingIntegrationRecord:
         """The credential is sealed before it touches the database; without
-        a configured key this refuses (SecretsUnavailableError)."""
+        a configured key this refuses (SecretsUnavailableError). `limit`:
+        the acting owner's integration entitlement for this organization
+        (Phase 12a); LimitReachedError once it is used up."""
         if self.secret_box is None:
             raise SecretsUnavailableError("HYDRA_API_SECRETS_KEYS is not configured")
         integration_id = secrets.token_hex(16)
         now = _now_iso()
-        sealed = self.secret_box.seal(json.dumps(credential, sort_keys=True))
+        sealed = self.secret_box.seal(json.dumps(integration.credential, sort_keys=True))
         with self._connect() as conn:
+            _enforce_limit(self.dialect, conn, "integrations", organization_id, limit)
             conn.execute(
                 "INSERT INTO ticketing_integrations (integration_id, organization_id, provider, "
                 "name, config_json, credential, event_types_json, created_by_account_id, "
@@ -3861,11 +3938,11 @@ class ControlDB:
                 (
                     integration_id,
                     organization_id,
-                    provider,
-                    name,
-                    json.dumps(config, sort_keys=True),
+                    integration.provider,
+                    integration.name,
+                    json.dumps(integration.config, sort_keys=True),
                     sealed,
-                    json.dumps(list(event_types)),
+                    json.dumps(list(integration.event_types)),
                     actor_account_id,
                     now,
                     now,
@@ -6401,14 +6478,14 @@ class ControlDB:
         event_types: tuple[str, ...],
         organization_id: str | None = None,
         kind: str = "generic",
+        limit: int | None = None,
     ) -> WebhookRecord:
-        """`organization_id` defaults to the account's own organization
-        (Fase 02) when not given explicitly — see `create_scan`'s
-        identical note."""
+        """Defaults to the account's own organization; `limit`: entitlement (12a)."""
         organization_id = organization_id or self.default_organization_id_for_account(account_id)
         webhook_id = secrets.token_hex(16)
         now = _now_iso()
         with self._connect() as conn:
+            _enforce_limit(self.dialect, conn, "webhooks", account_id, limit)
             conn.execute(
                 "INSERT INTO webhooks "
                 "(webhook_id, account_id, url, secret, event_types_json, status, "
@@ -6471,7 +6548,7 @@ class ControlDB:
         membership checked in Python since SQLite has no native JSON-
         array-contains operator portable across the versions this
         project supports; the per-account webhook count is always small
-        (a real, enforced cap — `api/webhooks.py::MAX_WEBHOOKS_PER_ACCOUNT`),
+        (capped per tier, at most 25: `api/entitlements.py`),
         so this is never a hot-path performance concern."""
         with self._connect() as conn:
             rows = conn.execute(
@@ -6787,7 +6864,23 @@ class ControlDB:
             scans_used=row["scans_used"],
             reportability_spend_usd=row["reportability_spend_usd"],
             hypotheses_spend_usd=row["hypotheses_spend_usd"],
+            imports_used=row["imports_used"],
         )
+
+    def reserve_usage(self, account_id: str, period_key: str, counter: str, cap: int) -> bool:
+        """Counts one use of `counter` ("scans" or "imports") unless the
+        month's cap is reached; atomic across processes. False = refused."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                _USAGE_RESERVE_SQL[counter],
+                {"account": account_id, "period": period_key, "cap": cap},
+            )
+        return cursor.rowcount == 1
+
+    def release_usage(self, account_id: str, period_key: str, counter: str) -> None:
+        """Gives back a reserved use whose work never started."""
+        with self._connect() as conn:
+            conn.execute(_USAGE_RELEASE_SQL[counter], {"account": account_id, "period": period_key})
 
     def increment_scan_usage(self, account_id: str, period_key: str) -> None:
         with self._connect() as conn:
@@ -7253,6 +7346,51 @@ _ACCOUNT_PSEUDONYMIZE_STATEMENTS: tuple[str, ...] = (
     "UPDATE security_audit_log SET client_ip = NULL "
     "WHERE actor_account_id = :account OR subject_account_id = :account",
 )
+
+# Productization Phase 12a: monthly usage, reserved atomically. The cap is
+# checked in the same statement that counts the use, so concurrent requests
+# (several API processes on one database) can never exceed it: the update
+# matches only while the counter is below the cap.
+_USAGE_RESERVE_SQL: dict[str, str] = {
+    "scans": "INSERT INTO monthly_usage (account_id, period_key, scans_used) "
+    "VALUES (:account, :period, 1) ON CONFLICT(account_id, period_key) DO UPDATE SET "
+    "scans_used = monthly_usage.scans_used + 1 WHERE monthly_usage.scans_used < :cap",
+    "imports": "INSERT INTO monthly_usage (account_id, period_key, imports_used) "
+    "VALUES (:account, :period, 1) ON CONFLICT(account_id, period_key) DO UPDATE SET "
+    "imports_used = monthly_usage.imports_used + 1 WHERE monthly_usage.imports_used < :cap",
+}
+_USAGE_RELEASE_SQL: dict[str, str] = {
+    "scans": "UPDATE monthly_usage SET scans_used = scans_used - 1 "
+    "WHERE account_id = :account AND period_key = :period AND scans_used > 0",
+    "imports": "UPDATE monthly_usage SET imports_used = imports_used - 1 "
+    "WHERE account_id = :account AND period_key = :period AND imports_used > 0",
+}
+# Current counts behind the count-based entitlements, read under the
+# entitlement's write lock (see _enforce_limit).
+_ENTITLEMENT_COUNT_SQL: dict[str, str] = {
+    "organizations": "SELECT count(*) FROM account_organization_roles "
+    "WHERE account_id = ? AND role = 'owner'",
+    "members": "SELECT count(*) FROM account_organization_roles WHERE organization_id = ?",
+    "webhooks": "SELECT count(*) FROM webhooks WHERE account_id = ?",
+    "integrations": "SELECT count(*) FROM ticketing_integrations "
+    "WHERE organization_id = ? AND status = 'active'",
+}
+
+
+def _enforce_limit(
+    dialect: Any, conn: Any, entitlement: str, owner_id: str, limit: int | None
+) -> None:
+    """Takes the entitlement's write lock (per owner), then refuses when the
+    current count has reached `limit`. Must be the transaction's first step;
+    the insert that follows in the same transaction is then serialized with
+    every other creation for this owner, in any process."""
+    dialect.begin_write(conn, f"entitlement:{entitlement}:{owner_id}")
+    if limit is None:
+        return
+    count = conn.execute(_ENTITLEMENT_COUNT_SQL[entitlement], (owner_id,)).fetchone()[0]
+    if count >= limit:
+        raise LimitReachedError(entitlement, limit)
+
 
 # The refill-then-consume decision as one statement (see
 # check_and_consume_rate_limit_token). Portable as written: on Postgres,
