@@ -229,3 +229,42 @@ class TestReadiness:
         monkeypatch.setattr(ControlDB, "ping", down)
         response = client.get("/ready")
         assert response.status_code == 503 and response.json() == {"status": "not ready"}
+
+
+class TestNulCharacters:
+    """Phase 11g: found by the adversarial re-test (a NUL reached a
+    PostgreSQL query and became a 500)."""
+
+    @pytest.mark.parametrize(
+        ("path", "params"),
+        [("/organizations/abc%00def/assets", None), ("/organizations", {"q": "a\x00b"})],
+    )
+    def test_in_the_path_or_query_is_400(
+        self, client: TestClient, path: str, params: dict[str, str] | None
+    ) -> None:
+        response = client.get(path, params=params)
+        assert response.status_code == 400
+        assert response.json() == {"detail": "Request contains a NUL character"}
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+    @pytest.mark.parametrize("body", [b'{"email": "a\\u0000@example.com"}', b"{\x00}"])
+    def test_in_the_body_is_400(self, client: TestClient, body: bytes) -> None:
+        response = client.post(
+            "/accounts", content=body, headers={"Content-Type": "application/json"}
+        )
+        assert response.status_code == 400
+
+    def test_split_across_streamed_chunks_is_still_found(self) -> None:
+        def chunks() -> Iterator[bytes]:
+            yield b'{"a": "x\\u0'
+            yield b'000"}'
+
+        response = TestClient(_mini_app()).post("/echo", content=chunks())
+        assert response.status_code == 400
+
+    def test_ordinary_requests_are_untouched(self) -> None:
+        mini = TestClient(_mini_app())
+        assert (
+            mini.post("/echo", content=b'{"a": "u0000 is fine without a backslash"}').status_code
+            == 200
+        )
