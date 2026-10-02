@@ -113,3 +113,10 @@ vulnerabilities).
   - counting by route template, with no raw ids in labels;
   - the state gauges;
   - an unreachable database reported as `hydra_control_db_up 0`.
+
+## Update: Phase 11e
+
+The recon-tool dependency refresh landed. 52 of the 53 entries were
+removed: the tools are rebuilt with verified dependency floors on Go
+1.26.8. The allowlist now holds only the CPython 3.12 entry. See
+[11e](11e_recon_tool_refresh.md).
