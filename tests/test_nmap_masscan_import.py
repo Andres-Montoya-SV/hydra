@@ -378,3 +378,24 @@ class TestCrossOrganizationIsolation:
         assert control_db.list_candidate_assets_for_organization(org_a) != []
         assert control_db.list_candidate_assets_for_organization(org_b) == []
         assert control_db.list_observation_batches_for_organization(org_b) == []
+
+
+@pytest.mark.parametrize(
+    ("importer", "payload"),
+    [
+        ("import_nmap_xml", b"<nmaprun>\x00</nmaprun>"),
+        ("import_masscan_json", b'[{"ip": "1.2.3.4\\u0000"}]'),
+    ],
+)
+def test_a_report_with_a_nul_character_is_refused(
+    tmp_path: Path, importer: str, payload: bytes
+) -> None:
+    """Phase 11g: NUL never belongs in a report and PostgreSQL refuses it."""
+    import api.nmap_masscan_import as imports
+
+    db = ControlDB(tmp_path / "control.db")
+    keyword = "xml_bytes" if importer == "import_nmap_xml" else "json_bytes"
+    with pytest.raises(imports.ImportValidationError, match="NUL"):
+        getattr(imports, importer)(
+            control_db=db, organization_id="o", account_id="a", dry_run=True, **{keyword: payload}
+        )

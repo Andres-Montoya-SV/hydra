@@ -7,6 +7,9 @@ behave) plus the optional CORS policy.
   `X-Request-ID`. A caller's own `X-Request-ID` is kept when it is a short
   token of safe characters, so ids can be followed across a proxy;
   anything else is replaced, so the id is never a log-injection vector.
+- **No NUL characters (Phase 11g).** A NUL in the path, the query or the
+  body (raw or JSON-escaped) is refused with 400: no legitimate request
+  carries one, and PostgreSQL rejects it deep inside a query.
 - **Body limit.** A request body larger than the limit is refused with 413
   before the router sees it — by `Content-Length` when declared, and by
   counting as it streams otherwise. The import endpoints get the importer's
@@ -82,6 +85,55 @@ class _BodyTooLargeError(HTTPException):
         super().__init__(status_code=413, detail=f"Request body exceeds {limit} bytes")
 
 
+class _NulCharacterError(HTTPException):
+    """Phase 11g: no legitimate request carries a NUL character, and
+    PostgreSQL refuses one in text (a 500 deep in a query, found by the
+    adversarial re-test). Refused at the edge instead."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=400, detail="Request contains a NUL character")
+
+
+# A raw NUL byte, or one escaped in JSON (`\u0000`, any case).
+_BODY_NUL_MARKERS = (b"\x00", b"\\u0000")
+# Bytes kept from the previous chunk, so a marker split across chunks is
+# still found: one less than the longest marker.
+_NUL_MARKER_OVERLAP = max(len(marker) for marker in _BODY_NUL_MARKERS) - 1
+
+
+def _has_nul_in_target(scope: Scope) -> bool:
+    # No case to fold: `%00` and NUL have none, and JSON accepts only a
+    # lowercase `\u` escape.
+    query = bytes(scope.get("query_string", b""))
+    return "\x00" in scope.get("path", "") or b"%00" in query or b"\x00" in query
+
+
+class _BodyGuard:
+    """Wraps `receive`: refuses a body past `limit` bytes or one carrying a
+    NUL, as it streams (a marker split across chunks is still found)."""
+
+    def __init__(self, receive: Receive, limit: int, scan_nul: bool = True) -> None:
+        self.receive = receive
+        self.limit = limit
+        self.scan_nul = scan_nul
+        self.received = 0
+        self.tail = b""
+
+    async def __call__(self) -> Message:
+        message = await self.receive()
+        if message["type"] == "http.request":
+            chunk = bytes(message.get("body", b""))
+            self.received += len(chunk)
+            if self.received > self.limit:
+                raise _BodyTooLargeError(self.limit)
+            if self.scan_nul:
+                window = self.tail + chunk
+                if any(marker in window for marker in _BODY_NUL_MARKERS):
+                    raise _NulCharacterError
+                self.tail = window[-_NUL_MARKER_OVERLAP:]
+        return message
+
+
 def _header(scope: Scope, name: bytes) -> str | None:
     for key, value in scope.get("headers", []):
         if key.lower() == name:
@@ -127,19 +179,12 @@ class EdgeMiddleware:
         declared = _header(scope, b"content-length")
         extra = self._response_headers(scope, request_id)
         if declared and declared.isdigit() and int(declared) > limit:
-            await _send_too_large(send, limit, extra)
+            await _send_error(send, _BodyTooLargeError(limit), extra)
             return
-        received = 0
+        if _has_nul_in_target(scope):
+            await _send_error(send, _NulCharacterError(), extra)
+            return
         started = False
-
-        async def counting_receive() -> Message:
-            nonlocal received
-            message = await receive()
-            if message["type"] == "http.request":
-                received += len(message.get("body", b""))
-                if received > limit:
-                    raise _BodyTooLargeError(limit)
-            return message
 
         async def decorating_send(message: Message) -> None:
             nonlocal started
@@ -151,12 +196,15 @@ class EdgeMiddleware:
                 ]
             await send(message)
 
+        # Imports keep their own body checks (a compressed upload gets its
+        # clearer 422; the importer refuses NUL itself).
+        scan_body = not _IMPORT_PATH.match(scope.get("path", ""))
         try:
-            await self.app(scope, counting_receive, decorating_send)
-        except _BodyTooLargeError:
+            await self.app(scope, _BodyGuard(receive, limit, scan_body), decorating_send)
+        except (_BodyTooLargeError, _NulCharacterError) as refused:
             if started:
                 raise
-            await _send_too_large(send, limit, extra)
+            await _send_error(send, refused, extra)
 
     def _response_headers(self, scope: Scope, request_id: str) -> list[tuple[bytes, bytes]]:
         headers = [*_SECURITY_HEADERS, (b"x-request-id", request_id.encode())]
@@ -167,12 +215,12 @@ class EdgeMiddleware:
         return headers
 
 
-async def _send_too_large(send: Send, limit: int, extra: list[tuple[bytes, bytes]]) -> None:
-    body = json.dumps({"detail": f"Request body exceeds {limit} bytes"}).encode()
+async def _send_error(send: Send, error: HTTPException, extra: list[tuple[bytes, bytes]]) -> None:
+    body = json.dumps({"detail": error.detail}).encode()
     await send(
         {
             "type": "http.response.start",
-            "status": 413,
+            "status": error.status_code,
             "headers": [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(body)).encode()),

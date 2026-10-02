@@ -12,6 +12,7 @@ returns 404, identical to a `scan_id` that doesn't exist at all — never
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 from dataclasses import asdict
 from typing import cast
@@ -37,6 +38,8 @@ from api.settings import APISettings
 from api.tenancy import account_settings
 from core.exceptions import ValidationError
 from utils.security import confine_path, validate_run_id
+
+logger = logging.getLogger("hydra.api.scans")
 
 router = APIRouter(prefix="/scans", tags=["scans"])
 
@@ -333,7 +336,13 @@ def get_scan_report(
     except ValidationError as exc:
         raise HTTPException(status_code=404, detail="Scan not found") from exc
     if not summary_path.is_file():
-        raise HTTPException(status_code=500, detail="Scan completed but summary.json is missing")
+        # Phase 11g: not a server fault. The scan is known but its files are
+        # gone (retention, tenant deletion, cleanup), so 410 Gone. It is
+        # still logged, since an unexpected loss is worth seeing.
+        logger.warning("Scan %s is completed but its summary.json is missing", scan_id)
+        raise HTTPException(
+            status_code=410, detail="This scan's report files are no longer available"
+        )
     return json.loads(summary_path.read_text(encoding="utf-8"))
 
 

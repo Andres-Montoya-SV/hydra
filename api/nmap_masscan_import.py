@@ -152,6 +152,15 @@ def _reject_if_compressed(raw_bytes: bytes) -> None:
             )
 
 
+def _reject_unsafe_bytes(raw_bytes: bytes) -> None:
+    """Compressed archives first (the clearer message for a gzip upload),
+    then NUL (Phase 11g): raw or escaped in JSON, it never belongs in a
+    report, and PostgreSQL refuses one in text."""
+    _reject_if_compressed(raw_bytes)
+    if b"\x00" in raw_bytes or b"\\u0000" in raw_bytes:
+        raise ImportValidationError("the report contains a NUL character")
+
+
 def _import_hosts(
     *,
     control_db: ControlDB,
@@ -167,7 +176,7 @@ def _import_hosts(
         raise ImportValidationError("empty artifact")
     if len(raw_bytes) > MAX_ARTIFACT_BYTES:
         raise ImportValidationError(f"artifact exceeds the {MAX_ARTIFACT_BYTES} byte limit")
-    _reject_if_compressed(raw_bytes)
+    _reject_unsafe_bytes(raw_bytes)
 
     artifact_hash = hashlib.sha256(raw_bytes).hexdigest()
     existing_batch = control_db.find_observation_batch_by_artifact_hash(
