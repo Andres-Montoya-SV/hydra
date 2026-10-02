@@ -16,6 +16,7 @@ from api.control_db import ControlDB
 from api.rate_limit import RateLimitExceededError, TokenBucketLimiter
 from api.security import is_currently_valid, lookup_hash_for, verify_key
 from api.security_audit import record_auth_failure
+from api.subscriptions import access_blocked_by_billing
 
 
 @dataclass(frozen=True)
@@ -66,7 +67,48 @@ def require_api_key(
         raise HTTPException(status_code=429, detail="Rate limit exceeded") from exc
 
     control_db.touch_key_last_used(record.key_id)
+    _refuse_writes_while_suspended(control_db, request, record.account_id)
     return AuthContext(account_id=record.account_id, key_id=record.key_id)
+
+
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# What a suspended account may still change (decision 2026-10-02): its
+# keys, its billing, its own deletion (and its organizations'), plus the
+# operator surface. Matched on route templates, never raw paths.
+_ALLOWED_WHILE_SUSPENDED: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("POST", "/keys/{key_id}/rotate"),
+        ("POST", "/keys/{key_id}/revoke"),
+        ("POST", "/account/subscription"),
+        ("DELETE", "/account"),
+        ("POST", "/account/deletion/cancel"),
+        ("DELETE", "/organizations/{organization_id}"),
+        ("POST", "/organizations/{organization_id}/deletion/cancel"),
+    }
+)
+
+
+def _refuse_writes_while_suspended(
+    control_db: ControlDB, request: Request, account_id: str
+) -> None:
+    """Productization Phase 12b: a billing-suspended account is read-only.
+    Checked here, on every authenticated request, so no route can forget
+    it; reads never pay for the lookup."""
+    if request.method in _READ_METHODS:
+        return
+    template = getattr(request.scope.get("route"), "path", "")
+    if (request.method, template) in _ALLOWED_WHILE_SUSPENDED or template.startswith("/admin/"):
+        return
+    subscription = control_db.get_subscription(account_id)
+    if subscription is not None and access_blocked_by_billing(subscription):
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": "account_suspended",
+                "message": "This account is suspended for non-payment and is read-only. "
+                "Resolve billing via POST /account/subscription to resume.",
+            },
+        )
 
 
 _AUTHENTICATED = Depends(require_api_key)

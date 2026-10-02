@@ -12,10 +12,10 @@ from typing import Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from api import subscriptions
+from api import entitlements, subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB
-from api.domain_verification import classify_scan_gate, normalize_domain
+from api.domain_verification import normalize_domain
 from api.schemas import (
     MonitoringNotificationResponse,
     MonitoringStatusResponse,
@@ -42,11 +42,13 @@ def _require_verified_domain_or_403(control_db: ControlDB, account_id: str, doma
     auto-scan a domain it doesn't control on a schedule, which is
     strictly worse than the one-off case Part A already exists to
     prevent."""
-    status, _ = classify_scan_gate(
-        domain,
-        active_verifications=control_db.get_verified_domains_for_account(account_id),
-        all_verifications=control_db.get_all_verifications_for_account(account_id),
+    limits = subscriptions.effective_limits(
+        subscriptions.get_or_create_subscription(control_db, account_id)
     )
+    status, _ = subscriptions.domain_scan_gate(control_db, account_id, domain, limits)
+    if status == "over_limit":  # verified, but beyond the tier's N (Phase 12b)
+        cap = limits.max_concurrent_verified_domains
+        raise entitlements.entitlement_error(limits.tier, "verified_domains", cap or 0)
     if status != "covered":
         raise HTTPException(
             status_code=403,

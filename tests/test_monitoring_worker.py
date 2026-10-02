@@ -606,19 +606,19 @@ class TestCycleIsSafeToInterruptMidWay:
     (`while not budget.exhausted(): page = list_due_..._page(...)`) is
     the exact mechanism under test: the budget is only re-checked BETWEEN
     pages, so a real, deterministic per-row delay (added to a genuine
-    dependency `_try_enqueue_one` calls, `classify_scan_gate` — never the
+    dependency `_try_enqueue_one` calls, `domain_scan_gate` — never the
     function under test itself) combined with a small `monitoring_batch_size`
     reliably stops the cycle after some pages but not all, without faking
     `time.monotonic()` or mocking away any monitoring logic."""
 
-    def _slow_down_classify_scan_gate(self, monkeypatch: pytest.MonkeyPatch, delay: float) -> None:
-        real = monitoring_worker_module.classify_scan_gate
+    def _slow_down_the_scan_gate(self, monkeypatch: pytest.MonkeyPatch, delay: float) -> None:
+        real = monitoring_worker_module.subscriptions.domain_scan_gate
 
         def slow(*args, **kwargs):
             time.sleep(delay)
             return real(*args, **kwargs)
 
-        monkeypatch.setattr(monitoring_worker_module, "classify_scan_gate", slow)
+        monkeypatch.setattr(monitoring_worker_module.subscriptions, "domain_scan_gate", slow)
 
     def _seed_domains(
         self, control_db: ControlDB, api_settings: APISettings, account_id: str, count: int
@@ -644,7 +644,7 @@ class TestCycleIsSafeToInterruptMidWay:
         account_a = _account(interrupted_db, tier="pro")
         domains = self._seed_domains(interrupted_db, interrupted_settings, account_a, 6)
 
-        self._slow_down_classify_scan_gate(monkeypatch, delay=0.05)
+        self._slow_down_the_scan_gate(monkeypatch, delay=0.05)
         stats1 = run_monitoring_cycle(
             api_settings=interrupted_settings,
             control_db=interrupted_db,

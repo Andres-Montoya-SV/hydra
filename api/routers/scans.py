@@ -19,10 +19,10 @@ from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from api import subscriptions
+from api import entitlements, subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, DomainVerificationRecord, ScanRecord
-from api.domain_verification import classify_scan_gate, normalize_domain
+from api.domain_verification import normalize_domain
 from api.monitoring import DEGRADED_OUTCOMES
 from api.schemas import (
     ClientReportRequest,
@@ -36,6 +36,7 @@ from api.schemas import (
 )
 from api.settings import APISettings
 from api.tenancy import account_settings
+from api.tiers import TierLimits
 from core.exceptions import ValidationError
 from utils.security import confine_path, validate_run_id
 
@@ -59,19 +60,20 @@ def _owned_scan_or_404(control_db: ControlDB, scan_id: str, account_id: str) -> 
     return scan
 
 
-def _require_verified_domain_or_403(control_db: ControlDB, account_id: str, domain: str) -> None:
+def _require_verified_domain_or_403(
+    control_db: ControlDB, account_id: str, domain: str, limits: TierLimits
+) -> None:
     """Part A's non-negotiable gate (docs/PAID_API_DESIGN.md) — lives
     directly in `create_scan` below, on the exact same mandatory
     `account_id` every other account-scoped lookup in this file already
     requires, rather than as a separate dependency/middleware layer a
     future route could add without remembering to include it."""
-    status, record = classify_scan_gate(
-        domain,
-        active_verifications=control_db.get_verified_domains_for_account(account_id),
-        all_verifications=control_db.get_all_verifications_for_account(account_id),
-    )
+    status, record = subscriptions.domain_scan_gate(control_db, account_id, domain, limits)
     if status == "covered":
         return
+    if status == "over_limit":  # verified, but beyond the tier's N (Phase 12b)
+        cap = limits.max_concurrent_verified_domains
+        raise entitlements.entitlement_error(limits.tier, "verified_domains", cap or 0)
     if status == "expired":
         expired = cast(DomainVerificationRecord, record)
         raise HTTPException(
@@ -198,7 +200,7 @@ async def create_scan(
     _require_verified_email_or_403(control_db, auth.account_id)
     limits = _require_billing_and_quota_ok(control_db, auth.account_id)
     domain = normalize_domain(body.domain)
-    _require_verified_domain_or_403(control_db, auth.account_id, domain)
+    _require_verified_domain_or_403(control_db, auth.account_id, domain, limits)
     _require_not_excluded(control_db, auth.account_id, domain)
     override = (
         None

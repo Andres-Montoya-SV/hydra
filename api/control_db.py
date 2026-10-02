@@ -5744,7 +5744,9 @@ class ControlDB:
 
     # --- durable scan queue -------------------------------------------
 
-    def claim_next_queued_scan(self, worker_id: str) -> ScanRecord | None:
+    def claim_next_queued_scan(
+        self, worker_id: str, priority_tiers: tuple[str, ...] = ()
+    ) -> ScanRecord | None:
         """Atomically claims the oldest `'queued'` scan for `worker_id`
         — one UPDATE statement, so this is safe under real concurrent
         callers (verified explicitly by
@@ -5759,7 +5761,11 @@ class ControlDB:
         now-current state and either picks a different row or finds
         none, never double-claiming the first caller's row. Returns
         `None` when there's nothing queued (the common, healthy case
-        between bursts of traffic)."""
+        between bursts of traffic).
+
+        Productization Phase 12b: scans of accounts on `priority_tiers`
+        (the tiers with `priority_queue`) are claimed first, then the
+        oldest. Same single atomic statement."""
         now = _now_iso()
         with self._connect() as conn:
             # RETURNING (SQLite 3.35+) hands back the exact row this
@@ -5769,14 +5775,13 @@ class ControlDB:
             # microsecond later (a real risk with a two-statement
             # claim-then-lookup under a tight, fast poll loop).
             row = conn.execute(
-                "UPDATE scans SET status = 'running', worker_id = ?, heartbeat_at = ?, "
-                "updated_at = ? "
-                "WHERE scan_id = ("
-                "    SELECT scan_id FROM scans WHERE status = 'queued' "
-                "    ORDER BY created_at ASC LIMIT 1"
-                ") AND status = 'queued' "
-                "RETURNING *",
-                (worker_id, now, now),
+                _CLAIM_NEXT_SCAN_SQL,
+                {
+                    "worker": worker_id,
+                    "now": now,
+                    # ",pro,ultra," — a tier matches as ",<tier>,".
+                    "priority": "," + ",".join(priority_tiers) + ",",
+                },
             ).fetchone()
         return None if row is None else _scan_record_from_row(row)
 
@@ -7349,6 +7354,23 @@ _ACCOUNT_PSEUDONYMIZE_STATEMENTS: tuple[str, ...] = (
     "UPDATE wompi_webhook_events SET raw_body = '{}' WHERE matched_account_id = :account",
     "UPDATE security_audit_log SET client_ip = NULL "
     "WHERE actor_account_id = :account OR subject_account_id = :account",
+)
+
+# The scan queue's claim (Productization Phase 12b): priority tiers first,
+# then the oldest; one atomic UPDATE (see claim_next_queued_scan). The
+# priority tiers arrive as one comma-delimited parameter, so the statement
+# stays literal and portable.
+_CLAIM_NEXT_SCAN_SQL = (
+    "UPDATE scans SET status = 'running', worker_id = :worker, heartbeat_at = :now, "
+    "updated_at = :now "
+    "WHERE scan_id = ("
+    "    SELECT s.scan_id FROM scans s "
+    "    LEFT JOIN subscriptions sub ON sub.account_id = s.account_id "
+    "    WHERE s.status = 'queued' "
+    "    ORDER BY CASE WHEN :priority LIKE '%,' || COALESCE(sub.tier, '') || ',%' "
+    "    THEN 0 ELSE 1 END, s.created_at ASC LIMIT 1"
+    ") AND status = 'queued' "
+    "RETURNING *"
 )
 
 # Productization Phase 12a: monthly usage, reserved atomically. The cap is

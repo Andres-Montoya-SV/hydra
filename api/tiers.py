@@ -176,15 +176,10 @@ TIERS: dict[Tier, TierLimits] = {
 
 DEFAULT_ULTRA_RETENTION_DAYS = 730
 
-# Scan-queue priority, stated honestly: Round 1/2's scan execution is a
-# plain `asyncio.create_task` per scan (api/scan_orchestrator.py) — there
-# is no real job queue to reorder (already a documented Round 1
-# limitation). `TierLimits.priority_queue` is recorded and surfaced via
-# `GET /account/subscription` so the field exists end-to-end and a real
-# queue landing later has something to read, but it is currently a NO-OP:
-# every scan starts executing the moment it passes the quota gate,
-# regardless of tier. Documented here rather than silently implying a
-# real scheduler exists.
+# Scan-queue priority (Productization Phase 12b): the scan worker claims
+# queued scans of `priority_queue` tiers first, then the oldest
+# (api/scan_worker.py::PRIORITY_TIERS, ControlDB.claim_next_queued_scan).
+# It reorders the queue only: it never skips a scan's checks or quota.
 
 
 def retention_days_for(limits: TierLimits, *, retention_days_override: int | None) -> int:

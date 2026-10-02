@@ -13,7 +13,7 @@ Phase 12 is split in two:
 | Part | Content |
 |---|---|
 | **12a** (this) | the audit; entitlements as data; atomic enforcement; the new per-tier limits |
-| 12b | read-only suspension; the downgrade rule (oldest N domains stay scannable); the scan priority queue |
+| [12b](12b_account_state.md) | read-only suspension; the downgrade rule (oldest N domains stay scannable); the scan priority queue |
 
 ## Audit (2026-10-02, `main` @ `18bd9b0`)
 
