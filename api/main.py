@@ -33,6 +33,7 @@ from api.routers import (
     accounts,
     asset_context,
     collection,
+    diagnostics,
     domains,
     easm,
     explanations,
@@ -57,6 +58,7 @@ from api.routers import (
 from api.scan_worker import generate_worker_id, run_worker_loop
 from api.secrets_box import box_from_keys
 from api.settings import APISettings, load_api_settings, validate_email_provider_config
+from api.version import HYDRA_VERSION
 from api.wompi_client import WompiClient
 
 logger = logging.getLogger("hydra.api")
@@ -280,6 +282,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
             "alive; error tracking (Sentry) and JSON logs are optional, "
             "env-configured — see docs/PAID_API_DESIGN.md."
         ),
+        version=HYDRA_VERSION,
         lifespan=lifespan,
     )
     app.include_router(health.router)
@@ -301,6 +304,7 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(reportability.router)
     app.include_router(hypotheses.router)
     app.include_router(subscription.router)
+    app.include_router(diagnostics.router)
     app.include_router(webhooks.router)
     app.include_router(security_events.router)
     app.include_router(tenant_lifecycle.router)

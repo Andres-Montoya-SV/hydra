@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request
 
 from api.control_db import ControlDB, role_can_modify_scope
 from api.db import set_request_organization
+from api.errors import ApiError
 
 
 def control_db(request: Request) -> ControlDB:
@@ -28,4 +29,4 @@ def require_member(db: ControlDB, account_id: str, organization_id: str) -> str:
 
 def require_owner(db: ControlDB, account_id: str, organization_id: str) -> None:
     if not role_can_modify_scope(require_member(db, account_id, organization_id)):
-        raise HTTPException(status_code=403, detail="Owner role required")
+        raise ApiError(403, "Owner role required", code="owner_role_required")

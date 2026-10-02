@@ -244,7 +244,7 @@ class TestNulCharacters:
     ) -> None:
         response = client.get(path, params=params)
         assert response.status_code == 400
-        assert response.json() == {"detail": "Request contains a NUL character"}
+        assert response.json()["detail"] == "Request contains a NUL character"
         assert response.headers["x-content-type-options"] == "nosniff"
 
     @pytest.mark.parametrize("body", [b'{"email": "a\\u0000@example.com"}', b"{\x00}"])

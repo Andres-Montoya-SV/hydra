@@ -47,6 +47,7 @@ from api import security_audit as audit
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, DuplicateEmailError
 from api.email_sender import EmailSender
+from api.errors import ApiError
 from api.schemas import (
     CreateAccountRequest,
     CreateAccountResponse,
@@ -90,8 +91,10 @@ def _require_account_creation_not_rate_limited(request: Request) -> None:
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     recent = control_db.count_recent_account_creations_from_ip(ip, since=since)
     if recent >= api_settings.account_creation_rate_limit_per_ip_per_day:
+        # The window slides, so an hour is a sensible time to check back.
         raise HTTPException(
             status_code=429,
+            headers={"Retry-After": "3600"},
             detail=(
                 f"Too many accounts created from this network recently "
                 f"(limit: {api_settings.account_creation_rate_limit_per_ip_per_day} per "
@@ -174,14 +177,17 @@ def verify_email(body: VerifyEmailRequest, request: Request) -> VerifyEmailRespo
     control_db = _control_db(request)
     account = control_db.get_account_by_verification_token(body.token)
     if account is None:
-        raise HTTPException(status_code=404, detail="Invalid or already-used verification token.")
+        raise ApiError(
+            404, "Invalid or already-used verification token.", code="verification_token_invalid"
+        )
     if account.email_verification_token_expires_at is not None:
         expires_at = datetime.fromisoformat(account.email_verification_token_expires_at)
         if datetime.now(timezone.utc) >= expires_at:
-            raise HTTPException(
-                status_code=400,
-                detail="This verification token has expired — "
+            raise ApiError(
+                400,
+                "This verification token has expired — "
                 "POST /accounts/resend-verification for a new one.",
+                code="verification_token_expired",
             )
     control_db.mark_email_verified(account.account_id)
     return VerifyEmailResponse(account_id=account.account_id, status="verified")

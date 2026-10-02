@@ -16,6 +16,7 @@ from api import entitlements, subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB
 from api.domain_verification import normalize_domain
+from api.errors import ApiError
 from api.schemas import (
     MonitoringNotificationResponse,
     MonitoringStatusResponse,
@@ -50,12 +51,11 @@ def _require_verified_domain_or_403(control_db: ControlDB, account_id: str, doma
         cap = limits.max_concurrent_verified_domains
         raise entitlements.entitlement_error(limits.tier, "verified_domains", cap or 0)
     if status != "covered":
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"Domain {domain!r} is not currently verified for this account. "
-                f"POST /domains {{'domain': '{domain}'}} to verify it before enabling monitoring."
-            ),
+        raise ApiError(
+            403,
+            f"Domain {domain!r} is not currently verified for this account. "
+            f"POST /domains {{'domain': '{domain}'}} to verify it before enabling monitoring.",
+            code="domain_not_verified",
         )
 
 

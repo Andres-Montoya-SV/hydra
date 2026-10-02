@@ -60,6 +60,7 @@ from api.control_db import (
     LimitReachedError,
     RelationshipRecord,
 )
+from api.errors import ApiError
 from api.routers.org_access import control_db as _db
 from api.routers.org_access import require_member as _require_member
 from api.routers.org_access import require_owner as _require_owner
@@ -113,7 +114,7 @@ def _require_member_manager(db: ControlDB, account_id: str, organization_id: str
     from api.control_db import role_can_manage_members
 
     if not role_can_manage_members(role):
-        raise HTTPException(status_code=403, detail="Owner role required")
+        raise ApiError(403, "Owner role required", code="owner_role_required")
 
 
 def _require_asset(db: ControlDB, organization_id: str, asset_id: str) -> AssetRecord:

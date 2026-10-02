@@ -13,6 +13,7 @@ from api import hypotheses_orchestrator as orchestrator
 from api import subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB
+from api.errors import ApiError
 from api.schemas import (
     HypothesesAssessmentRequest,
     HypothesesAssessmentResponse,
@@ -49,7 +50,9 @@ def _owned_completed_scan_or_404(control_db: ControlDB, scan_id: str, account_id
     if scan is None:
         raise HTTPException(status_code=404, detail="Scan not found")
     if scan.status != "completed":
-        raise HTTPException(status_code=409, detail=f"Scan is {scan.status!r}, not completed yet")
+        raise ApiError(
+            409, f"Scan is {scan.status!r}, not completed yet", code="scan_not_completed"
+        )
     return scan
 
 

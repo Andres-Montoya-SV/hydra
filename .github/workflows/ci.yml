@@ -103,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build image
-        run: docker build -t hydra:ci .
+        run: docker build --build-arg HYDRA_BUILD_COMMIT=${{ github.sha }} -t hydra:ci .
       - name: pytest inside container
         # The image installs requirements-optional.txt, so a missing optional
         # package here is a broken image: fail instead of skipping
