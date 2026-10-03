@@ -70,6 +70,10 @@ _ERROR_SCHEMA: dict[str, Any] = {
         },
     },
 }
+# A path item may also hold `parameters`, `summary`, `servers`...: only these
+# keys are operations.
+HTTP_METHODS = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})
+
 _ERROR_RESPONSE = {
     "description": "Error",
     "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
@@ -102,9 +106,10 @@ def improve(base: dict[str, Any]) -> dict[str, Any]:
     components["securitySchemes"] = {
         "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-API-Key"}
     }
-    for operations in spec["paths"].values():
-        for operation in operations.values():
-            _improve_operation(operation)
+    for path_item in spec["paths"].values():
+        for method, operation in path_item.items():
+            if method in HTTP_METHODS:
+                _improve_operation(operation)
     return spec
 
 
@@ -127,7 +132,7 @@ class HydraAPI(FastAPI):
 
 def _row(method: str, path: str, operation: dict[str, Any]) -> str:
     auth = "key" if operation.get("security") else "public"
-    summary = operation.get("summary", "").replace("|", "\\|")
+    summary = str(operation.get("summary") or "").replace("|", "\\|")
     return f"| `{method.upper()}` | `{path}` | {auth} | {summary} |"
 
 
@@ -136,6 +141,8 @@ def render_reference(spec: dict[str, Any]) -> str:
     groups: dict[str, list[str]] = {}
     for path in sorted(spec["paths"]):
         for method, operation in sorted(spec["paths"][path].items()):
+            if method not in HTTP_METHODS:
+                continue
             tag = (operation.get("tags") or ["other"])[0]
             groups.setdefault(tag, []).append(_row(method, path, operation))
     lines = [

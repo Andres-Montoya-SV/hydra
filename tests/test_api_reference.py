@@ -52,3 +52,23 @@ def test_auth_and_errors_are_declared_on_every_operation() -> None:
     assert spec["components"]["securitySchemes"]["ApiKeyAuth"]["name"] == "X-API-Key"
     error = spec["components"]["schemas"]["ErrorResponse"]["properties"]["error"]
     assert set(error["required"]) == {"code", "message", "request_id", "retryable"}
+
+
+def test_path_level_fields_and_missing_summaries_are_tolerated() -> None:
+    from api.openapi_docs import improve, render_reference
+
+    base = {
+        "openapi": "3.1.0",
+        "info": {"title": "t", "version": "1"},
+        "paths": {
+            "/x": {
+                "summary": "a path-level field, not an operation",
+                "parameters": [{"name": "id", "in": "path", "required": True}],
+                "get": {"summary": None, "responses": {}},
+            }
+        },
+    }
+    spec = improve(base)
+    assert set(spec["paths"]["/x"]["get"]["responses"]) == {"4XX", "5XX"}
+    assert spec["paths"]["/x"]["summary"] == "a path-level field, not an operation"
+    assert "| `GET` | `/x` | public |  |" in render_reference(spec)
