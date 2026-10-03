@@ -65,6 +65,10 @@ ACCOUNT_EXPORTED = "account.exported"
 ACCOUNT_DELETION_REQUESTED = "account.deletion_requested"
 ACCOUNT_DELETION_CANCELLED = "account.deletion_cancelled"
 ACCOUNT_PURGED = "account.purged"
+# Productization Phase 13b.
+DEMO_ORGANIZATION_CREATED = "organization.demo_created"
+FEEDBACK_SUBMITTED = "feedback.submitted"
+ADMIN_FEEDBACK_LISTED = "admin.feedback_listed"
 
 # One failed-sign-in event per client address per minute.
 _AUTH_FAILURE_EVENTS_PER_SECOND = 1 / 60

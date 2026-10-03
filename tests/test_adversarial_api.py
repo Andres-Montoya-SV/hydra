@@ -57,6 +57,7 @@ PUBLIC: frozenset[tuple[str, str]] = frozenset(
 OPERATOR: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/admin/security-events"),
+        ("GET", "/admin/feedback"),
         ("GET", "/admin/wompi/unmatched"),
         ("POST", "/admin/wompi/reconcile"),
         ("GET", "/metrics"),

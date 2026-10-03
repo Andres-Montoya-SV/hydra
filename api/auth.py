@@ -14,6 +14,7 @@ from typing import NoReturn
 from fastapi import Depends, Header, HTTPException, Request
 
 from api.control_db import ControlDB
+from api.errors import ApiError
 from api.rate_limit import RateLimitExceededError, TokenBucketLimiter
 from api.security import is_currently_valid, lookup_hash_for, verify_key
 from api.security_audit import record_auth_failure
@@ -74,6 +75,7 @@ def require_api_key(
 
     control_db.touch_key_last_used(record.key_id)
     _refuse_writes_while_suspended(control_db, request, record.account_id)
+    _refuse_writes_to_a_demo_organization(control_db, request, record.account_id)
     return AuthContext(account_id=record.account_id, key_id=record.key_id)
 
 
@@ -90,6 +92,7 @@ _ALLOWED_WHILE_SUSPENDED: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/account/deletion/cancel"),
         ("DELETE", "/organizations/{organization_id}"),
         ("POST", "/organizations/{organization_id}/deletion/cancel"),
+        ("POST", "/feedback"),  # still a way to reach us (Phase 13b)
     }
 )
 
@@ -114,6 +117,37 @@ def _refuse_writes_while_suspended(
                 "message": "This account is suspended for non-payment and is read-only. "
                 "Resolve billing via POST /account/subscription to resume.",
             },
+        )
+
+
+# A demo organization (Phase 13b) is read-only except for deleting it.
+_ALLOWED_ON_DEMO: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("DELETE", "/organizations/{organization_id}"),
+        ("POST", "/organizations/{organization_id}/deletion/cancel"),
+    }
+)
+
+
+def _refuse_writes_to_a_demo_organization(
+    control_db: ControlDB, request: Request, account_id: str
+) -> None:
+    """Productization Phase 13b: every write naming a demo organization in
+    its path is refused, here, so no route can forget it. Scans never name
+    an organization: they always go to the account's default one, which a
+    demo organization never is."""
+    organization_id = request.path_params.get("organization_id")
+    if request.method in _READ_METHODS or not organization_id:
+        return
+    template = getattr(request.scope.get("route"), "path", "")
+    if (request.method, template) in _ALLOWED_ON_DEMO:
+        return
+    if control_db.is_member_of_demo_organization(account_id, organization_id):
+        raise ApiError(
+            403,
+            "This is a demo organization with sample data; it is read-only. "
+            "Delete it with DELETE /organizations/{organization_id} when you're done.",
+            code="demo_organization_read_only",
         )
 
 
