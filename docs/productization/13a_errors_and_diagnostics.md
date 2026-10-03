@@ -8,8 +8,8 @@ Phase 13 (Private Beta Readiness) is split into four parts:
 | Part | Content |
 |---|---|
 | **13a** (this) | one error shape for every failure; retry semantics; `GET /version`; `GET /account/diagnostics` |
-| 13b | the demo organization (`POST /demo/organization`); feedback (`POST /feedback`) |
-| 13c | a thin API-client CLI; the beta acceptance test |
+| [13b](13b_demo_and_feedback.md) | the demo organization (`POST /demo/organization`); feedback (`POST /feedback`) |
+| [13c](13c_client_cli.md) | a thin API-client CLI; the beta acceptance test |
 | 13d | API reference, operator and customer runbooks, migration and rollback |
 
 ## Recon (2026-10-02, `main` @ `8bb5dc0`)
@@ -68,6 +68,7 @@ Every error has a code. A specific one, when the client can act on it:
 | `scan_not_completed` | 409 | The scan is still running; poll `GET /scans/{id}`. |
 | `owner_role_required` | 403 | Only an organization owner can do this. |
 | `account_suspended` | 402 | Read-only until billing is resolved (`POST /account/subscription`). |
+| `demo_organization_read_only` | 403 | A demo organization (Phase 13b) is sample data; only deleting it is allowed. |
 | `entitlement_exceeded` | 403 | A tier limit (Phase 12a); `upgrade_to` names the next tier. |
 | `capability_not_entitled` | 403 | The tier doesn't include that capability. |
 | `invalid_capability_request` | 422 | The capability selection is malformed. |
