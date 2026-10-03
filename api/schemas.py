@@ -613,6 +613,9 @@ class OrganizationResponse(BaseModel):
     role: str
     created_at: str
     updated_at: str
+    is_demo: bool = Field(
+        default=False, description="Sample data (Phase 13b): read-only, never scanned."
+    )
 
 
 class CreateOrganizationRequest(BaseModel):
@@ -1213,6 +1216,7 @@ class AccountExportResponse(BaseModel):
     api_keys: list[dict[str, Any]]
     memberships: list[dict[str, Any]]
     security_events: list[dict[str, Any]]
+    feedback: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class DiagnosticsScan(BaseModel):
@@ -1255,3 +1259,23 @@ class DiagnosticsResponse(BaseModel):
         default_factory=list,
         description="Plain-language reasons the account may not be working as expected.",
     )
+
+
+FeedbackCategory = Literal["bug", "idea", "question", "other"]
+
+
+class FeedbackRequest(BaseModel):
+    """Productization Phase 13b. Plain text; never include secrets."""
+
+    category: FeedbackCategory
+    message: str = Field(min_length=1, max_length=4000)
+
+
+class FeedbackResponse(BaseModel):
+    feedback_id: str
+    account_id: str
+    category: str
+    message: str
+    created_at: str
+    request_id: str | None = None
+    hydra_version: str | None = None
