@@ -9,8 +9,10 @@ exposures and changes before verifying a real domain (decision 2026-10-02).
   `example.org`; RFC 6761: `.test`), and every IP is in a documentation
   range (RFC 5737). Nothing here refers to anyone's real infrastructure,
   and a test checks every value.
-- **Nothing is scanned.** The fixtures are written as one completed scan
-  (`trigger_source = 'demo'`) in the owner's own results database, then
+- **Nothing is scanned.** The fixtures are written as one scan
+  (`trigger_source = 'demo'`) in the owner's own results database. Its
+  row is inserted already completed, never queued, and the scan worker's
+  claim skips `demo` scans too, so no worker can ever run it. Then
   the ordinary EASM backfill builds the assets, observations, evidence,
   exposures and events from it. The demo therefore shows exactly what a
   real scan would, through the same deterministic engine.
@@ -208,15 +210,14 @@ def _seed(
     control_db: ControlDB, api_settings: APISettings, account_id: str, organization_id: str
 ) -> None:
     scan_id = secrets.token_hex(16)
-    control_db.create_scan(
+    control_db.create_demo_scan(
         scan_id=scan_id,
         account_id=account_id,
+        organization_id=organization_id,
         domain=DEMO_ROOT_DOMAIN,
         # What every scan records (api/routers/scans.py); the results
         # themselves are always opened via `account_db_path`.
         db_path=str(account_settings(api_settings, account_id).project_root),
-        organization_id=organization_id,
-        trigger_source=DEMO_TRIGGER_SOURCE,
     )
     hosts = demo_hosts()
     store = AssetStore(account_db_path(api_settings, account_id))
@@ -224,7 +225,6 @@ def _seed(
     for host in hosts:
         store.upsert_host(scan_id, host)
     store.finish_run(scan_id, host_count=len(hosts), alive_count=len(hosts), warnings=[], errors=[])
-    control_db.update_scan_status(scan_id, "completed")
     run_easm_backfill_for_organization(
         control_db=control_db, api_settings=api_settings, organization_id=organization_id
     )

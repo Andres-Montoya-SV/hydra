@@ -9,7 +9,7 @@ Phase 13 (Private Beta Readiness) is split into four parts:
 |---|---|
 | **13a** (this) | one error shape for every failure; retry semantics; `GET /version`; `GET /account/diagnostics` |
 | [13b](13b_demo_and_feedback.md) | the demo organization (`POST /demo/organization`); feedback (`POST /feedback`) |
-| 13c | a thin API-client CLI; the beta acceptance test |
+| [13c](13c_client_cli.md) | a thin API-client CLI; the beta acceptance test |
 | 13d | API reference, operator and customer runbooks, migration and rollback |
 
 ## Recon (2026-10-02, `main` @ `8bb5dc0`)
