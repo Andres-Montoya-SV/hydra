@@ -150,6 +150,11 @@ class TestRequests:
             _run(argv, _Scripted())
         assert caught.value.code == 2
 
+    def test_a_value_starting_with_a_dash_goes_after_double_dash(self) -> None:
+        transport = _Scripted(_OK)
+        assert _run(["feedback", "idea", "--", "-dash first"], transport)[0] == 0
+        assert json.loads(transport.requests[0][3] or b"{}")["message"] == "-dash first"
+
     def test_unreachable_api(self) -> None:
         with socket.socket() as sock:  # a port nothing listens on
             sock.bind(("127.0.0.1", 0))

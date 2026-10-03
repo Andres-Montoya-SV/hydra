@@ -196,3 +196,14 @@ class TestEmailVerificationGatesScanning:
 
             resp = client.post("/scans", json={"domain": DOMAIN}, headers={"X-API-Key": raw_key})
             assert resp.status_code == 202
+
+
+def test_verification_tokens_never_start_with_a_dash() -> None:
+    """A token starting with `-` reads as an option on a command line
+    (`hydra_client verify-email <token>`): about one signup in 64 failed
+    the beta acceptance test, and CI on main, with SystemExit: 2."""
+    from api.routers.accounts import _new_verification_token
+
+    tokens = [_new_verification_token() for _ in range(2000)]
+    assert all(t[0] != "-" and len(t) == 64 for t in tokens)
+    assert len(set(tokens)) == len(tokens)
