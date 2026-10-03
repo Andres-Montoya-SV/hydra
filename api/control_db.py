@@ -117,7 +117,11 @@ CREATE TABLE IF NOT EXISTS organizations (
     -- deletion_due_at unless cancelled first.
     deletion_requested_at TEXT,
     deletion_due_at TEXT,
-    deletion_requested_by TEXT
+    deletion_requested_by TEXT,
+    -- Productization Phase 13b: a demo organization built from fixtures on
+    -- reserved names only. Read-only, never scanned, and not counted
+    -- against the organization entitlement.
+    is_demo INTEGER NOT NULL DEFAULT 0
 );
 
 -- One row per (account, organization) the account has a role on.
@@ -1216,6 +1220,20 @@ CREATE TABLE IF NOT EXISTS wompi_unmatched_payments (
 -- organization events (and is then covered by row-level security);
 -- `subject_account_id` is the account whose security an event concerns
 -- (key owner, member). No foreign keys: a row outlives what it describes.
+-- Productization Phase 13b: what beta customers tell us (POST /feedback).
+-- Operators read it via GET /admin/feedback. Deleted with the account.
+CREATE TABLE IF NOT EXISTS feedback (
+    feedback_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    request_id TEXT,
+    hydra_version TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_account_created ON feedback(account_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at);
+
 CREATE TABLE IF NOT EXISTS security_audit_log (
     event_id TEXT PRIMARY KEY,
     occurred_at TEXT NOT NULL,
@@ -1496,6 +1514,18 @@ class OrganizationRecord:
     name: str
     created_at: str
     updated_at: str
+    is_demo: bool = False
+
+
+@dataclass(frozen=True)
+class FeedbackRecord:
+    feedback_id: str
+    account_id: str
+    category: str
+    message: str
+    created_at: str
+    request_id: str | None
+    hydra_version: str | None
 
 
 @dataclass(frozen=True)
@@ -1943,6 +1973,7 @@ _ORGANIZATIONS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("deletion_requested_at", "TEXT"),
     ("deletion_due_at", "TEXT"),
     ("deletion_requested_by", "TEXT"),
+    ("is_demo", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 # Durable-queue fix: an existing `scans` table (every account with a
@@ -2362,6 +2393,48 @@ class ControlDB:
             )
         return organization_id
 
+    def create_demo_organization(self, *, account_id: str, name: str) -> tuple[str, bool]:
+        """The account's demo organization (Phase 13b): `(id, created)`.
+        At most one per account: an existing one is returned instead. The
+        check and the insert share the organization entitlement's lock, so
+        concurrent requests still make one. Never counted against it."""
+        organization_id = secrets.token_hex(16)
+        now = _now_iso()
+        with self._connect() as conn:
+            _enforce_limit(self.dialect, conn, "organizations", account_id, None)
+            existing = conn.execute(_DEMO_ORGANIZATION_SQL, (account_id,)).fetchone()
+            if existing is not None:
+                return existing["organization_id"], False
+            conn.execute(
+                "INSERT INTO organizations (organization_id, name, created_at, updated_at, "
+                "is_demo) VALUES (?, ?, ?, ?, 1)",
+                (organization_id, name, now, now),
+            )
+            conn.execute(
+                "INSERT INTO account_organization_roles "
+                "(account_id, organization_id, role, created_at) VALUES (?, ?, 'owner', ?)",
+                (account_id, organization_id, now),
+            )
+        return organization_id, True
+
+    def count_owned_organizations(self, account_id: str) -> int:
+        """What the organization entitlement counts: owned, demo excluded."""
+        with self._connect() as conn:
+            row = conn.execute(_ENTITLEMENT_COUNT_SQL["organizations"], (account_id,)).fetchone()
+        return int(row[0])
+
+    def is_member_of_demo_organization(self, account_id: str, organization_id: str) -> bool:
+        """True only for a member: to anyone else a demo organization must
+        look exactly like one that doesn't exist (404, never 403)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT o.is_demo FROM organizations o "
+                "JOIN account_organization_roles r ON r.organization_id = o.organization_id "
+                "WHERE o.organization_id = ? AND r.account_id = ?",
+                (organization_id, account_id),
+            ).fetchone()
+        return row is not None and bool(row["is_demo"])
+
     def get_organization(self, organization_id: str) -> OrganizationRecord | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -2374,6 +2447,7 @@ class ControlDB:
             name=row["name"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            is_demo=bool(row["is_demo"]),
         )
 
     def add_account_organization_role(
@@ -5742,6 +5816,68 @@ class ControlDB:
             ).fetchone()
         return None if row is None else _scan_record_from_row(row)
 
+    # --- feedback (Phase 13b) ------------------------------------------
+
+    def create_feedback(
+        self,
+        *,
+        account_id: str,
+        category: str,
+        message: str,
+        request_id: str | None,
+        hydra_version: str | None,
+    ) -> FeedbackRecord:
+        record = FeedbackRecord(
+            feedback_id=secrets.token_hex(16),
+            account_id=account_id,
+            category=category,
+            message=message,
+            created_at=_now_iso(),
+            request_id=request_id,
+            hydra_version=hydra_version,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO feedback (feedback_id, account_id, category, message, created_at, "
+                "request_id, hydra_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.feedback_id,
+                    record.account_id,
+                    record.category,
+                    record.message,
+                    record.created_at,
+                    record.request_id,
+                    record.hydra_version,
+                ),
+            )
+        return record
+
+    def count_recent_feedback(self, account_id: str, *, since: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT count(*) FROM feedback WHERE account_id = ? AND created_at >= ?",
+                (account_id, since),
+            ).fetchone()
+        return int(row[0])
+
+    def list_feedback(self, *, limit: int, offset: int) -> list[FeedbackRecord]:
+        """Newest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM feedback ORDER BY created_at DESC, feedback_id DESC "
+                "LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return [_feedback_from_row(row) for row in rows]
+
+    def list_feedback_for_account(self, account_id: str) -> list[FeedbackRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM feedback WHERE account_id = ? ORDER BY created_at",
+                (account_id,),
+            ).fetchall()
+        return [_feedback_from_row(row) for row in rows]
+
     def list_recent_scans_for_account(self, account_id: str, limit: int) -> list[ScanRecord]:
         """The account's own newest scans, in one indexed query (support
         diagnostics, Phase 13a). Ownership is the account, as in
@@ -6818,6 +6954,7 @@ class ControlDB:
             rows = conn.execute(
                 "SELECT * FROM scans WHERE account_id = ? "
                 "AND status IN ('completed', 'failed') AND created_at < ? "
+                "AND trigger_source <> 'demo' "
                 "ORDER BY created_at ASC LIMIT ?",
                 (account_id, cutoff, limit),
             ).fetchall()
@@ -7348,6 +7485,7 @@ _ACCOUNT_PURGE_STATEMENTS: tuple[tuple[str, str], ...] = (
         "DELETE FROM account_organization_roles WHERE account_id = :account",
     ),
     ("api_keys", "DELETE FROM api_keys WHERE account_id = :account"),
+    ("feedback", "DELETE FROM feedback WHERE account_id = :account"),
 )
 
 # What is kept of a purged account, without anything identifying a person:
@@ -7406,13 +7544,33 @@ _USAGE_RELEASE_SQL: dict[str, str] = {
 # Current counts behind the count-based entitlements, read under the
 # entitlement's write lock (see _enforce_limit).
 _ENTITLEMENT_COUNT_SQL: dict[str, str] = {
-    "organizations": "SELECT count(*) FROM account_organization_roles "
-    "WHERE account_id = ? AND role = 'owner'",
+    "organizations": "SELECT count(*) FROM account_organization_roles r "
+    "JOIN organizations o ON o.organization_id = r.organization_id "
+    "WHERE r.account_id = ? AND r.role = 'owner' AND o.is_demo = 0",
     "members": "SELECT count(*) FROM account_organization_roles WHERE organization_id = ?",
     "webhooks": "SELECT count(*) FROM webhooks WHERE account_id = ?",
     "integrations": "SELECT count(*) FROM ticketing_integrations "
     "WHERE organization_id = ? AND status = 'active'",
 }
+
+
+_DEMO_ORGANIZATION_SQL = (
+    "SELECT o.organization_id FROM organizations o "
+    "JOIN account_organization_roles r ON r.organization_id = o.organization_id "
+    "WHERE r.account_id = ? AND r.role = 'owner' AND o.is_demo = 1"
+)
+
+
+def _feedback_from_row(row: Any) -> FeedbackRecord:
+    return FeedbackRecord(
+        feedback_id=row["feedback_id"],
+        account_id=row["account_id"],
+        category=row["category"],
+        message=row["message"],
+        created_at=row["created_at"],
+        request_id=row["request_id"],
+        hydra_version=row["hydra_version"],
+    )
 
 
 def _enforce_limit(
