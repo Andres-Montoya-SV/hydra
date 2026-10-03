@@ -20,6 +20,7 @@ from api.control_db import ControlDB
 from api.db import PoolConfig
 from api.demo import DEMO_TRIGGER_SOURCE, demo_hosts
 from api.subscriptions import apply_tier_change
+from api.tenancy import account_settings
 from api.tenant_lifecycle import purge_organization_now
 
 _RESERVED_NAMES = ("example.com", "example.net", "example.org")
@@ -172,7 +173,11 @@ class TestNeverScannedNorCounted:
         assert db.default_organization_id_for_account(account) == default_org != org
         purgeable = db.list_purgeable_scans_for_account(account, cutoff="9999", limit=100)
         assert [s for s in purgeable if s.trigger_source == DEMO_TRIGGER_SOURCE] == []
-        assert [s.trigger_source for s in db.list_scans_for_organization(org)] == ["demo"]
+        (demo_scan,) = db.list_scans_for_organization(org)
+        assert demo_scan.trigger_source == "demo"
+        # Recorded like every real scan's.
+        settings = account_settings(client.app.state.api_settings, account)
+        assert demo_scan.db_path == str(settings.project_root)
 
 
 class TestFeedback:

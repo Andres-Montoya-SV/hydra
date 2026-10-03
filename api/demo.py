@@ -28,7 +28,7 @@ import secrets
 from typing import TYPE_CHECKING
 
 from api.easm_backfill import run_easm_backfill_for_organization
-from api.tenancy import account_db_path
+from api.tenancy import account_db_path, account_settings
 from core.assets import (
     DnsRecord,
     Finding,
@@ -212,7 +212,9 @@ def _seed(
         scan_id=scan_id,
         account_id=account_id,
         domain=DEMO_ROOT_DOMAIN,
-        db_path=str(api_settings.data_dir),
+        # What every scan records (api/routers/scans.py); the results
+        # themselves are always opened via `account_db_path`.
+        db_path=str(account_settings(api_settings, account_id).project_root),
         organization_id=organization_id,
         trigger_source=DEMO_TRIGGER_SOURCE,
     )
