@@ -163,6 +163,7 @@ def _account_export(db: ControlDB, account_id: str) -> AccountExportResponse:
             }
             for event in db.list_security_events_for_account(account_id, limit=500, offset=0)
         ],
+        feedback=[asdict(item) for item in db.list_feedback_for_account(account_id)],
     )
 
 

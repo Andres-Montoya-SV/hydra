@@ -180,6 +180,7 @@ def list_organizations(
                 role=role,
                 created_at=org.created_at,
                 updated_at=org.updated_at,
+                is_demo=org.is_demo,
             )
         )
     return responses

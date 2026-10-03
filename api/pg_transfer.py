@@ -30,6 +30,7 @@ SQLITE_TABLE_READS: dict[str, str] = {
     "wompi_webhook_events": "SELECT * FROM wompi_webhook_events",
     "account_organization_roles": "SELECT * FROM account_organization_roles",
     "api_keys": "SELECT * FROM api_keys",
+    "feedback": "SELECT * FROM feedback",
     "assets": "SELECT * FROM assets",
     "capability_audit_log": "SELECT * FROM capability_audit_log",
     "cost_estimates": "SELECT * FROM cost_estimates",
