@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, Request
 
 from api import subscriptions
 from api.auth import AuthContext, require_api_key
-from api.control_db import ControlDB, ScanRecord, SubscriptionRecord
+from api.control_db import ControlDB, SubscriptionRecord
 from api.edge import current_request_id
 from api.schemas import DiagnosticsResponse, DiagnosticsScan
 from api.security import is_currently_valid
@@ -27,13 +27,7 @@ RECENT_SCANS = 10
 
 
 def _recent_scans(control_db: ControlDB, account_id: str) -> list[DiagnosticsScan]:
-    scans: list[ScanRecord] = [
-        scan
-        for organization_id, _ in control_db.list_organizations_for_account(account_id)
-        for scan in control_db.list_scans_for_organization(organization_id)
-        if scan.account_id == account_id
-    ]
-    recent = sorted(scans, key=lambda s: s.created_at, reverse=True)[:RECENT_SCANS]
+    recent = control_db.list_recent_scans_for_account(account_id, RECENT_SCANS)
     return [
         DiagnosticsScan(
             scan_id=s.scan_id,

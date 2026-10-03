@@ -267,6 +267,22 @@ class TestDiagnostics:
         assert any(h.startswith("Account suspended") for h in body["hints"])
         assert any("beyond the tier's limit" in h for h in body["hints"])
 
+    def test_the_ten_newest_scans_in_one_query(self, client: TestClient) -> None:
+        headers, account, org = verified_owner(client)
+        db: ControlDB = client.app.state.control_db
+        for i in range(12):  # padded ids: the tie-break agrees with creation order
+            db.create_scan(
+                scan_id=f"scan-{i:02d}",
+                account_id=account,
+                domain="example.com",
+                db_path="x",
+                organization_id=org,
+            )
+        body = client.get("/account/diagnostics", headers=headers).json()
+        assert [s["scan_id"] for s in body["recent_scans"]] == [
+            f"scan-{i:02d}" for i in range(11, 1, -1)
+        ]
+
 
 def test_every_specific_code_is_documented() -> None:
     used = set()

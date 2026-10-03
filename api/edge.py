@@ -241,7 +241,9 @@ class EdgeMiddleware:
 
 async def _send_error(send: Send, error: HTTPException, extra: list[tuple[bytes, bytes]]) -> None:
     body = json.dumps(
-        error_body(error.status_code, error.detail, request_id=current_request_id())
+        jsonable_encoder(
+            error_body(error.status_code, error.detail, request_id=current_request_id())
+        )
     ).encode()
     await send(
         {
