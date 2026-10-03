@@ -158,30 +158,37 @@ def _simple(build: Callable[[argparse.Namespace], tuple[str, str, Any]]) -> Hand
     return run
 
 
+# Each command's arguments: positionals, then options as (flag, keyword arguments).
+_ARGUMENTS: dict[str, tuple[list[str], list[tuple[str, dict[str, Any]]]]] = {
+    "verify-email": (["token"], []),
+    "org-create": (["name"], []),
+    "domain-add": (["domain"], []),
+    "domain-verify": (
+        ["domain"],
+        [("--method", {"choices": ["dns_txt", "well_known_file"], "default": "dns_txt"})],
+    ),
+    "scan": (
+        ["domain"],
+        [("--profile", {"choices": ["standard", "passive"], "default": "standard"})],
+    ),
+    "scan-status": (["scan_id"], []),
+    "assets": (["organization_id"], []),
+    "exposures": (["organization_id"], []),
+    "exposure-resolve": (["organization_id", "exposure_id"], [("--reason", {"required": True})]),
+    "monitor": (
+        ["domain"],
+        [("--speed2", {"action": "store_true", "help": "Weekly active scan (Pro+)."})],
+    ),
+    "feedback": (["category", "message"], []),
+}
+
+
 def _add_arguments(name: str, parser: argparse.ArgumentParser) -> None:
-    positional = {
-        "verify-email": ["token"],
-        "org-create": ["name"],
-        "domain-add": ["domain"],
-        "domain-verify": ["domain"],
-        "scan": ["domain"],
-        "scan-status": ["scan_id"],
-        "assets": ["organization_id"],
-        "exposures": ["organization_id"],
-        "exposure-resolve": ["organization_id", "exposure_id"],
-        "monitor": ["domain"],
-        "feedback": ["category", "message"],
-    }
-    for argument in positional.get(name, []):
+    positionals, options = _ARGUMENTS.get(name, ([], []))
+    for argument in positionals:
         parser.add_argument(argument)
-    if name == "domain-verify":
-        parser.add_argument("--method", choices=["dns_txt", "well_known_file"], default="dns_txt")
-    elif name == "scan":
-        parser.add_argument("--profile", choices=["standard", "passive"], default="standard")
-    elif name == "exposure-resolve":
-        parser.add_argument("--reason", required=True)
-    elif name == "monitor":
-        parser.add_argument("--speed2", action="store_true", help="Weekly active scan (Pro+).")
+    for flag, settings in options:
+        parser.add_argument(flag, **settings)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -248,9 +255,11 @@ def main(
     transport: Transport | None = None,
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
-    env: Mapping[str, str] = os.environ,
+    env: Mapping[str, str] | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
+    """`env` defaults to the process environment, read at call time."""
+    env = os.environ if env is None else env
     args = build_parser().parse_args(argv)
     base_url = env.get("HYDRA_API_URL") or DEFAULT_API_URL
     try:

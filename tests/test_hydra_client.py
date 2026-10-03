@@ -126,6 +126,14 @@ class TestRequests:
         code, _, err = _run(["version"], _Scripted(), env={"HYDRA_API_URL": "ftp://x"})
         assert code == 2 and "http(s)" in err
 
+    def test_the_process_environment_is_read_at_call_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        err = io.StringIO()
+        monkeypatch.setenv("HYDRA_API_URL", "ftp://from-the-environment")
+        assert main(["version"], transport=_Scripted(), stderr=err) == 2
+        assert "ftp://from-the-environment" in err.getvalue()
+
     def test_cleartext_to_a_remote_host_warns(self) -> None:
         _, _, err = _run(
             ["version"], _Scripted(_OK), env={"HYDRA_API_URL": "http://api.example.com"}
