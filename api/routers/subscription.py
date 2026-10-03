@@ -76,11 +76,7 @@ def get_subscription(
         ),
         imports_used_this_period=usage.imports_used,
         imports_limit=limits.imports_per_month,
-        organizations_owned=sum(
-            1
-            for _, role in control_db.list_organizations_for_account(auth.account_id)
-            if role == "owner"
-        ),
+        organizations_owned=control_db.count_owned_organizations(auth.account_id),
         organizations_limit=limits.max_organizations,
         webhooks_count=control_db.count_webhooks_for_account(auth.account_id),
         webhooks_limit=limits.max_integrations,
