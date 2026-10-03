@@ -5630,6 +5630,22 @@ class ControlDB:
             if override_json is not None:
                 _audit_scan_override(conn, organization_id, account_id, scan_id, override_json, now)
 
+    def create_demo_scan(
+        self, *, scan_id: str, account_id: str, organization_id: str, domain: str, db_path: str
+    ) -> None:
+        """The demo organization's fixture scan (Phase 13b), inserted
+        already `completed`: it is never queued, so no worker can ever
+        claim and run it (the claim also skips `demo` scans)."""
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO scans "
+                "(scan_id, account_id, domain, db_path, status, created_at, updated_at, "
+                "trigger_source, organization_id) "
+                "VALUES (?, ?, ?, ?, 'completed', ?, ?, 'demo', ?)",
+                (scan_id, account_id, domain, db_path, now, now, organization_id),
+            )
+
     def account_for_run(self, organization_id: str, run_id: str) -> str | None:
         """Which account's scan produced `run_id` — only if that scan belongs
         to `organization_id` (a foreign run is indistinguishable from none).
@@ -7516,7 +7532,7 @@ _CLAIM_NEXT_SCAN_SQL = (
     "WHERE scan_id = ("
     "    SELECT s.scan_id FROM scans s "
     "    LEFT JOIN subscriptions sub ON sub.account_id = s.account_id "
-    "    WHERE s.status = 'queued' "
+    "    WHERE s.status = 'queued' AND s.trigger_source <> 'demo' "
     "    ORDER BY CASE WHEN :priority LIKE '%,' || COALESCE(sub.tier, '') || ',%' "
     "    THEN 0 ELSE 1 END, s.created_at ASC LIMIT 1"
     ") AND status = 'queued' "

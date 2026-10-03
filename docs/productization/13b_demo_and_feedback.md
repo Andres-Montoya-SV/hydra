@@ -27,8 +27,11 @@ and changes before verifying a real domain.
   Nothing refers to anyone's real infrastructure. A test checks every
   name, URL and address in the fixture.
 - **Nothing is scanned or contacted.** The fixtures (`api/demo.py`) are
-  written as one completed scan with `trigger_source = 'demo'` in the
-  owner's results database. The ordinary EASM backfill then builds the
+  written as one scan with `trigger_source = 'demo'` in the owner's
+  results database. Its row is inserted already completed, never queued,
+  and the scan worker's claim skips `demo` scans as well. (Fixed in 13c:
+  it used to be queued for a moment, see
+  [13c](13c_client_cli.md#a-13b-bug-it-found).) The ordinary EASM backfill then builds the
   assets, observations, evidence, exposures and events
   from it. The demo shows exactly what a real scan would, produced by the
   same deterministic engine, with real evidence chains.

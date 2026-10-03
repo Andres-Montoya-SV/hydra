@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,8 @@ from api.auth import _ALLOWED_ON_DEMO
 from api.control_db import ControlDB
 from api.db import PoolConfig
 from api.demo import DEMO_TRIGGER_SOURCE, demo_hosts
+from api.main import create_app
+from api.settings import APISettings
 from api.subscriptions import apply_tier_change
 from api.tenancy import account_settings
 from api.tenant_lifecycle import purge_organization_now
@@ -178,6 +181,44 @@ class TestNeverScannedNorCounted:
         # Recorded like every real scan's.
         settings = account_settings(client.app.state.api_settings, account)
         assert demo_scan.db_path == str(settings.project_root)
+
+
+class TestNoWorkerEverRunsTheDemoScan:
+    """Found by the 13c acceptance test: the demo scan was inserted
+    `queued` and completed a moment later, so a running scan worker could
+    claim it and really scan example.com."""
+
+    def test_the_claim_skips_demo_scans_even_if_one_were_queued(self, tmp_path: Path) -> None:
+        db = ControlDB(tmp_path / "control.db")
+        account = db.create_account(email="claim@example.com")
+        db.create_scan(
+            scan_id="queued-demo",
+            account_id=account,
+            domain="example.com",
+            db_path="x",
+            trigger_source="demo",
+        )
+        assert db.claim_next_queued_scan("w") is None
+
+    def test_creating_a_demo_with_workers_running_never_runs_a_pipeline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ran: list[str] = []
+
+        async def pipeline(settings: Any, *, domain: str, targets_file: Any, run_id: str) -> Any:
+            ran.append(domain)
+            raise RuntimeError("a demo scan must never run")
+
+        monkeypatch.setattr("app._run_headless_pipeline", pipeline)
+        settings = APISettings(
+            data_dir=tmp_path / "api", max_concurrent_scans=2, scan_poll_interval_seconds=0.01
+        )
+        with TestClient(create_app(settings)) as c:
+            headers, _, _ = verified_owner(c)
+            org = _demo(c, headers)
+            time.sleep(0.3)  # many worker poll cycles
+            (scan,) = c.app.state.control_db.list_scans_for_organization(org)
+        assert ran == [] and (scan.status, scan.worker_id) == ("completed", None)
 
 
 class TestFeedback:
