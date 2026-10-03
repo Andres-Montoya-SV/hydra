@@ -26,6 +26,9 @@ behave) plus the optional CORS policy.
     the API.
 - **CORS.** None unless HYDRA_API_CORS_ORIGINS lists origins; then exactly
   those, without credentials.
+- **One error shape (Phase 13a).** Every error, from a router, request
+  validation, an unhandled exception or this middleware itself, keeps
+  its `detail` and gains the `error` object of `api/errors.py`.
 """
 
 from __future__ import annotations
@@ -38,8 +41,13 @@ from collections.abc import Awaitable, Callable, MutableMapping
 from contextvars import ContextVar
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from api.errors import error_body
 from api.settings import APISettings
 
 Scope = MutableMapping[str, Any]
@@ -83,6 +91,13 @@ class _BodyTooLargeError(HTTPException):
 
     def __init__(self, limit: int) -> None:
         super().__init__(status_code=413, detail=f"Request body exceeds {limit} bytes")
+
+
+class _InternalError(HTTPException):
+    """An unhandled exception: the details stay in the server log."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=500, detail="Internal Server Error")
 
 
 class _NulCharacterError(HTTPException):
@@ -205,6 +220,15 @@ class EdgeMiddleware:
             if started:
                 raise
             await _send_error(send, refused, extra)
+        except Exception:
+            # Starlette answers an unhandled exception in its outermost
+            # layer, outside this one: without this, a 500 carried no
+            # request id and no security headers. Answer here, then
+            # re-raise so the server still logs it (and Sentry sees it);
+            # Starlette sends nothing more once a response has started.
+            if not started:
+                await _send_error(send, _InternalError(), extra)
+            raise
 
     def _response_headers(self, scope: Scope, request_id: str) -> list[tuple[bytes, bytes]]:
         headers = [*_SECURITY_HEADERS, (b"x-request-id", request_id.encode())]
@@ -216,7 +240,11 @@ class EdgeMiddleware:
 
 
 async def _send_error(send: Send, error: HTTPException, extra: list[tuple[bytes, bytes]]) -> None:
-    body = json.dumps({"detail": error.detail}).encode()
+    body = json.dumps(
+        jsonable_encoder(
+            error_body(error.status_code, error.detail, request_id=current_request_id())
+        )
+    ).encode()
     await send(
         {
             "type": "http.response.start",
@@ -229,6 +257,31 @@ async def _send_error(send: Send, error: HTTPException, extra: list[tuple[bytes,
         }
     )
     await send({"type": "http.response.body", "body": body})
+
+
+def _no_body(status_code: int) -> bool:
+    return status_code < 200 or status_code in (204, 304)
+
+
+async def _http_error(request: Request, exc: Exception) -> Response:
+    status_code = getattr(exc, "status_code", 500)
+    headers = getattr(exc, "headers", None)
+    if _no_body(status_code):
+        return Response(status_code=status_code, headers=headers)
+    body = error_body(
+        status_code,
+        getattr(exc, "detail", None),
+        request_id=current_request_id(),
+        code=getattr(exc, "code", None),
+        headers=headers,
+    )
+    return JSONResponse(body, status_code=status_code, headers=headers)
+
+
+async def _validation_error(request: Request, exc: Exception) -> Response:
+    errors = exc.errors() if isinstance(exc, RequestValidationError) else []
+    body = error_body(422, jsonable_encoder(errors), request_id=current_request_id())
+    return JSONResponse(body, status_code=422)
 
 
 def install_edge(app: FastAPI, settings: APISettings) -> None:
@@ -247,6 +300,8 @@ def install_edge(app: FastAPI, settings: APISettings) -> None:
             allow_headers=["X-API-Key", "Content-Type", REQUEST_ID_HEADER],
             expose_headers=[REQUEST_ID_HEADER],
         )
+    app.add_exception_handler(StarletteHTTPException, _http_error)
+    app.add_exception_handler(RequestValidationError, _validation_error)
     app.add_middleware(
         EdgeMiddleware,
         max_body_bytes=settings.max_body_bytes,

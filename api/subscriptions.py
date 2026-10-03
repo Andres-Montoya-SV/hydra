@@ -209,6 +209,13 @@ def domain_scan_gate(
     return ("covered", record) if within == "covered" else ("over_limit", record)
 
 
+def unscannable_domains(control_db: ControlDB, account_id: str, limits: TierLimits) -> list[str]:
+    """Verified domains beyond the tier's N oldest, sorted (Phase 12b)."""
+    active = control_db.get_verified_domains_for_account(account_id)
+    scannable = {v.verification_id for v in scannable_verifications(active, limits)}
+    return sorted(v.domain for v in active if v.verification_id not in scannable)
+
+
 # --- verified-domain concurrency limit (Part A x Part B) ---------------
 
 

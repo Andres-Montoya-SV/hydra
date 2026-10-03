@@ -5742,6 +5742,18 @@ class ControlDB:
             ).fetchone()
         return None if row is None else _scan_record_from_row(row)
 
+    def list_recent_scans_for_account(self, account_id: str, limit: int) -> list[ScanRecord]:
+        """The account's own newest scans, in one indexed query (support
+        diagnostics, Phase 13a). Ownership is the account, as in
+        `get_owned_scan`."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scans WHERE account_id = ? "
+                "ORDER BY created_at DESC, scan_id DESC LIMIT ?",
+                (account_id, limit),
+            ).fetchall()
+        return [_scan_record_from_row(row) for row in rows]
+
     # --- durable scan queue -------------------------------------------
 
     def claim_next_queued_scan(

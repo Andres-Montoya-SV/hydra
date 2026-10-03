@@ -46,6 +46,7 @@ PUBLIC: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/health"),
         ("GET", "/ready"),
+        ("GET", "/version"),  # release and contract version only (Phase 13a)
         ("POST", "/accounts"),
         ("POST", "/accounts/verify-email"),
         ("POST", "/accounts/resend-verification"),

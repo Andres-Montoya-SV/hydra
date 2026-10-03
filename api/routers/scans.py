@@ -23,6 +23,7 @@ from api import entitlements, subscriptions
 from api.auth import AuthContext, require_api_key
 from api.control_db import ControlDB, DomainVerificationRecord, ScanRecord
 from api.domain_verification import normalize_domain
+from api.errors import ApiError
 from api.monitoring import DEGRADED_OUTCOMES
 from api.schemas import (
     ClientReportRequest,
@@ -76,20 +77,18 @@ def _require_verified_domain_or_403(
         raise entitlements.entitlement_error(limits.tier, "verified_domains", cap or 0)
     if status == "expired":
         expired = cast(DomainVerificationRecord, record)
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"Verification for {expired.domain!r} expired on {expired.expires_at}. "
-                f"POST /domains {{'domain': '{expired.domain}'}} to re-verify before scanning."
-            ),
+        raise ApiError(
+            403,
+            f"Verification for {expired.domain!r} expired on {expired.expires_at}. "
+            f"POST /domains {{'domain': '{expired.domain}'}} to re-verify before scanning.",
+            code="domain_verification_expired",
         )
-    raise HTTPException(
-        status_code=403,
-        detail=(
-            f"Domain {domain!r} is not verified for this account. "
-            f"POST /domains {{'domain': '{domain}'}} to start verification, then "
-            "POST /domains/{domain}/verify."
-        ),
+    raise ApiError(
+        403,
+        f"Domain {domain!r} is not verified for this account. "
+        f"POST /domains {{'domain': '{domain}'}} to start verification, then "
+        "POST /domains/{domain}/verify.",
+        code="domain_not_verified",
     )
 
 
@@ -106,10 +105,11 @@ def _require_verified_email_or_403(control_db: ControlDB, account_id: str) -> No
     already-onboarded users, not a security fix."""
     account = control_db.get_account(account_id)
     if account is not None and account.email is not None and not account.is_email_verified:
-        raise HTTPException(
-            status_code=403,
-            detail="This account's email address has not been verified yet. Check your inbox "
+        raise ApiError(
+            403,
+            "This account's email address has not been verified yet. Check your inbox "
             "for the verification link, or POST /accounts/resend-verification for a new one.",
+            code="email_not_verified",
         )
 
 
@@ -122,18 +122,19 @@ def _require_billing_and_quota_ok(control_db: ControlDB, account_id: str):
     the real reason is unrelated to how many scans it has run."""
     subscription = subscriptions.get_or_create_subscription(control_db, account_id)
     if subscriptions.access_blocked_by_billing(subscription):
-        raise HTTPException(
-            status_code=402,
-            detail="This account's subscription is suspended (payment past due beyond the "
+        raise ApiError(
+            402,
+            "This account's subscription is suspended (payment past due beyond the "
             f"{subscriptions.GRACE_PERIOD_DAYS}-day grace period). Resolve billing via "
             "POST /account/subscription to resume scanning.",
+            code="account_suspended",
         )
     limits = subscriptions.effective_limits(subscription)
     # A cheap early refusal; the authoritative, atomic one is
     # `reserve_scan`, right before the scan is created.
     ok, reason = subscriptions.check_scan_quota(control_db, account_id, limits)
     if not ok:
-        raise HTTPException(status_code=403, detail=reason)
+        raise ApiError(403, reason, code="scan_quota_exceeded")
     return limits
 
 
@@ -210,7 +211,7 @@ async def create_scan(
 
     ok, reason = subscriptions.reserve_scan(control_db, auth.account_id, limits)
     if not ok:
-        raise HTTPException(status_code=403, detail=reason)
+        raise ApiError(403, reason, code="scan_quota_exceeded")
     scan_id = secrets.token_hex(16)
     db_path = str(account_settings(api_settings, auth.account_id).project_root)
     try:
@@ -336,7 +337,9 @@ def get_scan_report(
     control_db = _control_db(request)
     scan = _owned_scan_or_404(control_db, scan_id, auth.account_id)
     if scan.status != "completed":
-        raise HTTPException(status_code=409, detail=f"Scan is {scan.status!r}, not completed yet")
+        raise ApiError(
+            409, f"Scan is {scan.status!r}, not completed yet", code="scan_not_completed"
+        )
 
     settings = account_settings(_api_settings(request), auth.account_id)
     output_root = settings.project_root / settings.output_directory
@@ -376,7 +379,9 @@ def post_client_report(
 
     scan = _owned_scan_or_404(control_db, scan_id, auth.account_id)
     if scan.status != "completed":
-        raise HTTPException(status_code=409, detail=f"Scan is {scan.status!r}, not completed yet")
+        raise ApiError(
+            409, f"Scan is {scan.status!r}, not completed yet", code="scan_not_completed"
+        )
 
     settings = account_settings(_api_settings(request), auth.account_id)
     output_root = settings.project_root / settings.output_directory

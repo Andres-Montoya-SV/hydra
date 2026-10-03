@@ -163,6 +163,12 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY --chown=hydra:hydra . .
 
+# The commit this image was built from, shown in the authenticated support
+# diagnostics (`docker build --build-arg HYDRA_BUILD_COMMIT=$(git rev-parse HEAD)`).
+# After the source copy, so it never invalidates the dependency layers.
+ARG HYDRA_BUILD_COMMIT=
+ENV HYDRA_BUILD_COMMIT=$HYDRA_BUILD_COMMIT
+
 # output/, logs/, reports/ (and recon.db, which lives under output/) are
 # meant to be bind-mounted volumes, not image content — see docs/DOCKER.md.
 

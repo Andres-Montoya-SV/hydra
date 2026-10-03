@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from api.control_db import ControlDB
 from api.health import LoopHeartbeats, check_health
 from api.settings import APISettings
+from api.version import API_VERSION, HYDRA_VERSION
 
 router = APIRouter(tags=["health"])
 
@@ -43,3 +44,11 @@ def ready(request: Request) -> JSONResponse:
     except Exception:  # any failure to reach the database means "not ready"
         return JSONResponse(status_code=503, content={"status": "not ready"})
     return JSONResponse(status_code=200, content={"status": "ready"})
+
+
+@router.get("/version")
+def version() -> dict[str, str]:
+    """Public, like `/health`: a client can check compatibility before it
+    has a key. The release and contract version only; the build commit
+    is in the authenticated support diagnostics."""
+    return {"version": HYDRA_VERSION, "api_version": API_VERSION}

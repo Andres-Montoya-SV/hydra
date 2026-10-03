@@ -1213,3 +1213,45 @@ class AccountExportResponse(BaseModel):
     api_keys: list[dict[str, Any]]
     memberships: list[dict[str, Any]]
     security_events: list[dict[str, Any]]
+
+
+class DiagnosticsScan(BaseModel):
+    scan_id: str
+    domain: str
+    status: str
+    trigger_source: str
+    created_at: str
+    updated_at: str
+    retry_count: int
+    error_message: str | None = None
+
+
+class DiagnosticsResponse(BaseModel):
+    """Productization Phase 13a: everything support needs to help this
+    account, for this account only. Never a secret: no key material, no
+    tokens, no integration credentials."""
+
+    request_id: str
+    server_time: str
+    version: str
+    api_version: str
+    build_commit: str | None
+    account_id: str
+    email_verified: bool
+    key_id: str
+    key_expires_at: str | None
+    active_keys: int
+    tier: str
+    subscription_status: str
+    scans_used_this_period: int
+    scans_per_month: int
+    organizations: int
+    verified_domains: int
+    unscannable_verified_domains: list[str]
+    monitored_domains: int
+    monitored_domains_paused: int
+    recent_scans: list[DiagnosticsScan]
+    hints: list[str] = Field(
+        default_factory=list,
+        description="Plain-language reasons the account may not be working as expected.",
+    )

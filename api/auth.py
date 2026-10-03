@@ -7,6 +7,7 @@ SQLite lookups are blocking calls (see `api/control_db.py`).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import NoReturn
 
@@ -64,7 +65,12 @@ def require_api_key(
     try:
         _rate_limiter(request).check(record.key_id)
     except RateLimitExceededError as exc:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded") from exc
+        # One request's worth of tokens refills in 60/limit seconds.
+        per_minute = request.app.state.api_settings.rate_limit_per_minute
+        retry_after = str(max(1, math.ceil(60 / max(per_minute, 1))))
+        raise HTTPException(
+            status_code=429, detail="Rate limit exceeded", headers={"Retry-After": retry_after}
+        ) from exc
 
     control_db.touch_key_last_used(record.key_id)
     _refuse_writes_while_suspended(control_db, request, record.account_id)

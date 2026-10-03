@@ -24,6 +24,7 @@ from api.collection_capabilities import (
     validate_requested,
 )
 from api.control_db import ControlDB, role_can_modify_scope
+from api.errors import ApiError
 from api.routers.org_access import control_db as _db
 from api.routers.org_access import require_member as _require_member
 from api.schemas import (
@@ -112,7 +113,7 @@ def update_collection_settings(
     entry."""
     db = _db(request)
     if not role_can_modify_scope(_require_member(db, auth.account_id, organization_id)):
-        raise HTTPException(status_code=403, detail="Owner role required")
+        raise ApiError(403, "Owner role required", code="owner_role_required")
     try:
         requested = validate_requested(body.enabled_providers)
     except CapabilityRequestError as exc:
