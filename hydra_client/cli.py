@@ -5,6 +5,9 @@ other processes could read:
 - `HYDRA_API_URL`: the API (default `http://127.0.0.1:8000`);
 - `HYDRA_API_KEY`, or `--key-file PATH`: the API key.
 
+A value that starts with `-` goes after `--`, as with any command line:
+`python -m hydra_client feedback idea -- "-- a message"`.
+
 Every command prints the API's JSON response. An API error prints its
 code, message and request id to stderr; the exit status says what
 happened:

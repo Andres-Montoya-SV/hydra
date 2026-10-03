@@ -104,7 +104,10 @@ def _require_account_creation_not_rate_limited(request: Request) -> None:
 
 
 def _new_verification_token() -> str:
-    return secrets.token_urlsafe(32)
+    """256 random bits as hex. URL-safe base64 started with `-` about once
+    in 64 tokens, which a command line reads as an option: the CLI then
+    rejected the token as missing (found by the beta acceptance test)."""
+    return secrets.token_hex(32)
 
 
 @router.post(
