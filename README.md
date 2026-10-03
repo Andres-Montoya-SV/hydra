@@ -145,6 +145,17 @@ self-audit are documented under [`docs/easm/`](docs/easm/) —
 [`docs/easm/21_risk_reports_and_final_audit.md`](docs/easm/21_risk_reports_and_final_audit.md)
 is the closing summary and provider capability matrix.
 
+## The Hydra API
+
+Hydra also runs as a multi-tenant API (`api/`), with a thin command-line
+client (`python -m hydra_client`):
+
+- [Getting started](docs/runbooks/CUSTOMER_GUIDE.md): for customers.
+- [API reference](docs/API_REFERENCE.md): generated from the code, with
+  the full [OpenAPI document](docs/api/openapi.json).
+- [Deployment](docs/DEPLOYMENT.md) and the
+  [operator runbook](docs/runbooks/OPERATOR_RUNBOOK.md): for operators.
+
 ## Quickstart
 
 **Docker is the recommended path** — it's the only way to guarantee every

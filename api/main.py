@@ -27,6 +27,8 @@ from api.integration_worker import run_integration_delivery_loop
 from api.metrics import install_metrics
 from api.monitoring_worker import run_monitoring_loop
 from api.observability import configure_logging, init_sentry
+from api.openapi_docs import DESCRIPTION as OPENAPI_DESCRIPTION
+from api.openapi_docs import HydraAPI
 from api.rate_limit import PersistentTokenBucketLimiter
 from api.reconciliation_worker import run_reconciliation_loop
 from api.routers import (
@@ -253,37 +255,9 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
         await monitoring_task
         await integration_task
 
-    app = FastAPI(
+    app = HydraAPI(
         title="Hydra EASM API",
-        description=(
-            "Round 3: Free/Medium/Pro/Ultra tiers gate scan quotas, verified-"
-            "domain counts, report formats/languages, and the assess-"
-            "reportability/suggest-hypotheses LLM features; Wompi billing "
-            "(OAuth client-credentials, webhook-signature-verified tier "
-            "activation, payment-failure grace period) sits behind "
-            "POST /account/subscription. Round 2's domain-ownership "
-            "verification and Round 1's multi-tenant core/auth/async scans "
-            "underneath. Post-Round-3 hardening: POST /accounts is "
-            "per-IP rate limited (persisted, cross-process-safe) and "
-            "gated by email verification before POST /scans will run "
-            "anything (real delivery via Postmark when configured, "
-            "console-logged otherwise). Scans run on a durable, SQLite-"
-            "backed queue (api/scan_worker.py) — a scan interrupted by "
-            "a worker crash or restart is automatically requeued and "
-            "re-executed, up to a bounded retry ceiling, rather than "
-            "silently abandoned. A daily reconciliation loop "
-            "(api/reconciliation_worker.py) suspends accounts whose "
-            "payment-failure grace period expired (emailing them when "
-            "it does) and purges scans/artifacts past each account's "
-            "tier retention window. A daily backup loop "
-            "(api/backup_worker.py) snapshots control.db and every "
-            "account's recon.db via SQLite's own online backup API, "
-            "optionally pushing them to S3-compatible storage. "
-            "GET /health (unauthenticated) reports control_db "
-            "reachability and whether each background loop is still "
-            "alive; error tracking (Sentry) and JSON logs are optional, "
-            "env-configured — see docs/PAID_API_DESIGN.md."
-        ),
+        description=OPENAPI_DESCRIPTION,
         version=HYDRA_VERSION,
         lifespan=lifespan,
     )
