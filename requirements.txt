@@ -22,7 +22,7 @@ defusedxml==0.7.1
 # reintroduce urllib3 1.x/<2.5 by loosening some other package's pin.
 # Deliberately NOT following Snyk's own default suggestion of the 1.26.x
 # line — that would be a major downgrade off the already-current 2.x series.
-urllib3>=2.5.0
+urllib3>=2.8.0
 
 # Development / QA (install with: pip install -r requirements-dev.txt)
 # See requirements-dev.txt
