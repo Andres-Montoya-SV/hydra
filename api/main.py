@@ -33,12 +33,14 @@ from api.routers import (
     accounts,
     asset_context,
     collection,
+    demo,
     diagnostics,
     domains,
     easm,
     explanations,
     exports,
     exposures,
+    feedback,
     health,
     hypotheses,
     imports,
@@ -305,6 +307,8 @@ def create_app(api_settings: APISettings | None = None) -> FastAPI:
     app.include_router(hypotheses.router)
     app.include_router(subscription.router)
     app.include_router(diagnostics.router)
+    app.include_router(demo.router)
+    app.include_router(feedback.router)
     app.include_router(webhooks.router)
     app.include_router(security_events.router)
     app.include_router(tenant_lifecycle.router)
